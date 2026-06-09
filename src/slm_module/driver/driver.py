@@ -1,5 +1,6 @@
 import ctypes
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -70,6 +71,9 @@ class SLM_DVI_Driver:
         self.is_open = False
         self.dll = _load_slm_dll()
         self._bind_functions()
+        # DLL thread-safety is undocumented; serialize every DLL entry so the
+        # keep-alive thread and scan worker never call into it concurrently.
+        self._lock = threading.RLock()
 
     def _bind_functions(self):
         self.dll.SLM_Disp_Info.argtypes = [
@@ -134,7 +138,8 @@ class SLM_DVI_Driver:
         display_no = self.display_no if display_no is None else int(display_no)
         height = ctypes.c_uint16()
         width = ctypes.c_uint16()
-        ret = self.dll.SLM_Disp_Info(display_no, ctypes.byref(width), ctypes.byref(height))
+        with self._lock:
+            ret = self.dll.SLM_Disp_Info(display_no, ctypes.byref(width), ctypes.byref(height))
         self._check_error(ret, "SLM_Disp_Info")
         return width.value, height.value
 
@@ -148,9 +153,10 @@ class SLM_DVI_Driver:
         height = ctypes.c_uint16()
         width = ctypes.c_uint16()
         name = ctypes.create_string_buffer(128)
-        ret = self.dll.SLM_Disp_Info2(
-            display_no, ctypes.byref(width), ctypes.byref(height), name
-        )
+        with self._lock:
+            ret = self.dll.SLM_Disp_Info2(
+                display_no, ctypes.byref(width), ctypes.byref(height), name
+            )
         self._check_error(ret, "SLM_Disp_Info2")
         return width.value, height.value, name.value.decode("mbcs", errors="replace")
 
@@ -167,25 +173,30 @@ class SLM_DVI_Driver:
         return found
 
     def open_slm(self):
-        ret = self.dll.SLM_Disp_Open(self.display_no)
+        with self._lock:
+            ret = self.dll.SLM_Disp_Open(self.display_no)
         self._check_error(ret, "SLM_Disp_Open")
         self.is_open = True
 
     def close_slm(self):
-        ret = self.dll.SLM_Disp_Close(self.display_no)
+        with self._lock:
+            ret = self.dll.SLM_Disp_Close(self.display_no)
         self.is_open = False
         self._check_error(ret, "SLM_Disp_Close")
 
     def load_csv(self, csv_path: str, interval: float = 0.2, flags: int | None = None):
         csv_path = str(Path(csv_path).resolve())
         flags = self.flags if flags is None else int(flags)
-        ret = self.dll.SLM_Disp_ReadCSV(self.display_no, flags, csv_path)
+        # sleep outside the lock so the dwell never blocks other DLL callers
+        with self._lock:
+            ret = self.dll.SLM_Disp_ReadCSV(self.display_no, flags, csv_path)
         self._check_error(ret, "SLM_Disp_ReadCSV")
         time.sleep(interval)
 
     def load_grayscale(self, grayscale: int, interval: float = 0.2, flags: int | None = None):
         flags = self.flags if flags is None else int(flags)
-        ret = self.dll.SLM_Disp_GrayScale(self.display_no, flags, grayscale)
+        with self._lock:
+            ret = self.dll.SLM_Disp_GrayScale(self.display_no, flags, grayscale)
         self._check_error(ret, "SLM_Disp_GrayScale")
         time.sleep(interval)
 
@@ -198,35 +209,62 @@ class SLM_DVI_Driver:
         if mode not in (MODE_MEMORY, MODE_DVI):
             raise ValueError("mode must be 0 (Memory) or 1 (DVI)")
         slm_number = int(slm_number)
-        ret = self.dll.SLM_Ctrl_Open(slm_number)
-        self._check_error(ret, "SLM_Ctrl_Open")
-        try:
-            deadline = time.monotonic() + timeout
-            while True:
-                ret = self.dll.SLM_Ctrl_ReadSU(slm_number)
-                if ret == SLM_OK:
-                    break
-                if ret != SLM_BS or time.monotonic() >= deadline:
-                    self._check_error(ret, "SLM_Ctrl_ReadSU")
-                    raise RuntimeError("SLM_Ctrl_ReadSU: timed out waiting for ready")
-                time.sleep(0.5)
-            ret = self.dll.SLM_Ctrl_WriteVI(slm_number, mode)
-            self._check_error(ret, "SLM_Ctrl_WriteVI")
-        finally:
-            self.dll.SLM_Ctrl_Close(slm_number)
+        # hold the lock for the whole USB session so it is never interleaved
+        with self._lock:
+            ret = self.dll.SLM_Ctrl_Open(slm_number)
+            self._check_error(ret, "SLM_Ctrl_Open")
+            try:
+                deadline = time.monotonic() + timeout
+                while True:
+                    ret = self.dll.SLM_Ctrl_ReadSU(slm_number)
+                    if ret == SLM_OK:
+                        break
+                    if ret != SLM_BS or time.monotonic() >= deadline:
+                        self._check_error(ret, "SLM_Ctrl_ReadSU")
+                        raise RuntimeError("SLM_Ctrl_ReadSU: timed out waiting for ready")
+                    time.sleep(0.5)
+                ret = self.dll.SLM_Ctrl_WriteVI(slm_number, mode)
+                self._check_error(ret, "SLM_Ctrl_WriteVI")
+            finally:
+                self.dll.SLM_Ctrl_Close(slm_number)
 
     def get_video_mode(self, slm_number: int = 1) -> int:
         """Read the current Memory/DVI mode over USB."""
         slm_number = int(slm_number)
-        ret = self.dll.SLM_Ctrl_Open(slm_number)
-        self._check_error(ret, "SLM_Ctrl_Open")
-        try:
-            mode = ctypes.c_uint32()
-            ret = self.dll.SLM_Ctrl_ReadVI(slm_number, ctypes.byref(mode))
-            self._check_error(ret, "SLM_Ctrl_ReadVI")
-            return mode.value
-        finally:
-            self.dll.SLM_Ctrl_Close(slm_number)
+        with self._lock:
+            ret = self.dll.SLM_Ctrl_Open(slm_number)
+            self._check_error(ret, "SLM_Ctrl_Open")
+            try:
+                mode = ctypes.c_uint32()
+                ret = self.dll.SLM_Ctrl_ReadVI(slm_number, ctypes.byref(mode))
+                self._check_error(ret, "SLM_Ctrl_ReadVI")
+                return mode.value
+            finally:
+                self.dll.SLM_Ctrl_Close(slm_number)
+
+    def ping(self, slm_number: int = 1, verify_video_mode: bool = False) -> int | None:
+        """Heartbeat over USB to keep the SLM responsive (keep-alive).
+
+        Sends SLM_Ctrl_ReadSU, the documented command for resynchronizing
+        communication; SLM_BS (busy) still counts as alive. Optionally reads
+        back the video mode so callers can verify DVI is still active.
+        """
+        slm_number = int(slm_number)
+        with self._lock:
+            ret = self.dll.SLM_Ctrl_Open(slm_number)
+            self._check_error(ret, "SLM_Ctrl_Open")
+            try:
+                ret = self.dll.SLM_Ctrl_ReadSU(slm_number)
+                if ret not in (SLM_OK, SLM_BS):
+                    self._check_error(ret, "SLM_Ctrl_ReadSU")
+                if not verify_video_mode:
+                    return None
+                mode = ctypes.c_uint32()
+                ret = self.dll.SLM_Ctrl_ReadVI(slm_number, ctypes.byref(mode))
+                self._check_error(ret, "SLM_Ctrl_ReadVI")
+                return mode.value
+            finally:
+                self.dll.SLM_Ctrl_Close(slm_number)
 
     def __enter__(self):
         self.open_slm()

@@ -13,8 +13,18 @@ from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..calibration import CalibrationFit, fit_calibration, load_calibration_csv
-from ..controller import SLMController
-from ..generator import MAX_LEVEL, iter_center_scan_positions, make_vertical_window
+from ..controller import ScanParams, ScanResult, SLMController
+from ..detector import Detector, SimulatedDetector
+from ..generator import (
+    MAX_LEVEL,
+    equal_x_segment_edges,
+    make_equal_x_segments,
+    make_vertical_window,
+    make_x_segments,
+    write_santec_csv,
+)
+from ..keepalive import SLMKeepAlive
+from .style import DARK_STYLESHEET
 
 
 class WorkerSignals(QtCore.QObject):
@@ -37,8 +47,10 @@ class FunctionWorker(QtCore.QRunnable):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    scan_progress = QtCore.pyqtSignal(int, str)
-    scan_total = QtCore.pyqtSignal(int, int, int)
+    scan_progress = QtCore.pyqtSignal(int, int, str)
+    scan_started = QtCore.pyqtSignal(int, int, int, int)
+    scan_sample = QtCore.pyqtSignal(float, float)
+    keepalive_status = QtCore.pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -54,13 +66,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slm_size = (1920, 1200)
         self.calibration_fits: dict[float, CalibrationFit] = {}
         self.scan_stop_event: threading.Event | None = None
+        self.scan_pause_event: threading.Event | None = None
+        self.scan_params: ScanParams | None = None
+        self.keepalive: SLMKeepAlive | None = None
+        self._scan_x_range: tuple[int, int] = (0, 0)
+        self._segments_updating = False
 
         self.setWindowTitle("Santec SLM Control")
-        self.resize(1260, 820)
+        self.resize(1280, 840)
         self._build_ui()
         self._apply_style()
         self.scan_progress.connect(self._on_scan_progress)
-        self.scan_total.connect(self._on_scan_total)
+        self.scan_started.connect(self._on_scan_started)
+        self.scan_sample.connect(self._on_scan_sample)
+        self.keepalive_status.connect(self._on_keepalive_status)
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -68,21 +87,45 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        sidebar = QtWidgets.QWidget()
+        sidebar.setObjectName("Navigation")
+        sidebar.setFixedWidth(220)
+        sidebar_layout = QtWidgets.QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+
+        brand = QtWidgets.QLabel("Santec SLM-200")
+        brand.setObjectName("AppBrand")
+        brand_sub = QtWidgets.QLabel("Control Suite")
+        brand_sub.setObjectName("AppBrandSub")
+        sidebar_layout.addWidget(brand)
+        sidebar_layout.addWidget(brand_sub)
+
         self.nav = QtWidgets.QListWidget()
         self.nav.setObjectName("Navigation")
-        self.nav.setFixedWidth(210)
-        for label in ("SLM Control", "Calibration", "Center Scan", "TPA Encoding"):
+        self.nav.setFrameShape(QtWidgets.QFrame.NoFrame)
+        nav_items = (
+            ("\N{LINK SYMBOL}  SLM Control", "Connection and basic display"),
+            ("\N{CHART WITH UPWARDS TREND}  Calibration", "Intensity curve fitting"),
+            ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
+            ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
+            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Not implemented yet"),
+        )
+        for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
-            item.setSizeHint(QtCore.QSize(180, 52))
+            item.setSizeHint(QtCore.QSize(180, 48))
+            item.setToolTip(tooltip)
             self.nav.addItem(item)
+        sidebar_layout.addWidget(self.nav, 1)
 
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self._build_control_page())
         self.stack.addWidget(self._build_calibration_page())
         self.stack.addWidget(self._build_scan_page())
+        self.stack.addWidget(self._build_segments_page())
         self.stack.addWidget(self._build_tpa_page())
 
-        layout.addWidget(self.nav)
+        layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -127,6 +170,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         dvi_mode_button.clicked.connect(self._switch_to_dvi_mode)
 
+        self.keepalive_check = QtWidgets.QCheckBox("DVI keep-alive")
+        self.keepalive_check.setToolTip(
+            "Re-send the current pattern over DVI at a fixed interval so the "
+            "display link stays active and the SLM does not shut down or error"
+        )
+        self.keepalive_check.toggled.connect(self._toggle_keepalive)
+        self.keepalive_interval_spin = QtWidgets.QSpinBox()
+        self.keepalive_interval_spin.setRange(10, 30)
+        self.keepalive_interval_spin.setValue(15)
+        self.keepalive_interval_spin.setSuffix(" s")
+        self.keepalive_interval_spin.valueChanged.connect(self._on_keepalive_interval)
+        self.keepalive_status_label = QtWidgets.QLabel("Keep-alive: off")
+        self._set_status(self.keepalive_status_label, "Keep-alive: off", "off")
+
         connection_layout.addWidget(QtWidgets.QLabel("Display"), 0, 0)
         connection_layout.addWidget(self.display_no_spin, 0, 1)
         connection_layout.addWidget(detect_button, 0, 2)
@@ -137,8 +194,12 @@ class MainWindow(QtWidgets.QMainWindow):
         connection_layout.addWidget(self.usb_slm_no_spin, 1, 1)
         connection_layout.addWidget(dvi_mode_button, 1, 2)
         connection_layout.addWidget(self.rate120_check, 1, 3, 1, 2)
-        connection_layout.addWidget(self.conn_status_label, 2, 0, 1, 3)
-        connection_layout.addWidget(self.info_label, 2, 3, 1, 3)
+        connection_layout.addWidget(self.keepalive_check, 2, 0, 1, 2)
+        connection_layout.addWidget(QtWidgets.QLabel("Interval"), 2, 2)
+        connection_layout.addWidget(self.keepalive_interval_spin, 2, 3)
+        connection_layout.addWidget(self.keepalive_status_label, 2, 4, 1, 2)
+        connection_layout.addWidget(self.conn_status_label, 3, 0, 1, 3)
+        connection_layout.addWidget(self.info_label, 3, 3, 1, 3)
 
         grayscale = self._panel("Grayscale")
         grayscale_layout = QtWidgets.QGridLayout(grayscale)
@@ -237,6 +298,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dwell_spin.setValue(0.2)
         self.dwell_spin.setSuffix(" s")
 
+        self.detector_combo = QtWidgets.QComboBox()
+        self.detector_combo.addItems(["None", "Simulated"])
+        self.detector_combo.setToolTip(
+            "Detector sampled at each scan position for center detection; "
+            "real hardware can be plugged in via the Detector interface"
+        )
+
         fields = [
             ("Level", self.scan_level_spin),
             ("Window", self.window_px_spin),
@@ -244,6 +312,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Start x", self.start_x_spin),
             ("End x", self.end_x_spin),
             ("Dwell", self.dwell_spin),
+            ("Detector", self.detector_combo),
         ]
         for index, (label, widget) in enumerate(fields):
             row = index // 3
@@ -260,24 +329,54 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             widget.valueChanged.connect(self._update_scan_preview)
 
+        # level/window/step/dwell can be adjusted while a scan runs;
+        # changes take effect on the next frame
+        self.scan_level_spin.valueChanged.connect(
+            lambda value: self._on_scan_param_changed(level=value)
+        )
+        self.window_px_spin.valueChanged.connect(
+            lambda value: self._on_scan_param_changed(window_px=value)
+        )
+        self.step_px_spin.valueChanged.connect(
+            lambda value: self._on_scan_param_changed(step_px=value)
+        )
+        self.dwell_spin.valueChanged.connect(
+            lambda value: self._on_scan_param_changed(dwell_seconds=value)
+        )
+
         output = self._panel("Output")
         output_layout = QtWidgets.QGridLayout(output)
         self.scan_output_edit = QtWidgets.QLineEdit()
         output_browse = QtWidgets.QPushButton("Browse")
         self.start_scan_button = QtWidgets.QPushButton("Start Scan")
+        self.pause_scan_button = QtWidgets.QPushButton("Pause")
+        self.pause_scan_button.setProperty("variant", "ghost")
+        self.pause_scan_button.setEnabled(False)
         self.stop_scan_button = QtWidgets.QPushButton("Stop")
+        self.stop_scan_button.setProperty("variant", "danger")
         self.stop_scan_button.setEnabled(False)
         output_browse.clicked.connect(self._browse_scan_output)
         self.start_scan_button.clicked.connect(self._start_center_scan)
+        self.pause_scan_button.clicked.connect(self._toggle_scan_pause)
         self.stop_scan_button.clicked.connect(self._stop_center_scan)
         output_layout.addWidget(self.scan_output_edit, 0, 0)
         output_layout.addWidget(output_browse, 0, 1)
         output_layout.addWidget(self.start_scan_button, 0, 2)
-        output_layout.addWidget(self.stop_scan_button, 0, 3)
+        output_layout.addWidget(self.pause_scan_button, 0, 3)
+        output_layout.addWidget(self.stop_scan_button, 0, 4)
 
         self.scan_size_label = QtWidgets.QLabel("Using preview size 1920 x 1200")
         self.scan_progress_bar = QtWidgets.QProgressBar()
         self.scan_progress_bar.setValue(0)
+        status_row = QtWidgets.QHBoxLayout()
+        self.scan_signal_label = QtWidgets.QLabel("Signal: \N{EN DASH}")
+        self.scan_center_label = QtWidgets.QLabel("Center: \N{EN DASH}")
+        self._set_status(self.scan_center_label, "Center: \N{EN DASH}", "off")
+        status_row.addWidget(self.scan_size_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.scan_signal_label)
+        status_row.addWidget(self.scan_center_label)
+
         self.preview_label = QtWidgets.QLabel()
         self.preview_label.setMinimumHeight(280)
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
@@ -285,10 +384,86 @@ class MainWindow(QtWidgets.QMainWindow):
 
         page.layout().addWidget(controls)
         page.layout().addWidget(output)
-        page.layout().addWidget(self.scan_size_label)
+        page.layout().addLayout(status_row)
         page.layout().addWidget(self.scan_progress_bar)
         page.layout().addWidget(self.preview_label, 1)
         self._update_scan_preview()
+        return page
+
+    def _build_segments_page(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Phase Segments")
+        subtitle = QtWidgets.QLabel(
+            "Divide the x axis into vertical bands and assign a phase level "
+            "to each (constant along y)."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        page.layout().addWidget(subtitle)
+
+        controls = self._panel("Segments")
+        controls_layout = QtWidgets.QGridLayout(controls)
+        self.segment_mode_combo = QtWidgets.QComboBox()
+        self.segment_mode_combo.addItems(["Equal division", "Explicit segments"])
+        self.segment_count_spin = self._spin(1, 256, 4)
+        self.segment_fill_spin = self._spin(0, MAX_LEVEL, 512)
+        fill_button = QtWidgets.QPushButton("Set All Levels")
+        fill_button.setProperty("variant", "ghost")
+        add_row_button = QtWidgets.QPushButton("Add Row")
+        add_row_button.setProperty("variant", "ghost")
+        remove_row_button = QtWidgets.QPushButton("Remove Row")
+        remove_row_button.setProperty("variant", "ghost")
+
+        controls_layout.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
+        controls_layout.addWidget(self.segment_mode_combo, 0, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Parts"), 0, 2)
+        controls_layout.addWidget(self.segment_count_spin, 0, 3)
+        controls_layout.addWidget(self.segment_fill_spin, 0, 4)
+        controls_layout.addWidget(fill_button, 0, 5)
+        controls_layout.addWidget(add_row_button, 0, 6)
+        controls_layout.addWidget(remove_row_button, 0, 7)
+
+        self.segments_table = QtWidgets.QTableWidget(0, 3)
+        self.segments_table.setHorizontalHeaderLabels(["x start", "x end", "Level"])
+        self.segments_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch
+        )
+        self.segments_table.verticalHeader().setVisible(False)
+        self.segments_table.setAlternatingRowColors(True)
+        self.segments_table.setMaximumHeight(220)
+
+        actions = self._panel("Actions")
+        actions_layout = QtWidgets.QGridLayout(actions)
+        display_button = QtWidgets.QPushButton("Display on SLM")
+        export_button = QtWidgets.QPushButton("Export CSV")
+        export_button.setProperty("variant", "ghost")
+        self.segment_status_label = QtWidgets.QLabel("")
+        actions_layout.addWidget(display_button, 0, 0)
+        actions_layout.addWidget(export_button, 0, 1)
+        actions_layout.addWidget(self.segment_status_label, 0, 2)
+        actions_layout.setColumnStretch(2, 1)
+
+        self.segment_preview_label = QtWidgets.QLabel()
+        self.segment_preview_label.setMinimumHeight(240)
+        self.segment_preview_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.segment_preview_label.setObjectName("Preview")
+
+        page.layout().addWidget(controls)
+        page.layout().addWidget(self._panel_with_widget("Definition", self.segments_table))
+        page.layout().addWidget(actions)
+        page.layout().addWidget(self.segment_preview_label, 1)
+
+        self.segment_mode_combo.currentIndexChanged.connect(self._on_segment_mode_changed)
+        self.segment_count_spin.valueChanged.connect(self._rebuild_equal_segment_rows)
+        fill_button.clicked.connect(self._fill_segment_levels)
+        add_row_button.clicked.connect(self._add_segment_row)
+        remove_row_button.clicked.connect(self._remove_segment_row)
+        self.segments_table.itemChanged.connect(self._on_segment_item_changed)
+        display_button.clicked.connect(self._display_segments)
+        export_button.clicked.connect(self._export_segments_csv)
+
+        self._segment_add_button = add_row_button
+        self._segment_remove_button = remove_row_button
+        self._rebuild_equal_segment_rows()
+        self._on_segment_mode_changed()
         return page
 
     def _build_tpa_page(self) -> QtWidgets.QWidget:
@@ -330,6 +505,14 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setValue(value)
         return spin
 
+    def _set_status(self, label: QtWidgets.QLabel, text: str, status: str) -> None:
+        """Update a status pill label (status in: ok, error, off)."""
+        label.setText(text)
+        if label.property("status") != status:
+            label.setProperty("status", status)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
     def _controller(self) -> SLMController:
         display_no = self.display_no_spin.value()
         rate120 = self.rate120_check.isChecked()
@@ -346,7 +529,8 @@ class MainWindow(QtWidgets.QMainWindow):
         old_controller = self.controller
         self.controller = None
         self.controller_display_no = None
-        self.conn_status_label.setText("Status: closed")
+        self._stop_keepalive()
+        self._set_status(self.conn_status_label, "Status: closed", "off")
         if old_controller is not None and getattr(old_controller, "is_open", False):
             self._run_task("Close previous SLM", old_controller.close_slm)
 
@@ -387,7 +571,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_conn_status(self) -> None:
         is_open = self.controller is not None and getattr(self.controller, "is_open", False)
-        self.conn_status_label.setText("Status: open" if is_open else "Status: closed")
+        if is_open:
+            self._set_status(self.conn_status_label, "Status: open", "ok")
+        else:
+            self._set_status(self.conn_status_label, "Status: closed", "off")
 
     def _fail_task(
         self,
@@ -410,6 +597,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_task("Open SLM", lambda: self._controller().open_slm())
 
     def _close_slm(self) -> None:
+        self._stop_keepalive()
         self._run_task("Close SLM", lambda: self._controller().close_slm())
 
     def _detect_slm(self) -> None:
@@ -441,6 +629,66 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._controller().set_dvi_mode(slm_number),
         )
 
+    def _toggle_keepalive(self, checked: bool) -> None:
+        if checked:
+            self._start_keepalive()
+        else:
+            self._stop_keepalive()
+
+    def _start_keepalive(self) -> None:
+        if self.keepalive is not None and self.keepalive.is_running:
+            return
+        # capture the controller on the GUI thread; the heartbeat thread
+        # must not touch widgets
+        controller = self._controller()
+        self.keepalive = SLMKeepAlive(
+            # re-send the last displayed pattern so the DVI link stays active
+            ping=lambda: controller.refresh_display(),
+            interval_seconds=self.keepalive_interval_spin.value(),
+            on_status=lambda ok, message: self.keepalive_status.emit(ok, message),
+        )
+        self.keepalive.start()
+        self._set_status(
+            self.keepalive_status_label,
+            f"Keep-alive: every {self.keepalive_interval_spin.value()} s",
+            "ok",
+        )
+        self._log(
+            f"DVI keep-alive started (re-send pattern every "
+            f"{self.keepalive_interval_spin.value()} s)"
+        )
+
+    def _stop_keepalive(self) -> None:
+        if self.keepalive is not None:
+            self.keepalive.stop()
+            self.keepalive = None
+            self._log("Keep-alive stopped")
+        if hasattr(self, "keepalive_status_label"):
+            self._set_status(self.keepalive_status_label, "Keep-alive: off", "off")
+        if hasattr(self, "keepalive_check") and self.keepalive_check.isChecked():
+            self.keepalive_check.blockSignals(True)
+            self.keepalive_check.setChecked(False)
+            self.keepalive_check.blockSignals(False)
+
+    def _on_keepalive_interval(self, value: int) -> None:
+        if self.keepalive is not None and self.keepalive.is_running:
+            self.keepalive.set_interval(float(value))
+            self._set_status(
+                self.keepalive_status_label, f"Keep-alive: every {value} s", "ok"
+            )
+
+    def _on_keepalive_status(self, ok: bool, message: str) -> None:
+        timestamp = QtCore.QTime.currentTime().toString("HH:mm:ss")
+        if ok:
+            self._set_status(
+                self.keepalive_status_label, f"Keep-alive: ok {timestamp}", "ok"
+            )
+        else:
+            self._set_status(
+                self.keepalive_status_label, f"Keep-alive: error {timestamp}", "error"
+            )
+            self._log(f"Keep-alive refresh failed: {message}")
+
     def _on_info_read(self, result: tuple[int, int]) -> None:
         width, height = result
         self.slm_size = (int(width), int(height))
@@ -450,6 +698,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.end_x_spin.setMaximum(width - 1)
         self.end_x_spin.setValue(width - 1)
         self._update_scan_preview()
+        if self._segment_mode_is_equal():
+            self._rebuild_equal_segment_rows()
+        else:
+            self._update_segment_preview()
 
     def _display_grayscale(self) -> None:
         value = self.gray_spin.value()
@@ -559,47 +811,69 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.scan_output_edit.setText(path)
 
+    def _make_detector(self, start_x: int, end_x: int) -> Detector | None:
+        """Build the selected detector; extend here for real hardware."""
+        choice = self.detector_combo.currentText()
+        if choice == "Simulated":
+            span = max(end_x - start_x, 1)
+            return SimulatedDetector(
+                center_x=(start_x + end_x) / 2.0,
+                sigma_px=max(span / 8.0, 1.0),
+            )
+        return None
+
     def _start_center_scan(self) -> None:
-        level = self.scan_level_spin.value()
-        window_px = self.window_px_spin.value()
-        step_px = self.step_px_spin.value()
         start_x = self.start_x_spin.value()
         end_x = self.end_x_spin.value()
-        dwell_seconds = self.dwell_spin.value()
         output_dir = self.scan_output_edit.text().strip() or None
 
-        self.scan_progress_bar.setValue(0)
-        self.scan_stop_event = threading.Event()
-        self.start_scan_button.setEnabled(False)
-        self.stop_scan_button.setEnabled(True)
+        try:
+            params = ScanParams(
+                self.scan_level_spin.value(),
+                window_px=self.window_px_spin.value(),
+                step_px=self.step_px_spin.value(),
+                dwell_seconds=self.dwell_spin.value(),
+            )
+        except ValueError as exc:
+            self._log(f"Invalid scan parameters: {exc}")
+            return
 
-        def run_scan() -> list[Path]:
+        detector = self._make_detector(start_x, end_x)
+
+        self.scan_progress_bar.setValue(0)
+        self.scan_signal_label.setText("Signal: \N{EN DASH}")
+        self._set_status(self.scan_center_label, "Center: \N{EN DASH}", "off")
+        self.scan_params = params
+        self.scan_stop_event = threading.Event()
+        self.scan_pause_event = threading.Event()
+        self.start_scan_button.setEnabled(False)
+        self.pause_scan_button.setEnabled(True)
+        self.pause_scan_button.setText("Pause")
+        self.stop_scan_button.setEnabled(True)
+        if self.keepalive is not None:
+            self.keepalive.suspend()
+
+        stop_event = self.scan_stop_event
+        pause_event = self.scan_pause_event
+
+        def run_scan() -> ScanResult:
             controller = self._controller()
             width, height = controller.get_slm_info()
             clamped_start = min(start_x, width - 1)
             clamped_end = min(end_x, width - 1)
-            positions = list(
-                iter_center_scan_positions(
-                    width,
-                    window_px=window_px,
-                    step_px=step_px,
-                    start_x=clamped_start,
-                    end_x=clamped_end,
-                )
-            )
-            self.scan_total.emit(len(positions), width, height)
-            return controller.display_center_scan(
-                level,
-                window_px=window_px,
-                step_px=step_px,
+            self.scan_started.emit(clamped_start, clamped_end, width, height)
+            return controller.run_center_scan(
+                params,
                 start_x=clamped_start,
                 end_x=clamped_end,
-                dwell_seconds=dwell_seconds,
                 output_dir=output_dir,
-                stop_event=self.scan_stop_event,
-                progress_callback=lambda index, path: self.scan_progress.emit(
-                    index + 1, str(path)
+                stop_event=stop_event,
+                pause_event=pause_event,
+                detector=detector,
+                progress_callback=lambda index, x, path: self.scan_progress.emit(
+                    index, x, str(path)
                 ),
+                sample_callback=lambda x, signal: self.scan_sample.emit(x, signal),
             )
 
         self._run_task("Center scan", run_scan, self._on_scan_finished, self._on_scan_error)
@@ -609,25 +883,104 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scan_stop_event.set()
             self._log("Center scan stop requested")
 
-    def _on_scan_total(self, total: int, width: int, height: int) -> None:
-        self.scan_progress_bar.setMaximum(max(total, 1))
+    def _toggle_scan_pause(self) -> None:
+        if self.scan_pause_event is None:
+            return
+        if self.scan_pause_event.is_set():
+            self.scan_pause_event.clear()
+            self.pause_scan_button.setText("Pause")
+            # the scan streams frames again, so the heartbeat can rest
+            if self.keepalive is not None:
+                self.keepalive.suspend()
+            self._log("Center scan resumed")
+        else:
+            self.scan_pause_event.set()
+            self.pause_scan_button.setText("Resume")
+            # no frames flow while paused; let the heartbeat keep DVI active
+            if self.keepalive is not None:
+                self.keepalive.resume()
+            self._log("Center scan paused")
+
+    def _on_scan_param_changed(self, **kwargs: Any) -> None:
+        params = self.scan_params
+        if params is None:
+            return
+        try:
+            params.update(**kwargs)
+        except ValueError as exc:
+            self._log(f"Scan parameter rejected: {exc}")
+            return
+        name, value = next(iter(kwargs.items()))
+        self._log(f"Scan parameter updated for next frame: {name} = {value}")
+
+    def _on_scan_started(self, start_x: int, end_x: int, width: int, height: int) -> None:
+        self._scan_x_range = (start_x, end_x)
+        # progress tracks the x position, which stays correct when the step
+        # size is changed mid-scan
+        self.scan_progress_bar.setMaximum(max(end_x - start_x + 1, 1))
         self.slm_size = (width, height)
         self.scan_size_label.setText(f"Using SLM size {width} x {height}")
 
-    def _on_scan_progress(self, count: int, path: str) -> None:
-        self.scan_progress_bar.setValue(count)
-        self._log(f"Displayed {Path(path).name}")
+    def _on_scan_progress(self, index: int, x: int, path: str) -> None:
+        start_x, _end_x = self._scan_x_range
+        self.scan_progress_bar.setValue(max(x - start_x + 1, 0))
+        self._log(f"Displayed frame {index + 1} at x={x} ({Path(path).name})")
 
-    def _on_scan_finished(self, paths: list[Path]) -> None:
+    def _on_scan_sample(self, x: float, signal: float) -> None:
+        self.scan_signal_label.setText(f"Signal: {signal:.4g} at x={x:.1f}")
+
+    def _finish_scan_ui(self) -> None:
         self.start_scan_button.setEnabled(True)
+        self.pause_scan_button.setEnabled(False)
+        self.pause_scan_button.setText("Pause")
         self.stop_scan_button.setEnabled(False)
         self.scan_stop_event = None
-        self._log(f"Center scan frames displayed: {len(paths)}")
+        self.scan_pause_event = None
+        self.scan_params = None
+        if self.keepalive is not None:
+            self.keepalive.resume()
+
+    def _on_scan_finished(self, result: ScanResult) -> None:
+        self._finish_scan_ui()
+        self.scan_progress_bar.setValue(self.scan_progress_bar.maximum())
+        self._log(f"Center scan frames displayed: {len(result.frames)}")
+        if result.center is not None:
+            center = result.center
+            self._set_status(
+                self.scan_center_label,
+                f"Center: peak x={center.peak_x:.0f}, centroid x={center.centroid_x:.1f}",
+                "ok",
+            )
+            self._log(
+                f"Center detected: peak x={center.peak_x:.1f} "
+                f"(signal {center.peak_signal:.4g}), centroid x={center.centroid_x:.1f}"
+            )
+        elif result.samples:
+            self._set_status(self.scan_center_label, "Center: not enough samples", "error")
+        else:
+            self._set_status(self.scan_center_label, "Center: no detector", "off")
+        if result.samples_path is not None:
+            self._log(f"Detector samples saved: {result.samples_path}")
 
     def _on_scan_error(self, _error: str) -> None:
-        self.start_scan_button.setEnabled(True)
-        self.stop_scan_button.setEnabled(False)
-        self.scan_stop_event = None
+        self._finish_scan_ui()
+
+    def _render_pattern_preview(self, label: QtWidgets.QLabel, data: np.ndarray) -> None:
+        # render the real grayscale levels (0..1023) as display brightness
+        preview = (data.astype(np.float32) / MAX_LEVEL * 217.0 + 18.0).astype(np.uint8)
+        image = QtGui.QImage(
+            preview.data,
+            preview.shape[1],
+            preview.shape[0],
+            preview.shape[1],
+            QtGui.QImage.Format_Grayscale8,
+        ).copy()
+        pixmap = QtGui.QPixmap.fromImage(image).scaled(
+            label.size().expandedTo(QtCore.QSize(760, 240)),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        label.setPixmap(pixmap)
 
     def _update_scan_preview(self) -> None:
         width, height = self.slm_size
@@ -642,31 +995,197 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError as exc:
             self.preview_label.setText(str(exc))
             return
+        self._render_pattern_preview(self.preview_label, data)
 
-        # render the real grayscale levels (0..1023) as display brightness
-        preview = (data.astype(np.float32) / MAX_LEVEL * 217.0 + 18.0).astype(np.uint8)
-        image = QtGui.QImage(
-            preview.data,
-            preview.shape[1],
-            preview.shape[0],
-            preview.shape[1],
-            QtGui.QImage.Format_Grayscale8,
-        ).copy()
-        pixmap = QtGui.QPixmap.fromImage(image).scaled(
-            self.preview_label.size().expandedTo(QtCore.QSize(760, 280)),
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
+    def _segment_mode_is_equal(self) -> bool:
+        return self.segment_mode_combo.currentIndex() == 0
+
+    def _on_segment_mode_changed(self) -> None:
+        equal = self._segment_mode_is_equal()
+        self.segment_count_spin.setEnabled(equal)
+        self._segment_add_button.setEnabled(not equal)
+        self._segment_remove_button.setEnabled(not equal)
+        if equal:
+            self._rebuild_equal_segment_rows()
+        else:
+            self._make_segment_x_cells_editable()
+            self._update_segment_preview()
+
+    def _segment_table_item(self, value: int, editable: bool) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(str(value))
+        if not editable:
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        return item
+
+    def _rebuild_equal_segment_rows(self) -> None:
+        if not self._segment_mode_is_equal():
+            return
+        width, _height = self.slm_size
+        count = min(self.segment_count_spin.value(), width)
+        edges = equal_x_segment_edges(width, count)
+
+        previous_levels = []
+        for row in range(self.segments_table.rowCount()):
+            item = self.segments_table.item(row, 2)
+            previous_levels.append(item.text() if item is not None else "0")
+
+        self._segments_updating = True
+        try:
+            self.segments_table.setRowCount(count)
+            for row in range(count):
+                level = previous_levels[row] if row < len(previous_levels) else "0"
+                self.segments_table.setItem(
+                    row, 0, self._segment_table_item(edges[row], editable=False)
+                )
+                self.segments_table.setItem(
+                    row, 1, self._segment_table_item(edges[row + 1], editable=False)
+                )
+                level_item = QtWidgets.QTableWidgetItem(level)
+                self.segments_table.setItem(row, 2, level_item)
+        finally:
+            self._segments_updating = False
+        self._update_segment_preview()
+
+    def _make_segment_x_cells_editable(self) -> None:
+        self._segments_updating = True
+        try:
+            for row in range(self.segments_table.rowCount()):
+                for col in (0, 1):
+                    item = self.segments_table.item(row, col)
+                    if item is not None:
+                        item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
+        finally:
+            self._segments_updating = False
+
+    def _fill_segment_levels(self) -> None:
+        value = str(self.segment_fill_spin.value())
+        self._segments_updating = True
+        try:
+            for row in range(self.segments_table.rowCount()):
+                item = self.segments_table.item(row, 2)
+                if item is None:
+                    self.segments_table.setItem(row, 2, QtWidgets.QTableWidgetItem(value))
+                else:
+                    item.setText(value)
+        finally:
+            self._segments_updating = False
+        self._update_segment_preview()
+
+    def _add_segment_row(self) -> None:
+        width, _height = self.slm_size
+        row = self.segments_table.rowCount()
+        previous_end = 0
+        if row > 0:
+            item = self.segments_table.item(row - 1, 1)
+            try:
+                previous_end = int(item.text()) if item is not None else 0
+            except ValueError:
+                previous_end = 0
+        self._segments_updating = True
+        try:
+            self.segments_table.insertRow(row)
+            self.segments_table.setItem(
+                row, 0, QtWidgets.QTableWidgetItem(str(min(previous_end, width - 1)))
+            )
+            self.segments_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(width)))
+            self.segments_table.setItem(row, 2, QtWidgets.QTableWidgetItem("0"))
+        finally:
+            self._segments_updating = False
+        self._update_segment_preview()
+
+    def _remove_segment_row(self) -> None:
+        row = self.segments_table.currentRow()
+        if row < 0:
+            row = self.segments_table.rowCount() - 1
+        if row >= 0:
+            self.segments_table.removeRow(row)
+            self._update_segment_preview()
+
+    def _on_segment_item_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
+        if not self._segments_updating:
+            self._update_segment_preview()
+
+    def _segment_pattern_data(self) -> np.ndarray:
+        width, height = self.slm_size
+        rows = self.segments_table.rowCount()
+        if rows == 0:
+            raise ValueError("define at least one segment")
+
+        def cell(row: int, col: int, name: str) -> int:
+            item = self.segments_table.item(row, col)
+            text = item.text().strip() if item is not None else ""
+            try:
+                return int(text)
+            except ValueError as exc:
+                raise ValueError(f"row {row + 1}: {name} must be an integer") from exc
+
+        if self._segment_mode_is_equal():
+            levels = [cell(row, 2, "level") for row in range(rows)]
+            return make_equal_x_segments(width, height, levels)
+        segments = [
+            (cell(row, 0, "x start"), cell(row, 1, "x end"), cell(row, 2, "level"))
+            for row in range(rows)
+        ]
+        return make_x_segments(width, height, segments)
+
+    def _update_segment_preview(self) -> None:
+        if not hasattr(self, "segment_preview_label"):
+            return
+        try:
+            data = self._segment_pattern_data()
+        except ValueError as exc:
+            self.segment_preview_label.setText(str(exc))
+            self.segment_status_label.setText(str(exc))
+            return
+        self.segment_status_label.setText("")
+        self._render_pattern_preview(self.segment_preview_label, data)
+
+    def _display_segments(self) -> None:
+        try:
+            data = self._segment_pattern_data()
+        except ValueError as exc:
+            self._log(f"Invalid segments: {exc}")
+            QtWidgets.QMessageBox.warning(self, "Phase Segments", str(exc))
+            return
+        self._run_task(
+            "Display segments",
+            lambda: self._controller().display_mask_csv(data),
         )
-        self.preview_label.setPixmap(pixmap)
+
+    def _export_segments_csv(self) -> None:
+        try:
+            data = self._segment_pattern_data()
+        except ValueError as exc:
+            self._log(f"Invalid segments: {exc}")
+            QtWidgets.QMessageBox.warning(self, "Phase Segments", str(exc))
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Segments CSV", "phase_segments.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        self._run_task(
+            "Export segments CSV",
+            lambda: write_santec_csv(data, path),
+            lambda saved: self._log(f"Segments CSV saved: {saved}"),
+        )
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         if hasattr(self, "preview_label"):
             self._update_scan_preview()
+        if hasattr(self, "segment_preview_label"):
+            self._update_segment_preview()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.keepalive is not None:
+            self.keepalive.stop()
+            self.keepalive = None
         if self.scan_stop_event is not None:
             self.scan_stop_event.set()
+        if self.scan_pause_event is not None:
+            # wake a paused scan so the worker can observe the stop event
+            self.scan_pause_event.clear()
         self.thread_pool.waitForDone(3000)
         if self.controller is not None and getattr(self.controller, "is_open", False):
             try:
@@ -676,103 +1195,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background: #0f1419;
-                color: #d8dee9;
-                font-family: Segoe UI, Arial, sans-serif;
-                font-size: 10.5pt;
-            }
-            #Navigation {
-                background: #141b22;
-                border: none;
-                padding: 12px;
-            }
-            #Navigation::item {
-                border-radius: 6px;
-                padding: 14px 12px;
-                margin: 3px 0;
-            }
-            #Navigation::item:selected {
-                background: #1f6f78;
-                color: white;
-            }
-            #PageTitle {
-                font-size: 24pt;
-                font-weight: 650;
-                color: #f4f7f8;
-            }
-            QGroupBox#Panel {
-                border: 1px solid #2c3a43;
-                border-radius: 8px;
-                margin-top: 16px;
-                padding: 18px 12px 12px 12px;
-                background: #111a20;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: #9fc9cf;
-                font-weight: 600;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget {
-                background: #0b1116;
-                border: 1px solid #344650;
-                border-radius: 6px;
-                padding: 7px;
-                selection-background-color: #1f6f78;
-            }
-            QPushButton {
-                background: #236d77;
-                border: 1px solid #2f8995;
-                border-radius: 6px;
-                color: white;
-                padding: 8px 14px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background: #2b7f8a;
-            }
-            QPushButton:disabled {
-                background: #26313a;
-                border-color: #2d3942;
-                color: #6d7b84;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #273640;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #f5c542;
-                width: 18px;
-                margin: -7px 0;
-                border-radius: 9px;
-            }
-            QProgressBar {
-                background: #0b1116;
-                border: 1px solid #344650;
-                border-radius: 6px;
-                text-align: center;
-                height: 20px;
-            }
-            QProgressBar::chunk {
-                background: #f5c542;
-                border-radius: 5px;
-            }
-            #Preview {
-                border: 1px solid #2c3a43;
-                border-radius: 8px;
-                background: #0b1116;
-            }
-            #LogBox {
-                font-family: Consolas, monospace;
-                font-size: 9.5pt;
-            }
-            """
-        )
+        self.setStyleSheet(DARK_STYLESHEET)
 
 
 def main(argv: list[str] | None = None) -> int:

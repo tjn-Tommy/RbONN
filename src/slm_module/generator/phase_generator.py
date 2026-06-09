@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 
@@ -17,6 +17,15 @@ class PhasePattern:
     x_start: int
     x_end: int
     data: np.ndarray
+
+
+@dataclass(frozen=True)
+class XSegment:
+    """A vertical band [x_start, x_end) filled with a constant phase level."""
+
+    x_start: int
+    x_end: int
+    level: int
 
 
 def make_vertical_window(
@@ -36,6 +45,87 @@ def make_vertical_window(
     x_end = min(width, x_start + window_px)
     data[:, x_start:x_end] = level
     return data
+
+
+def make_x_segments(
+    width: int,
+    height: int,
+    segments: Sequence[XSegment | tuple[int, int, int]],
+    *,
+    background_level: int = 0,
+) -> np.ndarray:
+    """Build a pattern from explicit vertical bands along the x axis.
+
+    Each segment fills columns [x_start, x_end) with its level for the full
+    height. Segments must not overlap; uncovered columns get background_level.
+    """
+    width = _positive_int(width, "width")
+    height = _positive_int(height, "height")
+    background_level = _bounded_int(background_level, "background_level", MIN_LEVEL, MAX_LEVEL)
+    if not segments:
+        raise ValueError("segments must not be empty")
+
+    normalized: list[XSegment] = []
+    for index, segment in enumerate(segments):
+        if isinstance(segment, XSegment):
+            x_start, x_end, level = segment.x_start, segment.x_end, segment.level
+        else:
+            x_start, x_end, level = segment
+        name = f"segments[{index}]"
+        x_start = _bounded_int(x_start, f"{name}.x_start", 0, width - 1)
+        x_end = _bounded_int(x_end, f"{name}.x_end", 1, width)
+        level = _bounded_int(level, f"{name}.level", MIN_LEVEL, MAX_LEVEL)
+        if x_end <= x_start:
+            raise ValueError(f"{name}: x_end must be greater than x_start")
+        normalized.append(XSegment(x_start=x_start, x_end=x_end, level=level))
+
+    ordered = sorted(normalized, key=lambda segment: segment.x_start)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current.x_start < previous.x_end:
+            raise ValueError(
+                f"segments overlap: [{previous.x_start}, {previous.x_end}) and "
+                f"[{current.x_start}, {current.x_end})"
+            )
+
+    data = np.full((height, width), background_level, dtype=np.uint16)
+    for segment in ordered:
+        data[:, segment.x_start:segment.x_end] = segment.level
+    return data
+
+
+def make_equal_x_segments(
+    width: int,
+    height: int,
+    levels: Sequence[int],
+) -> np.ndarray:
+    """Divide the x axis into len(levels) equal parts with one level each.
+
+    Boundaries are rounded so the parts cover the full width exactly even
+    when width is not divisible by the number of parts.
+    """
+    width = _positive_int(width, "width")
+    height = _positive_int(height, "height")
+    if not levels:
+        raise ValueError("levels must not be empty")
+    count = len(levels)
+    if count > width:
+        raise ValueError("number of parts cannot exceed width")
+
+    edges = equal_x_segment_edges(width, count)
+    segments = [
+        XSegment(x_start=edges[index], x_end=edges[index + 1], level=int(level))
+        for index, level in enumerate(levels)
+    ]
+    return make_x_segments(width, height, segments)
+
+
+def equal_x_segment_edges(width: int, count: int) -> list[int]:
+    """Return count+1 boundary positions dividing [0, width) into equal parts."""
+    width = _positive_int(width, "width")
+    count = _positive_int(count, "count")
+    if count > width:
+        raise ValueError("number of parts cannot exceed width")
+    return [round(index * width / count) for index in range(count + 1)]
 
 
 def iter_center_scan_positions(
