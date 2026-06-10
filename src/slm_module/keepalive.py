@@ -26,6 +26,7 @@ class SLMKeepAlive:
         self._on_status = on_status
         self._stop = threading.Event()
         self._suspended = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     @property
@@ -36,32 +37,44 @@ class SLMKeepAlive:
         if self.is_running:
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._run, name="slm-keepalive", daemon=True
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         self._stop.set()
+        self._wake.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout)
-        self._thread = None
+        stopped = thread is None or not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
 
     def suspend(self) -> None:
         """Skip heartbeats (e.g. while a scan owns the device)."""
         self._suspended.set()
+        self._wake.set()
 
     def resume(self) -> None:
         self._suspended.clear()
+        self._wake.set()
 
     def set_interval(self, seconds: float) -> None:
         if seconds <= 0:
             raise ValueError("interval must be positive")
         self._interval = float(seconds)
+        self._wake.set()
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval):
+        while not self._stop.is_set():
+            self._wake.wait(self._interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             if self._suspended.is_set():
                 continue
             try:

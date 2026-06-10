@@ -83,6 +83,24 @@ class KeepAliveTests(unittest.TestCase):
         self.assertIn("usb glitch", statuses[0][1])
         self.assertEqual(statuses[1][0], True)
 
+    def test_set_interval_wakes_waiting_thread(self) -> None:
+        pings = []
+        keepalive = SLMKeepAlive(
+            ping=lambda: pings.append(time.monotonic()),
+            interval_seconds=1.0,
+        )
+
+        keepalive.start()
+        time.sleep(0.05)
+        self.assertEqual(pings, [])
+
+        keepalive.set_interval(0.01)
+
+        try:
+            self.assertTrue(_wait_until(lambda: len(pings) >= 1, timeout=0.5))
+        finally:
+            keepalive.stop()
+
     def test_rejects_invalid_interval(self) -> None:
         with self.assertRaises(ValueError):
             SLMKeepAlive(ping=lambda: None, interval_seconds=0)

@@ -239,6 +239,31 @@ class RefreshDisplayTests(unittest.TestCase):
 
         self.assertFalse(controller.refresh_display())
 
+    def test_skips_refresh_when_slm_io_is_busy(self) -> None:
+        fake = FakeDriver()
+        controller = SLMController(driver=fake)
+        controller.display_grayscale(300, interval=0.01)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_io_lock() -> None:
+            with controller._io_lock:
+                entered.set()
+                release.wait(5.0)
+
+        thread = threading.Thread(target=hold_io_lock)
+        thread.start()
+        self.assertTrue(entered.wait(5.0))
+
+        try:
+            self.assertFalse(controller.refresh_display())
+            self.assertEqual(fake.grayscale, [(300, 0.01)])
+        finally:
+            release.set()
+            thread.join(5.0)
+
+        self.assertFalse(thread.is_alive())
+
 
 class PingTests(unittest.TestCase):
     def test_ping_passes_through(self) -> None:

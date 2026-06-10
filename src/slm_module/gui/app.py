@@ -69,6 +69,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_pause_event: threading.Event | None = None
         self.scan_params: ScanParams | None = None
         self.keepalive: SLMKeepAlive | None = None
+        self._slm_tasks_active = 0
         self._scan_x_range: tuple[int, int] = (0, 0)
         self._segments_updating = False
 
@@ -152,13 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         detect_button.clicked.connect(self._detect_slm)
         open_button.clicked.connect(self._open_slm)
         close_button.clicked.connect(self._close_slm)
-        info_button.clicked.connect(
-            lambda: self._run_task(
-                "Read SLM info",
-                lambda: self._controller().get_slm_info(),
-                self._on_info_read,
-            )
-        )
+        info_button.clicked.connect(self._read_slm_info)
 
         self.usb_slm_no_spin = QtWidgets.QSpinBox()
         self.usb_slm_no_spin.setRange(1, 8)
@@ -176,9 +171,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "display link stays active and the SLM does not shut down or error"
         )
         self.keepalive_check.toggled.connect(self._toggle_keepalive)
-        self.keepalive_interval_spin = QtWidgets.QSpinBox()
-        self.keepalive_interval_spin.setRange(10, 30)
-        self.keepalive_interval_spin.setValue(15)
+        self.keepalive_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.keepalive_interval_spin.setRange(0.5, 30.0)
+        self.keepalive_interval_spin.setDecimals(1)
+        self.keepalive_interval_spin.setSingleStep(0.5)
+        self.keepalive_interval_spin.setValue(15.0)
         self.keepalive_interval_spin.setSuffix(" s")
         self.keepalive_interval_spin.valueChanged.connect(self._on_keepalive_interval)
         self.keepalive_status_label = QtWidgets.QLabel("Keep-alive: off")
@@ -532,7 +529,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_keepalive()
         self._set_status(self.conn_status_label, "Status: closed", "off")
         if old_controller is not None and getattr(old_controller, "is_open", False):
-            self._run_task("Close previous SLM", old_controller.close_slm)
+            self._run_slm_task("Close previous SLM", old_controller.close_slm)
 
     def _run_task(
         self,
@@ -557,6 +554,36 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.signals.error.connect(fail)
         self.thread_pool.start(worker)
         return worker
+
+    def _run_slm_task(
+        self,
+        label: str,
+        func: Callable[[], Any],
+        on_success: Callable[[Any], None] | None = None,
+        on_error: Callable[[str], None] | None = None,
+    ) -> FunctionWorker:
+        self._slm_tasks_active += 1
+        self._sync_keepalive_state()
+
+        def finish_slm_task() -> None:
+            self._slm_tasks_active = max(0, self._slm_tasks_active - 1)
+            self._sync_keepalive_state()
+
+        def finish(result: Any) -> None:
+            try:
+                if on_success is not None:
+                    on_success(result)
+            finally:
+                finish_slm_task()
+
+        def fail(error: str) -> None:
+            try:
+                if on_error is not None:
+                    on_error(error)
+            finally:
+                finish_slm_task()
+
+        return self._run_task(label, func, finish, fail)
 
     def _finish_task(
         self,
@@ -594,16 +621,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(message.splitlines()[0], 6000)
 
     def _open_slm(self) -> None:
-        self._run_task("Open SLM", lambda: self._controller().open_slm())
+        controller = self._controller()
+        self._run_slm_task("Open SLM", controller.open_slm)
 
     def _close_slm(self) -> None:
         self._stop_keepalive()
-        self._run_task("Close SLM", lambda: self._controller().close_slm())
+        controller = self._controller()
+        self._run_slm_task("Close SLM", controller.close_slm)
 
     def _detect_slm(self) -> None:
-        self._run_task(
+        controller = self._controller()
+        self._run_slm_task(
             "Detect SLM",
-            lambda: self._controller().detect_displays(),
+            controller.detect_displays,
             self._on_detect,
         )
 
@@ -624,9 +654,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _switch_to_dvi_mode(self) -> None:
         slm_number = self.usb_slm_no_spin.value()
-        self._run_task(
+        controller = self._controller()
+        self._run_slm_task(
             "Switch to DVI mode",
-            lambda: self._controller().set_dvi_mode(slm_number),
+            lambda: controller.set_dvi_mode(slm_number),
+        )
+
+    def _read_slm_info(self) -> None:
+        controller = self._controller()
+        self._run_slm_task(
+            "Read SLM info",
+            controller.get_slm_info,
+            self._on_info_read,
         )
 
     def _toggle_keepalive(self, checked: bool) -> None:
@@ -641,28 +680,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # capture the controller on the GUI thread; the heartbeat thread
         # must not touch widgets
         controller = self._controller()
+        interval = self.keepalive_interval_spin.value()
         self.keepalive = SLMKeepAlive(
             # re-send the last displayed pattern so the DVI link stays active
             ping=lambda: controller.refresh_display(),
-            interval_seconds=self.keepalive_interval_spin.value(),
+            interval_seconds=interval,
             on_status=lambda ok, message: self.keepalive_status.emit(ok, message),
         )
         self.keepalive.start()
+        self._sync_keepalive_state()
         self._set_status(
             self.keepalive_status_label,
-            f"Keep-alive: every {self.keepalive_interval_spin.value()} s",
+            f"Keep-alive: every {self._format_seconds(interval)}",
             "ok",
         )
         self._log(
             f"DVI keep-alive started (re-send pattern every "
-            f"{self.keepalive_interval_spin.value()} s)"
+            f"{self._format_seconds(interval)})"
         )
 
     def _stop_keepalive(self) -> None:
         if self.keepalive is not None:
-            self.keepalive.stop()
-            self.keepalive = None
-            self._log("Keep-alive stopped")
+            stopped = self.keepalive.stop()
+            if stopped:
+                self.keepalive = None
+                self._log("Keep-alive stopped")
+            else:
+                self._log("Keep-alive stop requested; worker is still finishing")
         if hasattr(self, "keepalive_status_label"):
             self._set_status(self.keepalive_status_label, "Keep-alive: off", "off")
         if hasattr(self, "keepalive_check") and self.keepalive_check.isChecked():
@@ -670,12 +714,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.keepalive_check.setChecked(False)
             self.keepalive_check.blockSignals(False)
 
-    def _on_keepalive_interval(self, value: int) -> None:
+    def _on_keepalive_interval(self, value: float) -> None:
         if self.keepalive is not None and self.keepalive.is_running:
-            self.keepalive.set_interval(float(value))
+            self.keepalive.set_interval(value)
             self._set_status(
-                self.keepalive_status_label, f"Keep-alive: every {value} s", "ok"
+                self.keepalive_status_label,
+                f"Keep-alive: every {self._format_seconds(value)}",
+                "ok",
             )
+
+    def _format_seconds(self, seconds: float) -> str:
+        return f"{seconds:g} s"
+
+    def _sync_keepalive_state(self) -> None:
+        if self.keepalive is None:
+            return
+        scan_active = self.scan_stop_event is not None
+        scan_paused = (
+            self.scan_pause_event is not None and self.scan_pause_event.is_set()
+        )
+        if self._slm_tasks_active > 0 or (scan_active and not scan_paused):
+            self.keepalive.suspend()
+        else:
+            self.keepalive.resume()
 
     def _on_keepalive_status(self, ok: bool, message: str) -> None:
         timestamp = QtCore.QTime.currentTime().toString("HH:mm:ss")
@@ -705,9 +766,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _display_grayscale(self) -> None:
         value = self.gray_spin.value()
-        self._run_task(
+        controller = self._controller()
+        self._run_slm_task(
             "Display grayscale",
-            lambda: self._controller().display_grayscale(value),
+            lambda: controller.display_grayscale(value),
         )
 
     def _browse_display_csv(self) -> None:
@@ -722,7 +784,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             self._log("Select a CSV file first")
             return
-        self._run_task("Display CSV", lambda: self._controller().display_csv(path))
+        controller = self._controller()
+        self._run_slm_task("Display CSV", lambda: controller.display_csv(path))
 
     def _browse_calibration_csv(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -850,14 +913,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_scan_button.setEnabled(True)
         self.pause_scan_button.setText("Pause")
         self.stop_scan_button.setEnabled(True)
-        if self.keepalive is not None:
-            self.keepalive.suspend()
+        self._sync_keepalive_state()
 
         stop_event = self.scan_stop_event
         pause_event = self.scan_pause_event
+        controller = self._controller()
 
         def run_scan() -> ScanResult:
-            controller = self._controller()
             width, height = controller.get_slm_info()
             clamped_start = min(start_x, width - 1)
             clamped_end = min(end_x, width - 1)
@@ -890,15 +952,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scan_pause_event.clear()
             self.pause_scan_button.setText("Pause")
             # the scan streams frames again, so the heartbeat can rest
-            if self.keepalive is not None:
-                self.keepalive.suspend()
+            self._sync_keepalive_state()
             self._log("Center scan resumed")
         else:
             self.scan_pause_event.set()
             self.pause_scan_button.setText("Resume")
             # no frames flow while paused; let the heartbeat keep DVI active
-            if self.keepalive is not None:
-                self.keepalive.resume()
+            self._sync_keepalive_state()
             self._log("Center scan paused")
 
     def _on_scan_param_changed(self, **kwargs: Any) -> None:
@@ -937,8 +997,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_stop_event = None
         self.scan_pause_event = None
         self.scan_params = None
-        if self.keepalive is not None:
-            self.keepalive.resume()
+        self._sync_keepalive_state()
 
     def _on_scan_finished(self, result: ScanResult) -> None:
         self._finish_scan_ui()
@@ -1147,9 +1206,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"Invalid segments: {exc}")
             QtWidgets.QMessageBox.warning(self, "Phase Segments", str(exc))
             return
-        self._run_task(
+        controller = self._controller()
+        self._run_slm_task(
             "Display segments",
-            lambda: self._controller().display_mask_csv(data),
+            lambda: controller.display_mask_csv(data),
         )
 
     def _export_segments_csv(self) -> None:

@@ -235,6 +235,7 @@ class SLMController:
         else:
             self.driver = SLMDriver(display_no, rate120=rate120)
         self._opened = False
+        self._io_lock = threading.RLock()
         # last pattern sent over DVI: ("gray", level) or ("csv", path)
         self._last_display: tuple[str, Any] | None = None
 
@@ -243,7 +244,8 @@ class SLMController:
         return self._opened
 
     def get_slm_info(self) -> tuple[int, int]:
-        return self.driver.slm_info()
+        with self._io_lock:
+            return self.driver.slm_info()
 
     def detect_displays(self) -> list[tuple[int, int, int, str]]:
         """Probe display numbers and return (no, width, height, name) tuples.
@@ -252,17 +254,20 @@ class SLMController:
         """
         if not hasattr(self.driver, "search_displays"):
             raise RuntimeError("driver does not support display search")
-        return self.driver.search_displays()
+        with self._io_lock:
+            return self.driver.search_displays()
 
     def open_slm(self) -> None:
-        self.driver.open_slm()
-        self._opened = True
+        with self._io_lock:
+            self.driver.open_slm()
+            self._opened = True
 
     def close_slm(self) -> None:
-        try:
-            self.driver.close_slm()
-        finally:
-            self._opened = False
+        with self._io_lock:
+            try:
+                self.driver.close_slm()
+            finally:
+                self._opened = False
 
     def _ensure_open(self) -> None:
         # Guide 1.3.2: SLM_Disp_Open must precede the display functions.
@@ -270,24 +275,28 @@ class SLMController:
             self.open_slm()
 
     def set_dvi_mode(self, slm_number: int = 1) -> None:
-        self.driver.set_video_mode(MODE_DVI, slm_number=slm_number)
+        with self._io_lock:
+            self.driver.set_video_mode(MODE_DVI, slm_number=slm_number)
 
     def set_memory_mode(self, slm_number: int = 1) -> None:
-        self.driver.set_video_mode(MODE_MEMORY, slm_number=slm_number)
+        with self._io_lock:
+            self.driver.set_video_mode(MODE_MEMORY, slm_number=slm_number)
 
     def display_grayscale(self, grayscale_value: int, interval: float = 0.2) -> None:
         grayscale_value = _validate_level(grayscale_value)
-        self._ensure_open()
-        self.driver.load_grayscale(grayscale_value, interval)
-        self._last_display = ("gray", grayscale_value)
+        with self._io_lock:
+            self._ensure_open()
+            self.driver.load_grayscale(grayscale_value, interval)
+            self._last_display = ("gray", grayscale_value)
 
     def display_csv(self, csv_path: str | Path, interval: float = 0.2) -> None:
         slm_width, slm_height = self.get_slm_info()
         validate_slm_csv(csv_path, expected_width=slm_width, expected_height=slm_height)
-        self._ensure_open()
         resolved = str(Path(csv_path).resolve())
-        self.driver.load_csv(resolved, interval)
-        self._last_display = ("csv", resolved)
+        with self._io_lock:
+            self._ensure_open()
+            self.driver.load_csv(resolved, interval)
+            self._last_display = ("csv", resolved)
 
     def display_mask_csv(
         self,
@@ -300,9 +309,10 @@ class SLMController:
             csv_path = _temporary_csv_path("slm_mask_")
         csv_path = write_santec_csv(data, csv_path)
         validate_slm_csv(csv_path, expected_width=slm_width, expected_height=slm_height)
-        self._ensure_open()
-        self.driver.load_csv(str(csv_path), interval)
-        self._last_display = ("csv", str(csv_path))
+        with self._io_lock:
+            self._ensure_open()
+            self.driver.load_csv(str(csv_path), interval)
+            self._last_display = ("csv", str(csv_path))
         return csv_path
 
     def display_vertical_window(
@@ -323,7 +333,8 @@ class SLMController:
         Only useful when the USB control channel is connected; the DVI
         keep-alive path is refresh_display().
         """
-        mode = self.driver.ping(slm_number, verify_video_mode=verify_dvi)
+        with self._io_lock:
+            mode = self.driver.ping(slm_number, verify_video_mode=verify_dvi)
         if verify_dvi and mode != MODE_DVI:
             raise RuntimeError(
                 f"SLM video interface is no longer DVI (mode={mode})"
@@ -333,17 +344,22 @@ class SLMController:
         """Re-send the last displayed pattern over DVI (keep-alive).
 
         Keeps the DVI link active by repeating the same data; returns False
-        when the SLM is not open or nothing has been displayed yet.
+        when the SLM is busy, not open, or nothing has been displayed yet.
         """
-        last = self._last_display
-        if not self._opened or last is None:
+        if not self._io_lock.acquire(blocking=False):
             return False
-        kind, value = last
-        if kind == "gray":
-            self.driver.load_grayscale(value, 0.0)
-        else:
-            self.driver.load_csv(value, 0.0)
-        return True
+        try:
+            last = self._last_display
+            if not self._opened or last is None:
+                return False
+            kind, value = last
+            if kind == "gray":
+                self.driver.load_grayscale(value, 0.0)
+            else:
+                self.driver.load_csv(value, 0.0)
+            return True
+        finally:
+            self._io_lock.release()
 
     def run_center_scan(
         self,
@@ -394,8 +410,9 @@ class SLMController:
             write_santec_csv(data, csv_path)
             validate_slm_csv(csv_path, expected_width=slm_width, expected_height=slm_height)
             # dwell is handled here in interruptible slices, not in the driver
-            self.driver.load_csv(str(csv_path), 0.0)
-            self._last_display = ("csv", str(csv_path))
+            with self._io_lock:
+                self.driver.load_csv(str(csv_path), 0.0)
+                self._last_display = ("csv", str(csv_path))
             result.frames.append(csv_path)
 
             dwell_completed = _interruptible_dwell(
