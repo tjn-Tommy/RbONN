@@ -1,8 +1,10 @@
 import ctypes
 import os
+import queue
 import threading
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 
 # load SLM DLL
@@ -58,11 +60,94 @@ def _load_slm_dll() -> ctypes.CDLL:
     return ctypes.CDLL(str(_DLL_PATH))
 
 
+def _make_message_pump():
+    """Win32 message pump for windows owned by the device thread.
+
+    SLM_Disp_Open creates the SLM window on the calling thread; pumping its
+    pending messages while idle mirrors the vendor sample, which drives the
+    DLL from a message-pumping UI thread. Returns a no-op off Windows.
+    """
+    if not hasattr(ctypes, "windll"):
+        return lambda: None
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    msg = wintypes.MSG()
+    pm_remove = 0x0001
+
+    def pump() -> None:
+        try:
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, pm_remove):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            pass
+
+    return pump
+
+
+class _DeviceThread:
+    """Executes every DLL call on one long-lived thread.
+
+    The SLM window created by SLM_Disp_Open belongs to the thread that called
+    it, and the vendor samples call all display functions from that same
+    single thread. Pooled worker threads (which expire and get replaced) or a
+    separate keep-alive thread calling the DLL directly can therefore stall
+    inside the DLL. Funneling every call through this thread both pins the
+    window to a thread that never dies and serializes all DLL entry.
+    """
+
+    _IDLE_POLL_SECONDS = 0.05
+
+    def __init__(self):
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="slm-dll", daemon=True)
+        self._thread.start()
+
+    def call(self, label: str, func: Callable[[], Any], timeout: float = 30.0) -> Any:
+        """Run func() on the device thread and return its result.
+
+        Raises RuntimeError when the call does not finish within timeout so a
+        stalled DLL call becomes a visible error instead of blocking every
+        later operation forever.
+        """
+        done = threading.Event()
+        box: dict[str, Any] = {}
+        self._jobs.put((func, box, done))
+        if not done.wait(timeout):
+            raise RuntimeError(
+                f"{label}: SLM DLL call did not return within {timeout:.0f} s; "
+                "the display link may be stalled"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def _run(self) -> None:
+        pump = _make_message_pump()
+        while True:
+            try:
+                job = self._jobs.get(timeout=self._IDLE_POLL_SECONDS)
+            except queue.Empty:
+                pump()
+                continue
+            func, box, done = job
+            try:
+                box["result"] = func()
+            except BaseException as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+
 class SLM_DVI_Driver:
     """DVI-mode driver following the documented flow (Guide 1.3.2):
 
     search display (SLM_Disp_Info/Info2) -> SLM_Disp_Open ->
     display functions -> SLM_Disp_Close
+
+    All DLL calls run on a dedicated device thread (see _DeviceThread);
+    public methods are safe to call from any thread.
     """
 
     def __init__(self, display_no: int = 1, rate120: bool = False):
@@ -71,9 +156,7 @@ class SLM_DVI_Driver:
         self.is_open = False
         self.dll = _load_slm_dll()
         self._bind_functions()
-        # DLL thread-safety is undocumented; serialize every DLL entry so the
-        # keep-alive thread and scan worker never call into it concurrently.
-        self._lock = threading.RLock()
+        self._device = _DeviceThread()
 
     def _bind_functions(self):
         self.dll.SLM_Disp_Info.argtypes = [
@@ -138,8 +221,12 @@ class SLM_DVI_Driver:
         display_no = self.display_no if display_no is None else int(display_no)
         height = ctypes.c_uint16()
         width = ctypes.c_uint16()
-        with self._lock:
-            ret = self.dll.SLM_Disp_Info(display_no, ctypes.byref(width), ctypes.byref(height))
+        ret = self._device.call(
+            "SLM_Disp_Info",
+            lambda: self.dll.SLM_Disp_Info(
+                display_no, ctypes.byref(width), ctypes.byref(height)
+            ),
+        )
         self._check_error(ret, "SLM_Disp_Info")
         return width.value, height.value
 
@@ -153,10 +240,12 @@ class SLM_DVI_Driver:
         height = ctypes.c_uint16()
         width = ctypes.c_uint16()
         name = ctypes.create_string_buffer(128)
-        with self._lock:
-            ret = self.dll.SLM_Disp_Info2(
+        ret = self._device.call(
+            "SLM_Disp_Info2",
+            lambda: self.dll.SLM_Disp_Info2(
                 display_no, ctypes.byref(width), ctypes.byref(height), name
-            )
+            ),
+        )
         self._check_error(ret, "SLM_Disp_Info2")
         return width.value, height.value, name.value.decode("mbcs", errors="replace")
 
@@ -173,30 +262,37 @@ class SLM_DVI_Driver:
         return found
 
     def open_slm(self):
-        with self._lock:
-            ret = self.dll.SLM_Disp_Open(self.display_no)
+        ret = self._device.call(
+            "SLM_Disp_Open", lambda: self.dll.SLM_Disp_Open(self.display_no)
+        )
         self._check_error(ret, "SLM_Disp_Open")
         self.is_open = True
 
     def close_slm(self):
-        with self._lock:
-            ret = self.dll.SLM_Disp_Close(self.display_no)
+        ret = self._device.call(
+            "SLM_Disp_Close", lambda: self.dll.SLM_Disp_Close(self.display_no)
+        )
         self.is_open = False
         self._check_error(ret, "SLM_Disp_Close")
 
     def load_csv(self, csv_path: str, interval: float = 0.2, flags: int | None = None):
         csv_path = str(Path(csv_path).resolve())
         flags = self.flags if flags is None else int(flags)
-        # sleep outside the lock so the dwell never blocks other DLL callers
-        with self._lock:
-            ret = self.dll.SLM_Disp_ReadCSV(self.display_no, flags, csv_path)
+        # the settle sleep stays on the calling thread so it never delays
+        # other device-thread jobs
+        ret = self._device.call(
+            "SLM_Disp_ReadCSV",
+            lambda: self.dll.SLM_Disp_ReadCSV(self.display_no, flags, csv_path),
+        )
         self._check_error(ret, "SLM_Disp_ReadCSV")
         time.sleep(interval)
 
     def load_grayscale(self, grayscale: int, interval: float = 0.2, flags: int | None = None):
         flags = self.flags if flags is None else int(flags)
-        with self._lock:
-            ret = self.dll.SLM_Disp_GrayScale(self.display_no, flags, grayscale)
+        ret = self._device.call(
+            "SLM_Disp_GrayScale",
+            lambda: self.dll.SLM_Disp_GrayScale(self.display_no, flags, grayscale),
+        )
         self._check_error(ret, "SLM_Disp_GrayScale")
         time.sleep(interval)
 
@@ -209,8 +305,10 @@ class SLM_DVI_Driver:
         if mode not in (MODE_MEMORY, MODE_DVI):
             raise ValueError("mode must be 0 (Memory) or 1 (DVI)")
         slm_number = int(slm_number)
-        # hold the lock for the whole USB session so it is never interleaved
-        with self._lock:
+
+        # the whole USB session runs as one device-thread job so it is never
+        # interleaved with other DLL calls
+        def session():
             ret = self.dll.SLM_Ctrl_Open(slm_number)
             self._check_error(ret, "SLM_Ctrl_Open")
             try:
@@ -228,10 +326,13 @@ class SLM_DVI_Driver:
             finally:
                 self.dll.SLM_Ctrl_Close(slm_number)
 
+        self._device.call("SLM_Ctrl_WriteVI session", session, timeout=timeout + 30.0)
+
     def get_video_mode(self, slm_number: int = 1) -> int:
         """Read the current Memory/DVI mode over USB."""
         slm_number = int(slm_number)
-        with self._lock:
+
+        def session():
             ret = self.dll.SLM_Ctrl_Open(slm_number)
             self._check_error(ret, "SLM_Ctrl_Open")
             try:
@@ -242,6 +343,8 @@ class SLM_DVI_Driver:
             finally:
                 self.dll.SLM_Ctrl_Close(slm_number)
 
+        return int(self._device.call("SLM_Ctrl_ReadVI session", session))
+
     def ping(self, slm_number: int = 1, verify_video_mode: bool = False) -> int | None:
         """Heartbeat over USB to keep the SLM responsive (keep-alive).
 
@@ -250,7 +353,8 @@ class SLM_DVI_Driver:
         back the video mode so callers can verify DVI is still active.
         """
         slm_number = int(slm_number)
-        with self._lock:
+
+        def session():
             ret = self.dll.SLM_Ctrl_Open(slm_number)
             self._check_error(ret, "SLM_Ctrl_Open")
             try:
@@ -265,6 +369,8 @@ class SLM_DVI_Driver:
                 return mode.value
             finally:
                 self.dll.SLM_Ctrl_Close(slm_number)
+
+        return self._device.call("SLM_Ctrl_ReadSU session", session)
 
     def __enter__(self):
         self.open_slm()
