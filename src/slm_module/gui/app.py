@@ -630,6 +630,34 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addStretch(1)
         return row
 
+    def _region_row(self, step: int) -> QtWidgets.QWidget:
+        """A 'Limit region x start→end' toggle stored on self.step_widgets[step]."""
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        widgets = self.step_widgets[step]
+        check = QtWidgets.QCheckBox("Limit region")
+        check.setToolTip(
+            "Only sweep/calibrate this band of SLM columns (x). Off = full width "
+            "(or, for a loaded map, its whole range)."
+        )
+        start = self._spin(0, 8191, 0)
+        end = self._spin(0, 8191, 1919)
+        start.setEnabled(False)
+        end.setEnabled(False)
+        check.toggled.connect(start.setEnabled)
+        check.toggled.connect(end.setEnabled)
+        widgets["region_check"] = check
+        widgets["region_start"] = start
+        widgets["region_end"] = end
+        layout.addWidget(check)
+        layout.addWidget(QtWidgets.QLabel("x"))
+        layout.addWidget(start)
+        layout.addWidget(QtWidgets.QLabel("→"))
+        layout.addWidget(end)
+        layout.addStretch(1)
+        return row
+
     def _run_row(self, step: int, run_text: str, slot: Callable[[], None]) -> QtWidgets.QWidget:
         """A status label + Run button row, stored under [step]['status'] / ['run']."""
         row = QtWidgets.QWidget()
@@ -677,6 +705,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.addWidget(widgets["peak_nm"])
         cfg.addStretch(1)
         layout.addLayout(cfg)
+        layout.addWidget(self._region_row(2))
 
         # input source
         src_row = QtWidgets.QHBoxLayout()
@@ -729,6 +758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.addStretch(1)
         layout.addLayout(cfg)
         layout.addWidget(self._level_sweep_row(3, stop=1023, stepv=32))
+        layout.addWidget(self._region_row(3))
 
         # wavelength source
         src_row = QtWidgets.QHBoxLayout()
@@ -1259,6 +1289,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_x_spin.setMaximum(width - 1)
         self.end_x_spin.setMaximum(width - 1)
         self.end_x_spin.setValue(width - 1)
+        # keep the calibration region spinners bounded to the real SLM width
+        for step in (2, 3):
+            widgets = getattr(self, "step_widgets", {}).get(step, {})
+            if "region_end" in widgets:
+                widgets["region_start"].setMaximum(width - 1)
+                widgets["region_end"].setMaximum(width - 1)
+                if not widgets["region_check"].isChecked():
+                    widgets["region_end"].setValue(width - 1)
         self._update_scan_preview()
         if self._segment_mode_is_equal():
             self._rebuild_equal_segment_rows()
@@ -1461,6 +1499,16 @@ class MainWindow(QtWidgets.QMainWindow):
             levels.append(stop)
         return levels
 
+    def _step_region(self, step: int) -> tuple[int, int] | None:
+        widgets = self.step_widgets[step]
+        if not widgets["region_check"].isChecked():
+            return None
+        start = widgets["region_start"].value()
+        end = widgets["region_end"].value()
+        if end < start:
+            raise ValueError("region end must be >= region start")
+        return (start, end)
+
     def _resolve_output_path(self, text: str, default_name: str) -> Path:
         text = text.strip()
         if text:
@@ -1597,6 +1645,7 @@ class MainWindow(QtWidgets.QMainWindow):
             seed = self._resolve_step_input(2)
             window = self.step_widgets[2]["window"].value()
             peak_nm = self.step_widgets[2]["peak_nm"].value() or None
+            region = self._step_region(2)
         except ValueError as exc:
             return self._reject_calibration(exc)
         out_path = self._resolve_output_path(
@@ -1608,7 +1657,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
             result = wavelength_calibration(
                 osa, controller, [], settings, seed,
-                window_size=window, peak_half_window_nm=peak_nm,
+                window_size=window, peak_half_window_nm=peak_nm, region=region,
                 stop_event=stop_event, progress_callback=report,
             )
             save_calibration_result(result, out_path)
@@ -1629,6 +1678,7 @@ class MainWindow(QtWidgets.QMainWindow):
             levels = self._step_levels(3)
             window = self.step_widgets[3]["window"].value()
             avg_nm = self.step_widgets[3]["avg_nm"].value() or None
+            region = self._step_region(3)
         except ValueError as exc:
             return self._reject_calibration(exc)
         out_json = self._resolve_output_path(
@@ -1643,7 +1693,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
             result = intensity_calibration(
                 osa, controller, levels, settings, mapping,
-                window_size=window, wavelength_window_nm=avg_nm,
+                window_size=window, wavelength_window_nm=avg_nm, region=region,
                 stop_event=stop_event, progress_callback=report,
             )
             save_calibration_result(result, out_json)
@@ -1665,10 +1715,12 @@ class MainWindow(QtWidgets.QMainWindow):
             s2 = self._step_settings(2)
             window2 = self.step_widgets[2]["window"].value()
             peak_nm = self.step_widgets[2]["peak_nm"].value() or None
+            region2 = self._step_region(2)
             s3 = self._step_settings(3)
             levels3 = self._step_levels(3)
             window3 = self.step_widgets[3]["window"].value()
             avg_nm = self.step_widgets[3]["avg_nm"].value() or None
+            region3 = self._step_region(3)
         except ValueError as exc:
             return self._reject_calibration(exc)
         out1 = self._resolve_output_path(self.step_widgets[1]["out"].text(), "calib_step1.json")
@@ -1693,13 +1745,13 @@ class MainWindow(QtWidgets.QMainWindow):
             save_calibration_result(seed, out1)
             wl_result = wavelength_calibration(
                 osa, controller, [], s2, seed,
-                window_size=window2, peak_half_window_nm=peak_nm,
+                window_size=window2, peak_half_window_nm=peak_nm, region=region2,
                 stop_event=stop_event, progress_callback=report,
             )
             save_calibration_result(wl_result, out2)
             final = intensity_calibration(
                 osa, controller, levels3, s3, wl_result,
-                window_size=window3, wavelength_window_nm=avg_nm,
+                window_size=window3, wavelength_window_nm=avg_nm, region=region3,
                 stop_event=stop_event, progress_callback=report,
             )
             save_calibration_result(final, out3)

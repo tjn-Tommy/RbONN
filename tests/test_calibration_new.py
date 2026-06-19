@@ -232,6 +232,58 @@ class CalibrationNewTests(unittest.TestCase):
         self.assertEqual(result.coordinates.size, 4)
         self.assertTrue(np.all(np.isfinite(result.wavelength)))
 
+    def test_wavelength_calibration_region_limits_the_sweep(self) -> None:
+        wavelengths = np.asarray([769.0, 770.0, 771.0, 772.0, 773.0])
+        peak = [0.1, 0.5, 1.0, 0.5, 0.1]
+        # width 20, window 2, region (5, 10) -> window starts 5..9 = 5 positions
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+        ] + [make_trace(wavelengths, peak) for _ in range(5)]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(20, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        result = wavelength_calibration(
+            osa, slm, [], MeasurementSettings(), seed, window_size=2, region=(5, 10)
+        )
+
+        self.assertEqual(result.coordinates.size, 5)
+        self.assertGreaterEqual(result.coordinates.min(), 5)
+        self.assertLessEqual(result.coordinates.max(), 10)
+        self.assertEqual(osa.measure_calls, 7)  # background + reference + 5 positions
+
+    def test_intensity_calibration_region_filters_loaded_mapping(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])
+        # mapping spans the SLM; only coordinates 6 and 8 are inside region (5, 10)
+        mapping = CalibrationResult(
+            wavelength=np.asarray([100.0, 101.0, 102.0, 103.0]),
+            coordinates=np.asarray([2.0, 6.0, 8.0, 14.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+        )
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+        ] + [make_trace(wavelengths, [0.2, 0.4, 0.6, 0.4, 0.2]) for _ in range(4)]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(20, 2))
+
+        result = intensity_calibration(
+            osa, slm, [0, 100], MeasurementSettings(), mapping,
+            window_size=2, region=(5, 10),
+        )
+
+        self.assertEqual(sorted(result.coordinates.tolist()), [6.0, 8.0])
+        self.assertEqual(result.intensity_levels.shape, (2, 2))
+
     def test_load_wavelength_map_csv_drives_intensity_calibration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "map.csv"

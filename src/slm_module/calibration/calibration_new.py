@@ -254,6 +254,7 @@ def wavelength_calibration(
     peak_half_window: int = 100,
     *,
     peak_half_window_nm: float | None = None,
+    region: tuple[int, int] | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> CalibrationResult:
@@ -262,6 +263,10 @@ def wavelength_calibration(
     The peak of each window measurement is located by weighted centroid over a
     +/- peak_half_window_nm wavelength window when that is given, otherwise over
     peak_half_window samples on each side.
+
+    ``region`` (x_start, x_end) limits the sweep to that inclusive band of SLM
+    columns, which is useful when the source only illuminates part of the SLM
+    width (e.g. a ~6 nm pulse on a ~20 nm aperture); None sweeps the full width.
     """
 
     del levels
@@ -269,6 +274,7 @@ def wavelength_calibration(
     window_size = _validate_window_size(window_size, slm_width)
     min_level = _level_value(calibration_results.min_level, "min_level")
     max_level = _level_value(calibration_results.max_level, "max_level")
+    region_lo, region_hi = _resolve_scan_region(region, slm_width, window_size)
 
     dark_pattern = np.full(slm_width, min_level, dtype=int)
     _display_1d_pattern(slm, dark_pattern, slm_height)
@@ -283,8 +289,8 @@ def wavelength_calibration(
     coordinates: list[int] = []
     wavelengths: list[float] = []
 
-    total = max(0, slm_width - window_size + 1)
-    for index, x_start in enumerate(range(0, slm_width - window_size + 1)):
+    total = max(0, region_hi - region_lo)
+    for index, x_start in enumerate(range(region_lo, region_hi)):
         _check_stop(stop_event)
         pattern = dark_pattern.copy()
         pattern[x_start : x_start + window_size] = max_level
@@ -340,6 +346,7 @@ def intensity_calibration(
     *,
     average_half_window: int = 2,
     wavelength_window_nm: float | None = None,
+    region: tuple[int, int] | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> CalibrationResult:
@@ -350,10 +357,16 @@ def intensity_calibration(
     (n_coordinates, n_levels). Each row belongs to
     calibration_results.coordinates / calibration_results.wavelength; each
     column belongs to the corresponding entry in levels.
+
+    ``region`` (x_start, x_end) restricts the sweep to the calibrated
+    coordinates that fall within that inclusive band of SLM columns. This also
+    applies to a mapping loaded from a file, so only the selected slice of the
+    loaded range is calibrated; None calibrates every coordinate.
     """
 
     level_values = _validate_levels(levels)
     coordinates, wavelengths = _calibrated_mapping(calibration_results)
+    coordinates, wavelengths = _select_region_mapping(coordinates, wavelengths, region)
 
     slm_width, slm_height = slm.get_slm_info()
     window_size = _validate_window_size(window_size, slm_width)
@@ -743,6 +756,49 @@ def _window_start_from_coordinate(
 ) -> int:
     start = int(round(float(coordinate))) - window_size // 2
     return max(0, min(start, slm_width - window_size))
+
+
+def _region_bounds(region: tuple[int, int]) -> tuple[int, int]:
+    start, end = int(region[0]), int(region[1])
+    if end < start:
+        raise ValueError("region end must be >= region start")
+    return start, end
+
+
+def _resolve_scan_region(
+    region: tuple[int, int] | None,
+    slm_width: int,
+    window_size: int,
+) -> tuple[int, int]:
+    """Window-start range [lo, hi) that keeps the window inside the region.
+
+    Returns the full-width range when region is None; raises when the region is
+    narrower than the window.
+    """
+    max_start = slm_width - window_size + 1
+    if region is None:
+        return 0, max_start
+    start, end = _region_bounds(region)
+    lo = max(0, start)
+    hi = min(max_start, end - window_size + 2)
+    if hi <= lo:
+        raise ValueError("region is too small for the window size")
+    return lo, hi
+
+
+def _select_region_mapping(
+    coordinates: np.ndarray,
+    wavelengths: np.ndarray,
+    region: tuple[int, int] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only the calibrated coordinates within the region (inclusive)."""
+    if region is None:
+        return coordinates, wavelengths
+    start, end = _region_bounds(region)
+    mask = (coordinates >= start) & (coordinates <= end)
+    if not np.any(mask):
+        raise ValueError("no calibrated coordinates fall within the region")
+    return coordinates[mask], wavelengths[mask]
 
 
 def _validate_levels(levels: Iterable[int]) -> np.ndarray:
