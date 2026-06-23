@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import threading
@@ -39,6 +40,14 @@ from ..generator import (
     make_x_segments,
     write_santec_csv,
 )
+from ..analysis import (
+    AnalysisAborted,
+    AnalysisProgress,
+    ModulationErrorResult,
+    measure_channel_spectra,
+    write_analysis_csv,
+)
+from ..encoding import ChannelLayout, build_channel_layout, encode_to_pattern
 from ..keepalive import SLMKeepAlive
 from .style import DARK_STYLESHEET
 
@@ -448,6 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
     scan_sample = QtCore.pyqtSignal(float, float)
     keepalive_status = QtCore.pyqtSignal(bool, str)
     calibration_progress = QtCore.pyqtSignal(object)
+    analysis_progress = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -475,6 +485,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._scan_x_range: tuple[int, int] = (0, 0)
         self._scan_start_time: float | None = None
         self._segments_updating = False
+        self.encoding_layout: ChannelLayout | None = None
+        self._encoding_pattern: np.ndarray | None = None
+        self._enc_calib_override: CalibrationResult | None = None
+        self.analysis_result: ModulationErrorResult | None = None
+        self.analysis_stop_event: threading.Event | None = None
+        self._ana_capture_dir: str | None = None
 
         self.setWindowTitle("Santec SLM Control")
         self.resize(1280, 840)
@@ -485,6 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_sample.connect(self._on_scan_sample)
         self.keepalive_status.connect(self._on_keepalive_status)
         self.calibration_progress.connect(self._on_calibration_progress)
+        self.analysis_progress.connect(self._on_analysis_progress)
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -514,7 +531,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("\N{CHART WITH UPWARDS TREND}  Calibration", "Intensity curve fitting"),
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
-            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Not implemented yet"),
+            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding"),
+            ("\N{LEFT-POINTING MAGNIFYING GLASS}  Mod Error", "Single-channel spectral error"),
         )
         for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
@@ -529,6 +547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_scan_page())
         self.stack.addWidget(self._build_segments_page())
         self.stack.addWidget(self._build_tpa_page())
+        self.stack.addWidget(self._build_analysis_page())
 
         layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
@@ -1245,15 +1264,734 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_tpa_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("TPA Encoding")
-        panel = self._panel("Encoding")
-        panel.setEnabled(False)
-        layout = QtWidgets.QGridLayout(panel)
-        layout.addWidget(QtWidgets.QLabel("Strategy"), 0, 0)
-        layout.addWidget(QtWidgets.QLineEdit("TPA Multiplication"), 0, 1)
-        layout.addWidget(QtWidgets.QPushButton("Encode"), 1, 1)
-        page.layout().addWidget(panel)
-        page.layout().addStretch(1)
+
+        # --- Layout config panel ---
+        cfg_panel = self._panel("Channel Layout")
+        cfg_grid = QtWidgets.QGridLayout(cfg_panel)
+
+        self.enc_center_wl_spin = self._double_spin(700.0, 900.0, 778.0, " nm", 2)
+        self.enc_width_spin = self._spin(1, 256, 15)
+        self.enc_pad_spin   = self._spin(0, 64, 5)
+
+        self.enc_calib_label = QtWidgets.QLabel("Calibration: (none loaded)")
+        self.enc_calib_label.setObjectName("PageSubtitle")
+        enc_reload = QtWidgets.QPushButton("Load other…")
+        enc_reload.setProperty("variant", "ghost")
+        enc_reload.setToolTip("Override the local calibration with another result file")
+        enc_reload.clicked.connect(self._enc_browse_calib)
+
+        self.enc_build_button = QtWidgets.QPushButton("Build Layout")
+        self.enc_build_button.clicked.connect(self._enc_build_layout)
+
+        self.enc_layout_status = QtWidgets.QLabel("Configure parameters and click Build Layout")
+        self.enc_layout_status.setWordWrap(True)
+
+        self.enc_width_spin.valueChanged.connect(self._enc_update_channel_count)
+        self.enc_pad_spin.valueChanged.connect(self._enc_update_channel_count)
+        self.enc_center_wl_spin.valueChanged.connect(self._enc_update_channel_count)
+
+        cfg_grid.addWidget(QtWidgets.QLabel("Centre λ"),      0, 0)
+        cfg_grid.addWidget(self.enc_center_wl_spin,           0, 1)
+        cfg_grid.addWidget(QtWidgets.QLabel("Channel width"),  0, 2)
+        cfg_grid.addWidget(self.enc_width_spin,               0, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("px   Padding"),  0, 4)
+        cfg_grid.addWidget(self.enc_pad_spin,                 0, 5)
+        cfg_grid.addWidget(QtWidgets.QLabel("px"),            0, 6)
+        cfg_grid.addWidget(self.enc_calib_label,             1, 0, 1, 5)
+        cfg_grid.addWidget(enc_reload,                        1, 5)
+        cfg_grid.addWidget(self.enc_build_button,             1, 6)
+        cfg_grid.addWidget(self.enc_layout_status,            2, 0, 1, 7)
+
+        # --- Channel values table ---
+        # Columns: # | x λ (nm) | x value [0-1] | w λ (nm) | w value [0-1]
+        self.enc_val_table = QtWidgets.QTableWidget(0, 5)
+        self.enc_val_table.setHorizontalHeaderLabels(
+            ["#", "x  λ (nm)", "x value [0–1]", "w  λ (nm)", "w value [0–1]"]
+        )
+        hdr = self.enc_val_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
+        self.enc_val_table.verticalHeader().setVisible(False)
+        self.enc_val_table.setAlternatingRowColors(True)
+
+        val_buttons = QtWidgets.QHBoxLayout()
+        enc_zeros = QtWidgets.QPushButton("All Zeros")
+        enc_zeros.setProperty("variant", "ghost")
+        enc_zeros.clicked.connect(lambda: self._enc_fill_values(0.0))
+        enc_ones = QtWidgets.QPushButton("All Ones")
+        enc_ones.setProperty("variant", "ghost")
+        enc_ones.clicked.connect(lambda: self._enc_fill_values(1.0))
+        enc_randomize = QtWidgets.QPushButton("Randomize")
+        enc_randomize.setProperty("variant", "ghost")
+        enc_randomize.clicked.connect(self._enc_randomize)
+        val_buttons.addWidget(enc_zeros)
+        val_buttons.addWidget(enc_ones)
+        val_buttons.addWidget(enc_randomize)
+        val_buttons.addStretch(1)
+
+        val_panel = self._panel("Channel Values  [0 = off · 1 = on]")
+        val_layout = QtWidgets.QVBoxLayout(val_panel)
+        val_layout.addWidget(self.enc_val_table, 1)
+        val_layout.addLayout(val_buttons)
+
+        # --- Controls row ---
+        ctrl_row = QtWidgets.QHBoxLayout()
+        self.enc_generate_button = QtWidgets.QPushButton("Generate & Preview")
+        self.enc_generate_button.setEnabled(False)
+        self.enc_generate_button.clicked.connect(self._enc_generate)
+        self.enc_send_button = QtWidgets.QPushButton("Send to SLM")
+        self.enc_send_button.setEnabled(False)
+        self.enc_send_button.clicked.connect(self._enc_send)
+        self.enc_status_label = QtWidgets.QLabel("\N{EN DASH}")
+        ctrl_row.addWidget(self.enc_status_label, 1)
+        ctrl_row.addWidget(self.enc_generate_button)
+        ctrl_row.addWidget(self.enc_send_button)
+
+        # --- Colormap preview (matplotlib) ---
+        self.enc_figure = Figure(figsize=(10, 2.0), tight_layout=True)
+        self.enc_canvas = FigureCanvas(self.enc_figure)
+        self.enc_canvas.setMinimumHeight(150)
+        preview_panel = self._panel_with_widget("Pattern Preview", self.enc_canvas)
+
+        # --- Feedback / hints log ---
+        self.enc_log = QtWidgets.QPlainTextEdit()
+        self.enc_log.setReadOnly(True)
+        self.enc_log.setObjectName("LogBox")
+        self.enc_log.setMaximumHeight(120)
+        log_panel = self._panel_with_widget("Feedback", self.enc_log)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        split.addWidget(val_panel)
+        split.addWidget(preview_panel)
+        split.addWidget(log_panel)
+        split.setSizes([300, 180, 110])
+
+        page.layout().addWidget(cfg_panel)
+        page.layout().addWidget(split, 1)
+        page.layout().addLayout(ctrl_row)
+
+        # auto-load the local calibration and build a default layout so the
+        # value table is populated and ready for manual input immediately
+        QtCore.QTimer.singleShot(0, self._enc_autostart)
         return page
+
+    def _enc_autostart(self) -> None:
+        """Load local calibration and build the default layout on first show."""
+        calib = self._enc_get_calib()
+        if calib is None or calib.intensity_levels is None:
+            self._enc_log(
+                "No calibration found. Run Step 3 on the Calibration page, or use "
+                "'Load other…' to pick a result file."
+            )
+            return
+        self._enc_build_layout()
+
+    # ------------------------------------------------------------------
+    # Encoding page handlers
+    # ------------------------------------------------------------------
+
+    def _enc_log(self, message: str) -> None:
+        """Append a timestamped hint/action line to the encoding feedback box."""
+        stamp = time.strftime("%H:%M:%S")
+        self.enc_log.appendPlainText(f"[{stamp}] {message}")
+
+    def _enc_local_calib_path(self) -> Path | None:
+        """Locate the project-local calibration result (calib_step3.json)."""
+        candidates = [
+            Path.cwd() / "calib_step3.json",
+            Path(__file__).resolve().parents[3] / "calib_step3.json",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _enc_get_calib(self) -> CalibrationResult | None:
+        """Calibration source: explicit override → in-memory result → local file."""
+        if self._enc_calib_override is not None:
+            return self._enc_calib_override
+        if self.calibration_result is not None and self.calibration_result.intensity_levels is not None:
+            self.enc_calib_label.setText("Calibration: in-memory (from Step 3 / loaded fit)")
+            return self.calibration_result
+        local = self._enc_local_calib_path()
+        if local is not None:
+            try:
+                calib = load_calibration_result(str(local))
+                self.enc_calib_label.setText(f"Calibration: {local.name} (local)")
+                return calib
+            except Exception as exc:
+                self._enc_log(f"Failed to read {local.name}: {exc}")
+                return None
+        return None
+
+    def _enc_update_channel_count(self) -> None:
+        pitch = self.enc_width_spin.value() + self.enc_pad_spin.value()
+        calib = self._enc_get_calib()
+        if calib is None or calib.intensity_levels is None:
+            self.enc_layout_status.setText(
+                f"Pitch = {pitch} px  —  no calibration available"
+            )
+            return
+        coords = np.asarray(calib.coordinates, dtype=float)
+        wls    = np.asarray(calib.wavelength,  dtype=float)
+        a, b   = np.polyfit(coords, wls, 1)
+        cx     = (self.enc_center_wl_spin.value() - b) / a
+        max_ch = int(min(cx - coords.min(), coords.max() - cx) / pitch)
+        self.enc_layout_status.setText(
+            f"Pitch = {pitch} px  |  max {max_ch} channels per side  "
+            f"(calib x = {int(coords.min())}–{int(coords.max())} px, "
+            f"centre ≈ {int(cx)} px)"
+        )
+
+    def _enc_browse_calib(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Calibration Result", "", "JSON Files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            self._enc_calib_override = load_calibration_result(path)
+        except Exception as exc:
+            self._enc_log(f"Failed to load {Path(path).name}: {exc}")
+            return
+        self.enc_calib_label.setText(f"Calibration: {Path(path).name} (override)")
+        self._enc_log(f"Loaded calibration override: {path}")
+        self._enc_build_layout()
+
+    def _enc_build_layout(self) -> None:
+        calib = self._enc_get_calib()
+        if calib is None or calib.intensity_levels is None:
+            self.enc_layout_status.setText(
+                "No calibration available. Run Step 3 or load a result file."
+            )
+            return
+
+        # compute max channels from calibrated range
+        coords = np.asarray(calib.coordinates, dtype=float)
+        wls    = np.asarray(calib.wavelength,  dtype=float)
+        a, b   = np.polyfit(coords, wls, 1)
+        cx     = (self.enc_center_wl_spin.value() - b) / a
+        pitch  = self.enc_width_spin.value() + self.enc_pad_spin.value()
+        n_ch   = int(min(cx - coords.min(), coords.max() - cx) / pitch)
+        if n_ch < 1:
+            self.enc_layout_status.setText(
+                "Pitch too large — no channels fit on both sides of the centre wavelength."
+            )
+            return
+
+        try:
+            layout = build_channel_layout(
+                calib,
+                n_channels=n_ch,
+                channel_width_px=self.enc_width_spin.value(),
+                gap_px=self.enc_pad_spin.value(),
+                center_wl=self.enc_center_wl_spin.value(),
+            )
+        except Exception as exc:
+            self.enc_layout_status.setText(f"Layout error: {exc}")
+            return
+
+        self.encoding_layout = layout
+        self._enc_populate_val_table(layout)
+        self.enc_layout_status.setText(
+            f"{n_ch} channels per side  |  "
+            f"x: {layout.x_channels[-1].wavelength_nm:.3f}–{layout.x_channels[0].wavelength_nm:.3f} nm  |  "
+            f"w: {layout.w_channels[0].wavelength_nm:.3f}–{layout.w_channels[-1].wavelength_nm:.3f} nm  |  "
+            f"pitch {layout.pitch_px} px  |  padding {layout.pitch_px - layout.channel_width_px} px (nearest off level)"
+        )
+        self.enc_generate_button.setEnabled(True)
+        self._enc_log(
+            f"Layout built: {n_ch} channels/side, width "
+            f"{layout.channel_width_px} px, padding {layout.pitch_px - layout.channel_width_px} px. "
+            "Edit values in the table, then Generate & Preview."
+        )
+
+    def _enc_populate_val_table(self, layout: ChannelLayout) -> None:
+        n = layout.n_channels
+        self.enc_val_table.setRowCount(n)
+        for i in range(n):
+            xch = layout.x_channels[i]
+            wch = layout.w_channels[i]
+
+            idx_item = QtWidgets.QTableWidgetItem(str(i))
+            idx_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            idx_item.setFlags(idx_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.enc_val_table.setItem(i, 0, idx_item)
+
+            for col, text in [(1, f"{xch.wavelength_nm:.4f}"), (3, f"{wch.wavelength_nm:.4f}")]:
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.enc_val_table.setItem(i, col, item)
+
+            for col in (2, 4):
+                spin = QtWidgets.QDoubleSpinBox()
+                spin.setRange(0.0, 1.0)
+                spin.setSingleStep(0.01)
+                spin.setDecimals(3)
+                spin.setValue(0.0)
+                spin.setFrame(False)
+                self.enc_val_table.setCellWidget(i, col, spin)
+
+        self.enc_val_table.resizeRowsToContents()
+
+    def _enc_fill_values(self, value: float) -> None:
+        if self.encoding_layout is None:
+            return
+        for i in range(self.encoding_layout.n_channels):
+            for col in (2, 4):
+                w = self.enc_val_table.cellWidget(i, col)
+                if w:
+                    w.setValue(value)
+
+    def _enc_randomize(self) -> None:
+        if self.encoding_layout is None:
+            return
+        rng = np.random.default_rng()
+        vals = rng.uniform(0.0, 1.0, (self.encoding_layout.n_channels, 2))
+        for i in range(self.encoding_layout.n_channels):
+            for j, col in enumerate((2, 4)):
+                w = self.enc_val_table.cellWidget(i, col)
+                if w:
+                    w.setValue(float(vals[i, j]))
+
+    def _enc_get_values(self) -> tuple[np.ndarray, np.ndarray] | None:
+        layout = self.encoding_layout
+        if layout is None:
+            return None
+        n = layout.n_channels
+        x_vals = np.zeros(n)
+        w_vals = np.zeros(n)
+        for i in range(n):
+            xw = self.enc_val_table.cellWidget(i, 2)
+            ww = self.enc_val_table.cellWidget(i, 4)
+            if xw:
+                x_vals[i] = xw.value()
+            if ww:
+                w_vals[i] = ww.value()
+        return x_vals, w_vals
+
+    def _enc_generate(self) -> None:
+        layout = self.encoding_layout
+        if layout is None:
+            return
+        parsed = self._enc_get_values()
+        if parsed is None:
+            return
+        x_vals, w_vals = parsed
+        slm_w, slm_h = self.slm_size
+        try:
+            pattern = encode_to_pattern(x_vals, w_vals, layout, slm_w, slm_h)
+        except Exception as exc:
+            self.enc_status_label.setText(f"Encoding error: {exc}")
+            self._enc_log(f"Encoding error: {exc}")
+            return
+        self._encoding_pattern = pattern
+        self.enc_send_button.setEnabled(True)
+        self.enc_status_label.setText(
+            f"Pattern ready  |  SLM levels {int(pattern.min())}–{int(pattern.max())}"
+        )
+        self._enc_log(
+            f"Pattern generated ({slm_w}x{slm_h}, levels "
+            f"{int(pattern.min())}–{int(pattern.max())}). Open the SLM and click "
+            "Send to SLM to display it."
+        )
+        self._enc_draw_preview(pattern, layout)
+
+    def _enc_draw_preview(self, pattern: np.ndarray, layout: ChannelLayout) -> None:
+        self.enc_figure.clear()
+        ax = self.enc_figure.add_subplot(111)
+
+        # crop to active channel region + margin
+        x0 = max(0, min(ch.x_start for ch in layout.all_channels) - 30)
+        x1 = min(pattern.shape[1], max(ch.x_end for ch in layout.all_channels) + 30)
+        # show a thin horizontal slice so column structure is clear
+        mid = pattern.shape[0] // 2
+        crop = pattern[mid - 25 : mid + 25, x0:x1].astype(float)
+
+        im = ax.imshow(
+            crop,
+            aspect="auto",
+            cmap="viridis",
+            vmin=0,
+            vmax=1023,
+            extent=[x0, x1, 0, crop.shape[0]],
+            interpolation="nearest",
+        )
+
+        # centre dividing line
+        ax.axvline(layout.center_x, color="white", linewidth=1.0, linestyle="--", alpha=0.6)
+
+        # side labels
+        x_mid = (x0 + layout.center_x) / 2
+        w_mid = (layout.center_x + x1) / 2
+        ax.text(x_mid, crop.shape[0] * 0.85, "x channels (>778 nm)", color="white",
+                ha="center", fontsize=8, alpha=0.85)
+        ax.text(w_mid, crop.shape[0] * 0.85, "w channels (<778 nm)", color="white",
+                ha="center", fontsize=8, alpha=0.85)
+
+        # horizontal flip so the preview matches the OSA / physical orientation
+        # (wavelength increases left-to-right); data and labels stay correct
+        ax.invert_xaxis()
+
+        ax.set_xlabel("SLM x (px)", color="#d8dee9", fontsize=8)
+        ax.set_yticks([])
+        ax.tick_params(colors="#d8dee9", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#41515c")
+
+        self.enc_figure.patch.set_facecolor("#101820")
+        ax.set_facecolor("#101820")
+
+        cbar = self.enc_figure.colorbar(im, ax=ax, orientation="vertical",
+                                        fraction=0.015, pad=0.01)
+        cbar.set_label("SLM level", color="#d8dee9", fontsize=8)
+        cbar.ax.tick_params(colors="#d8dee9", labelsize=7)
+
+        self.enc_canvas.draw_idle()
+
+    def _enc_send(self) -> None:
+        pattern = self._encoding_pattern
+        if pattern is None:
+            self._enc_log("Nothing to send — click Generate & Preview first.")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self._enc_log(
+                "SLM is not open. Open it on the SLM Control page first, then "
+                "click Send to SLM again."
+            )
+        tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        tmp.close()
+        write_santec_csv(pattern, tmp.name)
+        self._enc_log("Sending encoding pattern to SLM…")
+        self._run_slm_task("Send encoding pattern", lambda: controller.display_csv(tmp.name))
+
+    # ==================================================================
+    # Modulation Error Analysis page (B1: single-channel spectral shape)
+    # ==================================================================
+
+    def _build_analysis_page(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Modulation Error Analysis")
+        subtitle = QtWidgets.QLabel(
+            "Turn on each channel of the encoder grid in isolation, sweep the "
+            "OSA across the spectrum, and quantify each single-channel lineshape "
+            "vs an ideal rectangular passband."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        page.layout().addWidget(subtitle)
+
+        # --- OSA measurement settings ---
+        cfg = self._panel("OSA Sweep Settings")
+        grid = QtWidgets.QGridLayout(cfg)
+        # OSA re-centres on each channel; only the (narrow) span is set here
+        self.ana_span = QtWidgets.QLineEdit("0.8nm")
+        self.ana_span.setToolTip("OSA span, re-centred on each channel's wavelength")
+        self.ana_sensitivity = QtWidgets.QComboBox()
+        self.ana_sensitivity.addItems(["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"])
+        self.ana_sensitivity.setCurrentText("HIGH3")
+        self.ana_ref_level = QtWidgets.QLineEdit("10uW")
+        self.ana_yunit = QtWidgets.QComboBox()
+        self.ana_yunit.addItems(["LOG (dBm)", "LIN (W)"])
+        self.ana_yunit.setToolTip(
+            "OSA acquisition Y unit. LOG resolves weak crosstalk tails far below "
+            "the peak; LIN compresses them near the noise floor. Saved data is "
+            "always converted to watts."
+        )
+        self.ana_averages = self._spin(1, 20, 1)
+        self.ana_stride = self._spin(1, 64, 1)
+        self.ana_stride.setToolTip("Measure only every Nth channel per side (1 = all)")
+        self.ana_bg_check = QtWidgets.QCheckBox("Subtract background")
+        self.ana_bg_check.setChecked(True)
+        self.ana_bg_check.setToolTip(
+            "Take an all-off trace at each channel's centre and subtract it "
+            "(2x sweeps, cleaner low-level crosstalk floor)"
+        )
+        grid.addWidget(QtWidgets.QLabel("Span / channel"), 0, 0)
+        grid.addWidget(self.ana_span, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Sensitivity"), 0, 2)
+        grid.addWidget(self.ana_sensitivity, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Ref level"), 0, 4)
+        grid.addWidget(self.ana_ref_level, 0, 5)
+        grid.addWidget(QtWidgets.QLabel("Y unit"), 1, 0)
+        grid.addWidget(self.ana_yunit, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Averages"), 1, 2)
+        grid.addWidget(self.ana_averages, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Stride"), 1, 4)
+        grid.addWidget(self.ana_stride, 1, 5)
+        grid.addWidget(self.ana_bg_check, 2, 0, 1, 3)
+        page.layout().addWidget(cfg)
+
+        self.ana_layout_label = QtWidgets.QLabel("Grid: (build a layout on the TPA Encoding page)")
+        self.ana_layout_label.setObjectName("PageSubtitle")
+        self.ana_layout_label.setWordWrap(True)
+        page.layout().addWidget(self.ana_layout_label)
+
+        # --- results: table + plots ---
+        self.ana_table = QtWidgets.QTableWidget(0, 6)
+        self.ana_table.setHorizontalHeaderLabels(
+            ["Ch", "λ (nm)", "Peak λ", "FWHM (nm)", "In-band %", "Leak %"]
+        )
+        self.ana_table.verticalHeader().setVisible(False)
+        self.ana_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.ana_table.setAlternatingRowColors(True)
+        self.ana_table.itemSelectionChanged.connect(self._ana_on_row_selected)
+
+        self.ana_spectra_fig = Figure(figsize=(6, 3), tight_layout=True)
+        self.ana_spectra_canvas = FigureCanvas(self.ana_spectra_fig)
+        self.ana_metrics_fig = Figure(figsize=(6, 3), tight_layout=True)
+        self.ana_metrics_canvas = FigureCanvas(self.ana_metrics_fig)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._panel_with_widget("Spectra", self.ana_spectra_canvas), "Spectra")
+        tabs.addTab(self._panel_with_widget("Metrics vs λ", self.ana_metrics_canvas), "Metrics vs λ")
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self._panel_with_widget("Per-channel metrics", self.ana_table))
+        split.addWidget(tabs)
+        split.setSizes([430, 650])
+        page.layout().addWidget(split, 1)
+
+        # --- controls ---
+        self.ana_progress_bar = QtWidgets.QProgressBar()
+        self.ana_progress_bar.setValue(0)
+        self.ana_status = QtWidgets.QLabel("\N{EN DASH}")
+        self.ana_run_button = QtWidgets.QPushButton("Run Analysis")
+        self.ana_run_button.clicked.connect(self._ana_run)
+        self.ana_stop_button = QtWidgets.QPushButton("Stop")
+        self.ana_stop_button.setProperty("variant", "danger")
+        self.ana_stop_button.setEnabled(False)
+        self.ana_stop_button.clicked.connect(self._ana_stop)
+        self.ana_save_button = QtWidgets.QPushButton("Save CSV…")
+        self.ana_save_button.setProperty("variant", "ghost")
+        self.ana_save_button.setEnabled(False)
+        self.ana_save_button.clicked.connect(self._ana_save)
+        ctrl = QtWidgets.QHBoxLayout()
+        ctrl.addWidget(self.ana_status, 1)
+        ctrl.addWidget(self.ana_save_button)
+        ctrl.addWidget(self.ana_run_button)
+        ctrl.addWidget(self.ana_stop_button)
+        page.layout().addWidget(self.ana_progress_bar)
+        page.layout().addLayout(ctrl)
+
+        self._ana_live_wl: list[float] = []
+        self._ana_live_metric: list[float] = []
+        return page
+
+    def _ana_settings(self) -> MeasurementSettings:
+        # center_wl is a placeholder; measure_channel_spectra re-centres per channel
+        y_unit = "LOGarithmic" if self.ana_yunit.currentText().startswith("LOG") else "LINear"
+        return MeasurementSettings(
+            center_wl="778nm",
+            span=self.ana_span.text().strip() or "0.8nm",
+            sensitivity=self.ana_sensitivity.currentText(),
+            reference_level=self.ana_ref_level.text().strip() or "10uW",
+            y_unit=y_unit,
+        )
+
+    def _ana_set_running(self, running: bool) -> None:
+        self.ana_run_button.setEnabled(not running)
+        self.ana_stop_button.setEnabled(running)
+        self.ana_save_button.setEnabled(not running and self.analysis_result is not None)
+
+    def _ana_run(self) -> None:
+        layout = self.encoding_layout
+        if layout is None:
+            self.ana_status.setText("No channel grid — open the TPA Encoding page to build one.")
+            return
+        osa = self._osa_ready()
+        if osa is None:
+            self.ana_status.setText("Connect the OSA on the Calibration page first.")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.ana_status.setText("Open the SLM on the SLM Control page first.")
+            return
+
+        settings = self._ana_settings()
+        averages = self.ana_averages.value()
+        stride = self.ana_stride.value()
+        subtract_bg = self.ana_bg_check.isChecked()
+        n_targets = 2 * len(range(0, layout.n_channels, max(1, stride)))
+        capture_dir = tempfile.mkdtemp(prefix="mod_err_")
+        self._ana_capture_dir = capture_dir
+
+        self.ana_layout_label.setText(
+            f"Grid: {layout.n_channels} ch/side, width {layout.channel_width_px} px "
+            f"({layout.channel_width_px * layout.nm_per_px:.4f} nm), centre "
+            f"{layout.center_wl:.2f} nm  ·  measuring {n_targets} channels"
+        )
+        self._ana_live_wl = []
+        self._ana_live_metric = []
+        self.ana_progress_bar.setMaximum(n_targets)
+        self.ana_progress_bar.setValue(0)
+        self.ana_status.setText("Starting…")
+        self._ana_set_running(True)
+
+        stop_event = threading.Event()
+        self.analysis_stop_event = stop_event
+
+        def report(progress: AnalysisProgress) -> None:
+            self.analysis_progress.emit(progress)
+
+        def work() -> dict[str, Any]:
+            try:
+                result = measure_channel_spectra(
+                    osa, controller, layout, settings,
+                    averages=averages, stride=stride,
+                    subtract_background=subtract_bg, capture_dir=capture_dir,
+                    stop_event=stop_event, progress_callback=report,
+                )
+            except AnalysisAborted:
+                return {"status": "aborted"}
+            return {"status": "ok", "result": result}
+
+        self._run_slm_task("Modulation error analysis", work,
+                           self._ana_finished, self._ana_error)
+
+    def _ana_stop(self) -> None:
+        if self.analysis_stop_event is not None:
+            self.analysis_stop_event.set()
+            self.ana_status.setText("Stopping…")
+
+    def _on_analysis_progress(self, progress: AnalysisProgress) -> None:
+        done = min(progress.step + 1, progress.total)
+        self.ana_progress_bar.setMaximum(max(progress.total, 1))
+        self.ana_progress_bar.setValue(done)
+        self.ana_status.setText(progress.message)
+        if progress.wl is not None and progress.metric is not None:
+            self._ana_live_wl.append(progress.wl)
+            self._ana_live_metric.append(progress.metric)
+            self._ana_draw_live()
+
+    def _ana_draw_live(self) -> None:
+        self.ana_metrics_fig.clear()
+        ax = self.ana_metrics_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("In-band fraction")
+        ax.set_ylim(0, 1.02)
+        ax.scatter(self._ana_live_wl, self._ana_live_metric, s=12, color="#47b8e0")
+        self.ana_metrics_fig.patch.set_facecolor("#101820")
+        self.ana_metrics_canvas.draw_idle()
+
+    def _ana_finished(self, payload: dict[str, Any]) -> None:
+        self.analysis_stop_event = None
+        self._ana_set_running(False)
+        if payload.get("status") == "aborted":
+            self.ana_status.setText(
+                f"Analysis stopped · partial captures in {self._ana_capture_dir}"
+            )
+            return
+        result = payload["result"]
+        self.analysis_result = result
+        self.ana_save_button.setEnabled(True)
+        self._ana_populate_table(result)
+        self._ana_draw_spectra(result)
+        self._ana_draw_metrics(result)
+        n = len(result.channels)
+        mean_inband = float(np.mean([c.in_band_fraction for c in result.channels])) if n else 0.0
+        mean_leak = float(np.mean([c.neighbor_leakage for c in result.channels])) if n else 0.0
+        npz = result.raw_npz_path or "(none)"
+        self.ana_status.setText(
+            f"Done · {n} channels · mean in-band {mean_inband*100:.1f}% · "
+            f"mean leak {mean_leak*100:.1f}% · raw NPZ: {npz}"
+        )
+
+    def _ana_error(self, _error: str) -> None:
+        self.analysis_stop_event = None
+        self._ana_set_running(False)
+        self.ana_status.setText("Analysis failed (see Status log)")
+
+    def _ana_populate_table(self, result: ModulationErrorResult) -> None:
+        self.ana_table.setRowCount(len(result.channels))
+        for r, ch in enumerate(result.channels):
+            cells = [
+                f"{ch.side}[{ch.index}]",
+                f"{ch.nominal_wl_nm:.4f}",
+                f"{ch.peak_wl_nm:.4f}",
+                f"{ch.fwhm_nm:.4f}",
+                f"{ch.in_band_fraction*100:.1f}",
+                f"{ch.neighbor_leakage*100:.1f}",
+            ]
+            for c, text in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.ana_table.setItem(r, c, item)
+        self.ana_table.resizeColumnsToContents()
+
+    def _ana_draw_spectra(self, result: ModulationErrorResult, highlight: int | None = None) -> None:
+        self.ana_spectra_fig.clear()
+        ax = self.ana_spectra_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Power (W)")
+        for i, ch in enumerate(result.channels):
+            if ch.wavelengths_nm.size == 0:
+                continue
+            if highlight is not None and i != highlight:
+                ax.plot(ch.wavelengths_nm, ch.signal_w, color="#3a4a54", linewidth=0.6)
+        for i, ch in enumerate(result.channels):
+            if ch.wavelengths_nm.size == 0:
+                continue
+            if highlight is None:
+                ax.plot(ch.wavelengths_nm, ch.signal_w, linewidth=0.8)
+            elif i == highlight:
+                ax.plot(ch.wavelengths_nm, ch.signal_w, color="#47b8e0", linewidth=1.4)
+                half = ch.nominal_bw_nm / 2.0
+                ax.axvspan(ch.nominal_wl_nm - half, ch.nominal_wl_nm + half,
+                           color="#47b8e0", alpha=0.15)
+        self.ana_spectra_fig.patch.set_facecolor("#101820")
+        self.ana_spectra_canvas.draw_idle()
+
+    def _ana_draw_metrics(self, result: ModulationErrorResult) -> None:
+        self.ana_metrics_fig.clear()
+        ax = self.ana_metrics_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        wl = [c.nominal_wl_nm for c in result.channels]
+        inband = [c.in_band_fraction for c in result.channels]
+        leak = [c.neighbor_leakage for c in result.channels]
+        ax.scatter(wl, inband, s=14, color="#47b8e0", label="in-band fraction")
+        ax.scatter(wl, leak, s=14, color="#e0735a", label="neighbour leakage")
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Fraction")
+        ax.set_ylim(0, 1.02)
+        ax.legend(fontsize=7, facecolor="#101820", edgecolor="#41515c", labelcolor="#d8dee9")
+        self.ana_metrics_fig.patch.set_facecolor("#101820")
+        self.ana_metrics_canvas.draw_idle()
+
+    def _ana_on_row_selected(self) -> None:
+        if self.analysis_result is None:
+            return
+        rows = self.ana_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        self._ana_draw_spectra(self.analysis_result, highlight=rows[0].row())
+
+    def _ana_save(self) -> None:
+        if self.analysis_result is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Analysis CSV", "modulation_error.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        out = write_analysis_csv(self.analysis_result, path)
+        # copy the consolidated raw NPZ next to the metrics CSV
+        npz_src = self.analysis_result.raw_npz_path
+        msg = f"Saved {out}"
+        if npz_src and Path(npz_src).is_file():
+            npz_dst = Path(path).with_suffix(".npz")
+            try:
+                shutil.copyfile(npz_src, npz_dst)
+                msg += f"  +  raw spectra {npz_dst}"
+            except OSError as exc:
+                msg += f"  (raw NPZ copy failed: {exc})"
+        self.ana_status.setText(msg)
 
     def _page_shell(self, title: str) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
