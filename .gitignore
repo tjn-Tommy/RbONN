@@ -3,3 +3,11 @@ __pycache__/
 .vscode/
 settings.json
 *.npz
+*.pt
+*.png
+*.jpeg
+*.gz
+\data
+# experiment artifacts (metrics JSON, trained weights, cached encoders)
+output/
+data/

@@ -1,0 +1,21 @@
+{
+  "run_name": "patch_mean",
+  "detection_mode": "intensity",
+  "encoding": "patch_scan_20px_x40_patches",
+  "best_acc": 0.11349999904632568,
+  "I_sat": 0.19443485140800476,
+  "hw_aware": false,
+  "epochs": 300,
+  "per_class_acc": {
+    "0": 0.0,
+    "1": 1.0,
+    "2": 0.0,
+    "3": 0.0,
+    "4": 0.0,
+    "5": 0.0,
+    "6": 0.0,
+    "7": 0.0,
+    "8": 0.0,
+    "9": 0.0
+  }
+}
