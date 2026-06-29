@@ -22,32 +22,16 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import datasets, transforms
+
+from ..common import confusion_matrix, per_class_acc, print_model_summary
+from .data import load_mnist
 
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
 OUTPUT_DIR = HERE / "output"
 N_CLASSES = 10
-
-
-def _load_mnist(root: Path = DATA_DIR):
-    t = transforms.ToTensor()
-    tr = datasets.MNIST(root, train=True, download=True, transform=t)
-    te = datasets.MNIST(root, train=False, download=True, transform=t)
-    X_tr = tr.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    X_te = te.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    return X_tr, tr.targets.numpy(), X_te, te.targets.numpy()
-
-
-def _confusion_matrix(pred: torch.Tensor, truth: torch.Tensor) -> np.ndarray:
-    cm = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
-    for t, p in zip(truth.cpu().numpy(), pred.cpu().numpy()):
-        cm[t, p] += 1
-    return cm
 
 
 def train_linear(
@@ -62,7 +46,7 @@ def train_linear(
     gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else ""
     print(f"Device: {device}" + (f" ({gpu})" if gpu else ""))
 
-    X_tr, y_tr, X_te, y_te = _load_mnist()
+    X_tr, y_tr, X_te, y_te = load_mnist()
     A_tr = torch.from_numpy(X_tr).to(device)
     A_te = torch.from_numpy(X_te).to(device)
     y_tr_t = torch.tensor(y_tr, dtype=torch.long, device=device)
@@ -71,6 +55,7 @@ def train_linear(
     model = nn.Linear(784, N_CLASSES, bias=bias).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: pure linear 784 -> {N_CLASSES}  (bias={bias})  |  {n_params} parameters")
+    print_model_summary(model, (1, 784), device)
 
     loader = DataLoader(TensorDataset(A_tr, y_tr_t), batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -112,7 +97,7 @@ def train_linear(
     model.eval()
     with torch.no_grad():
         pred = model(A_te).argmax(1)
-    cm = _confusion_matrix(pred, y_te_t)
+    cm = confusion_matrix(pred, y_te_t, N_CLASSES)
 
     metrics_path = OUTPUT_DIR / f"metrics_{name}.json"
     with open(metrics_path, "w") as f:
@@ -123,7 +108,7 @@ def train_linear(
             "n_params": n_params,
             "best_acc": best_acc,
             "epochs": epochs,
-            "per_class_acc": {str(k): float(cm[k, k] / cm[k].sum()) for k in range(N_CLASSES)},
+            "per_class_acc": per_class_acc(cm),
             "history": history,
         }, f, indent=2)
 

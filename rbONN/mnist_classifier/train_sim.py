@@ -37,48 +37,29 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
-import sys
 from pathlib import Path
 
-import numpy as np
 import trackio
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import datasets, transforms
 
+from ..common import confusion_matrix, launch_trackio, print_model_summary
+from .data import load_mnist
 from .pca_encoder import PCAEncoder
 from .twin import RbONNTwin, RbONNDeep, DETECTION_MODES
 
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
 OUTPUT_DIR = HERE / "output"
 N_CLASSES = 10
 TRACKIO_PROJECT = "rbONN_sim"
 PATCH_SIZE = 20   # SLM spatial channels = pixels per patch
 
 
-def _load_mnist(root: Path = DATA_DIR):
-    t = transforms.ToTensor()
-    tr = datasets.MNIST(root, train=True, download=True, transform=t)
-    te = datasets.MNIST(root, train=False, download=True, transform=t)
-    X_tr = tr.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    X_te = te.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    return X_tr, tr.targets.numpy(), X_te, te.targets.numpy()
-
-
 def _inject_noise(phi: torch.Tensor, sigma_rad: float, bits: int = 10) -> torch.Tensor:
     n = 2 ** bits
     phi_q = phi + (torch.round(phi / (2 * math.pi) * n) / n * (2 * math.pi) - phi).detach()
     return phi_q + torch.randn_like(phi_q) * sigma_rad
-
-
-def _confusion_matrix(pred: torch.Tensor, truth: torch.Tensor) -> np.ndarray:
-    cm = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
-    for t, p in zip(truth.cpu().numpy(), pred.cpu().numpy()):
-        cm[t, p] += 1
-    return cm
 
 
 # ── Training -----------------------------------------------------------------
@@ -145,6 +126,7 @@ def train_one(
         ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {arch_str}  |  {n_params} parameters")
+    print_model_summary(model, (1, A_tr.shape[1]), device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -211,7 +193,7 @@ def train_one(
         logits_te = model(A_te)
         pred = logits_te.argmax(dim=1)
 
-    cm = _confusion_matrix(pred, y_te_t)
+    cm = confusion_matrix(pred, y_te_t, N_CLASSES)
 
     per_class_metrics = {}
     for k in range(N_CLASSES):
@@ -299,18 +281,14 @@ def train(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Launch trackio dashboard in background so it's live during training
-    subprocess.Popen(
-        [sys.executable, "-m", "trackio", "show", "--project", TRACKIO_PROJECT],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    print(f"Trackio dashboard starting at http://localhost:7860  (project: {TRACKIO_PROJECT})")
+    launch_trackio(TRACKIO_PROJECT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else ""
     print(f"Device: {device}" + (f" ({gpu_name})" if gpu_name else ""))
 
     # -- Data -----------------------------------------------------------------
-    X_tr, y_tr, X_te, y_te = _load_mnist()
+    X_tr, y_tr, X_te, y_te = load_mnist()
 
     if arch == "deep" or use_patches:
         # Raw 28x28 pixels -- deep network handles patching internally

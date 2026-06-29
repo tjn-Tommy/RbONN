@@ -32,8 +32,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +39,12 @@ import trackio
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import datasets, transforms
 
+from ..common import confusion_matrix, launch_trackio, per_class_acc, print_model_summary
+from .data import load_mnist
 from .twin import amplitudes_to_efield, phases_to_efield
 
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
 OUTPUT_DIR = HERE / "output"
 N_CLASSES = 10
 TRACKIO_PROJECT = "rbONN_mnist_opt"
@@ -56,28 +54,12 @@ TRACKIO_PROJECT = "rbONN_mnist_opt"
 # Sticking with the pure square-law layer:  logit_k = | sum_i W~[k,i] x~_i |^2.
 
 
-def _load_mnist(root: Path = DATA_DIR):
-    t = transforms.ToTensor()
-    tr = datasets.MNIST(root, train=True, download=True, transform=t)
-    te = datasets.MNIST(root, train=False, download=True, transform=t)
-    X_tr = tr.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    X_te = te.data.numpy().reshape(-1, 784).astype(np.float32) / 255.0
-    return X_tr, tr.targets.numpy(), X_te, te.targets.numpy()
-
-
 def _patch_perm() -> np.ndarray:
     """Index permutation reordering flat-784 pixels into 4x4-block raster order."""
     idx = np.arange(784).reshape(28, 28)
     blocks = [idx[by * 4:(by + 1) * 4, bx * 4:(bx + 1) * 4].reshape(-1)
               for by in range(7) for bx in range(7)]
     return np.concatenate(blocks)
-
-
-def _confusion_matrix(pred: torch.Tensor, truth: torch.Tensor) -> np.ndarray:
-    cm = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
-    for t, p in zip(truth.cpu().numpy(), pred.cpu().numpy()):
-        cm[t, p] += 1
-    return cm
 
 
 class OpticalLayer(nn.Module):
@@ -89,16 +71,21 @@ class OpticalLayer(nn.Module):
     """
 
     def __init__(self, n_in: int = 784, n_out: int = N_CLASSES,
-                 bias: bool = False, logit_scale: bool = False, init_scale: float = 1.0):
+                 bias: bool = False, logit_scale: bool = False, init_scale: float = 1.0,
+                 phase_insensitive: bool = False):
         super().__init__()
         self.phi_w = nn.Parameter(torch.rand(n_out, n_in) * 2.0 * math.pi * init_scale)
         self.bias = nn.Parameter(torch.zeros(n_out)) if bias else None
         self.log_s = nn.Parameter(torch.zeros(())) if logit_scale else None
+        self.phase_insensitive = phase_insensitive
 
     def raw_intensity(self, a: torch.Tensor) -> torch.Tensor:
         x = amplitudes_to_efield(a)        # (batch, 784) complex
         W = phases_to_efield(self.phi_w)   # (n_out, 784) complex
-        return (x @ W.T).abs().pow(2)      # (batch, n_out) square-law intensity
+        if self.phase_insensitive:
+            # phase-INSENSITIVE quadratic sum: drop cross-terms -> sum of intensities
+            return x.abs().pow(2) @ W.abs().pow(2).T
+        return (x @ W.T).abs().pow(2)      # phase-SENSITIVE |S|^2 (interference)
 
     def forward(self, a: torch.Tensor) -> torch.Tensor:
         out = self.raw_intensity(a)
@@ -121,23 +108,20 @@ def train_optical(
     optimizer_name: str = "adam",
     warmup: int = 0,
     label_smoothing: float = 0.0,
+    phase_insensitive: bool = False,
     seed: int = 0,
     name: str = "optical",
 ) -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
 
-    subprocess.Popen(
-        [sys.executable, "-m", "trackio", "show", "--project", TRACKIO_PROJECT],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    print(f"Trackio dashboard: http://localhost:7860  (project: {TRACKIO_PROJECT})")
+    launch_trackio(TRACKIO_PROJECT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else ""
     print(f"Device: {device}" + (f" ({gpu})" if gpu else "") + f"  |  run: {name}")
 
-    X_tr, y_tr, X_te, y_te = _load_mnist()
+    X_tr, y_tr, X_te, y_te = load_mnist()
     if encoding == "patch":
         perm = _patch_perm()
         X_tr, X_te = X_tr[:, perm], X_te[:, perm]
@@ -148,14 +132,16 @@ def train_optical(
     y_te_t = torch.tensor(y_te, dtype=torch.long, device=device)
 
     model = OpticalLayer(784, N_CLASSES, bias=bias, logit_scale=logit_scale,
-                         init_scale=init_scale).to(device)
+                         init_scale=init_scale, phase_insensitive=phase_insensitive).to(device)
 
+    quad = "phase-insensitive" if phase_insensitive else "phase-sensitive"
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: optical 784->{N_CLASSES} |S|^2  encoding={encoding}  "
+    print(f"Model: optical 784->{N_CLASSES} {quad} quad-sum  encoding={encoding}  "
           f"bias={bias}  logit_scale={logit_scale}  |  {n_params} params")
+    print_model_summary(model, (1, 784), device)
 
     trackio.init(project=TRACKIO_PROJECT, name=name, config={
-        "model": "optical_784x10", "encoding": encoding,
+        "model": "optical_784x10", "encoding": encoding, "phase_insensitive": phase_insensitive,
         "bias": bias, "logit_scale": logit_scale, "init_scale": init_scale,
         "optimizer": optimizer_name, "warmup": warmup, "label_smoothing": label_smoothing,
         "n_params": n_params, "epochs": epochs, "lr": lr, "batch_size": batch_size,
@@ -215,9 +201,9 @@ def train_optical(
     model.eval()
     with torch.no_grad():
         pred = model(A_te).argmax(1)
-    cm = _confusion_matrix(pred, y_te_t)
+    cm = confusion_matrix(pred, y_te_t, N_CLASSES)
 
-    per_class = {str(k): float(cm[k, k] / cm[k].sum()) for k in range(N_CLASSES)}
+    per_class = per_class_acc(cm)
     trackio.log({**{f"class_{k}_acc": per_class[str(k)] for k in range(N_CLASSES)},
                  "epoch": epochs})
     trackio.finish()
@@ -225,6 +211,7 @@ def train_optical(
     metrics_path = OUTPUT_DIR / f"metrics_{name}.json"
     with open(metrics_path, "w") as f:
         json.dump({"run_name": name, "model": "optical_784x10", "encoding": encoding,
+                   "phase_insensitive": phase_insensitive,
                    "bias": bias, "logit_scale": logit_scale,
                    "optimizer": optimizer_name, "warmup": warmup,
                    "label_smoothing": label_smoothing,
@@ -247,6 +234,8 @@ def main():
     p.add_argument("--encoding", choices=["flat", "patch"], default="flat")
     p.add_argument("--bias", action="store_true", help="learnable per-class offset")
     p.add_argument("--logit-scale", action="store_true", help="learnable logit temperature")
+    p.add_argument("--phase-insensitive", action="store_true",
+                   help="phase-insensitive quadratic sum (drop cross-terms): Sum |w~|^2 |x~|^2")
     p.add_argument("--optimizer", choices=["adam", "adamw"], default="adam")
     p.add_argument("--warmup", type=int, default=0, help="linear warmup epochs before cosine")
     p.add_argument("--label-smoothing", type=float, default=0.0)
@@ -259,6 +248,7 @@ def main():
                   bias=args.bias, logit_scale=args.logit_scale,
                   init_scale=args.init_scale, optimizer_name=args.optimizer,
                   warmup=args.warmup, label_smoothing=args.label_smoothing,
+                  phase_insensitive=args.phase_insensitive,
                   seed=args.seed, name=args.name)
 
 
