@@ -1,0 +1,181 @@
+{
+  "_about": "R&S RTO6 SCPI commands used by scope_module, verified against the RTO6 User Manual (1801.6687.02-13). 'page' = page number in that manual. This is a human reference; the driver in driver.py is the source of truth for what is actually sent.",
+  "instrument": "Rohde & Schwarz RTO6 oscilloscope",
+  "manual": "RTO6 User Manual 1801.6687.02 – 13 (RTO6_UserManual_scpicmd.pdf)",
+
+  "transport": {
+    "_note": "PyVISA over HiSLIP is R&S's recommended high-throughput LAN protocol; raw socket also works.",
+    "hislip_resource": "TCPIP::<ip>::hislip0::INSTR",
+    "vxi11_resource": "TCPIP::<ip>::inst0::INSTR",
+    "socket_resource": "TCPIP::<ip>::5025::SOCKET",
+    "backend": "pyvisa-py ('@py') — pure-Python, implements HiSLIP/TCPIP natively"
+  },
+
+  "ieee4882": {
+    "*IDN?": {"desc": "Identification query: manufacturer, model, serial, firmware."},
+    "*CLS": {"desc": "Clear status: empties the event registers and error queue."},
+    "*OPC": {"desc": "Sets the OPC bit (ESR bit 0) when all pending operations finish. Used as 'SINGle;*OPC' then poll *ESR? for an abortable wait."},
+    "*OPC?": {"desc": "Blocks and returns 1 when operations complete. Manual's examples use 'SINGle;*OPC?'. We avoid the blocking form so acquisitions stay abortable."},
+    "*ESR?": {"desc": "Reads and clears the standard event status register. Bit 0 (0x01) is Operation Complete.", "opc_bit": "0x01"},
+    "*WAI": {"desc": "Wait-to-continue; alternative overlap guard."}
+  },
+
+  "format": {
+    "FORMat[:DATA]": {
+      "command": "FORMat:DATA <Format>[,<Length>]",
+      "args": "ASCii | REAL,32 | INT,8 | INT,16",
+      "page": 1456,
+      "used": "REAL,32 (samples already in volts; simplest). INT,16 returns raw counts and needs scaling.",
+      "set_by": "_open_transport"
+    },
+    "FORMat:BORDer": {
+      "command": "FORMat:BORDer <ByteOrder>",
+      "args": "LSBFirst | MSBFirst",
+      "page": 1458,
+      "used": "LSBFirst → query_binary_values(is_big_endian=False). Relevant for INT,16/REAL,32.",
+      "set_by": "_open_transport"
+    },
+    "EXPort:WAVeform:INCXvalues": {
+      "command": "EXPort:WAVeform:INCXvalues <ON|OFF>",
+      "page": 1510,
+      "used": "Forced OFF so CHANnel:DATA? returns Y-values only; the time axis is rebuilt from the header. If ON, X and Y come back interleaved.",
+      "set_by": "_open_transport"
+    }
+  },
+
+  "vertical": {
+    "CHANnel<ch>[:STATe]": {"command": "CHANnel<ch>:STATe <ON|OFF>", "page": 1509, "suffix": "ch = 1..4", "set_by": "configure_channel"},
+    "CHANnel<ch>:SCALe":   {"command": "CHANnel<ch>:SCALe <Scale>",   "page": 1509, "unit": "V/div", "set_by": "configure_channel"},
+    "CHANnel<ch>:OFFSet":  {"command": "CHANnel<ch>:OFFSet <Offset>", "page": 1507, "unit": "V", "set_by": "configure_channel"},
+    "CHANnel<ch>:COUPling":{"command": "CHANnel<ch>:COUPling <Value>","page": 1505, "args": "DC | DCLimit | AC", "notes": "DC=50Ω, DCLimit=1MΩ DC, AC=1MΩ AC.", "set_by": "configure_channel"}
+  },
+
+  "decimation": {
+    "CHANnel<ch>[:WAVeform<wf>]:TYPE": {
+      "command": "CHANnel<ch>:TYPE <DecimationMode>",
+      "args": "SAMPle | PDETect | HRESolution | RMS",
+      "page": 1501,
+      "rst": "SAMPle",
+      "notes": "PDETect (peak detect) records the min and max of each sample interval → 2 values per sample, so a reduced record length still captures true pulse peaks. HRESolution = boxcar average; RMS = root-mean-square per interval.",
+      "set_by": "set_decimation"
+    },
+    "CHANnel<ch>[:WAVeform<wf>]:ARIThmetics": {
+      "command": "CHANnel<ch>:ARIThmetics <Arithmetics>",
+      "args": "OFF | AVERage | ENVelope",
+      "page": 1501,
+      "rst": "OFF",
+      "notes": "Across-acquisition combination (with ACQuire:COUNt). OFF = raw single-shot; AVERage = mean of N acquisitions; ENVelope = accumulated min/max. Forced OFF by configure() so captures are deterministically raw regardless of front-panel state. Distinct from decimation (TYPE), which reduces within one acquisition.",
+      "set_by": "set_arithmetics"
+    }
+  },
+
+  "horizontal_acquisition": {
+    "TIMebase:RANGe": {"command": "TIMebase:RANGe <AcqTime>", "page": 1493, "unit": "s", "notes": "Total acquisition time window. RANGe = 10 * SCALe.", "set_by": "set_time_range"},
+    "TIMebase:SCALe": {"command": "TIMebase:SCALe <TimeScale>", "page": 1492, "unit": "s/div", "notes": "Alternative to RANGe (10 divisions)."},
+    "ACQuire:POINts:AUTO": {
+      "command": "ACQuire:POINts:AUTO <RESolution|RECLength>",
+      "page": 1498,
+      "rst": "RESolution",
+      "notes": "Selects which quantity is held constant when the time scale changes. RECLength pins record length (resolution adapts) — used to fix a point budget over 1 s. NOT an ON/OFF toggle.",
+      "set_by": "set_record_length"
+    },
+    "ACQuire:POINts[:VALue]": {
+      "command": "ACQuire:POINts <RecordLength>",
+      "query": "ACQuire:POINts?",
+      "page": 1500,
+      "range": "1000 to 1E9 pts (increment 2)",
+      "notes": "With AUTO RECLength + a fixed RANGe, resolution = RANGe / POINts (e.g. 1 s / 1e6 = 1 µs → 1 MSa/s effective).",
+      "set_by": "set_record_length",
+      "read_by": "record_length"
+    },
+    "ACQuire:RESolution": {"command": "ACQuire:RESolution <s>", "page": 1500, "notes": "Time between waveform points; alternative to POINts."},
+    "ACQuire:SRATe": {"command": "ACQuire:SRATe <Sa/s>", "query": "ACQuire:SRATe?", "page": 1500, "notes": "Configured sample rate.", "read_by": "sample_rate"},
+    "ACQuire:SRReal?": {"command": "ACQuire:SRReal?", "page": 1500, "firmware": "FW 3.40", "notes": "Realized waveform points/s after decimation."},
+    "ACQuire:POINts:ARATe?": {"command": "ACQuire:POINts:ARATe?", "page": 1499, "notes": "ADC sample rate (points sampled per second)."},
+    "ACQuire:COUNt": {"command": "ACQuire:COUNt <MaxAcqCnt>", "page": 1497, "rst": "1", "notes": "Number of acquisitions for a SINGle/averaging run. Default 1 = one acquisition."}
+  },
+
+  "run_control": {
+    "RUN":        {"command": "RUN", "page": 1491, "notes": "Continuous acquisition."},
+    "RUNContinous": {"command": "RUNContinous", "page": 1491, "notes": "Alias of RUN (note R&S's spelling)."},
+    "RUNSingle":  {"command": "RUNSingle", "page": 1492, "notes": "Alias of SINGle."},
+    "SINGle":     {"command": "SINGle", "page": 1492, "notes": "Run ACQuire:COUNt acquisitions then stop. We send 'SINGle;*OPC' and poll *ESR? bit 0.", "used_by": "single_acquisition"},
+    "STOP":       {"command": "STOP", "page": 1492, "notes": "Stop acquisition. Used to abort a polled single acquisition.", "used_by": "stop"}
+  },
+
+  "waveform_readout": {
+    "CHANnel<ch>[:WAVeform<wf>]:DATA:HEADer?": {
+      "command": "CHANnel<ch>:DATA:HEADer?",
+      "page": 1510,
+      "returns": ["XStart [s]", "XStop [s]", "RecordLength", "ValuesPerSample"],
+      "example": "CHAN1:WAV1:DATA:HEAD?  ->  -9.477E-008,9.477E-008,200000,1",
+      "notes": "ValuesPerSample is 2 for peak-detect/envelope (interleaved min,max), else 1. [:WAVeform<wf>] omitted = waveform 1.",
+      "read_by": "read_waveform_header"
+    },
+    "CHANnel<ch>[:WAVeform<wf>]:DATA[:VALues]?": {
+      "command": "CHANnel<ch>:DATA? | CHANnel<ch>:WAVeform<wf>:DATA:VALues? [<Offset>],[<Length>]",
+      "page": 1510,
+      "notes": "Y-values per FORMat[:DATA] (when INCXvalues OFF). Offset/Length allow chunked reads. Returned as an IEEE-488.2 binary block under REAL,32/INT,16.",
+      "read_by": "read_waveform"
+    }
+  },
+
+  "trigger": {
+    "TRIGger<t>:MODE": {"command": "TRIGger1:MODE <AUTO|NORMal|FREerun>", "page": 1607, "notes": "NORMal waits for a real trigger (required for the SLM-triggered monitor); AUTO free-runs if none. Suffix irrelevant.", "set_by": "set_trigger"},
+    "TRIGger<t>:SOURce": {"command": "TRIGger1:SOURce <CHANnel1..4|EXTernanalog>", "notes": "Trigger source. t=1 is the A-event.", "set_by": "set_trigger"},
+    "TRIGger<t>:TYPE": {"command": "TRIGger1:TYPE EDGE", "rst": "EDGE", "notes": "Edge trigger.", "set_by": "set_trigger"},
+    "TRIGger<t>:EDGE:SLOPe": {"command": "TRIGger1:EDGE:SLOPe <POSitive|NEGative|EITHer>", "page": 1567, "rst": "POSitive", "notes": "POSitive = rising edge (the SLM 0->3 V pulse).", "set_by": "set_trigger"},
+    "TRIGger<t>:LEVel<n>": {"command": "TRIGger1:LEVel<n> <V>", "page": 1566, "notes": "Level for source index n: 1..4 = channels, 5 = external trigger input. e.g. TRIG:LEV3 1.5.", "set_by": "set_trigger"}
+  },
+
+  "bandwidth_filter": {
+    "CHANnel<ch>:BANDwidth": {"command": "CHANnel<ch>:BANDwidth <FULL|B800|B200|B20>", "page": 1504, "notes": "Analog bandwidth limit. B20 (20 MHz) is the lowest hardware limit — big noise reduction for a low-frequency signal. B800 needs 50 Ohm coupling.", "set_by": "set_bandwidth_limit"},
+    "CHANnel<ch>:DIGFilter:STATe": {"command": "CHANnel<ch>:DIGFilter:STATe <ON|OFF>", "page": 1557, "set_by": "set_digital_filter"},
+    "CHANnel<ch>:DIGFilter:CUToff": {"command": "CHANnel<ch>:DIGFilter:CUToff <Hz>", "page": 1557, "notes": "Digital low-pass cutoff. For a smooth <=kHz signal, ~10x the signal bandwidth rejects almost all noise.", "set_by": "set_digital_filter"}
+  },
+
+  "horizontal_position": {
+    "TIMebase:REFerence": {"command": "TIMebase:REFerence <0..100 %>", "page": 1493, "rst": "50", "notes": "Reference-point position on screen. Set to 0 to put the reference at the left edge.", "set_by": "set_post_trigger_window"},
+    "TIMebase:HORizontal:POSition": {"command": "TIMebase:HORizontal:POSition <s>", "page": 1493, "rst": "0", "notes": "Time between the reference point and the trigger (zero point). With REFerence 0 and POSition 0 the trigger sits at the record's left edge, so the whole record is post-trigger [0, RANGe].", "set_by": "set_post_trigger_window"}
+  },
+
+  "measurement": {
+    "_note": "On-scope averaging: a MEAN measurement returns the average signal level as one scalar, so we read a number instead of transferring the whole record.",
+    "MEASurement<mg>[:ENABle]": {"command": "MEASurement<mg>:ENABle ON", "page": 1670, "notes": "mg = 1..10 measurement group.", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:CATegory": {"command": "MEASurement<mg>:CATegory AMPTime", "page": 1672, "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:SOURce": {"command": "MEASurement<mg>:SOURce C<ch>W1", "page": 1670, "notes": "Waveform source in Cn W m form (channel n, waveform 1).", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:MAIN": {"command": "MEASurement<mg>:MAIN MEAN", "page": 1673, "notes": "MEAN = mean value of the waveform over its window. Many other types exist (RMS, AMPLitude, MAXimum, AREA, ...).", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:GATE": {"command": "MEASurement<mg>:GATE:MODE ABS ; :GATE:ABSolute:STARt <s> ; :GATE:ABSolute:STOP <s> ; :GATE:STATe ON", "page": 1742, "notes": "Restrict the measurement to an absolute time window (seconds after the trigger). Used to average only the settled [hold, hold+duration] part.", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:RESult[:ACTual]?": {"command": "MEASurement<mg>:RESult:ACTual?", "page": 1746, "notes": "Current main-measurement value (one float).", "read_by": "read_measurement"},
+    "MEASurement<mg>:STATistics[:ENABle]": {"command": "MEASurement<mg>:STATistics:ENABle ON", "page": 1668, "notes": "Accumulate statistics across acquisitions; then MEASurement<mg>:RESult:AVG? / :STDDev? / :WFMCount?. Needs multiple triggers (not used by the single-trigger monitor)."}
+  },
+
+  "typical_monitor_sequence": [
+    "TRIGger1:MODE NORMal",
+    "TRIGger1:SOURce CHANnel3 ; TRIGger1:TYPE EDGE ; TRIGger1:EDGE:SLOPe POSitive ; TRIGger1:LEVel3 1.5",
+    "CHANnel1:STATe ON ; CHANnel1:TYPE HRESolution ; CHANnel1:ARIThmetics OFF",
+    "CHANnel1:BANDwidth B20            # optional; DIGFilter for a harder low-pass",
+    "TIMebase:RANGe 1.1               # hold(0.1) + duration(1.0)",
+    "ACQuire:POINts:AUTO RECLength ; ACQuire:POINts 1000000",
+    "TIMebase:REFerence 0 ; TIMebase:HORizontal:POSition 0   # trigger at left edge",
+    "MEASurement1:ENABle ON ; MEASurement1:CATegory AMPTime ; MEASurement1:SOURce C1W1 ; MEASurement1:MAIN MEAN",
+    "MEASurement1:GATE:MODE ABS ; :GATE:ABSolute:STARt 0.1 ; :GATE:ABSolute:STOP 1.1 ; :GATE:STATe ON",
+    "(loop) STOP;*CLS;SINGle;*OPC -> poll *ESR? bit0 -> MEASurement1:RESult:ACTual?   # one scalar per trigger"
+  ],
+
+  "typical_sequence": [
+    "*CLS",
+    "FORMat:DATA REAL,32",
+    "FORMat:BORDer LSBFirst",
+    "EXPort:WAVeform:INCXvalues OFF",
+    "CHANnel2:STATe ON",
+    "CHANnel2:TYPE PDETect",
+    "TIMebase:RANGe 1.0",
+    "ACQuire:POINts:AUTO RECLength",
+    "ACQuire:POINts 1000000",
+    "SINGle;*OPC",
+    "(poll) *ESR?   # bit 0 set when done",
+    "CHANnel2:DATA:HEADer?   # -> XStart,XStop,RecordLength,ValuesPerSample",
+    "CHANnel2:DATA?          # binary block of REAL,32 Y-values"
+  ]
+}

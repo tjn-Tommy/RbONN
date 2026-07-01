@@ -309,4 +309,34 @@ QStatusBar {
     font-family: Consolas, monospace;
     font-size: 9.5pt;
 }
+QTabWidget::pane {
+    border: 1px solid #243440;
+    border-radius: 8px;
+    top: -1px;
+    background: #121b22;
+}
+QTabBar {
+    background: transparent;
+}
+QTabBar::tab {
+    background: #16212a;
+    color: #b8c8cf;
+    border: 1px solid #243440;
+    border-bottom: none;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    padding: 8px 16px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background: #1f6f78;
+    color: #ffffff;
+}
+QTabBar::tab:hover:!selected {
+    background: #1a242d;
+    color: #e5edf1;
+}
+QTabBar::tab:disabled {
+    color: #5b6a73;
+}
 """
