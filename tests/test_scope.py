@@ -9,7 +9,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scope_module.controller import ScopeController, ScopeSettings, Waveform
+from scope_module.controller import (
+    MonitorSample,
+    MonitorSettings,
+    ScopeController,
+    ScopeSettings,
+    Waveform,
+)
 from scope_module.driver import RTO6_Driver, ScopeError
 
 
@@ -39,6 +45,18 @@ class FakeDriver:
     def set_arithmetics(self, ch, mode): self.calls.append(f"arith={ch},{mode}")
     def set_time_range(self, v): self.calls.append(f"trange={v}")
     def set_record_length(self, v): self.calls.append(f"rlen={v}")
+    def set_bandwidth_limit(self, ch, v): self.calls.append(f"bw={ch},{v}")
+    def set_digital_filter(self, ch, v): self.calls.append(f"digf={ch},{v}")
+    def set_post_trigger_window(self): self.calls.append("posttrig")
+
+    def set_trigger(self, *, source="CHANnel1", level=None, slope="POSitive", mode="NORMal"):
+        self.calls.append(f"trig={source},lvl={level},slope={slope},mode={mode}")
+
+    def setup_mean_measurement(self, ch, *, group=1, gate_start=None, gate_stop=None):
+        self.calls.append(f"meas={ch},g={group},gate={gate_start},{gate_stop}")
+
+    def read_measurement(self, group=1):
+        return 0.0425
 
     def single_acquisition(self) -> None:
         self.calls.append("single")
@@ -138,6 +156,47 @@ class ControllerTests(unittest.TestCase):
             with np.load(npz_path) as loaded:
                 np.testing.assert_allclose(loaded["times"], wf.times)
                 np.testing.assert_allclose(loaded["values"], wf.values)
+
+
+class MonitorTests(unittest.TestCase):
+    def test_configure_monitor_issues_trigger_and_gate(self):
+        driver = FakeDriver()
+        scope = ScopeController(driver=driver)
+        scope.configure_monitor(MonitorSettings(
+            channel=1, trigger_source="CHANnel3", trigger_level=1.5,
+            hold=0.1, duration=1.0, decimation="HRESolution",
+            bandwidth_limit="B20", digital_filter_cutoff=10e3,
+        ))
+        calls = driver.calls
+        self.assertIn("trig=CHANnel3,lvl=1.5,slope=POSitive,mode=NORMal", calls)
+        self.assertIn("decim=1,HRESolution", calls)
+        self.assertIn("bw=1,B20", calls)
+        self.assertIn("digf=1,10000.0", calls)
+        self.assertIn("posttrig", calls)
+        self.assertIn("trange=1.1", calls)          # hold + duration
+        self.assertIn("meas=1,g=1,gate=0.1,1.1", calls)  # gate = [hold, hold+dur]
+
+    def test_monitor_cycle_returns_scope_mean(self):
+        driver = FakeDriver()
+        scope = ScopeController(driver=driver)
+        scope.configure_monitor(MonitorSettings())
+        sample = scope.monitor_cycle(index=5, poll_interval=0.0)
+        self.assertIsInstance(sample, MonitorSample)
+        self.assertEqual(sample.index, 5)
+        self.assertAlmostEqual(sample.value, 0.0425)  # from FakeDriver.read_measurement
+        self.assertIsNone(sample.waveform)
+
+    def test_monitor_cycle_aborts_on_stop(self):
+        driver = FakeDriver()
+        driver.complete_after = 10_000  # never triggers on its own
+        scope = ScopeController(driver=driver)
+        scope.configure_monitor(MonitorSettings())
+        stop = threading.Event()
+        stop.set()
+        self.assertIsNone(scope.monitor_cycle(poll_interval=0.0, stop_event=stop))
+
+    def test_total_window(self):
+        self.assertAlmostEqual(MonitorSettings(hold=0.1, duration=1.0).total_window, 1.1)
 
 
 class DriverConstructionTests(unittest.TestCase):

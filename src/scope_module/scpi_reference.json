@@ -120,6 +120,49 @@
     }
   },
 
+  "trigger": {
+    "TRIGger<t>:MODE": {"command": "TRIGger1:MODE <AUTO|NORMal|FREerun>", "page": 1607, "notes": "NORMal waits for a real trigger (required for the SLM-triggered monitor); AUTO free-runs if none. Suffix irrelevant.", "set_by": "set_trigger"},
+    "TRIGger<t>:SOURce": {"command": "TRIGger1:SOURce <CHANnel1..4|EXTernanalog>", "notes": "Trigger source. t=1 is the A-event.", "set_by": "set_trigger"},
+    "TRIGger<t>:TYPE": {"command": "TRIGger1:TYPE EDGE", "rst": "EDGE", "notes": "Edge trigger.", "set_by": "set_trigger"},
+    "TRIGger<t>:EDGE:SLOPe": {"command": "TRIGger1:EDGE:SLOPe <POSitive|NEGative|EITHer>", "page": 1567, "rst": "POSitive", "notes": "POSitive = rising edge (the SLM 0->3 V pulse).", "set_by": "set_trigger"},
+    "TRIGger<t>:LEVel<n>": {"command": "TRIGger1:LEVel<n> <V>", "page": 1566, "notes": "Level for source index n: 1..4 = channels, 5 = external trigger input. e.g. TRIG:LEV3 1.5.", "set_by": "set_trigger"}
+  },
+
+  "bandwidth_filter": {
+    "CHANnel<ch>:BANDwidth": {"command": "CHANnel<ch>:BANDwidth <FULL|B800|B200|B20>", "page": 1504, "notes": "Analog bandwidth limit. B20 (20 MHz) is the lowest hardware limit — big noise reduction for a low-frequency signal. B800 needs 50 Ohm coupling.", "set_by": "set_bandwidth_limit"},
+    "CHANnel<ch>:DIGFilter:STATe": {"command": "CHANnel<ch>:DIGFilter:STATe <ON|OFF>", "page": 1557, "set_by": "set_digital_filter"},
+    "CHANnel<ch>:DIGFilter:CUToff": {"command": "CHANnel<ch>:DIGFilter:CUToff <Hz>", "page": 1557, "notes": "Digital low-pass cutoff. For a smooth <=kHz signal, ~10x the signal bandwidth rejects almost all noise.", "set_by": "set_digital_filter"}
+  },
+
+  "horizontal_position": {
+    "TIMebase:REFerence": {"command": "TIMebase:REFerence <0..100 %>", "page": 1493, "rst": "50", "notes": "Reference-point position on screen. Set to 0 to put the reference at the left edge.", "set_by": "set_post_trigger_window"},
+    "TIMebase:HORizontal:POSition": {"command": "TIMebase:HORizontal:POSition <s>", "page": 1493, "rst": "0", "notes": "Time between the reference point and the trigger (zero point). With REFerence 0 and POSition 0 the trigger sits at the record's left edge, so the whole record is post-trigger [0, RANGe].", "set_by": "set_post_trigger_window"}
+  },
+
+  "measurement": {
+    "_note": "On-scope averaging: a MEAN measurement returns the average signal level as one scalar, so we read a number instead of transferring the whole record.",
+    "MEASurement<mg>[:ENABle]": {"command": "MEASurement<mg>:ENABle ON", "page": 1670, "notes": "mg = 1..10 measurement group.", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:CATegory": {"command": "MEASurement<mg>:CATegory AMPTime", "page": 1672, "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:SOURce": {"command": "MEASurement<mg>:SOURce C<ch>W1", "page": 1670, "notes": "Waveform source in Cn W m form (channel n, waveform 1).", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:MAIN": {"command": "MEASurement<mg>:MAIN MEAN", "page": 1673, "notes": "MEAN = mean value of the waveform over its window. Many other types exist (RMS, AMPLitude, MAXimum, AREA, ...).", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:GATE": {"command": "MEASurement<mg>:GATE:MODE ABS ; :GATE:ABSolute:STARt <s> ; :GATE:ABSolute:STOP <s> ; :GATE:STATe ON", "page": 1742, "notes": "Restrict the measurement to an absolute time window (seconds after the trigger). Used to average only the settled [hold, hold+duration] part.", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>:RESult[:ACTual]?": {"command": "MEASurement<mg>:RESult:ACTual?", "page": 1746, "notes": "Current main-measurement value (one float).", "read_by": "read_measurement"},
+    "MEASurement<mg>:STATistics[:ENABle]": {"command": "MEASurement<mg>:STATistics:ENABle ON", "page": 1668, "notes": "Accumulate statistics across acquisitions; then MEASurement<mg>:RESult:AVG? / :STDDev? / :WFMCount?. Needs multiple triggers (not used by the single-trigger monitor)."}
+  },
+
+  "typical_monitor_sequence": [
+    "TRIGger1:MODE NORMal",
+    "TRIGger1:SOURce CHANnel3 ; TRIGger1:TYPE EDGE ; TRIGger1:EDGE:SLOPe POSitive ; TRIGger1:LEVel3 1.5",
+    "CHANnel1:STATe ON ; CHANnel1:TYPE HRESolution ; CHANnel1:ARIThmetics OFF",
+    "CHANnel1:BANDwidth B20            # optional; DIGFilter for a harder low-pass",
+    "TIMebase:RANGe 1.1               # hold(0.1) + duration(1.0)",
+    "ACQuire:POINts:AUTO RECLength ; ACQuire:POINts 1000000",
+    "TIMebase:REFerence 0 ; TIMebase:HORizontal:POSition 0   # trigger at left edge",
+    "MEASurement1:ENABle ON ; MEASurement1:CATegory AMPTime ; MEASurement1:SOURce C1W1 ; MEASurement1:MAIN MEAN",
+    "MEASurement1:GATE:MODE ABS ; :GATE:ABSolute:STARt 0.1 ; :GATE:ABSolute:STOP 1.1 ; :GATE:STATe ON",
+    "(loop) STOP;*CLS;SINGle;*OPC -> poll *ESR? bit0 -> MEASurement1:RESult:ACTual?   # one scalar per trigger"
+  ],
+
   "typical_sequence": [
     "*CLS",
     "FORMat:DATA REAL,32",

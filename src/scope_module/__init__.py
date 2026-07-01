@@ -1,6 +1,12 @@
 """Rohde & Schwarz RTO6 oscilloscope control package."""
 
-from .controller import ScopeController, ScopeSettings, Waveform
+from .controller import (
+    MonitorSample,
+    MonitorSettings,
+    ScopeController,
+    ScopeSettings,
+    Waveform,
+)
 from .driver import (
     BaseScope,
     RTO6_Driver,
@@ -12,6 +18,8 @@ from .driver import (
 __all__ = [
     "ScopeController",
     "ScopeSettings",
+    "MonitorSettings",
+    "MonitorSample",
     "Waveform",
     "RTO6_Driver",
     "BaseScope",

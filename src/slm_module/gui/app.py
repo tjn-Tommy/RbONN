@@ -16,7 +16,13 @@ from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from osa_module.controller import MeasurementSettings, OSAController
-from scope_module.controller import ScopeController, ScopeSettings, Waveform
+from scope_module.controller import (
+    MonitorSample,
+    MonitorSettings,
+    ScopeController,
+    ScopeSettings,
+    Waveform,
+)
 
 from ..calibration import CalibrationFit, fit_calibration, load_calibration_csv
 from ..calibration.calibration_new import (
@@ -102,6 +108,27 @@ class FunctionWorker(QtCore.QRunnable):
             self.signals.finished.emit(self.func())
         except Exception:
             self.signals.error.emit(traceback.format_exc())
+
+
+class WheelSpinBox(QtWidgets.QDoubleSpinBox):
+    """Double spin box with an independent (large) mouse-wheel step.
+
+    The wheel changes the value by ``wheel_step`` regardless of the small
+    ``singleStep`` used by the arrows/keyboard, so a couple of scrolls can span
+    the whole 0..1 range while typed/arrow entry stays fine-grained.
+    """
+
+    def __init__(self, wheel_step: float = 0.2, parent=None):
+        super().__init__(parent)
+        self.wheel_step = float(wheel_step)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta:
+            self.setValue(self.value() + (self.wheel_step if delta > 0 else -self.wheel_step))
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
 
 class CalibrationProgressDialog(QtWidgets.QDialog):
@@ -283,8 +310,8 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
-class SLMMonitorWindow(QtWidgets.QDialog):
-    """A standalone live view of the exact pattern currently on the SLM.
+class SLMMonitorView(QtWidgets.QWidget):
+    """An embeddable live view of the exact pattern currently on the SLM.
 
     It does not talk to hardware directly: it polls ``get_pattern`` (which
     returns a copy of the controller's last displayed grid) on a timer and
@@ -295,19 +322,17 @@ class SLMMonitorWindow(QtWidgets.QDialog):
 
     def __init__(
         self,
-        parent: QtWidgets.QWidget | None,
         get_pattern: Callable[[], np.ndarray | None],
         describe: Callable[[], str | None],
+        parent: QtWidgets.QWidget | None = None,
     ):
         super().__init__(parent)
         self._get_pattern = get_pattern
         self._describe = describe
         self._last_shape: tuple[int, int] | None = None
-        self.setWindowTitle("SLM Pattern Monitor")
-        self.setModal(False)
-        self.resize(820, 680)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         controls = QtWidgets.QHBoxLayout()
         self.live_check = QtWidgets.QCheckBox("Live")
@@ -447,6 +472,9 @@ class SLMMonitorWindow(QtWidgets.QDialog):
             return
         _pattern_to_qimage(pattern).save(path, "PNG")
 
+    def stop(self) -> None:
+        self._timer.stop()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._timer.stop()
         super().closeEvent(event)
@@ -459,6 +487,8 @@ class MainWindow(QtWidgets.QMainWindow):
     keepalive_status = QtCore.pyqtSignal(bool, str)
     calibration_progress = QtCore.pyqtSignal(object)
     analysis_progress = QtCore.pyqtSignal(object)
+    monitor_sample = QtCore.pyqtSignal(object)
+    hold_progress = QtCore.pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -477,7 +507,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_result: CalibrationResult | None = None
         self.calibration_stop_event: threading.Event | None = None
         self.calibration_dialog: CalibrationProgressDialog | None = None
-        self.slm_monitor: SLMMonitorWindow | None = None
         self.scan_stop_event: threading.Event | None = None
         self.scan_pause_event: threading.Event | None = None
         self.scan_params: ScanParams | None = None
@@ -488,13 +517,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._segments_updating = False
         self.encoding_layout: ChannelLayout | None = None
         self._encoding_pattern: np.ndarray | None = None
+        self._enc_wheel_step = 0.2   # scroll sensitivity for channel value cells
         self._enc_calib_override: CalibrationResult | None = None
         self.analysis_result: ModulationErrorResult | None = None
         self.analysis_stop_event: threading.Event | None = None
         self._ana_capture_dir: str | None = None
         self.scope_controller: ScopeController | None = None
         self.scope_stop_event: threading.Event | None = None
-        self.scope_waveform: Waveform | None = None
+        self.monitor_stop_event: threading.Event | None = None
+        self._monitor_values: list[float] = []
+        self.hold_stop_event: threading.Event | None = None
 
         self.setWindowTitle("Santec SLM Control")
         self.resize(1280, 840)
@@ -506,6 +538,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.keepalive_status.connect(self._on_keepalive_status)
         self.calibration_progress.connect(self._on_calibration_progress)
         self.analysis_progress.connect(self._on_analysis_progress)
+        self.monitor_sample.connect(self._on_monitor_sample)
+        self.hold_progress.connect(self._on_hold_progress)
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -531,13 +565,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setObjectName("Navigation")
         self.nav.setFrameShape(QtWidgets.QFrame.NoFrame)
         nav_items = (
-            ("\N{LINK SYMBOL}  SLM Control", "Connection and basic display"),
-            ("\N{CHART WITH UPWARDS TREND}  Calibration", "Intensity curve fitting"),
+            ("\N{ELECTRIC PLUG}  Connections", "Connect SLM, OSA and scope"),
+            ("\N{LINK SYMBOL}  SLM Control", "Grayscale and CSV display"),
+            ("\N{CHART WITH UPWARDS TREND}  Calibration", "Intensity, mod error, scope holding"),
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
             ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding"),
-            ("\N{LEFT-POINTING MAGNIFYING GLASS}  Mod Error", "Single-channel spectral error"),
-            ("\N{HIGH VOLTAGE SIGN}  Scope", "RTO6 ch1 waveform capture"),
+            ("\N{WATCH}  Scope Monitor", "Triggered per-event averaged readout"),
         )
         for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
@@ -547,13 +581,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sidebar_layout.addWidget(self.nav, 1)
 
         self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._build_connection_page())
         self.stack.addWidget(self._build_control_page())
         self.stack.addWidget(self._build_calibration_page())
         self.stack.addWidget(self._build_scan_page())
         self.stack.addWidget(self._build_segments_page())
         self.stack.addWidget(self._build_tpa_page())
-        self.stack.addWidget(self._build_analysis_page())
-        self.stack.addWidget(self._build_scope_page())
+        self.stack.addWidget(self._build_scope_monitor_page())
 
         layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
@@ -561,11 +595,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
 
-    def _build_control_page(self) -> QtWidgets.QWidget:
-        page = self._page_shell("SLM Control")
+    def _build_connection_page(self) -> QtWidgets.QWidget:
+        """First page: connect the SLM, OSA and scope, with a shared status log."""
+        page = self._page_shell("Connections")
 
-        connection = self._panel("Connection")
-        connection_layout = QtWidgets.QGridLayout(connection)
+        # ---- SLM ----
+        slm = self._panel("SLM (Santec)")
+        sl = QtWidgets.QGridLayout(slm)
         self.display_no_spin = QtWidgets.QSpinBox()
         self.display_no_spin.setRange(1, 8)
         self.display_no_spin.setValue(1)
@@ -573,6 +609,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rate120_check = QtWidgets.QCheckBox("120 Hz model")
         self.rate120_check.toggled.connect(self._reset_controller)
         self.conn_status_label = QtWidgets.QLabel("Status: closed")
+        self._set_status(self.conn_status_label, "Status: closed", "off")
         self.info_label = QtWidgets.QLabel("Size: unknown")
 
         detect_button = QtWidgets.QPushButton("Detect SLM")
@@ -594,12 +631,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         dvi_mode_button.clicked.connect(self._switch_to_dvi_mode)
 
-        monitor_button = QtWidgets.QPushButton("SLM Monitor")
-        monitor_button.setToolTip(
-            "Open a separate live view of the exact pattern currently on the SLM"
-        )
-        monitor_button.clicked.connect(self._open_slm_monitor)
-
         self.keepalive_check = QtWidgets.QCheckBox("DVI keep-alive")
         self.keepalive_check.setToolTip(
             "Re-send the current pattern over DVI at a fixed interval so the "
@@ -616,23 +647,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self.keepalive_status_label = QtWidgets.QLabel("Keep-alive: off")
         self._set_status(self.keepalive_status_label, "Keep-alive: off", "off")
 
-        connection_layout.addWidget(QtWidgets.QLabel("Display"), 0, 0)
-        connection_layout.addWidget(self.display_no_spin, 0, 1)
-        connection_layout.addWidget(detect_button, 0, 2)
-        connection_layout.addWidget(open_button, 0, 3)
-        connection_layout.addWidget(close_button, 0, 4)
-        connection_layout.addWidget(info_button, 0, 5)
-        connection_layout.addWidget(QtWidgets.QLabel("USB SLM"), 1, 0)
-        connection_layout.addWidget(self.usb_slm_no_spin, 1, 1)
-        connection_layout.addWidget(dvi_mode_button, 1, 2)
-        connection_layout.addWidget(self.rate120_check, 1, 3, 1, 2)
-        connection_layout.addWidget(monitor_button, 1, 5)
-        connection_layout.addWidget(self.keepalive_check, 2, 0, 1, 2)
-        connection_layout.addWidget(QtWidgets.QLabel("Interval"), 2, 2)
-        connection_layout.addWidget(self.keepalive_interval_spin, 2, 3)
-        connection_layout.addWidget(self.keepalive_status_label, 2, 4, 1, 2)
-        connection_layout.addWidget(self.conn_status_label, 3, 0, 1, 3)
-        connection_layout.addWidget(self.info_label, 3, 3, 1, 3)
+        sl.addWidget(QtWidgets.QLabel("Display"), 0, 0)
+        sl.addWidget(self.display_no_spin, 0, 1)
+        sl.addWidget(detect_button, 0, 2)
+        sl.addWidget(open_button, 0, 3)
+        sl.addWidget(close_button, 0, 4)
+        sl.addWidget(info_button, 0, 5)
+        sl.addWidget(QtWidgets.QLabel("USB SLM"), 1, 0)
+        sl.addWidget(self.usb_slm_no_spin, 1, 1)
+        sl.addWidget(dvi_mode_button, 1, 2)
+        sl.addWidget(self.rate120_check, 1, 3, 1, 2)
+        sl.addWidget(self.keepalive_check, 2, 0, 1, 2)
+        sl.addWidget(QtWidgets.QLabel("Interval"), 2, 2)
+        sl.addWidget(self.keepalive_interval_spin, 2, 3)
+        sl.addWidget(self.keepalive_status_label, 2, 4, 1, 2)
+        sl.addWidget(self.conn_status_label, 3, 0, 1, 3)
+        sl.addWidget(self.info_label, 3, 3, 1, 3)
+        page.layout().addWidget(slm)
+
+        # ---- OSA ----
+        osa = self._panel("OSA (Yokogawa AQ637X)")
+        ol = QtWidgets.QGridLayout(osa)
+        self.osa_host_edit = QtWidgets.QLineEdit("192.168.1.11")
+        self.osa_host_edit.setPlaceholderText("OSA host / IP")
+        self.osa_port_spin = self._spin(1, 65535, 10001)
+        self.osa_connect_button = QtWidgets.QPushButton("Connect OSA")
+        self.osa_disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self.osa_disconnect_button.setProperty("variant", "ghost")
+        self.osa_disconnect_button.setEnabled(False)
+        self.osa_status_label = QtWidgets.QLabel("OSA: closed")
+        self._set_status(self.osa_status_label, "OSA: closed", "off")
+        self.osa_connect_button.clicked.connect(self._connect_osa)
+        self.osa_disconnect_button.clicked.connect(self._disconnect_osa)
+        ol.addWidget(QtWidgets.QLabel("OSA Host"), 0, 0)
+        ol.addWidget(self.osa_host_edit, 0, 1)
+        ol.addWidget(QtWidgets.QLabel("Port"), 0, 2)
+        ol.addWidget(self.osa_port_spin, 0, 3)
+        ol.addWidget(self.osa_connect_button, 0, 4)
+        ol.addWidget(self.osa_disconnect_button, 0, 5)
+        ol.addWidget(self.osa_status_label, 0, 6)
+        ol.setColumnStretch(1, 1)
+        page.layout().addWidget(osa)
+
+        # ---- Scope ----
+        scope = self._panel("Oscilloscope (R&S RTO6)")
+        scl = QtWidgets.QGridLayout(scope)
+        self.scope_host_edit = QtWidgets.QLineEdit("192.168.1.2")
+        self.scope_host_edit.setPlaceholderText("RTO6 host / IP")
+        self.scope_connect_button = QtWidgets.QPushButton("Connect Scope")
+        self.scope_connect_button.clicked.connect(self._connect_scope)
+        self.scope_disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self.scope_disconnect_button.setProperty("variant", "ghost")
+        self.scope_disconnect_button.setEnabled(False)
+        self.scope_disconnect_button.clicked.connect(self._disconnect_scope)
+        self.scope_status_label = QtWidgets.QLabel("Scope: closed")
+        self._set_status(self.scope_status_label, "Scope: closed", "off")
+        scl.addWidget(QtWidgets.QLabel("Scope Host"), 0, 0)
+        scl.addWidget(self.scope_host_edit, 0, 1)
+        scl.addWidget(self.scope_connect_button, 0, 2)
+        scl.addWidget(self.scope_disconnect_button, 0, 3)
+        scl.addWidget(self.scope_status_label, 0, 4)
+        scl.setColumnStretch(1, 1)
+        page.layout().addWidget(scope)
+
+        # ---- shared status log ----
+        self.log_box = QtWidgets.QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setObjectName("LogBox")
+        page.layout().addWidget(self._panel_with_widget("Status", self.log_box), 1)
+        return page
+
+    def _build_control_page(self) -> QtWidgets.QWidget:
+        page = self._page_shell("SLM Control")
 
         grayscale = self._panel("Grayscale")
         grayscale_layout = QtWidgets.QGridLayout(grayscale)
@@ -661,21 +747,66 @@ class MainWindow(QtWidgets.QMainWindow):
         csv_layout.addWidget(csv_browse, 0, 1)
         csv_layout.addWidget(csv_display, 0, 2)
 
-        self.log_box = QtWidgets.QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setObjectName("LogBox")
+        self.slm_monitor_view = SLMMonitorView(
+            get_pattern=self._current_slm_pattern,
+            describe=self._describe_slm_pattern,
+        )
 
-        page.layout().addWidget(connection)
         page.layout().addWidget(grayscale)
         page.layout().addWidget(csv_panel)
-        page.layout().addWidget(self._panel_with_widget("Status", self.log_box), 1)
+        page.layout().addWidget(
+            self._panel_with_widget("SLM Pattern Monitor", self.slm_monitor_view), 1
+        )
         return page
 
     def _build_calibration_page(self) -> QtWidgets.QWidget:
-        page = self._page_shell("Calibration")
+        """Top-level step tabs; each step (incl. Mod Error / Holding) uses the full page."""
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
 
-        acquisition = self._build_acquisition_panel()
+        # per-step widget registry: self.step_widgets[step][key]
+        self.step_widgets: dict[int, dict[str, Any]] = {1: {}, 2: {}, 3: {}}
 
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(self._build_step1_tab(), "Step 1 · Min/Max")
+        tabs.addTab(self._build_step2_tab(), "Step 2 · Wavelength")
+        tabs.addTab(self._build_step3_page(), "Step 3 · Intensity")
+        tabs.addTab(self._build_analysis_page(), "Step 4 · Mod Error")
+        tabs.addTab(self._build_scope_holding_tab(), "Step 5 · Holding")
+        lay.addWidget(tabs)
+
+        # every Run button, toggled together by _set_calibration_running
+        self.calibration_run_buttons = [
+            self.step_widgets[1]["run"],
+            self.step_widgets[2]["run"],
+            self.step_widgets[3]["run"],
+            self.run_all_button,
+        ]
+        return page
+
+    def _build_step3_page(self) -> QtWidgets.QWidget:
+        """Step 3 (intensity) config + Run-All + the calibration fit/plots (full page)."""
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(page)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(self._build_step3_tab())
+
+        # run all three steps in sequence
+        self.run_all_button = QtWidgets.QPushButton("Run All (1→2→3)")
+        self.run_all_button.setEnabled(False)
+        self.run_all_button.clicked.connect(self._run_all)
+        self.stop_cal_button = QtWidgets.QPushButton("Stop")
+        self.stop_cal_button.setProperty("variant", "danger")
+        self.stop_cal_button.setEnabled(False)
+        self.stop_cal_button.clicked.connect(self._stop_full_calibration)
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.addStretch(1)
+        run_row.addWidget(self.run_all_button)
+        run_row.addWidget(self.stop_cal_button)
+        lay.addLayout(run_row)
+
+        # --- fit from a saved calibration CSV ---
         controls = self._panel("Fit from CSV")
         controls_layout = QtWidgets.QGridLayout(controls)
         self.calibration_path_edit = QtWidgets.QLineEdit()
@@ -686,17 +817,17 @@ class MainWindow(QtWidgets.QMainWindow):
         browse_button.clicked.connect(self._browse_calibration_csv)
         fit_button.clicked.connect(self._run_calibration_fit)
         self.save_fit_button.clicked.connect(self._save_calibration_result)
-
         self.wavelength_combo = QtWidgets.QComboBox()
         self.wavelength_combo.currentIndexChanged.connect(self._update_calibration_view)
-
         controls_layout.addWidget(self.calibration_path_edit, 0, 0)
         controls_layout.addWidget(browse_button, 0, 1)
         controls_layout.addWidget(fit_button, 0, 2)
         controls_layout.addWidget(self.save_fit_button, 0, 3)
         controls_layout.addWidget(QtWidgets.QLabel("Wavelength"), 1, 0)
         controls_layout.addWidget(self.wavelength_combo, 1, 1, 1, 3)
+        lay.addWidget(controls)
 
+        # --- results: fit parameters + fit curve / intensity map ---
         self.fit_table = QtWidgets.QTableWidget(0, 2)
         self.fit_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self.fit_table.horizontalHeader().setStretchLastSection(True)
@@ -708,7 +839,6 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_layout = QtWidgets.QVBoxLayout(plot_panel)
         plot_layout.addWidget(self.canvas)
 
-        # second canvas: the acquired intensity maps (normalized vs raw W)
         self.map_figure = Figure(figsize=(6, 4), tight_layout=True)
         self.map_canvas = FigureCanvas(self.map_figure)
         map_panel = self._panel("Intensity Map")
@@ -731,71 +861,8 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(self._panel_with_widget("Fit Parameters", self.fit_table))
         split.addWidget(right_tabs)
         split.setSizes([360, 720])
-
-        page.layout().addWidget(acquisition)
-        page.layout().addWidget(controls)
-        page.layout().addWidget(split, 1)
+        lay.addWidget(split, 1)
         return page
-
-    def _build_acquisition_panel(self) -> QtWidgets.QGroupBox:
-        """OSA-driven calibration: connect, then run the 3 steps independently."""
-        panel = self._panel("Acquisition (OSA + SLM)")
-        outer = QtWidgets.QVBoxLayout(panel)
-
-        # --- shared OSA connection row ---
-        conn = QtWidgets.QGridLayout()
-        self.osa_host_edit = QtWidgets.QLineEdit("192.168.1.11")
-        self.osa_host_edit.setPlaceholderText("OSA host / IP")
-        self.osa_port_spin = self._spin(1, 65535, 10001)
-        self.osa_connect_button = QtWidgets.QPushButton("Connect OSA")
-        self.osa_disconnect_button = QtWidgets.QPushButton("Disconnect")
-        self.osa_disconnect_button.setProperty("variant", "ghost")
-        self.osa_disconnect_button.setEnabled(False)
-        self.osa_status_label = QtWidgets.QLabel("OSA: closed")
-        self._set_status(self.osa_status_label, "OSA: closed", "off")
-        self.osa_connect_button.clicked.connect(self._connect_osa)
-        self.osa_disconnect_button.clicked.connect(self._disconnect_osa)
-        conn.addWidget(QtWidgets.QLabel("OSA Host"), 0, 0)
-        conn.addWidget(self.osa_host_edit, 0, 1)
-        conn.addWidget(QtWidgets.QLabel("Port"), 0, 2)
-        conn.addWidget(self.osa_port_spin, 0, 3)
-        conn.addWidget(self.osa_connect_button, 0, 4)
-        conn.addWidget(self.osa_disconnect_button, 0, 5)
-        conn.addWidget(self.osa_status_label, 0, 6)
-        conn.setColumnStretch(1, 1)
-        outer.addLayout(conn)
-
-        # per-step widget registry: self.step_widgets[step][key]
-        self.step_widgets: dict[int, dict[str, Any]] = {1: {}, 2: {}, 3: {}}
-
-        tabs = QtWidgets.QTabWidget()
-        tabs.addTab(self._build_step1_tab(), "Step 1 · Min/Max")
-        tabs.addTab(self._build_step2_tab(), "Step 2 · Wavelength")
-        tabs.addTab(self._build_step3_tab(), "Step 3 · Intensity")
-        outer.addWidget(tabs)
-
-        # --- shared bottom row ---
-        bottom = QtWidgets.QHBoxLayout()
-        self.run_all_button = QtWidgets.QPushButton("Run All (1→2→3)")
-        self.run_all_button.setEnabled(False)
-        self.run_all_button.clicked.connect(self._run_all)
-        self.stop_cal_button = QtWidgets.QPushButton("Stop")
-        self.stop_cal_button.setProperty("variant", "danger")
-        self.stop_cal_button.setEnabled(False)
-        self.stop_cal_button.clicked.connect(self._stop_full_calibration)
-        bottom.addStretch(1)
-        bottom.addWidget(self.run_all_button)
-        bottom.addWidget(self.stop_cal_button)
-        outer.addLayout(bottom)
-
-        # every Run button, toggled together by _set_calibration_running
-        self.calibration_run_buttons = [
-            self.step_widgets[1]["run"],
-            self.step_widgets[2]["run"],
-            self.step_widgets[3]["run"],
-            self.run_all_button,
-        ]
-        return panel
 
     def _build_measurement_group(self, step: int, defaults: dict[str, str]) -> QtWidgets.QGroupBox:
         """OSA measurement settings (center λ / span / sensitivity / ref) for a step."""
@@ -1073,6 +1140,183 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setSuffix(suffix)
         return spin
 
+    def _build_scope_holding_tab(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Scope Holding Time")
+        subtitle = QtWidgets.QLabel(
+            "Measure the SLM settling (hold) time: switch a full-screen grayscale "
+            "A→B, capture the CH transient, and average many repeats so the "
+            "deterministic settling emerges above the signal fluctuation."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        page.layout().addWidget(subtitle)
+        page.layout().addWidget(self._build_scope_holding_controls())
+        self.hold_fig = Figure(figsize=(7, 3.4), tight_layout=True)
+        self.hold_canvas = FigureCanvas(self.hold_fig)
+        page.layout().addWidget(self._panel_with_widget("Averaged transient", self.hold_canvas), 1)
+        self._hold_result = QtWidgets.QLabel("\N{EN DASH}")
+        page.layout().addWidget(self._hold_result)
+        return page
+
+    def _build_scope_holding_controls(self) -> QtWidgets.QGroupBox:
+        panel = self._panel("Settling measurement")
+        grid = QtWidgets.QGridLayout(panel)
+        self.hold_channel = QtWidgets.QComboBox(); self.hold_channel.addItems(["1", "2", "3", "4"])
+        self.hold_gray_a = self._spin(0, 1023, 880)
+        self.hold_gray_b = self._spin(0, 1023, 420)
+        self.hold_averages = self._spin(1, 1000, 60)
+        self.hold_window = self._double_spin(0.05, 5.0, 0.8, " s", 2)
+        self.hold_settle = self._double_spin(0.1, 5.0, 0.6, " s", 2)
+        self.hold_baseline = self._double_spin(0.02, 2.0, 0.15, " s", 2)
+        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0); grid.addWidget(self.hold_channel, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Gray A (start)"), 0, 2); grid.addWidget(self.hold_gray_a, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Gray B (switch to)"), 0, 4); grid.addWidget(self.hold_gray_b, 0, 5)
+        grid.addWidget(QtWidgets.QLabel("Averages"), 1, 0); grid.addWidget(self.hold_averages, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Capture window"), 1, 2); grid.addWidget(self.hold_window, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Pre-settle"), 1, 4); grid.addWidget(self.hold_settle, 1, 5)
+        grid.addWidget(QtWidgets.QLabel("Baseline"), 2, 0); grid.addWidget(self.hold_baseline, 2, 1)
+        self.hold_status = QtWidgets.QLabel("\N{EN DASH}")
+        self.hold_start_button = QtWidgets.QPushButton("Run")
+        self.hold_start_button.clicked.connect(self._hold_start)
+        self.hold_stop_button = QtWidgets.QPushButton("Stop")
+        self.hold_stop_button.setProperty("variant", "danger")
+        self.hold_stop_button.setEnabled(False)
+        self.hold_stop_button.clicked.connect(self._hold_stop)
+        grid.addWidget(self.hold_status, 3, 0, 1, 3)
+        grid.addWidget(self.hold_start_button, 3, 4)
+        grid.addWidget(self.hold_stop_button, 3, 5)
+        return panel
+
+    def _hold_set_running(self, running: bool) -> None:
+        self.hold_start_button.setEnabled(not running)
+        self.hold_stop_button.setEnabled(running)
+
+    def _hold_start(self) -> None:
+        scope = self.scope_controller
+        if scope is None or not scope.is_connected:
+            self.hold_status.setText("Connect the scope on the Connections page first.")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.hold_status.setText("Open the SLM on the Connections page first.")
+            return
+        ch = int(self.hold_channel.currentText())
+        ga, gb = self.hold_gray_a.value(), self.hold_gray_b.value()
+        n = self.hold_averages.value()
+        window = self.hold_window.value()
+        settle = self.hold_settle.value()
+        baseline = self.hold_baseline.value()
+        rl = max(1000, int(window * 100_000))          # ~100 kSa/s
+        stop_event = threading.Event()
+        self.hold_stop_event = stop_event
+        self.hold_progress.emit(0, n)
+        self._hold_set_running(True)
+
+        def work() -> dict[str, Any]:
+            drv = scope.driver
+            drv.configure_channel(ch, state=True, scale="0.02", offset="0", coupling="DCLimit")
+            drv.set_decimation(ch, "HRESolution")
+            drv.set_time_range(str(window)); drv.set_record_length(rl)
+            drv.set_post_trigger_window(); drv.write("TRIGger1:MODE AUTO")
+
+            # center the vertical range on the gray-A level
+            controller.display_grayscale(ga, interval=0.0); time.sleep(settle)
+            drv.single_acquisition()
+            dl = time.monotonic() + 4
+            while time.monotonic() < dl and not drv.is_acquisition_complete():
+                time.sleep(0.02)
+            y0 = drv.read_waveform(ch)
+            mid = float(np.mean(y0)); pkpk = float(np.ptp(y0))
+            scale = min(max(pkpk * 1.5 / 8.0, 0.002), 0.5)
+            drv.configure_channel(ch, state=True, scale=f"{scale:.4f}",
+                                  offset=f"{mid:.4f}", coupling="DCLimit")
+
+            acc = None; t = None; cmds = []; first = None
+            for i in range(n):
+                if stop_event.is_set():
+                    return {"status": "aborted"}
+                controller.display_grayscale(ga, interval=0.0); time.sleep(settle)
+                drv.single_acquisition(); t0 = time.monotonic()
+                time.sleep(baseline)
+                controller.display_grayscale(gb, interval=0.0)     # A -> B transition
+                cmds.append(time.monotonic() - t0)
+                dl = time.monotonic() + 4
+                while time.monotonic() < dl and not drv.is_acquisition_complete():
+                    if stop_event.is_set():
+                        return {"status": "aborted"}
+                    time.sleep(0.02)
+                xs, xe, npts, vps = drv.read_waveform_header(ch)
+                y = np.asarray(drv.read_waveform(ch))
+                if acc is None:
+                    acc = np.zeros_like(y); t = np.linspace(xs, xe, y.size); first = y.copy()
+                acc[: y.size] += y[: acc.size]
+                self.hold_progress.emit(i + 1, n)
+
+            avg = acc / n
+            tcmd = float(np.mean(cmds))
+            base = avg[t < (tcmd - 0.01)]
+            initial = float(base.mean()) if base.size else float(avg[:100].mean())
+            final = float(avg[t > t[-1] - 0.1].mean())
+            step = final - initial
+            resid = float(base.std()) if base.size else 0.0
+            post = np.where(t > tcmd)[0]
+            band = 0.02 * abs(step)
+            outside = post[np.abs(avg[post] - final) > band] if post.size else np.array([])
+            tset = float(t[outside[-1]]) if outside.size else tcmd
+            return {"status": "ok", "t": t, "avg": avg, "first": first, "tcmd": tcmd,
+                    "initial": initial, "final": final, "step": step, "resid": resid,
+                    "settle": tset - tcmd, "n": n}
+
+        self._run_task("Scope holding", work, self._hold_finished, self._hold_error)
+
+    def _hold_stop(self) -> None:
+        if self.hold_stop_event is not None:
+            self.hold_stop_event.set()
+            self.hold_status.setText("Stopping…")
+
+    def _on_hold_progress(self, done: int, total: int) -> None:
+        self.hold_status.setText(f"Averaging {done}/{total} transients…")
+
+    def _hold_finished(self, payload: dict[str, Any]) -> None:
+        self.hold_stop_event = None
+        self._hold_set_running(False)
+        if payload.get("status") == "aborted":
+            self.hold_status.setText("Stopped.")
+            return
+        self._hold_draw(payload)
+        sig = abs(payload["step"]) / max(payload["resid"], 1e-9)
+        self.hold_status.setText(f"Done · {payload['n']} averages")
+        self._hold_result.setText(
+            f"Settle to 2%: {payload['settle']*1000:.0f} ms after command  ·  "
+            f"step {payload['step']*1000:.2f} mV  ·  residual noise "
+            f"{payload['resid']*1000:.2f} mV  ·  step/noise {sig:.1f}"
+            + ("  \N{WARNING SIGN} step not significant (use higher-contrast patterns)"
+               if sig < 3 else "")
+        )
+
+    def _hold_error(self, _error: str) -> None:
+        self.hold_stop_event = None
+        self._hold_set_running(False)
+        self.hold_status.setText("Measurement failed (see Status log)")
+
+    def _hold_draw(self, p: dict[str, Any]) -> None:
+        self.hold_fig.clear()
+        self.hold_fig.patch.set_facecolor("#101820")
+        ax = self.hold_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("time (ms)"); ax.set_ylabel("CH (mV)")
+        t = p["t"] * 1000.0
+        if p.get("first") is not None:
+            ax.plot(t, p["first"] * 1000.0, lw=0.5, color="#556", label="single raw")
+        ax.plot(t, p["avg"] * 1000.0, lw=1.4, color="#47b8e0", label=f"avg N={p['n']}")
+        ax.axvline(p["tcmd"] * 1000.0, color="#f0a3a3", ls="--", lw=1.2, label="A→B command")
+        ax.axhline(p["final"] * 1000.0, color="#8fd6a0", ls=":", lw=1.0)
+        ax.legend(loc="upper right", fontsize=8)
+        self.hold_canvas.draw_idle()
+
+    def _build_scan_page(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Center Scan")
+
     def _build_scan_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("Center Scan")
 
@@ -1333,10 +1577,22 @@ class MainWindow(QtWidgets.QMainWindow):
         enc_randomize = QtWidgets.QPushButton("Randomize")
         enc_randomize.setProperty("variant", "ghost")
         enc_randomize.clicked.connect(self._enc_randomize)
+        self.enc_wheel_step_spin = QtWidgets.QDoubleSpinBox()
+        self.enc_wheel_step_spin.setRange(0.01, 1.0)
+        self.enc_wheel_step_spin.setDecimals(2)
+        self.enc_wheel_step_spin.setSingleStep(0.05)
+        self.enc_wheel_step_spin.setValue(self._enc_wheel_step)
+        self.enc_wheel_step_spin.setToolTip(
+            "Mouse-wheel step for the channel value cells "
+            "(a few scrolls span 0→1 at higher values)"
+        )
+        self.enc_wheel_step_spin.valueChanged.connect(self._enc_set_wheel_step)
         val_buttons.addWidget(enc_zeros)
         val_buttons.addWidget(enc_ones)
         val_buttons.addWidget(enc_randomize)
         val_buttons.addStretch(1)
+        val_buttons.addWidget(QtWidgets.QLabel("Scroll step"))
+        val_buttons.addWidget(self.enc_wheel_step_spin)
 
         val_panel = self._panel("Channel Values  [0 = off · 1 = on]")
         val_layout = QtWidgets.QVBoxLayout(val_panel)
@@ -1534,15 +1790,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.enc_val_table.setItem(i, col, item)
 
             for col in (2, 4):
-                spin = QtWidgets.QDoubleSpinBox()
+                spin = WheelSpinBox(wheel_step=self._enc_wheel_step)
                 spin.setRange(0.0, 1.0)
-                spin.setSingleStep(0.01)
+                spin.setSingleStep(0.01)     # fine step for arrows / typing
                 spin.setDecimals(3)
                 spin.setValue(0.0)
                 spin.setFrame(False)
                 self.enc_val_table.setCellWidget(i, col, spin)
 
         self.enc_val_table.resizeRowsToContents()
+
+    def _enc_set_wheel_step(self, step: float) -> None:
+        self._enc_wheel_step = float(step)
+        for i in range(self.enc_val_table.rowCount()):
+            for col in (2, 4):
+                w = self.enc_val_table.cellWidget(i, col)
+                if isinstance(w, WheelSpinBox):
+                    w.wheel_step = self._enc_wheel_step
 
     def _enc_fill_values(self, value: float) -> None:
         if self.encoding_layout is None:
@@ -1667,14 +1931,37 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self._controller()
         if not getattr(controller, "is_open", False):
             self._enc_log(
-                "SLM is not open. Open it on the SLM Control page first, then "
+                "SLM is not open. Open it on the Connections page first, then "
                 "click Send to SLM again."
             )
+            return
         tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
         tmp.close()
         write_santec_csv(pattern, tmp.name)
-        self._enc_log("Sending encoding pattern to SLM…")
-        self._run_slm_task("Send encoding pattern", lambda: controller.display_csv(tmp.name))
+        self._enc_log("Sending encoding pattern to SLM… (full-res transfer, a few seconds)")
+        self.enc_send_button.setEnabled(False)
+
+        def _cleanup() -> None:
+            try:
+                Path(tmp.name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        def done(_result: Any) -> None:
+            self._enc_log("\N{CHECK MARK} Pattern received and displayed on the SLM.")
+            self.enc_send_button.setEnabled(True)
+            _cleanup()
+
+        def failed(_error: str) -> None:
+            self._enc_log("\N{CROSS MARK} Send failed (see the Status log on the Connections page).")
+            self.enc_send_button.setEnabled(True)
+            _cleanup()
+
+        self._run_slm_task(
+            "Send encoding pattern",
+            lambda: controller.display_csv(tmp.name),
+            done, failed,
+        )
 
     # ==================================================================
     # Modulation Error Analysis page (B1: single-channel spectral shape)
@@ -2000,138 +2287,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ana_status.setText(msg)
 
     # ===================== Scope (RTO6) page =========================
-    def _build_scope_page(self) -> QtWidgets.QWidget:
-        page = self._page_shell("Oscilloscope (R&S RTO6)")
-        subtitle = QtWidgets.QLabel(
-            "Capture a channel's waveform over a chosen time window. Peak-detect "
-            "decimation keeps the min/max of each interval, so a reduced record "
-            "length still preserves the true pulse peaks of the 80 MHz signal."
-        )
-        subtitle.setObjectName("PageSubtitle")
-        subtitle.setWordWrap(True)
-        page.layout().addWidget(subtitle)
-
-        # --- connection ---
-        conn = self._panel("Connection")
-        cgrid = QtWidgets.QGridLayout(conn)
-        self.scope_host_edit = QtWidgets.QLineEdit("192.168.1.2")
-        self.scope_host_edit.setPlaceholderText("RTO6 host / IP")
-        self.scope_status_label = QtWidgets.QLabel("Scope: closed")
-        self.scope_status_label.setObjectName("StatusPill")
-        self.scope_connect_button = QtWidgets.QPushButton("Connect")
-        self.scope_connect_button.clicked.connect(self._connect_scope)
-        self.scope_disconnect_button = QtWidgets.QPushButton("Disconnect")
-        self.scope_disconnect_button.setProperty("variant", "ghost")
-        self.scope_disconnect_button.setEnabled(False)
-        self.scope_disconnect_button.clicked.connect(self._disconnect_scope)
-        cgrid.addWidget(QtWidgets.QLabel("Host"), 0, 0)
-        cgrid.addWidget(self.scope_host_edit, 0, 1)
-        cgrid.addWidget(self.scope_status_label, 0, 2)
-        cgrid.addWidget(self.scope_connect_button, 0, 3)
-        cgrid.addWidget(self.scope_disconnect_button, 0, 4)
-        page.layout().addWidget(conn)
-
-        # --- acquisition settings ---
-        cfg = self._panel("Acquisition")
-        grid = QtWidgets.QGridLayout(cfg)
-        self.scope_channel = QtWidgets.QComboBox()
-        self.scope_channel.addItems(["1", "2", "3", "4"])
-        self.scope_time_range = QtWidgets.QLineEdit("1.0")
-        self.scope_time_range.setToolTip("Total acquisition window in seconds (TIMebase:RANGe)")
-        self.scope_record_length = QtWidgets.QSpinBox()
-        self.scope_record_length.setRange(1000, 2_000_000_000)
-        self.scope_record_length.setSingleStep(100_000)
-        self.scope_record_length.setValue(1_000_000)
-        self.scope_record_length.setGroupSeparatorShown(True)
-        self.scope_decimation = QtWidgets.QComboBox()
-        self.scope_decimation.addItems(["PDETect", "SAMPle", "HRESolution", "RMS"])
-        self.scope_format = QtWidgets.QComboBox()
-        self.scope_format.addItems(["REAL,32", "INT,16"])
-        self.scope_coupling = QtWidgets.QComboBox()
-        self.scope_coupling.addItems(["(keep)", "DC", "DCLimit", "AC"])
-        self.scope_vscale = QtWidgets.QLineEdit("")
-        self.scope_vscale.setPlaceholderText("keep")
-        self.scope_vscale.setToolTip("Vertical scale, V/div (blank = keep current)")
-        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0)
-        grid.addWidget(self.scope_channel, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Time range (s)"), 0, 2)
-        grid.addWidget(self.scope_time_range, 0, 3)
-        grid.addWidget(QtWidgets.QLabel("Record length"), 0, 4)
-        grid.addWidget(self.scope_record_length, 0, 5)
-        grid.addWidget(QtWidgets.QLabel("Decimation"), 1, 0)
-        grid.addWidget(self.scope_decimation, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Format"), 1, 2)
-        grid.addWidget(self.scope_format, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Coupling"), 1, 4)
-        grid.addWidget(self.scope_coupling, 1, 5)
-        grid.addWidget(QtWidgets.QLabel("V/div"), 2, 0)
-        grid.addWidget(self.scope_vscale, 2, 1)
-        self.scope_size_hint = QtWidgets.QLabel("")
-        self.scope_size_hint.setObjectName("PageSubtitle")
-        grid.addWidget(self.scope_size_hint, 2, 2, 1, 4)
-        page.layout().addWidget(cfg)
-        for w in (self.scope_record_length, self.scope_format):
-            (w.valueChanged if isinstance(w, QtWidgets.QSpinBox)
-             else w.currentTextChanged).connect(self._scope_update_size_hint)
-        self.scope_decimation.currentTextChanged.connect(self._scope_update_size_hint)
-        self._scope_update_size_hint()
-
-        # --- plot ---
-        self.scope_fig = Figure(figsize=(7, 3.4), tight_layout=True)
-        self.scope_canvas = FigureCanvas(self.scope_fig)
-        page.layout().addWidget(
-            self._panel_with_widget("Waveform", self.scope_canvas), 1
-        )
-
-        # --- controls ---
-        self.scope_status = QtWidgets.QLabel("\N{EN DASH}")
-        self.scope_acquire_button = QtWidgets.QPushButton("Acquire")
-        self.scope_acquire_button.clicked.connect(self._scope_acquire)
-        self.scope_acquire_button.setEnabled(False)
-        self.scope_stop_button = QtWidgets.QPushButton("Stop")
-        self.scope_stop_button.setProperty("variant", "danger")
-        self.scope_stop_button.setEnabled(False)
-        self.scope_stop_button.clicked.connect(self._scope_stop)
-        self.scope_save_csv_button = QtWidgets.QPushButton("Save CSV…")
-        self.scope_save_csv_button.setProperty("variant", "ghost")
-        self.scope_save_csv_button.setEnabled(False)
-        self.scope_save_csv_button.clicked.connect(lambda: self._scope_save("csv"))
-        self.scope_save_npz_button = QtWidgets.QPushButton("Save NPZ…")
-        self.scope_save_npz_button.setProperty("variant", "ghost")
-        self.scope_save_npz_button.setEnabled(False)
-        self.scope_save_npz_button.clicked.connect(lambda: self._scope_save("npz"))
-        ctrl = QtWidgets.QHBoxLayout()
-        ctrl.addWidget(self.scope_status, 1)
-        ctrl.addWidget(self.scope_save_csv_button)
-        ctrl.addWidget(self.scope_save_npz_button)
-        ctrl.addWidget(self.scope_acquire_button)
-        ctrl.addWidget(self.scope_stop_button)
-        page.layout().addLayout(ctrl)
-        return page
-
-    def _scope_update_size_hint(self) -> None:
-        pts = self.scope_record_length.value()
-        vps = 2 if self.scope_decimation.currentText() == "PDETect" else 1
-        bytes_per = 2 if self.scope_format.currentText() == "INT,16" else 4
-        mb = pts * vps * bytes_per / 1e6
-        warn = "  \N{WARNING SIGN} large transfer" if mb > 200 else ""
-        self.scope_size_hint.setText(
-            f"Transfer ≈ {mb:,.1f} MB ({pts:,} pts × {vps} val × {bytes_per} B){warn}"
-        )
-
-    def _scope_settings(self) -> ScopeSettings:
-        coupling = self.scope_coupling.currentText()
-        vscale = self.scope_vscale.text().strip()
-        return ScopeSettings(
-            channel=int(self.scope_channel.currentText()),
-            vertical_scale=vscale or None,
-            coupling=None if coupling == "(keep)" else coupling,
-            time_range=self.scope_time_range.text().strip() or "1.0",
-            record_length=self.scope_record_length.value(),
-            decimation=self.scope_decimation.currentText(),
-            data_format=self.scope_format.currentText(),
-        )
-
     def _connect_scope(self) -> None:
         host = self.scope_host_edit.text().strip()
         if not host:
@@ -2152,7 +2307,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(self.scope_status_label, "Scope: open", "ok")
         self.scope_connect_button.setEnabled(False)
         self.scope_disconnect_button.setEnabled(True)
-        self.scope_acquire_button.setEnabled(True)
         self._log(f"Scope connected: {identity.strip()}")
 
     def _on_scope_error(self, _error: str) -> None:
@@ -2165,95 +2319,219 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(self.scope_status_label, "Scope: closed", "off")
         self.scope_connect_button.setEnabled(True)
         self.scope_disconnect_button.setEnabled(False)
-        self.scope_acquire_button.setEnabled(False)
         if scope is not None:
             self._run_task("Disconnect scope", scope.disconnect)
 
-    def _scope_set_running(self, running: bool) -> None:
-        connected = self.scope_controller is not None
-        self.scope_acquire_button.setEnabled(connected and not running)
-        self.scope_stop_button.setEnabled(running)
-        self.scope_disconnect_button.setEnabled(connected and not running)
-        has_wf = self.scope_waveform is not None
-        self.scope_save_csv_button.setEnabled(has_wf and not running)
-        self.scope_save_npz_button.setEnabled(has_wf and not running)
+    # ===================== Scope Monitor page ========================
+    _TRIG_SOURCES = [("CH1", "CHANnel1"), ("CH2", "CHANnel2"), ("CH3", "CHANnel3"),
+                     ("CH4", "CHANnel4"), ("EXT", "EXTernanalog")]
 
-    def _scope_acquire(self) -> None:
-        scope = self.scope_controller
-        if scope is None or not scope.is_connected:
-            self.scope_status.setText("Connect the scope first.")
-            return
-        settings = self._scope_settings()
+    def _build_scope_monitor_page(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Scope Monitor · Triggered Readout")
+        subtitle = QtWidgets.QLabel(
+            "For each SLM trigger (rising edge): wait the hold time, then have "
+            "the scope average ch over the window and return one value. Connect "
+            "the scope on the Scope page first. The mean is computed on-scope, so "
+            "no waveform is transferred per trigger."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        page.layout().addWidget(subtitle)
+
+        cfg = self._panel("Trigger & averaging")
+        grid = QtWidgets.QGridLayout(cfg)
+        self.mon_channel = QtWidgets.QComboBox()
+        self.mon_channel.addItems(["1", "2", "3", "4"])
+        self.mon_trig_source = QtWidgets.QComboBox()
+        for label, _tok in self._TRIG_SOURCES:
+            self.mon_trig_source.addItem(label)
+        self.mon_trig_source.setCurrentIndex(2)  # CH3 as a sensible default
+        self.mon_trig_level = QtWidgets.QDoubleSpinBox()
+        self.mon_trig_level.setRange(-5.0, 5.0)
+        self.mon_trig_level.setSingleStep(0.1)
+        self.mon_trig_level.setValue(1.5)
+        self.mon_trig_level.setSuffix(" V")
+        self.mon_trig_level.setToolTip("Mid-level of the 0–3 V SLM pulse; rising edge")
+        self.mon_hold = QtWidgets.QDoubleSpinBox()
+        self.mon_hold.setRange(0.0, 10000.0)
+        self.mon_hold.setValue(100.0)
+        self.mon_hold.setSuffix(" ms")
+        self.mon_hold.setToolTip("Settle time after the trigger before averaging")
+        self.mon_duration = QtWidgets.QDoubleSpinBox()
+        self.mon_duration.setRange(0.001, 10.0)
+        self.mon_duration.setDecimals(3)
+        self.mon_duration.setValue(1.0)
+        self.mon_duration.setSuffix(" s")
+        self.mon_duration.setToolTip("Averaging window length (MEAN gate)")
+        self.mon_decimation = QtWidgets.QComboBox()
+        self.mon_decimation.addItems(["HRESolution", "SAMPle"])
+        self.mon_bandwidth = QtWidgets.QComboBox()
+        self.mon_bandwidth.addItems(["(keep)", "FULL", "B800", "B200", "B20"])
+        self.mon_digfilter = QtWidgets.QLineEdit("")
+        self.mon_digfilter.setPlaceholderText("off")
+        self.mon_digfilter.setToolTip("Digital low-pass cutoff in Hz (blank = off)")
+        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0)
+        grid.addWidget(self.mon_channel, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Trigger src"), 0, 2)
+        grid.addWidget(self.mon_trig_source, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Trigger level"), 0, 4)
+        grid.addWidget(self.mon_trig_level, 0, 5)
+        grid.addWidget(QtWidgets.QLabel("Hold"), 1, 0)
+        grid.addWidget(self.mon_hold, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Average for"), 1, 2)
+        grid.addWidget(self.mon_duration, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Decimation"), 1, 4)
+        grid.addWidget(self.mon_decimation, 1, 5)
+        grid.addWidget(QtWidgets.QLabel("BW limit"), 2, 0)
+        grid.addWidget(self.mon_bandwidth, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("Digital LP (Hz)"), 2, 2)
+        grid.addWidget(self.mon_digfilter, 2, 3)
+        page.layout().addWidget(cfg)
+
+        # live value readout
+        self.mon_value_label = QtWidgets.QLabel("—")
+        self.mon_value_label.setObjectName("PageTitle")
+        self.mon_value_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.mon_count_label = QtWidgets.QLabel("0 readings")
+        self.mon_count_label.setObjectName("PageSubtitle")
+        self.mon_count_label.setAlignment(QtCore.Qt.AlignCenter)
+        readout = QtWidgets.QVBoxLayout()
+        readout.addWidget(self.mon_value_label)
+        readout.addWidget(self.mon_count_label)
+        page.layout().addLayout(readout)
+
+        self.mon_fig = Figure(figsize=(7, 3.0), tight_layout=True)
+        self.mon_canvas = FigureCanvas(self.mon_fig)
+        page.layout().addWidget(self._panel_with_widget("Value per trigger", self.mon_canvas), 1)
+
+        self.mon_status = QtWidgets.QLabel("\N{EN DASH}")
+        self.mon_start_button = QtWidgets.QPushButton("Start Monitor")
+        self.mon_start_button.clicked.connect(self._monitor_start)
+        self.mon_stop_button = QtWidgets.QPushButton("Stop")
+        self.mon_stop_button.setProperty("variant", "danger")
+        self.mon_stop_button.setEnabled(False)
+        self.mon_stop_button.clicked.connect(self._monitor_stop)
+        self.mon_clear_button = QtWidgets.QPushButton("Clear")
+        self.mon_clear_button.setProperty("variant", "ghost")
+        self.mon_clear_button.clicked.connect(self._monitor_clear)
+        self.mon_save_button = QtWidgets.QPushButton("Save CSV…")
+        self.mon_save_button.setProperty("variant", "ghost")
+        self.mon_save_button.clicked.connect(self._monitor_save)
+        ctrl = QtWidgets.QHBoxLayout()
+        ctrl.addWidget(self.mon_status, 1)
+        ctrl.addWidget(self.mon_clear_button)
+        ctrl.addWidget(self.mon_save_button)
+        ctrl.addWidget(self.mon_start_button)
+        ctrl.addWidget(self.mon_stop_button)
+        page.layout().addLayout(ctrl)
+        return page
+
+    def _monitor_settings(self) -> MonitorSettings:
+        cutoff_text = self.mon_digfilter.text().strip()
         try:
-            time_range = float(settings.time_range)
+            cutoff = float(cutoff_text) if cutoff_text else None
         except ValueError:
-            time_range = 1.0
-        timeout = max(60.0, time_range * 10.0 + 30.0)
-        stop_event = threading.Event()
-        self.scope_stop_event = stop_event
-        self.scope_status.setText("Acquiring…")
-        self._scope_set_running(True)
-
-        def work() -> Waveform:
-            return scope.acquire(settings, timeout=timeout, stop_event=stop_event)
-
-        self._run_task("Scope acquire", work, self._scope_finished, self._scope_error)
-
-    def _scope_stop(self) -> None:
-        if self.scope_stop_event is not None:
-            self.scope_stop_event.set()
-            self.scope_status.setText("Stopping…")
-
-    def _scope_finished(self, waveform: Waveform) -> None:
-        self.scope_stop_event = None
-        self.scope_waveform = waveform
-        self._scope_set_running(False)
-        self._scope_draw(waveform)
-        rate = waveform.sample_rate
-        rate_txt = f"{rate/1e6:.3f} MSa/s" if rate else "?"
-        peak = float(np.max(waveform.maxs)) if waveform.n_points else float("nan")
-        self.scope_status.setText(
-            f"Done · {waveform.n_points:,} pts · {rate_txt} · peak {peak:.4g} V"
+            cutoff = None
+        bw = self.mon_bandwidth.currentText()
+        return MonitorSettings(
+            channel=int(self.mon_channel.currentText()),
+            trigger_source=self._TRIG_SOURCES[self.mon_trig_source.currentIndex()][1],
+            trigger_level=self.mon_trig_level.value(),
+            trigger_slope="POSitive",
+            hold=self.mon_hold.value() / 1000.0,      # ms -> s
+            duration=self.mon_duration.value(),
+            decimation=self.mon_decimation.currentText(),
+            bandwidth_limit=None if bw == "(keep)" else bw,
+            digital_filter_cutoff=cutoff,
         )
 
-    def _scope_error(self, _error: str) -> None:
-        self.scope_stop_event = None
-        self._scope_set_running(False)
-        self.scope_status.setText("Acquisition failed (see Status log)")
+    def _monitor_set_running(self, running: bool) -> None:
+        self.mon_start_button.setEnabled(not running)
+        self.mon_stop_button.setEnabled(running)
+        self.mon_clear_button.setEnabled(not running)
 
-    def _scope_draw(self, waveform: Waveform) -> None:
-        self.scope_fig.clear()
-        self.scope_fig.patch.set_facecolor("#101820")
-        ax = self.scope_fig.add_subplot(111)
-        self._style_dark_axes(ax)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Signal (V)")
-        if waveform.n_points:
-            t = waveform.times
-            if waveform.values_per_sample == 2:
-                ax.fill_between(t, waveform.mins, waveform.maxs,
-                                color="#47b8e0", alpha=0.35, linewidth=0)
-                ax.plot(t, waveform.maxs, color="#47b8e0", linewidth=0.8)
-            else:
-                ax.plot(t, waveform.values, color="#47b8e0", linewidth=0.8)
-        self.scope_canvas.draw_idle()
-
-    def _scope_save(self, kind: str) -> None:
-        waveform = self.scope_waveform
-        if waveform is None:
+    def _monitor_start(self) -> None:
+        scope = self.scope_controller
+        if scope is None or not scope.is_connected:
+            self.mon_status.setText("Connect the scope on the Scope page first.")
             return
-        if kind == "csv":
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save waveform CSV", "scope_ch1.csv", "CSV (*.csv)")
-            if path:
-                saved = waveform.to_csv(path)
-                self._log(f"Waveform saved: {saved}")
-        else:
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save waveform NPZ", "scope_ch1.npz", "NumPy (*.npz)")
-            if path:
-                saved = waveform.to_npz(path)
-                self._log(f"Waveform saved: {saved}")
+        settings = self._monitor_settings()
+        stop_event = threading.Event()
+        self.monitor_stop_event = stop_event
+        self.mon_status.setText("Waiting for trigger…")
+        self._monitor_set_running(True)
+
+        def work() -> dict[str, Any]:
+            scope.configure_monitor(settings)
+            n = 0
+            while not stop_event.is_set():
+                sample = scope.monitor_cycle(
+                    index=n, timeout=600.0, poll_interval=0.05, stop_event=stop_event
+                )
+                if sample is None:
+                    break
+                self.monitor_sample.emit(sample)
+                n += 1
+            return {"count": n}
+
+        self._run_task("Scope monitor", work, self._monitor_finished, self._monitor_error)
+
+    def _monitor_stop(self) -> None:
+        if self.monitor_stop_event is not None:
+            self.monitor_stop_event.set()
+            self.mon_status.setText("Stopping…")
+
+    def _on_monitor_sample(self, sample: MonitorSample) -> None:
+        self._monitor_values.append(sample.value)
+        self.mon_value_label.setText(f"{sample.value*1000:.4f} mV")
+        self.mon_count_label.setText(f"{len(self._monitor_values)} readings")
+        self.mon_status.setText(f"#{sample.index + 1} · waiting for next trigger…")
+        self._monitor_draw()
+
+    def _monitor_draw(self) -> None:
+        self.mon_fig.clear()
+        self.mon_fig.patch.set_facecolor("#101820")
+        ax = self.mon_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("Trigger #")
+        ax.set_ylabel("Mean (V)")
+        if self._monitor_values:
+            ax.plot(range(1, len(self._monitor_values) + 1), self._monitor_values,
+                    marker="o", ms=3, color="#47b8e0", linewidth=0.8)
+        self.mon_canvas.draw_idle()
+
+    def _monitor_finished(self, payload: dict[str, Any]) -> None:
+        self.monitor_stop_event = None
+        self._monitor_set_running(False)
+        self.mon_status.setText(f"Stopped · {payload.get('count', 0)} readings")
+
+    def _monitor_error(self, _error: str) -> None:
+        self.monitor_stop_event = None
+        self._monitor_set_running(False)
+        self.mon_status.setText("Monitor failed (see Status log) — check trigger/connection")
+
+    def _monitor_clear(self) -> None:
+        self._monitor_values = []
+        self.mon_value_label.setText("—")
+        self.mon_count_label.setText("0 readings")
+        self._monitor_draw()
+
+    def _monitor_save(self) -> None:
+        if not self._monitor_values:
+            self.mon_status.setText("No readings to save.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save monitor readings", "scope_monitor.csv", "CSV (*.csv)")
+        if not path:
+            return
+        import csv as _csv
+
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = _csv.writer(f)
+            writer.writerow(["trigger", "mean_V"])
+            for i, v in enumerate(self._monitor_values, start=1):
+                writer.writerow([i, v])
+        self._log(f"Monitor readings saved: {path}")
 
     def _page_shell(self, title: str) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -2447,25 +2725,6 @@ class MainWindow(QtWidgets.QMainWindow):
             controller.get_slm_info,
             self._on_info_read,
         )
-
-    def _open_slm_monitor(self) -> None:
-        """Open (or re-focus) the standalone live SLM pattern monitor."""
-        if self.slm_monitor is not None:
-            self.slm_monitor.show()
-            self.slm_monitor.raise_()
-            self.slm_monitor.activateWindow()
-            return
-        monitor = SLMMonitorWindow(
-            self,
-            get_pattern=self._current_slm_pattern,
-            describe=self._describe_slm_pattern,
-        )
-        monitor.finished.connect(self._on_monitor_closed)
-        self.slm_monitor = monitor
-        monitor.show()
-
-    def _on_monitor_closed(self, _result: int) -> None:
-        self.slm_monitor = None
 
     def _current_slm_pattern(self) -> np.ndarray | None:
         controller = self.controller
@@ -3603,9 +3862,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_segment_preview()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self.slm_monitor is not None:
-            self.slm_monitor.close()
-            self.slm_monitor = None
+        if hasattr(self, "slm_monitor_view"):
+            self.slm_monitor_view.stop()
         if self.keepalive is not None:
             self.keepalive.stop()
             self.keepalive = None
@@ -3630,6 +3888,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.osa_controller = None
         if self.scope_stop_event is not None:
             self.scope_stop_event.set()
+        if self.monitor_stop_event is not None:
+            self.monitor_stop_event.set()
         if self.scope_controller is not None:
             try:
                 self.scope_controller.disconnect()

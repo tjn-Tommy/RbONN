@@ -35,10 +35,51 @@ class ScopeSettings:
     decimation: str = "PDETect"            # SAMPle | PDETect | HRESolution | RMS
     arithmetics: str = "OFF"               # OFF (raw) | AVERage | ENVelope
     data_format: str = "REAL,32"           # REAL,32 (volts) or INT,16 (raw)
+    bandwidth_limit: str | None = None     # FULL | B800 | B200 | B20 (None=keep)
+    digital_filter_cutoff: float | None = None  # Hz low-pass (None=off)
 
     @property
     def datatype(self) -> str:
         return _DATATYPE.get(self.data_format.upper().replace(" ", ""), "f")
+
+
+@dataclass(frozen=True)
+class MonitorSettings:
+    """Parameters for the triggered per-event mean readout (monitor loop).
+
+    Each SLM trigger starts one acquisition; after ``hold`` seconds of settling
+    the scope averages the signal (MEAN measurement) over ``duration`` seconds
+    and returns one value. HRESolution + a bandwidth/digital-filter low-pass
+    maximise the accuracy of that mean for a smooth, low-frequency signal.
+    """
+
+    channel: int = 1
+    trigger_mode: str = "NORMal"           # NORMal (hardware edge) | AUTO (software/immediate)
+    trigger_source: str = "CHANnel1"       # CHANnel1..4 or EXTernanalog (NORMal only)
+    trigger_level: float | None = 1.5      # volts; SLM pulse is 0->3 V (NORMal only)
+    trigger_slope: str = "POSitive"        # rising edge
+    hold: float = 0.1                      # settle time after trigger, seconds
+    duration: float = 1.0                  # averaging window, seconds
+    record_length: int | None = 1_000_000  # points across hold+duration
+    decimation: str = "HRESolution"        # best SNR for a smooth signal
+    coupling: str | None = None
+    vertical_scale: str | None = None
+    bandwidth_limit: str | None = None     # e.g. "B20"
+    digital_filter_cutoff: float | None = None  # Hz
+
+    @property
+    def total_window(self) -> float:
+        return float(self.hold) + float(self.duration)
+
+
+@dataclass
+class MonitorSample:
+    """One triggered reading: the scope-computed mean of the settled window."""
+
+    value: float                           # volts (gated MEAN of the channel)
+    index: int = 0                         # sequence number in the monitor run
+    timestamp: float = 0.0                 # time.time() when read
+    waveform: "Waveform | None" = None     # optional captured trace
 
 
 @dataclass
@@ -162,6 +203,10 @@ class ScopeController:
         )
         driver.set_decimation(settings.channel, settings.decimation)
         driver.set_arithmetics(settings.channel, settings.arithmetics)
+        if settings.bandwidth_limit is not None:
+            driver.set_bandwidth_limit(settings.channel, settings.bandwidth_limit)
+        if settings.digital_filter_cutoff is not None:
+            driver.set_digital_filter(settings.channel, settings.digital_filter_cutoff)
         driver.set_time_range(settings.time_range)
         driver.set_record_length(settings.record_length)
         self._settings = settings
@@ -250,6 +295,71 @@ class ScopeController:
             raise ScopeError("acquisition aborted before completion")
         channel = settings.channel if settings is not None else None
         return self.download(channel)
+
+    # --- triggered monitor (per-event averaged readout) ------------------
+    def configure_monitor(self, settings: MonitorSettings) -> None:
+        """Set up the scope once for the triggered mean-readout loop.
+
+        Arms a NORMal edge trigger, places the whole record after the trigger,
+        applies the vertical/decimation/filter setup for a clean average, and
+        gates an on-scope MEAN measurement to the settled window
+        [hold, hold+duration]. After this, each monitor_cycle() waits for one
+        trigger and returns the scope-computed mean -- one scalar, no waveform
+        transfer.
+        """
+        driver = self.driver
+        ch = settings.channel
+        driver.configure_channel(
+            ch, state=True, scale=settings.vertical_scale, coupling=settings.coupling
+        )
+        driver.set_decimation(ch, settings.decimation)
+        driver.set_arithmetics(ch, "OFF")
+        if settings.bandwidth_limit is not None:
+            driver.set_bandwidth_limit(ch, settings.bandwidth_limit)
+        if settings.digital_filter_cutoff is not None:
+            driver.set_digital_filter(ch, settings.digital_filter_cutoff)
+        driver.set_trigger(
+            source=settings.trigger_source,
+            level=settings.trigger_level,
+            slope=settings.trigger_slope,
+            mode="NORMal",
+        )
+        driver.set_time_range(settings.total_window)
+        driver.set_record_length(settings.record_length)
+        driver.set_post_trigger_window()
+        driver.setup_mean_measurement(
+            ch, gate_start=settings.hold, gate_stop=settings.total_window
+        )
+        self._monitor_settings = settings
+
+    def monitor_cycle(
+        self,
+        *,
+        index: int = 0,
+        timeout: float = 30.0,
+        poll_interval: float = 0.05,
+        stop_event: threading.Event | None = None,
+        want_waveform: bool = False,
+    ) -> MonitorSample | None:
+        """Wait for one trigger, then return the gated MEAN as a MonitorSample.
+
+        Returns None if stop_event fires before a trigger arrives. Assumes
+        configure_monitor() has already run. ``timeout`` must exceed the worst
+        case wait for a trigger plus the acquisition window.
+        """
+        settings = getattr(self, "_monitor_settings", None)
+        completed = self.run_single_acquisition(
+            timeout=timeout, poll_interval=poll_interval, stop_event=stop_event
+        )
+        if not completed:
+            return None
+        value = self.driver.read_measurement(group=1)
+        waveform = None
+        if want_waveform and settings is not None:
+            waveform = self.download(settings.channel)
+        return MonitorSample(
+            value=value, index=index, timestamp=time.time(), waveform=waveform
+        )
 
     def __enter__(self):
         self.connect()

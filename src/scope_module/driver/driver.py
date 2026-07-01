@@ -209,6 +209,60 @@ class RTO6_Driver(BaseScope):
         # RTO6: CHANnel<n>:ARIThmetics {OFF|AVERage|ENVelope}
         self.write(f"CHANnel{int(channel)}:ARIThmetics {mode}")
 
+    def set_bandwidth_limit(self, channel: int, limit: str) -> None:
+        """Limit the channel's analog bandwidth to cut wideband noise.
+
+        RTO6: CHANnel<n>:BANDwidth {FULL|B800|B200|B20}. B20 (20 MHz) is the
+        lowest hardware limit -- a large SNR win for a low-frequency signal.
+        """
+        self.write(f"CHANnel{int(channel)}:BANDwidth {limit}")
+
+    def set_digital_filter(self, channel: int, cutoff: float | None) -> None:
+        """Enable/disable the per-channel digital low-pass filter.
+
+        RTO6: CHANnel<n>:DIGFilter:STATe / :CUToff <Hz>. Passing None turns the
+        filter off. For a smooth <=kHz signal a cutoff ~10x the signal bandwidth
+        rejects almost all noise.
+        """
+        ch = int(channel)
+        if cutoff is None:
+            self.write(f"CHANnel{ch}:DIGFilter:STATe OFF")
+        else:
+            self.write(f"CHANnel{ch}:DIGFilter:STATe ON")
+            self.write(f"CHANnel{ch}:DIGFilter:CUToff {cutoff}")
+
+    # --- trigger ----------------------------------------------------------
+    # Source token -> the LEVel<n> index (RTO6: 1..4 channels, 5 = ext input).
+    _TRIG_LEVEL_INDEX = {
+        "CHANNEL1": 1, "CHAN1": 1, "C1": 1,
+        "CHANNEL2": 2, "CHAN2": 2, "C2": 2,
+        "CHANNEL3": 3, "CHAN3": 3, "C3": 3,
+        "CHANNEL4": 4, "CHAN4": 4, "C4": 4,
+        "EXTERNANALOG": 5, "EXT": 5,
+    }
+
+    def set_trigger(
+        self,
+        *,
+        source: str = "CHANnel1",
+        level: float | None = None,
+        slope: str = "POSitive",
+        mode: str = "NORMal",
+    ) -> None:
+        """Configure a single edge trigger (A-event).
+
+        mode: AUTO | NORMal | FREerun (NORMal waits for a real trigger).
+        source: CHANnel1..4 or EXTernanalog. slope: POSitive (rising) etc.
+        The level is written to the LEVel index that matches the source.
+        """
+        self.write(f"TRIGger1:MODE {mode}")
+        self.write(f"TRIGger1:SOURce {source}")
+        self.write("TRIGger1:TYPE EDGE")
+        self.write(f"TRIGger1:EDGE:SLOPe {slope}")
+        if level is not None:
+            n = self._TRIG_LEVEL_INDEX.get(source.upper(), 1)
+            self.write(f"TRIGger1:LEVel{n} {level}")
+
     # --- acquisition / horizontal ----------------------------------------
     def set_time_range(self, seconds: str | float) -> None:
         """Set the full acquisition time window (TIMebase:RANGe, in seconds)."""
@@ -227,6 +281,16 @@ class RTO6_Driver(BaseScope):
         else:
             self.write("ACQuire:POINts:AUTO RECLength")
             self.write(f"ACQuire:POINts {int(points)}")
+
+    def set_post_trigger_window(self) -> None:
+        """Place the trigger at the record's left edge (all data post-trigger).
+
+        REFerence 0 puts the reference point at 0% of the screen and
+        HORizontal:POSition 0 makes it coincide with the trigger (the zero
+        point), so the acquisition spans [0, TIMebase:RANGe] after the trigger.
+        """
+        self.write("TIMebase:REFerence 0")
+        self.write("TIMebase:HORizontal:POSition 0")
 
     def sample_rate(self) -> float:
         return float(self.query("ACQuire:SRATe?"))
@@ -281,3 +345,37 @@ class RTO6_Driver(BaseScope):
         at connect so only Y-values come back.
         """
         return self.query_binary(f"CHANnel{int(channel)}:DATA?", datatype)
+
+    # --- automatic measurement (on-scope averaging over the record) -------
+    def setup_mean_measurement(
+        self,
+        channel: int,
+        *,
+        group: int = 1,
+        gate_start: float | None = None,
+        gate_stop: float | None = None,
+    ) -> None:
+        """Configure measurement group <group> to return ch<channel> MEAN.
+
+        The MEAN measurement is the average of the waveform over its window --
+        i.e. the scope computes the averaged signal level for us, so we read one
+        scalar instead of transferring the whole record. An optional absolute
+        time gate [gate_start, gate_stop] (seconds after the trigger) restricts
+        the mean to the settled part of the acquisition.
+        """
+        mg = int(group)
+        self.write(f"MEASurement{mg}:ENABle ON")
+        self.write(f"MEASurement{mg}:CATegory AMPTime")
+        self.write(f"MEASurement{mg}:SOURce C{int(channel)}W1")
+        self.write(f"MEASurement{mg}:MAIN MEAN")
+        if gate_start is not None and gate_stop is not None:
+            self.write(f"MEASurement{mg}:GATE:MODE ABS")
+            self.write(f"MEASurement{mg}:GATE:ABSolute:STARt {gate_start}")
+            self.write(f"MEASurement{mg}:GATE:ABSolute:STOP {gate_stop}")
+            self.write(f"MEASurement{mg}:GATE:STATe ON")
+        else:
+            self.write(f"MEASurement{mg}:GATE:STATe OFF")
+
+    def read_measurement(self, group: int = 1) -> float:
+        """Return the current main-measurement result of a group as a float."""
+        return float(self.query(f"MEASurement{int(group)}:RESult:ACTual?"))
