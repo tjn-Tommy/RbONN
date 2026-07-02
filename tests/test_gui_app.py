@@ -61,5 +61,25 @@ class CalibrationDialogEtaTests(unittest.TestCase):
             dialog.close()
 
 
+class MainWindowStartupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PyQt5 import QtWidgets
+
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_navigation_has_one_page_per_item(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            self.assertEqual(window.nav.count(), window.stack.count())
+            labels = [window.nav.item(i).text() for i in range(window.nav.count())]
+            self.assertEqual(sum("TPA Encoding" in label for label in labels), 1)
+            self.assertFalse(any("Scope Monitor" in label for label in labels))
+        finally:
+            window.close()
+
+
 if __name__ == "__main__":
     unittest.main()

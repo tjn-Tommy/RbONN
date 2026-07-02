@@ -683,10 +683,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
             ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding + scope readout"),
-            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding"),
             ("\N{DOWNWARDS ARROW WITH TIP RIGHTWARDS}  Edge Ratio",
              "Per-column edge-taper ratio + OSA optimisation hook"),
-            ("\N{WATCH}  Scope Monitor", "Triggered per-event averaged readout"),
         )
         for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
@@ -703,7 +701,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_segments_page())
         self.stack.addWidget(self._build_tpa_page())
         self.stack.addWidget(self._build_edge_ratio_page())
-        self.stack.addWidget(self._build_scope_monitor_page())
 
         layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
