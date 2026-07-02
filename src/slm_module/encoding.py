@@ -213,12 +213,13 @@ def encode_to_pattern(
         ``edge = ratio * (max - min) + min`` with the floor being the channel's
         *measured* off level (ratio -> 0 sits the column at the measured
         background, not literal zero). ``None`` -> uniform 1.0, i.e. the flat band
-        used before this profile existed (byte-identical output).
+        used before this profile existed (byte-identical output). Ratios are
+        normalised intensity ratios, not field-amplitude ratios.
 
     level_trim: optional callable applied to each channel's per-column level
-        vector after ``level_for``, before it is written into the pattern. This
-        is the reserved per-level fine-tune hook (see ``optimize_from_osa``);
-        ``None`` -> identity.
+        vector after ``level_for``, before it is written into the pattern;
+        ``None`` -> identity. It is independent of the OSA intensity-profile
+        optimiser.
     """
     x_vals = np.asarray(x_vals, dtype=float)
     w_vals = np.asarray(w_vals, dtype=float)
@@ -259,23 +260,55 @@ def encode_to_pattern(
 
 def optimize_from_osa(
     layout: ChannelLayout,
-    trace,
+    trace=None,
     *,
     col_ratio: np.ndarray | None = None,
     level_trim: Callable[[np.ndarray], np.ndarray] | None = None,
+    osa=None,
+    slm=None,
+    initial_l: np.ndarray | None = None,
+    config=None,
+    stop_event=None,
+    progress_callback=None,
     **kwargs,
-) -> Callable[[np.ndarray], np.ndarray]:
-    """Reserved: derive per-level fine-tune corrections from an OSA trace.
+):
+    """Run the live two-stage OSA optimisation.
 
-    Intended to consume an OSAController ``TraceData`` (measured per-channel
-    output) and return a ``level_trim`` callable — a per-channel/per-level delta
-    map — that flattens per-channel output and minimises inter-channel
-    crosstalk, refining the quantised levels produced by
-    :func:`encode_to_pattern`. ``col_ratio`` / ``level_trim`` carry the current
-    encoding state so the optimiser can start from it.
+    ``initial_l`` is the independent half-profile and always contains
+    normalised *intensity* ratios (eight values for the required 15-pixel
+    channel).  For compatibility with the Edge Ratio UI, a symmetric full
+    ``col_ratio`` may be supplied instead.  The optimiser does not load an
+    initial profile from a model or file.
 
-    Interface only — not implemented yet.
+    A downloaded ``trace`` is insufficient because each COBYQA evaluation
+    requires a new SLM pattern and OSA sweep; callers must provide live ``osa``
+    and ``slm`` controllers.
     """
-    raise NotImplementedError(
-        "OSA-driven per-level optimisation is reserved; not implemented yet"
+    if kwargs:
+        names = ", ".join(sorted(kwargs))
+        raise TypeError(f"unexpected optimisation arguments: {names}")
+    if trace is not None:
+        raise ValueError("live optimisation does not accept a pre-recorded trace")
+    if level_trim is not None:
+        raise ValueError("per-level trim is not part of the intensity-profile plan")
+    if osa is None or slm is None:
+        raise ValueError("live OSA and SLM controllers are required")
+
+    from .optimization import (
+        independent_intensity_profile,
+        run_osa_optimization,
+    )
+
+    if initial_l is None:
+        if col_ratio is None:
+            raise ValueError("an eight-value initial intensity profile is required")
+        initial_l = independent_intensity_profile(col_ratio)
+    return run_osa_optimization(
+        osa,
+        slm,
+        layout,
+        initial_l,
+        config=config,
+        stop_event=stop_event,
+        progress_callback=progress_callback,
     )

@@ -99,9 +99,9 @@ class EncodeToPatternTests(unittest.TestCase):
 
 
 class OptimizeFromOsaTests(unittest.TestCase):
-    def test_reserved_interface_raises(self) -> None:
+    def test_live_interface_requires_controllers(self) -> None:
         layout = _make_layout()
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "controllers"):
             optimize_from_osa(layout, None, col_ratio=np.ones(10))
 
 
