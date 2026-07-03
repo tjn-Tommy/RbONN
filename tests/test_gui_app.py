@@ -148,6 +148,53 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_pipeline_step3_csv_reuses_step_panel_levels(self) -> None:
+        from slm_module.calibration.calibration_new import CalibrationResult
+        from slm_module.gui.app import MainWindow
+
+        class ConnectedOSA:
+            is_connected = True
+
+        window = MainWindow()
+        try:
+            window.osa_controller = ConnectedOSA()
+            window._controller = lambda: object()
+            window.pipeline_checks[1].setChecked(False)
+            window.pipeline_checks[2].setChecked(False)
+            window.pipeline_checks[3].setChecked(True)
+            window.step_widgets[3]["min"].setValue(123)
+            window.step_widgets[3]["max"].setValue(900)
+            window._launch_calibration = lambda _label, _work: None
+
+            mapping = CalibrationResult(
+                wavelength=np.asarray([778.0]),
+                coordinates=np.asarray([100.0]),
+                max_level=900,
+                min_level=123,
+                level_range=np.asarray([], dtype=int),
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                input_path = root / "wavelength_map.csv"
+                input_path.write_text("placeholder", encoding="utf-8")
+                window.pipeline_input_edits[3].setText(str(input_path))
+                window.pipeline_output_edits[3].setText(str(root / "step3.json"))
+                window.pipeline_csv_edit.setText(str(root / "calibration.csv"))
+
+                with patch(
+                    "slm_module.gui.app.load_wavelength_map_csv",
+                    return_value=mapping,
+                ) as load_map:
+                    window._run_pipeline()
+
+                self.assertEqual(load_map.call_count, 1)
+                self.assertEqual(load_map.call_args.kwargs["min_level"], 123)
+                self.assertEqual(load_map.call_args.kwargs["max_level"], 900)
+                self.assertFalse(hasattr(window, "pipeline_csv_min_spin"))
+                self.assertFalse(hasattr(window, "pipeline_csv_max_spin"))
+        finally:
+            window.close()
+
     def test_pipeline_reloads_each_selected_step_output(self) -> None:
         from slm_module.calibration.calibration_new import (
             CalibrationResult,

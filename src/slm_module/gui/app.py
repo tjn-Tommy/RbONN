@@ -996,19 +996,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline_source_labels[step] = source_label
             grid.addWidget(source_label, row, 2, 1, 4)
 
-        csv_levels = QtWidgets.QWidget()
-        csv_levels_layout = QtWidgets.QHBoxLayout(csv_levels)
-        csv_levels_layout.setContentsMargins(0, 0, 0, 0)
-        self.pipeline_csv_min_spin = self._spin(0, 1023, 0)
-        self.pipeline_csv_max_spin = self._spin(0, 1023, 1023)
-        csv_levels_layout.addWidget(QtWidgets.QLabel("min"))
-        csv_levels_layout.addWidget(self.pipeline_csv_min_spin)
-        csv_levels_layout.addWidget(QtWidgets.QLabel("max"))
-        csv_levels_layout.addWidget(self.pipeline_csv_max_spin)
-        csv_levels_layout.addStretch(1)
-        grid.addWidget(QtWidgets.QLabel("External Step 3 CSV levels"), 6, 1)
-        grid.addWidget(csv_levels, 6, 2, 1, 4)
-
         self.pipeline_csv_edit = QtWidgets.QLineEdit("calibration.csv")
         self.pipeline_csv_button = QtWidgets.QPushButton("Browse")
         self.pipeline_csv_button.clicked.connect(
@@ -1016,9 +1003,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.pipeline_csv_edit, "calibration.csv", "CSV Files (*.csv)"
             )
         )
-        grid.addWidget(QtWidgets.QLabel("Step 3 output CSV"), 7, 1)
-        grid.addWidget(self.pipeline_csv_edit, 7, 4)
-        grid.addWidget(self.pipeline_csv_button, 7, 5)
+        grid.addWidget(QtWidgets.QLabel("Step 3 output CSV"), 6, 1)
+        grid.addWidget(self.pipeline_csv_edit, 6, 4)
+        grid.addWidget(self.pipeline_csv_button, 6, 5)
         grid.setColumnStretch(2, 1)
         grid.setColumnStretch(4, 1)
         layout.addWidget(flow)
@@ -1171,9 +1158,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline_source_labels[step].setText(source)
 
         step3_selected = 3 in selected
-        step3_external = step3_selected and 2 not in selected
-        self.pipeline_csv_min_spin.setEnabled(step3_external)
-        self.pipeline_csv_max_spin.setEnabled(step3_external)
         self.pipeline_csv_edit.setEnabled(step3_selected)
         self.pipeline_csv_button.setEnabled(step3_selected)
         optimize_selected = 4 in selected
@@ -5256,8 +5240,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"external input cannot also be a pipeline output: {collision}"
                 )
 
-            csv_min_level = self.pipeline_csv_min_spin.value()
-            csv_max_level = self.pipeline_csv_max_spin.value()
+            # A bare wavelength-map CSV does not carry min/max levels. Reuse the
+            # existing Step 3 panel values instead of maintaining duplicate state.
+            csv_min_level = self.step_widgets[3]["min"].value()
+            csv_max_level = self.step_widgets[3]["max"].value()
             if csv_max_level < csv_min_level:
                 raise ValueError("Step 3 CSV max level must be >= min level")
 
