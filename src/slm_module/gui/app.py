@@ -71,8 +71,10 @@ from ..optimization import (
     OptimizationAborted,
     OptimizationProgress,
     OptimizationResult,
+    independent_intensity_profile,
     amplitudes_to_intensity_commands,
     load_optimization_result,
+    validate_independent_profile,
 )
 from ..scope_background import (
     BackgroundAborted,
@@ -603,6 +605,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_result: CalibrationResult | None = None
         self.calibration_stop_event: threading.Event | None = None
         self.calibration_dialog: CalibrationProgressDialog | None = None
+        self._calibration_is_running = False
+        self._active_calibration_label: str | None = None
         self.scan_stop_event: threading.Event | None = None
         self.scan_pause_event: threading.Event | None = None
         self.scan_params: ScanParams | None = None
@@ -616,6 +620,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.enc_col_ratio: np.ndarray | None = None  # per-column edge-ratio profile
         self._edge_gain: EncodingGain | None = None
         self._edge_optimization_result: OptimizationResult | None = None
+        self._pipeline_optimization_active = False
         self.edge_gain_stop_event: threading.Event | None = None
         self._enc_wheel_step = 0.2   # scroll sensitivity for channel value cells
         self._enc_calib_override: CalibrationResult | None = None
@@ -889,6 +894,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_scope_holding_tab(), "Step 5 · Holding")
         tabs.addTab(self._build_background_tab(), "Step 6 · BG Scatter")
         tabs.addTab(self._build_tpa_tab(), "Step 7 · TPA Efficiency")
+        tabs.insertTab(0, self._build_pipeline_page(), "Pipeline")
+        self.calibration_tabs = tabs
         lay.addWidget(tabs)
 
         # every Run button, toggled together by _set_calibration_running
@@ -897,8 +904,292 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_widgets[2]["run"],
             self.step_widgets[3]["run"],
             self.run_all_button,
+            self.pipeline_run_button,
         ]
         return page
+
+    def _build_pipeline_page(self) -> QtWidgets.QWidget:
+        """Build the file-only calibration and encoding-optimisation runner."""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.addWidget(
+            self._caption(
+                "Select any stages to run in dependency order. Every "
+                "handoff is saved and reloaded from a file; no in-memory result is "
+                "used as a step input. Step settings come from the corresponding tabs."
+            )
+        )
+
+        flow = self._panel("Pipeline steps and files")
+        grid = QtWidgets.QGridLayout(flow)
+        grid.addWidget(QtWidgets.QLabel("Run"), 0, 0)
+        grid.addWidget(QtWidgets.QLabel("Step"), 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Input"), 0, 2, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Output JSON"), 0, 4, 1, 2)
+
+        self.pipeline_checks: dict[int, QtWidgets.QCheckBox] = {}
+        self.pipeline_input_edits: dict[int, QtWidgets.QLineEdit] = {}
+        self.pipeline_input_buttons: dict[int, QtWidgets.QPushButton] = {}
+        self.pipeline_source_labels: dict[int, QtWidgets.QLabel] = {}
+        self.pipeline_output_edits: dict[int, QtWidgets.QLineEdit] = {}
+        self.pipeline_output_buttons: dict[int, QtWidgets.QPushButton] = {}
+
+        step_names = {
+            1: "Step 1 - Min/Max",
+            2: "Step 2 - Wavelength",
+            3: "Step 3 - Intensity",
+        }
+        output_names = {
+            1: "calib_step1.json",
+            2: "calib_step2.json",
+            3: "calib_step3.json",
+        }
+        for row, step in enumerate((1, 2, 3), start=1):
+            check = QtWidgets.QCheckBox()
+            check.setChecked(True)
+            check.toggled.connect(self._refresh_pipeline_ui)
+            self.pipeline_checks[step] = check
+            grid.addWidget(check, row, 0, QtCore.Qt.AlignCenter)
+            grid.addWidget(QtWidgets.QLabel(step_names[step]), row, 1)
+
+            if step == 1:
+                no_input = QtWidgets.QLabel("No input")
+                no_input.setObjectName("PageSubtitle")
+                grid.addWidget(no_input, row, 2, 1, 2)
+            else:
+                input_edit = QtWidgets.QLineEdit()
+                input_edit.setPlaceholderText(
+                    "Required when the preceding step is not selected"
+                )
+                input_button = QtWidgets.QPushButton("Browse")
+                input_filter = (
+                    "JSON Files (*.json)"
+                    if step == 2
+                    else "Calibration Files (*.json *.csv)"
+                )
+                input_button.clicked.connect(
+                    lambda _checked=False, edit=input_edit, number=step,
+                    filt=input_filter: self._browse_open_into(
+                        edit, f"Select Step {number} input", filt
+                    )
+                )
+                self.pipeline_input_edits[step] = input_edit
+                self.pipeline_input_buttons[step] = input_button
+                grid.addWidget(input_edit, row, 2)
+                grid.addWidget(input_button, row, 3)
+
+            output_edit = QtWidgets.QLineEdit(output_names[step])
+            output_button = QtWidgets.QPushButton("Browse")
+            output_button.clicked.connect(
+                lambda _checked=False, edit=output_edit, name=output_names[step]:
+                self._browse_save_into(edit, name, "JSON Files (*.json)")
+            )
+            self.pipeline_output_edits[step] = output_edit
+            self.pipeline_output_buttons[step] = output_button
+            grid.addWidget(output_edit, row, 4)
+            grid.addWidget(output_button, row, 5)
+
+        for row, step in enumerate((2, 3), start=4):
+            source_label = QtWidgets.QLabel()
+            source_label.setObjectName("PageSubtitle")
+            self.pipeline_source_labels[step] = source_label
+            grid.addWidget(source_label, row, 2, 1, 4)
+
+        csv_levels = QtWidgets.QWidget()
+        csv_levels_layout = QtWidgets.QHBoxLayout(csv_levels)
+        csv_levels_layout.setContentsMargins(0, 0, 0, 0)
+        self.pipeline_csv_min_spin = self._spin(0, 1023, 0)
+        self.pipeline_csv_max_spin = self._spin(0, 1023, 1023)
+        csv_levels_layout.addWidget(QtWidgets.QLabel("min"))
+        csv_levels_layout.addWidget(self.pipeline_csv_min_spin)
+        csv_levels_layout.addWidget(QtWidgets.QLabel("max"))
+        csv_levels_layout.addWidget(self.pipeline_csv_max_spin)
+        csv_levels_layout.addStretch(1)
+        grid.addWidget(QtWidgets.QLabel("External Step 3 CSV levels"), 6, 1)
+        grid.addWidget(csv_levels, 6, 2, 1, 4)
+
+        self.pipeline_csv_edit = QtWidgets.QLineEdit("calibration.csv")
+        self.pipeline_csv_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_csv_button.clicked.connect(
+            lambda: self._browse_save_into(
+                self.pipeline_csv_edit, "calibration.csv", "CSV Files (*.csv)"
+            )
+        )
+        grid.addWidget(QtWidgets.QLabel("Step 3 output CSV"), 7, 1)
+        grid.addWidget(self.pipeline_csv_edit, 7, 4)
+        grid.addWidget(self.pipeline_csv_button, 7, 5)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(4, 1)
+        layout.addWidget(flow)
+
+        optimization = self._panel("Encoding Optimization")
+        opt_grid = QtWidgets.QGridLayout(optimization)
+        self.pipeline_checks[4] = QtWidgets.QCheckBox("Run Encoding Optimization")
+        self.pipeline_checks[4].setChecked(False)
+        self.pipeline_checks[4].toggled.connect(self._refresh_pipeline_ui)
+        opt_grid.addWidget(self.pipeline_checks[4], 0, 0, 1, 3)
+
+        self.pipeline_input_edits[4] = QtWidgets.QLineEdit()
+        self.pipeline_input_edits[4].setPlaceholderText(
+            "External Step 3 calibration JSON when Step 3 is not selected"
+        )
+        self.pipeline_input_buttons[4] = QtWidgets.QPushButton("Browse")
+        self.pipeline_input_buttons[4].clicked.connect(
+            lambda: self._browse_open_into(
+                self.pipeline_input_edits[4],
+                "Select encoding calibration",
+                "JSON Files (*.json)",
+            )
+        )
+        opt_grid.addWidget(QtWidgets.QLabel("Calibration input"), 1, 0)
+        opt_grid.addWidget(self.pipeline_input_edits[4], 1, 1)
+        opt_grid.addWidget(self.pipeline_input_buttons[4], 1, 2)
+
+        self.pipeline_source_labels[4] = QtWidgets.QLabel()
+        self.pipeline_source_labels[4].setObjectName("PageSubtitle")
+        opt_grid.addWidget(self.pipeline_source_labels[4], 2, 1, 1, 2)
+
+        self.pipeline_profile_edit = QtWidgets.QLineEdit()
+        self.pipeline_profile_edit.setPlaceholderText(
+            "8-value l_init or symmetric 15-value profile"
+        )
+        self.pipeline_profile_edit.setToolTip(
+            "JSON may be an array or use l_init, initial_l, final_l, final_profile, "
+            "or profile. CSV/TXT may contain 8 numeric values or a symmetric 15-value "
+            "intensity profile."
+        )
+        self.pipeline_profile_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_profile_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.pipeline_profile_edit,
+                "Select initial encoding profile",
+                "Profile Files (*.json *.csv *.txt)",
+            )
+        )
+        opt_grid.addWidget(QtWidgets.QLabel("Initial profile file"), 3, 0)
+        opt_grid.addWidget(self.pipeline_profile_edit, 3, 1)
+        opt_grid.addWidget(self.pipeline_profile_button, 3, 2)
+
+        self.pipeline_optimization_root_edit = QtWidgets.QLineEdit(
+            "data/osa_optimization"
+        )
+        self.pipeline_optimization_root_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_optimization_root_button.clicked.connect(
+            self._browse_pipeline_optimization_root
+        )
+        opt_grid.addWidget(QtWidgets.QLabel("Output root"), 4, 0)
+        opt_grid.addWidget(self.pipeline_optimization_root_edit, 4, 1)
+        opt_grid.addWidget(self.pipeline_optimization_root_button, 4, 2)
+
+        self.pipeline_optimization_name_edit = QtWidgets.QLineEdit()
+        self.pipeline_optimization_name_edit.setPlaceholderText(
+            "Optional; blank uses a timestamped run directory"
+        )
+        opt_grid.addWidget(QtWidgets.QLabel("Run name"), 5, 0)
+        opt_grid.addWidget(self.pipeline_optimization_name_edit, 5, 1, 1, 2)
+        opt_grid.setColumnStretch(1, 1)
+        layout.addWidget(optimization)
+
+        layout.addWidget(
+            self._caption(
+                "A selected prerequisite supplies its output file. A skipped "
+                "prerequisite must be supplied as an external file. Encoding "
+                "Optimization always requires its initial profile from a file."
+            )
+        )
+
+        self.pipeline_log = QtWidgets.QPlainTextEdit()
+        self.pipeline_log.setReadOnly(True)
+        self.pipeline_log.setObjectName("LogBox")
+        self.pipeline_log.setPlaceholderText("Pipeline activity will appear here.")
+        layout.addWidget(self._panel_with_widget("Pipeline log", self.pipeline_log), 1)
+
+        action_row = QtWidgets.QHBoxLayout()
+        self.pipeline_status_label = QtWidgets.QLabel("Ready")
+        self.pipeline_run_button = QtWidgets.QPushButton("Run Pipeline")
+        self.pipeline_run_button.setEnabled(False)
+        self.pipeline_run_button.clicked.connect(self._run_pipeline)
+        self.pipeline_stop_button = QtWidgets.QPushButton("Stop")
+        self.pipeline_stop_button.setProperty("variant", "danger")
+        self.pipeline_stop_button.setEnabled(False)
+        self.pipeline_stop_button.clicked.connect(self._stop_full_calibration)
+        action_row.addWidget(self.pipeline_status_label, 1)
+        action_row.addWidget(self.pipeline_run_button)
+        action_row.addWidget(self.pipeline_stop_button)
+        layout.addLayout(action_row)
+        self._refresh_pipeline_ui()
+        return page
+
+    def _refresh_pipeline_ui(self) -> None:
+        """Update file-source hints and controls after the selection changes."""
+        if not hasattr(self, "pipeline_checks"):
+            return
+        selected = {
+            step for step, check in self.pipeline_checks.items() if check.isChecked()
+        }
+        for step in (1, 2, 3):
+            enabled = step in selected
+            self.pipeline_output_edits[step].setEnabled(enabled)
+            self.pipeline_output_buttons[step].setEnabled(enabled)
+        for step in (2, 3):
+            predecessor = step - 1
+            chained = step in selected and predecessor in selected
+            external = step in selected and not chained
+            self.pipeline_input_edits[step].setEnabled(external)
+            self.pipeline_input_buttons[step].setEnabled(external)
+            if chained:
+                source = (
+                    f"Step {step} input: Step {predecessor} output file "
+                    "(saved, then reloaded)"
+                )
+            elif step in selected:
+                source = f"Step {step} input: external file (required)"
+            else:
+                source = f"Step {step}: not selected"
+            self.pipeline_source_labels[step].setText(source)
+
+        step3_selected = 3 in selected
+        step3_external = step3_selected and 2 not in selected
+        self.pipeline_csv_min_spin.setEnabled(step3_external)
+        self.pipeline_csv_max_spin.setEnabled(step3_external)
+        self.pipeline_csv_edit.setEnabled(step3_selected)
+        self.pipeline_csv_button.setEnabled(step3_selected)
+        optimize_selected = 4 in selected
+        optimization_external = optimize_selected and not step3_selected
+        self.pipeline_input_edits[4].setEnabled(optimization_external)
+        self.pipeline_input_buttons[4].setEnabled(optimization_external)
+        if optimize_selected and step3_selected:
+            optimization_source = (
+                "Optimization calibration: Step 3 output JSON (saved, then reloaded)"
+            )
+        elif optimize_selected:
+            optimization_source = "Optimization calibration: external Step 3 JSON (required)"
+        else:
+            optimization_source = "Encoding Optimization: not selected"
+        self.pipeline_source_labels[4].setText(optimization_source)
+        for widget in (
+            self.pipeline_profile_edit,
+            self.pipeline_profile_button,
+            self.pipeline_optimization_root_edit,
+            self.pipeline_optimization_root_button,
+            self.pipeline_optimization_name_edit,
+        ):
+            widget.setEnabled(optimize_selected)
+        self.pipeline_run_button.setEnabled(
+            bool(selected)
+            and self.osa_controller is not None
+            and not self._calibration_is_running
+        )
+
+    def _browse_pipeline_optimization_root(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select optimization output root",
+            self.pipeline_optimization_root_edit.text().strip() or ".",
+        )
+        if path:
+            self.pipeline_optimization_root_edit.setText(path)
 
     def _build_step3_page(self) -> QtWidgets.QWidget:
         """Step 3 (intensity) config + Run-All + the calibration fit/plots (full page)."""
@@ -4435,12 +4726,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_task("Disconnect OSA", osa.disconnect)
 
     def _set_calibration_running(self, running: bool) -> None:
+        self._calibration_is_running = running
         connected = self.osa_controller is not None
         for button in getattr(self, "calibration_run_buttons", []):
             button.setEnabled(connected and not running)
         self.stop_cal_button.setEnabled(running)
+        self.pipeline_stop_button.setEnabled(running)
         self.osa_connect_button.setEnabled(not running and not connected)
         self.osa_disconnect_button.setEnabled(not running and connected)
+        self._refresh_pipeline_ui()
 
     # ----- per-step config readers (GUI thread) -----
     def _step_settings(self, step: int) -> MeasurementSettings:
@@ -4678,6 +4972,485 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._launch_calibration("Run step 3", work)
 
+    def _pipeline_file_path(
+        self,
+        edit: QtWidgets.QLineEdit,
+        label: str,
+        *,
+        must_exist: bool = False,
+    ) -> Path:
+        """Resolve a required pipeline path and reject directories/missing inputs."""
+        text = edit.text().strip()
+        if not text:
+            raise ValueError(f"{label} is required")
+        path = Path(text).expanduser().resolve()
+        if must_exist and not path.is_file():
+            raise ValueError(f"{label} does not exist: {path}")
+        if path.exists() and path.is_dir():
+            raise ValueError(f"{label} must be a file: {path}")
+        return path
+
+    def _load_pipeline_input(
+        self,
+        step: int,
+        path: Path,
+        *,
+        csv_min_level: int,
+        csv_max_level: int,
+    ) -> CalibrationResult:
+        """Load and validate one step input without consulting in-memory state."""
+        if step == 3 and path.suffix.lower() == ".csv":
+            result = load_wavelength_map_csv(
+                path,
+                min_level=csv_min_level,
+                max_level=csv_max_level,
+            )
+        else:
+            result = load_calibration_result(path)
+        self._require_levels(result)
+        if step == 3 and (
+            np.asarray(result.coordinates).size == 0
+            or np.asarray(result.wavelength).size == 0
+        ):
+            raise ValueError(
+                "Step 3 input file has no coordinate -> wavelength mapping"
+            )
+        return result
+
+    def _pipeline_directory_path(
+        self, edit: QtWidgets.QLineEdit, label: str
+    ) -> Path:
+        text = edit.text().strip()
+        if not text:
+            raise ValueError(f"{label} is required")
+        path = Path(text).expanduser().resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"{label} must be a directory: {path}")
+        return path
+
+    def _load_pipeline_initial_profile(self, path: Path) -> np.ndarray:
+        """Load an 8-value initial profile or a symmetric 15-value profile."""
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                for key in (
+                    "l_init",
+                    "final_l",
+                    "final_profile",
+                    "initial_l",
+                    "profile",
+                ):
+                    if key in payload:
+                        payload = payload[key]
+                        break
+                else:
+                    raise ValueError(
+                        "profile JSON must contain l_init, initial_l, final_l, "
+                        "final_profile, or profile"
+                    )
+            values = np.asarray(payload, dtype=float).reshape(-1)
+        else:
+            delimiter = "," if path.suffix.lower() == ".csv" else None
+            values = np.asarray(
+                np.genfromtxt(path, delimiter=delimiter, dtype=float), dtype=float
+            ).reshape(-1)
+            values = values[np.isfinite(values)]
+
+        if values.size == 15:
+            return independent_intensity_profile(values)
+        if values.size == 8:
+            return validate_independent_profile(values, width=15)
+        raise ValueError(
+            f"initial profile file must contain 8 values or a symmetric 15-value "
+            f"profile; found {values.size}"
+        )
+
+    def _load_pipeline_optimization_calibration(
+        self, path: Path
+    ) -> CalibrationResult:
+        result = load_calibration_result(path)
+        self._require_levels(result)
+        if result.intensity_levels is None:
+            raise ValueError("Encoding Optimization requires a Step 3 intensity result")
+        if (
+            np.asarray(result.coordinates).size < 2
+            or np.asarray(result.wavelength).size < 2
+        ):
+            raise ValueError("Encoding Optimization calibration has too few coordinates")
+        return result
+
+    def _build_pipeline_encoding_layout(
+        self,
+        calibration: CalibrationResult,
+        *,
+        center_wl: float,
+        channel_width_px: int,
+        gap_px: int,
+    ) -> ChannelLayout:
+        coords = np.asarray(calibration.coordinates, dtype=float)
+        wavelengths = np.asarray(calibration.wavelength, dtype=float)
+        slope, intercept = np.polyfit(coords, wavelengths, 1)
+        if not np.isfinite(slope) or abs(float(slope)) < 1e-12:
+            raise ValueError("calibration wavelength slope is zero or invalid")
+        center_x = (center_wl - intercept) / slope
+        pitch = channel_width_px + gap_px
+        n_channels = int(min(center_x - coords.min(), coords.max() - center_x) / pitch)
+        if n_channels < 1:
+            raise ValueError("no encoding channels fit inside the calibrated range")
+        return build_channel_layout(
+            calibration,
+            n_channels=n_channels,
+            channel_width_px=channel_width_px,
+            gap_px=gap_px,
+            center_wl=center_wl,
+        )
+
+    def _run_pipeline(self) -> None:
+        """Run any selected steps, using files as the only inter-step boundary."""
+        osa = self._osa_ready()
+        if osa is None:
+            return
+        selected = tuple(
+            step
+            for step in (1, 2, 3, 4)
+            if self.pipeline_checks[step].isChecked()
+        )
+        if not selected:
+            return self._reject_calibration(
+                ValueError("select at least one pipeline step")
+            )
+
+        try:
+            outputs = {
+                step: self._pipeline_file_path(
+                    self.pipeline_output_edits[step], f"Step {step} output"
+                )
+                for step in selected
+                if step in (1, 2, 3)
+            }
+            csv_output = (
+                self._pipeline_file_path(
+                    self.pipeline_csv_edit, "Step 3 CSV output"
+                )
+                if 3 in selected
+                else None
+            )
+            external_inputs: dict[int, Path] = {}
+            if 2 in selected and 1 not in selected:
+                external_inputs[2] = self._pipeline_file_path(
+                    self.pipeline_input_edits[2],
+                    "Step 2 input",
+                    must_exist=True,
+                )
+            if 3 in selected and 2 not in selected:
+                external_inputs[3] = self._pipeline_file_path(
+                    self.pipeline_input_edits[3],
+                    "Step 3 input",
+                    must_exist=True,
+                )
+
+            optimization_calibration_input = None
+            profile_path = None
+            optimization_root = None
+            optimization_run_name = None
+            if 4 in selected:
+                if 3 not in selected:
+                    optimization_calibration_input = self._pipeline_file_path(
+                        self.pipeline_input_edits[4],
+                        "Encoding Optimization calibration input",
+                        must_exist=True,
+                    )
+                profile_path = self._pipeline_file_path(
+                    self.pipeline_profile_edit,
+                    "Encoding Optimization initial profile",
+                    must_exist=True,
+                )
+                optimization_root = self._pipeline_directory_path(
+                    self.pipeline_optimization_root_edit,
+                    "Encoding Optimization output root",
+                )
+                optimization_run_name = (
+                    self.pipeline_optimization_name_edit.text().strip() or None
+                )
+                if optimization_run_name is not None and (
+                    Path(optimization_run_name).name != optimization_run_name
+                    or optimization_run_name in (".", "..")
+                ):
+                    raise ValueError("optimization run name must be one directory name")
+
+            output_paths = list(outputs.values())
+            if csv_output is not None:
+                output_paths.append(csv_output)
+            if len(set(output_paths)) != len(output_paths):
+                raise ValueError("every selected pipeline output must use a unique file")
+            external_file_paths = list(external_inputs.values())
+            if optimization_calibration_input is not None:
+                external_file_paths.append(optimization_calibration_input)
+            if profile_path is not None:
+                external_file_paths.append(profile_path)
+            collisions = set(output_paths).intersection(external_file_paths)
+            if collisions:
+                collision = next(iter(collisions))
+                raise ValueError(
+                    f"external input cannot also be a pipeline output: {collision}"
+                )
+
+            csv_min_level = self.pipeline_csv_min_spin.value()
+            csv_max_level = self.pipeline_csv_max_spin.value()
+            if csv_max_level < csv_min_level:
+                raise ValueError("Step 3 CSV max level must be >= min level")
+
+            # Validate external files before starting hardware acquisition. The worker
+            # reloads them again at the actual step boundary.
+            for step, input_path in external_inputs.items():
+                self._load_pipeline_input(
+                    step,
+                    input_path,
+                    csv_min_level=csv_min_level,
+                    csv_max_level=csv_max_level,
+                )
+
+            if 4 in selected:
+                assert profile_path is not None
+                self._load_pipeline_initial_profile(profile_path)
+                if optimization_calibration_input is not None:
+                    self._load_pipeline_optimization_calibration(
+                        optimization_calibration_input
+                    )
+
+            settings = {
+                step: self._step_settings(step)
+                for step in selected
+                if step in (1, 2, 3)
+            }
+            levels1 = self._step_levels(1) if 1 in selected else None
+            levels3 = self._step_levels(3) if 3 in selected else None
+            window2 = self.step_widgets[2]["window"].value() if 2 in selected else None
+            peak_nm = (
+                self.step_widgets[2]["peak_nm"].value() or None
+                if 2 in selected
+                else None
+            )
+            region2 = self._step_region(2) if 2 in selected else None
+            window3 = self.step_widgets[3]["window"].value() if 3 in selected else None
+            avg_nm = (
+                self.step_widgets[3]["avg_nm"].value() or None
+                if 3 in selected
+                else None
+            )
+            sweep_nm = (
+                self.step_widgets[3]["sweep_nm"].value() or None
+                if 3 in selected
+                else None
+            )
+            stride = self.step_widgets[3]["stride"].value() if 3 in selected else None
+            refine = (
+                self.step_widgets[3]["refine"].isChecked()
+                if 3 in selected
+                else None
+            )
+            region3 = self._step_region(3) if 3 in selected else None
+            if 4 in selected:
+                center_wl = self.enc_center_wl_spin.value()
+                channel_width = self.enc_width_spin.value()
+                gap_px = self.enc_pad_spin.value()
+                if channel_width != 15:
+                    raise ValueError(
+                        "Encoding Optimization requires a 15 px channel width"
+                    )
+                ana = self._ana_settings()
+                optimization_settings = MeasurementSettings(
+                    center_wl=f"{center_wl:g}nm",
+                    span="0.8nm",
+                    sensitivity=ana.sensitivity,
+                    sampling_points="1001",
+                    y_unit=ana.y_unit,
+                    reference_level=ana.reference_level,
+                    trace_id=ana.trace_id,
+                    trace_mode=ana.trace_mode,
+                )
+                assert optimization_root is not None
+                optimization_config = OSAOptimizationConfig(
+                    settings=optimization_settings,
+                    output_root=str(optimization_root),
+                    run_name=optimization_run_name,
+                )
+            else:
+                center_wl = None
+                channel_width = None
+                gap_px = None
+                optimization_config = None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return self._reject_calibration(exc)
+
+        controller = self._controller()
+        if 4 in selected and not getattr(controller, "is_open", False):
+            return self._reject_calibration(
+                ValueError("open the SLM before running Encoding Optimization")
+            )
+        stage_names = {
+            1: "Step 1",
+            2: "Step 2",
+            3: "Step 3",
+            4: "Encoding Optimization",
+        }
+        sequence = " -> ".join(stage_names[step] for step in selected)
+        self.pipeline_status_label.setText(f"Running steps {sequence}")
+        self.pipeline_log.appendPlainText(f"Starting pipeline: {sequence}")
+        self._log(f"Pipeline started (steps {sequence}, file-only handoffs)")
+
+        def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
+            result: CalibrationResult | None = None
+            optimization_result: OptimizationResult | None = None
+            optimization_layout: ChannelLayout | None = None
+            saved_files: list[Path] = []
+
+            if 1 in selected:
+                assert levels1 is not None
+                _mn, _mx, min_level, max_level, _rec = find_min_max_intensity_levels(
+                    osa,
+                    controller,
+                    levels1,
+                    settings[1],
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+                result = CalibrationResult(
+                    wavelength=np.asarray([]),
+                    coordinates=np.asarray([]),
+                    max_level=max_level,
+                    min_level=min_level,
+                    level_range=np.asarray(levels1, dtype=int),
+                )
+                saved_files.append(save_calibration_result(result, outputs[1]))
+
+            if 2 in selected:
+                input_path = outputs[1] if 1 in selected else external_inputs[2]
+                seed = self._load_pipeline_input(
+                    2,
+                    input_path,
+                    csv_min_level=csv_min_level,
+                    csv_max_level=csv_max_level,
+                )
+                result = wavelength_calibration(
+                    osa,
+                    controller,
+                    [],
+                    settings[2],
+                    seed,
+                    window_size=window2,
+                    peak_half_window_nm=peak_nm,
+                    region=region2,
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+                saved_files.append(save_calibration_result(result, outputs[2]))
+
+            if 3 in selected:
+                input_path = outputs[2] if 2 in selected else external_inputs[3]
+                mapping = self._load_pipeline_input(
+                    3,
+                    input_path,
+                    csv_min_level=csv_min_level,
+                    csv_max_level=csv_max_level,
+                )
+                assert levels3 is not None and csv_output is not None
+                result = intensity_calibration(
+                    osa,
+                    controller,
+                    levels3,
+                    settings[3],
+                    mapping,
+                    window_size=window3,
+                    wavelength_window_nm=avg_nm,
+                    sweep_span_nm=sweep_nm,
+                    coordinate_stride=stride,
+                    refine_wavelength=refine,
+                    region=region3,
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+                saved_files.append(save_calibration_result(result, outputs[3]))
+                csv_path = write_intensity_calibration_csv(result, csv_output)
+            else:
+                csv_path = None
+
+            if 4 in selected:
+                calibration_path = (
+                    outputs[3]
+                    if 3 in selected
+                    else optimization_calibration_input
+                )
+                assert calibration_path is not None
+                assert profile_path is not None
+                assert center_wl is not None
+                assert channel_width is not None
+                assert gap_px is not None
+                assert optimization_config is not None
+                optimization_calibration = (
+                    self._load_pipeline_optimization_calibration(calibration_path)
+                )
+                optimization_layout = self._build_pipeline_encoding_layout(
+                    optimization_calibration,
+                    center_wl=center_wl,
+                    channel_width_px=channel_width,
+                    gap_px=gap_px,
+                )
+                initial_l = self._load_pipeline_initial_profile(profile_path)
+
+                def report_optimization(progress: OptimizationProgress) -> None:
+                    self.edge_optimization_progress.emit(progress)
+                    report(
+                        CalibrationProgress(
+                            phase=f"optimization: {progress.stage}",
+                            step=progress.step,
+                            total=max(progress.total, 1),
+                            message=progress.message,
+                            x=float(progress.step),
+                            y=progress.best_loss,
+                        )
+                    )
+
+                try:
+                    optimization_result = optimize_from_osa(
+                        optimization_layout,
+                        osa=osa,
+                        slm=controller,
+                        initial_l=initial_l,
+                        config=optimization_config,
+                        stop_event=stop_event,
+                        progress_callback=report_optimization,
+                    )
+                except OptimizationAborted:
+                    return {"status": "aborted"}
+                result = optimization_calibration
+                saved_files.append(
+                    Path(optimization_result.run_dir, "final_result.json").resolve()
+                )
+
+            if result is None:  # guarded by the non-empty selection check
+                raise RuntimeError("pipeline completed without a result")
+            return {
+                "status": "ok",
+                "step": "pipeline",
+                "result": result,
+                "saved": saved_files[-1],
+                "saved_files": saved_files,
+                "csv": csv_path,
+                "optimization_result": optimization_result,
+                "optimization_layout": optimization_layout,
+                "summary": f"completed steps {sequence}",
+            }
+
+        self._pipeline_optimization_active = 4 in selected
+        if self._pipeline_optimization_active:
+            self._edge_gain_running(True)
+            self.edge_gain_bar.setRange(0, 0)
+            self.edge_gain_status.setText("Encoding Optimization running from Pipeline")
+        self._launch_calibration("Run pipeline", work)
+        if self._pipeline_optimization_active:
+            self.edge_gain_stop_event = self.calibration_stop_event
+
     def _run_all(self) -> None:
         osa = self._osa_ready()
         if osa is None:
@@ -4752,6 +5525,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         stop_event = threading.Event()
         self.calibration_stop_event = stop_event
+        self._active_calibration_label = label
         self._set_calibration_running(True)
         self._open_calibration_dialog()
 
@@ -4791,10 +5565,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("Calibration stop requested")
 
     def _on_step_finished(self, payload: dict[str, Any]) -> None:
+        active_label = self._active_calibration_label
+        self._active_calibration_label = None
         self.calibration_stop_event = None
         self._set_calibration_running(False)
         if payload.get("status") == "aborted":
             self._log("Calibration stopped")
+            if self._pipeline_optimization_active:
+                self._pipeline_optimization_active = False
+                self.edge_gain_stop_event = None
+                self._edge_gain_running(False)
+                self.edge_gain_bar.setRange(0, 100)
+                self.edge_gain_bar.setValue(0)
+                self.edge_gain_status.setText(
+                    "Pipeline optimization stopped; checkpoints were retained."
+                )
+            if active_label == "Run pipeline":
+                self.pipeline_status_label.setText("Stopped")
+                self.pipeline_log.appendPlainText("Pipeline stopped")
             if self.calibration_dialog is not None:
                 self.calibration_dialog.finish(False, "Calibration stopped")
             return
@@ -4810,10 +5598,49 @@ class MainWindow(QtWidgets.QMainWindow):
             out_edit = self.step_widgets[step]["out"]
             if saved is not None and not out_edit.text().strip():
                 out_edit.setText(str(saved))
+        elif step == "pipeline":
+            self.pipeline_status_label.setText(f"Done - {summary}")
+            self.pipeline_log.appendPlainText(f"Done: {summary}")
+            for path in payload.get("saved_files", []):
+                self.pipeline_log.appendPlainText(f"Saved: {path}")
+            optimization_result = payload.get("optimization_result")
+            optimization_layout = payload.get("optimization_layout")
+            if optimization_result is not None and optimization_layout is not None:
+                self._pipeline_optimization_active = False
+                self._enc_calib_override = result
+                self.encoding_layout = optimization_layout
+                self._enc_populate_val_table(optimization_layout)
+                self._edge_sync_layout(optimization_layout)
+                self.enc_calib_label.setText("Calibration: Pipeline calibration JSON")
+                self.enc_layout_status.setText(
+                    f"Pipeline layout: {optimization_layout.n_channels} channels/side, "
+                    f"width {optimization_layout.channel_width_px} px, "
+                    f"pitch {optimization_layout.pitch_px} px"
+                )
+                self.enc_generate_button.setEnabled(True)
+                self._edge_optimization_finished(
+                    {"status": "ok", "result": optimization_result}
+                )
+                if optimization_result.accepted:
+                    message = (
+                        "Accepted encoding profile and LUT applied to the Encoding "
+                        "and Edge Ratio pages."
+                    )
+                else:
+                    message = (
+                        "Optimization was not accepted; the layout was loaded but "
+                        "the candidate profile and LUT were not applied."
+                    )
+                self.pipeline_log.appendPlainText(message)
         if saved is not None:
             self._log(f"Saved {saved}")
 
-        label = "Run all" if step == "all" else f"Step {step}"
+        if step == "all":
+            label = "Run all"
+        elif step == "pipeline":
+            label = "Pipeline"
+        else:
+            label = f"Step {step}"
         self._log(f"{label} done: {summary}")
 
         csv_path = payload.get("csv")
@@ -4830,8 +5657,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_step_error(self, _error: str) -> None:
         # _fail_task already logged the traceback and showed a dialog
+        active_label = self._active_calibration_label
+        self._active_calibration_label = None
         self.calibration_stop_event = None
         self._set_calibration_running(False)
+        if active_label == "Run pipeline":
+            self.pipeline_status_label.setText("Failed")
+            self.pipeline_log.appendPlainText("Pipeline failed; see the main log.")
+        if self._pipeline_optimization_active:
+            self._pipeline_optimization_active = False
+            self.edge_gain_stop_event = None
+            self._edge_gain_running(False)
+            self.edge_gain_bar.setRange(0, 100)
+            self.edge_gain_bar.setValue(0)
+            self.edge_gain_status.setText("Pipeline optimization failed.")
         if self.calibration_dialog is not None:
             self.calibration_dialog.finish(False, "Calibration failed")
 
