@@ -148,6 +148,24 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_pipeline_quick_optimization_uses_step2_source(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            window.pipeline_checks[4].setChecked(True)
+            window.pipeline_quick_optimization_check.setChecked(True)
+
+            self.assertFalse(window.pipeline_input_edits[4].isEnabled())
+            self.assertIn("Step 2 output JSON", window.pipeline_source_labels[4].text())
+            self.assertTrue(window.pipeline_quick_calibration_edit.isEnabled())
+
+            window.pipeline_checks[2].setChecked(False)
+            self.assertTrue(window.pipeline_input_edits[4].isEnabled())
+            self.assertIn("external Step 2 JSON", window.pipeline_source_labels[4].text())
+        finally:
+            window.close()
+
     def test_pipeline_step3_csv_reuses_step_panel_levels(self) -> None:
         from slm_module.calibration.calibration_new import CalibrationResult
         from slm_module.gui.app import MainWindow
@@ -380,6 +398,120 @@ class MainWindowStartupTests(unittest.TestCase):
                 window._on_step_finished(payload)
                 self.assertIs(window._edge_optimization_result, payload["optimization_result"])
                 self.assertTrue(window.enc_use_optimized_lut.isChecked())
+        finally:
+            window.close()
+
+    def test_pipeline_quick_optimization_calibrates_interpolated_center(self) -> None:
+        from slm_module.calibration.calibration_new import (
+            CalibrationResult,
+            save_calibration_result,
+        )
+        from slm_module.gui.app import MainWindow
+        from slm_module.optimization import OptimizationResult
+
+        class ConnectedOSA:
+            is_connected = True
+
+        class OpenSLM:
+            is_open = True
+
+        window = MainWindow()
+        try:
+            window.osa_controller = ConnectedOSA()
+            window._controller = lambda: OpenSLM()
+            for step in (1, 2, 3):
+                window.pipeline_checks[step].setChecked(False)
+            window.pipeline_checks[4].setChecked(True)
+            window.pipeline_quick_optimization_check.setChecked(True)
+
+            launched = {}
+            window._launch_calibration = (
+                lambda label, work: launched.update(label=label, work=work)
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                step2_path = root / "step2.json"
+                quick_path = root / "quick_778.json"
+                output_root = root / "optimization"
+                step2 = CalibrationResult(
+                    wavelength=np.asarray([780.0, 778.0, 776.0]),
+                    coordinates=np.asarray([0.0, 100.0, 200.0]),
+                    max_level=1023,
+                    min_level=0,
+                    level_range=np.asarray([0, 1023]),
+                )
+                save_calibration_result(step2, step2_path)
+                window.pipeline_input_edits[4].setText(str(step2_path))
+                window.pipeline_quick_calibration_edit.setText(str(quick_path))
+                window.pipeline_optimization_root_edit.setText(str(output_root))
+                window.pipeline_optimization_name_edit.setText("quick_test")
+
+                def fake_intensity(_osa, _slm, levels, _settings, mapping, **kwargs):
+                    np.testing.assert_allclose(mapping.coordinates, [100.0])
+                    np.testing.assert_allclose(mapping.wavelength, [778.0])
+                    self.assertFalse(kwargs["refine_wavelength"])
+                    count = len(levels)
+                    curve = np.linspace(0.0, 1.0, count)[None, :]
+                    return CalibrationResult(
+                        wavelength=mapping.wavelength.copy(),
+                        coordinates=mapping.coordinates.copy(),
+                        max_level=mapping.max_level,
+                        min_level=mapping.min_level,
+                        level_range=np.asarray(levels),
+                        intensity_levels=curve,
+                        raw_intensity_levels=curve.copy(),
+                    )
+
+                def fake_optimize(layout, **kwargs):
+                    config = kwargs["config"]
+                    self.assertEqual(config.anchor_offsets, (0,))
+                    self.assertFalse(config.full_validation)
+                    ordered = sorted(
+                        layout.all_channels,
+                        key=lambda channel: channel.wavelength_nm,
+                    )
+                    self.assertEqual(ordered[len(ordered) // 2].x_center, 100)
+                    initial = np.asarray(kwargs["initial_l"])
+                    final_profile = np.concatenate([initial, initial[-2::-1]])
+                    run_dir = output_root / "quick_test"
+                    run_dir.mkdir(parents=True)
+                    (run_dir / "final_result.json").write_text(
+                        "{}", encoding="utf-8"
+                    )
+                    return OptimizationResult(
+                        initial_l=initial.copy(),
+                        stage1_l=initial.copy(),
+                        stage3_l=initial.copy(),
+                        final_l=initial.copy(),
+                        final_profile=final_profile,
+                        final_luts={},
+                        final_metrics={},
+                        run_dir=str(run_dir),
+                        accepted=True,
+                    )
+
+                with (
+                    patch(
+                        "slm_module.gui.app.intensity_calibration",
+                        side_effect=fake_intensity,
+                    ),
+                    patch(
+                        "slm_module.gui.app.optimize_from_osa",
+                        side_effect=fake_optimize,
+                    ),
+                ):
+                    window._run_pipeline()
+                    payload = launched["work"](
+                        lambda _progress: None, threading.Event()
+                    )
+
+                self.assertTrue(quick_path.is_file())
+                self.assertEqual(payload["quick_target_coordinate"], 100.0)
+                self.assertEqual(
+                    payload["optimization_result"].run_dir,
+                    str(output_root / "quick_test"),
+                )
         finally:
             window.close()
 

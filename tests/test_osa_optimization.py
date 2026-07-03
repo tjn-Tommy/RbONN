@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
+from slm_module.calibration.calibration_new import CalibrationResult
 from slm_module.optimization import (
     AmplitudeLUT,
     FixedChannelBins,
@@ -27,7 +28,12 @@ from slm_module.optimization import (
     stage3_loss,
     validate_independent_profile,
 )
-from slm_module.encoding import ChannelLayout, EncodingChannel
+from slm_module.encoding import (
+    ChannelLayout,
+    EncodingChannel,
+    build_single_anchor_layout,
+    interpolate_coordinate_for_wavelength,
+)
 
 
 class IntensityProfileTests(unittest.TestCase):
@@ -48,6 +54,48 @@ class IntensityProfileTests(unittest.TestCase):
             validate_independent_profile([0, 0, 0, 0, 0, 0, 0, 1.1])
         with self.assertRaises(ValueError):
             independent_intensity_profile([0.2, 0.5, 0.9, 0.4, 0.2])
+
+
+class SingleAnchorLayoutTests(unittest.TestCase):
+    @staticmethod
+    def _step2() -> CalibrationResult:
+        return CalibrationResult(
+            wavelength=np.asarray([780.0, 778.0, 776.0]),
+            coordinates=np.asarray([0.0, 100.0, 200.0]),
+            max_level=1023,
+            min_level=0,
+            level_range=np.asarray([0, 512, 1023]),
+        )
+
+    def test_interpolates_target_wavelength_to_fractional_pixel(self) -> None:
+        coordinate = interpolate_coordinate_for_wavelength(self._step2(), 778.5)
+        self.assertAlmostEqual(coordinate, 75.0)
+
+    def test_builds_layout_with_target_as_only_offset_zero_anchor(self) -> None:
+        intensity = CalibrationResult(
+            wavelength=np.asarray([778.0]),
+            coordinates=np.asarray([100.0]),
+            max_level=1023,
+            min_level=0,
+            level_range=np.asarray([0, 512, 1023]),
+            intensity_levels=np.asarray([[0.0, 0.4, 1.0]]),
+        )
+        layout, coordinate = build_single_anchor_layout(
+            self._step2(), intensity, target_wavelength_nm=778.0,
+            channel_width_px=15, gap_px=5,
+        )
+
+        self.assertEqual(coordinate, 100.0)
+        ordered = sorted(layout.all_channels, key=lambda channel: channel.wavelength_nm)
+        anchor = ordered[len(ordered) // 2]
+        self.assertEqual(anchor.x_center, 100)
+        self.assertEqual(anchor.wavelength_nm, 778.0)
+        self.assertEqual(layout.n_channels, 5)
+        self.assertTrue(all(channel.levels.size == 3 for channel in ordered))
+
+    def test_rejects_target_outside_step2_range(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outside the Step 2 range"):
+            interpolate_coordinate_for_wavelength(self._step2(), 781.0)
 
 
 class AmplitudeLUTTests(unittest.TestCase):

@@ -189,6 +189,165 @@ def build_channel_layout(
     )
 
 
+def interpolate_coordinate_for_wavelength(
+    calibration: CalibrationResult,
+    wavelength_nm: float,
+) -> float:
+    """Invert a monotonic Step-2 wavelength map by linear interpolation."""
+    coordinates = np.asarray(calibration.coordinates, dtype=float)
+    wavelengths = np.asarray(calibration.wavelength, dtype=float)
+    if coordinates.ndim != 1 or wavelengths.ndim != 1:
+        raise ValueError("Step 2 coordinates and wavelengths must be 1-D arrays")
+    if coordinates.size < 2 or coordinates.size != wavelengths.size:
+        raise ValueError("at least two matching Step 2 calibration points are required")
+    if not np.all(np.isfinite(coordinates)) or not np.all(np.isfinite(wavelengths)):
+        raise ValueError("Step 2 calibration contains NaN or infinity")
+
+    order = np.argsort(coordinates)
+    coordinates = coordinates[order]
+    wavelengths = wavelengths[order]
+    if np.any(np.diff(coordinates) <= 0.0):
+        raise ValueError("Step 2 coordinates must be unique")
+    wavelength_steps = np.diff(wavelengths)
+    increasing = bool(np.all(wavelength_steps > 0.0))
+    decreasing = bool(np.all(wavelength_steps < 0.0))
+    if not (increasing or decreasing):
+        raise ValueError(
+            "Step 2 wavelength map must be strictly monotonic for interpolation"
+        )
+
+    target = float(wavelength_nm)
+    if not np.isfinite(target):
+        raise ValueError("target wavelength must be finite")
+    lower = float(np.min(wavelengths))
+    upper = float(np.max(wavelengths))
+    if target < lower or target > upper:
+        raise ValueError(
+            f"target wavelength {target:g} nm is outside the Step 2 range "
+            f"{lower:g}..{upper:g} nm"
+        )
+    if decreasing:
+        wavelengths = wavelengths[::-1]
+        coordinates = coordinates[::-1]
+    return float(np.interp(target, wavelengths, coordinates))
+
+
+def build_single_anchor_layout(
+    wavelength_calibration: CalibrationResult,
+    intensity_calibration: CalibrationResult,
+    *,
+    target_wavelength_nm: float = 778.0,
+    channel_width_px: int = 15,
+    gap_px: int = 5,
+) -> tuple[ChannelLayout, float]:
+    """Build a layout whose offset-0 channel is the interpolated target pixel.
+
+    The intensity calibration is intentionally allowed to contain only the
+    target coordinate.  Its measured transfer curve is reused by the nearby
+    channels needed to form fixed OSA bins; only the target channel is used as
+    an optimisation anchor.
+    """
+    if channel_width_px < 1:
+        raise ValueError("channel_width_px must be positive")
+    if gap_px < 0:
+        raise ValueError("gap_px must be non-negative")
+    levels = np.asarray(intensity_calibration.level_range, dtype=int)
+    intensity = np.asarray(intensity_calibration.intensity_levels, dtype=float)
+    intensity_coordinates = np.asarray(intensity_calibration.coordinates, dtype=float)
+    if levels.ndim != 1 or levels.size < 2:
+        raise ValueError("quick intensity calibration requires at least two levels")
+    if intensity.ndim != 2 or intensity.shape[1] != levels.size:
+        raise ValueError("quick intensity calibration has an invalid intensity map")
+    if intensity.shape[0] < 1 or intensity.shape[0] != intensity_coordinates.size:
+        raise ValueError("quick intensity calibration has no calibrated coordinate")
+    if not np.all(np.isfinite(intensity)):
+        raise ValueError("quick intensity calibration contains NaN or infinity")
+
+    interpolated_x = interpolate_coordinate_for_wavelength(
+        wavelength_calibration, target_wavelength_nm
+    )
+    center_x = int(round(interpolated_x))
+    source_row = int(np.argmin(np.abs(intensity_coordinates - center_x)))
+    curve = intensity[source_row].copy()
+
+    map_coordinates = np.asarray(wavelength_calibration.coordinates, dtype=float)
+    map_wavelengths = np.asarray(wavelength_calibration.wavelength, dtype=float)
+    order = np.argsort(map_coordinates)
+    map_coordinates = map_coordinates[order]
+    map_wavelengths = map_wavelengths[order]
+    pitch_px = int(channel_width_px) + int(gap_px)
+    wavelength_slope = float(
+        np.median(np.diff(map_wavelengths) / np.diff(map_coordinates))
+    )
+    if not np.isfinite(wavelength_slope) or wavelength_slope == 0.0:
+        raise ValueError("Step 2 wavelength slope is zero or invalid")
+
+    # x channels run toward higher wavelengths, with x[0] exactly at the
+    # requested wavelength. w channels run toward lower wavelengths. Keeping
+    # both lists the same length preserves the encoder's x/w array contract.
+    high_direction = 1 if wavelength_slope > 0.0 else -1
+    low_direction = -high_direction
+
+    def available_steps(direction: int) -> int:
+        boundary = map_coordinates[-1] if direction > 0 else map_coordinates[0]
+        return int(np.floor(abs(float(boundary) - center_x) / pitch_px))
+
+    high_steps = available_steps(high_direction)
+    low_steps = available_steps(low_direction)
+    n_channels = min(high_steps + 1, low_steps)
+    if n_channels < 3:
+        raise ValueError(
+            "Step 2 range must fit at least two neighbours on each side of "
+            "the target channel"
+        )
+
+    half_width = int(channel_width_px) // 2
+
+    def wavelength_at(coordinate: int) -> float:
+        return float(np.interp(coordinate, map_coordinates, map_wavelengths))
+
+    def make_channel(index: int, side: str, coordinate: int) -> EncodingChannel:
+        wavelength = (
+            float(target_wavelength_nm)
+            if side == "x" and index == 0
+            else wavelength_at(coordinate)
+        )
+        return EncodingChannel(
+            index=index,
+            side=side,
+            x_center=coordinate,
+            x_start=coordinate - half_width,
+            x_end=coordinate - half_width + int(channel_width_px),
+            wavelength_nm=wavelength,
+            levels=levels.copy(),
+            intensity_curve=curve.copy(),
+        )
+
+    x_channels = [
+        make_channel(i, "x", center_x + high_direction * i * pitch_px)
+        for i in range(n_channels)
+    ]
+    w_channels = [
+        make_channel(i, "w", center_x + low_direction * (i + 1) * pitch_px)
+        for i in range(n_channels)
+    ]
+    off_level = int(levels[int(np.argmin(curve))])
+    return (
+        ChannelLayout(
+            x_channels=x_channels,
+            w_channels=w_channels,
+            center_wl=float(target_wavelength_nm),
+            center_x=float(center_x),
+            channel_width_px=int(channel_width_px),
+            pitch_px=pitch_px,
+            nm_per_px=abs(wavelength_slope),
+            calib_coords=map_coordinates.copy(),
+            calib_off_levels=np.full(map_coordinates.size, off_level, dtype=int),
+        ),
+        interpolated_x,
+    )
+
+
 def encode_to_pattern(
     x_vals: np.ndarray,
     w_vals: np.ndarray,

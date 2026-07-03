@@ -63,7 +63,9 @@ from ..analysis import (
 from ..encoding import (
     ChannelLayout,
     build_channel_layout,
+    build_single_anchor_layout,
     encode_to_pattern,
+    interpolate_coordinate_for_wavelength,
     optimize_from_osa,
 )
 from ..optimization import (
@@ -96,7 +98,6 @@ from ..scope_tpa import (
     save_tpa_npz,
     write_tpa_csv,
 )
-from ..encoding import ChannelLayout, build_channel_layout, encode_to_pattern
 from ..keepalive import SLMKeepAlive
 from .style import DARK_STYLESHEET
 
@@ -1017,6 +1018,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_checks[4].toggled.connect(self._refresh_pipeline_ui)
         opt_grid.addWidget(self.pipeline_checks[4], 0, 0, 1, 3)
 
+        self.pipeline_quick_optimization_check = QtWidgets.QCheckBox(
+            "Fast single-channel mode at the Encoding centre wavelength"
+        )
+        self.pipeline_quick_optimization_check.setToolTip(
+            "Use a Step 2 wavelength map to interpolate the centre pixel, run "
+            "a local intensity calibration there, and optimise only that one "
+            "OSA anchor. Full three-anchor mode remains the default."
+        )
+        self.pipeline_quick_optimization_check.toggled.connect(
+            self._refresh_pipeline_ui
+        )
+        opt_grid.addWidget(self.pipeline_quick_optimization_check, 1, 0, 1, 3)
+
         self.pipeline_input_edits[4] = QtWidgets.QLineEdit()
         self.pipeline_input_edits[4].setPlaceholderText(
             "External Step 3 calibration JSON when Step 3 is not selected"
@@ -1029,21 +1043,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 "JSON Files (*.json)",
             )
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Calibration input"), 1, 0)
-        opt_grid.addWidget(self.pipeline_input_edits[4], 1, 1)
-        opt_grid.addWidget(self.pipeline_input_buttons[4], 1, 2)
+        self.pipeline_optimization_input_label = QtWidgets.QLabel(
+            "Calibration input"
+        )
+        opt_grid.addWidget(self.pipeline_optimization_input_label, 2, 0)
+        opt_grid.addWidget(self.pipeline_input_edits[4], 2, 1)
+        opt_grid.addWidget(self.pipeline_input_buttons[4], 2, 2)
 
         self.pipeline_source_labels[4] = QtWidgets.QLabel()
         self.pipeline_source_labels[4].setObjectName("PageSubtitle")
-        opt_grid.addWidget(self.pipeline_source_labels[4], 2, 1, 1, 2)
+        opt_grid.addWidget(self.pipeline_source_labels[4], 3, 1, 1, 2)
 
         self.pipeline_profile_source_combo = QtWidgets.QComboBox()
         self.pipeline_profile_source_combo.addItems(["Direct values", "From file"])
         self.pipeline_profile_source_combo.currentIndexChanged.connect(
             self._refresh_pipeline_ui
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile source"), 3, 0)
-        opt_grid.addWidget(self.pipeline_profile_source_combo, 3, 1, 1, 2)
+        opt_grid.addWidget(QtWidgets.QLabel("Initial profile source"), 4, 0)
+        opt_grid.addWidget(self.pipeline_profile_source_combo, 4, 1, 1, 2)
 
         self.pipeline_profile_values_edit = QtWidgets.QLineEdit(
             "1, 1, 1, 1, 1, 1, 1, 1"
@@ -1054,8 +1071,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_profile_values_edit.setToolTip(
             "Normalised intensity ratios in [0, 1], separated by commas or spaces."
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile values"), 4, 0)
-        opt_grid.addWidget(self.pipeline_profile_values_edit, 4, 1, 1, 2)
+        opt_grid.addWidget(QtWidgets.QLabel("Initial profile values"), 5, 0)
+        opt_grid.addWidget(self.pipeline_profile_values_edit, 5, 1, 1, 2)
 
         self.pipeline_profile_edit = QtWidgets.QLineEdit()
         self.pipeline_profile_edit.setPlaceholderText(
@@ -1074,9 +1091,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Profile Files (*.json *.csv *.txt)",
             )
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile file"), 5, 0)
-        opt_grid.addWidget(self.pipeline_profile_edit, 5, 1)
-        opt_grid.addWidget(self.pipeline_profile_button, 5, 2)
+        opt_grid.addWidget(QtWidgets.QLabel("Initial profile file"), 6, 0)
+        opt_grid.addWidget(self.pipeline_profile_edit, 6, 1)
+        opt_grid.addWidget(self.pipeline_profile_button, 6, 2)
 
         self.pipeline_optimization_root_edit = QtWidgets.QLineEdit(
             "data/osa_optimization"
@@ -1085,16 +1102,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_optimization_root_button.clicked.connect(
             self._browse_pipeline_optimization_root
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Output root"), 6, 0)
-        opt_grid.addWidget(self.pipeline_optimization_root_edit, 6, 1)
-        opt_grid.addWidget(self.pipeline_optimization_root_button, 6, 2)
+        opt_grid.addWidget(QtWidgets.QLabel("Output root"), 7, 0)
+        opt_grid.addWidget(self.pipeline_optimization_root_edit, 7, 1)
+        opt_grid.addWidget(self.pipeline_optimization_root_button, 7, 2)
 
         self.pipeline_optimization_name_edit = QtWidgets.QLineEdit()
         self.pipeline_optimization_name_edit.setPlaceholderText(
             "Optional; blank uses a timestamped run directory"
         )
-        opt_grid.addWidget(QtWidgets.QLabel("Run name"), 7, 0)
-        opt_grid.addWidget(self.pipeline_optimization_name_edit, 7, 1, 1, 2)
+        opt_grid.addWidget(QtWidgets.QLabel("Run name"), 8, 0)
+        opt_grid.addWidget(self.pipeline_optimization_name_edit, 8, 1, 1, 2)
+
+        self.pipeline_quick_calibration_edit = QtWidgets.QLineEdit(
+            "calib_quick_center.json"
+        )
+        self.pipeline_quick_calibration_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_quick_calibration_button.clicked.connect(
+            lambda: self._browse_save_into(
+                self.pipeline_quick_calibration_edit,
+                "calib_quick_center.json",
+                "JSON Files (*.json)",
+            )
+        )
+        self.pipeline_quick_calibration_label = QtWidgets.QLabel(
+            "Quick calibration JSON"
+        )
+        opt_grid.addWidget(self.pipeline_quick_calibration_label, 9, 0)
+        opt_grid.addWidget(self.pipeline_quick_calibration_edit, 9, 1)
+        opt_grid.addWidget(self.pipeline_quick_calibration_button, 9, 2)
         opt_grid.setColumnStretch(1, 1)
         layout.addWidget(optimization)
 
@@ -1103,7 +1138,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "A selected prerequisite supplies its output file. A skipped "
                 "prerequisite must be supplied as an external file. The Encoding "
                 "Optimization initial profile may be entered directly or loaded "
-                "from a file."
+                "from a file. Fast single-channel mode uses the Step 2 map to "
+                "interpolate the Encoding centre wavelength (778 nm by default), "
+                "calibrates that physical pixel, and optimises only that anchor."
             )
         )
 
@@ -1161,18 +1198,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_csv_edit.setEnabled(step3_selected)
         self.pipeline_csv_button.setEnabled(step3_selected)
         optimize_selected = 4 in selected
-        optimization_external = optimize_selected and not step3_selected
+        self.pipeline_quick_optimization_check.setEnabled(optimize_selected)
+        quick_optimization = (
+            optimize_selected and self.pipeline_quick_optimization_check.isChecked()
+        )
+        source_step = 2 if quick_optimization else 3
+        source_step_selected = source_step in selected
+        optimization_external = optimize_selected and not source_step_selected
         self.pipeline_input_edits[4].setEnabled(optimization_external)
         self.pipeline_input_buttons[4].setEnabled(optimization_external)
-        if optimize_selected and step3_selected:
+        if quick_optimization:
+            self.pipeline_optimization_input_label.setText("Step 2 input")
+            self.pipeline_input_edits[4].setPlaceholderText(
+                "External Step 2 calibration JSON when Step 2 is not selected"
+            )
+        else:
+            self.pipeline_optimization_input_label.setText("Calibration input")
+            self.pipeline_input_edits[4].setPlaceholderText(
+                "External Step 3 calibration JSON when Step 3 is not selected"
+            )
+        if optimize_selected and source_step_selected:
             optimization_source = (
-                "Optimization calibration: Step 3 output JSON (saved, then reloaded)"
+                f"Optimization calibration: Step {source_step} output JSON "
+                "(saved, then reloaded)"
             )
         elif optimize_selected:
-            optimization_source = "Optimization calibration: external Step 3 JSON (required)"
+            optimization_source = (
+                f"Optimization calibration: external Step {source_step} JSON "
+                "(required)"
+            )
         else:
             optimization_source = "Encoding Optimization: not selected"
         self.pipeline_source_labels[4].setText(optimization_source)
+        for widget in (
+            self.pipeline_quick_calibration_label,
+            self.pipeline_quick_calibration_edit,
+            self.pipeline_quick_calibration_button,
+        ):
+            widget.setEnabled(quick_optimization)
         profile_from_file = self.pipeline_profile_source_combo.currentIndex() == 1
         self.pipeline_profile_source_combo.setEnabled(optimize_selected)
         self.pipeline_profile_values_edit.setEnabled(
@@ -5118,6 +5181,29 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("Encoding Optimization calibration has too few coordinates")
         return result
 
+    def _load_pipeline_wavelength_calibration(
+        self, path: Path, *, target_wavelength_nm: float
+    ) -> CalibrationResult:
+        """Load Step 2 data and verify that the target can be interpolated."""
+        result = load_calibration_result(path)
+        self._require_levels(result)
+        interpolate_coordinate_for_wavelength(result, target_wavelength_nm)
+        return result
+
+    def _load_pipeline_quick_intensity_calibration(
+        self, path: Path
+    ) -> CalibrationResult:
+        result = load_calibration_result(path)
+        self._require_levels(result)
+        coordinates = np.asarray(result.coordinates)
+        wavelengths = np.asarray(result.wavelength)
+        intensity = result.intensity_levels
+        if coordinates.size != 1 or wavelengths.size != 1 or intensity is None:
+            raise ValueError(
+                "quick optimization requires a one-coordinate intensity calibration"
+            )
+        return result
+
     def _build_pipeline_encoding_layout(
         self,
         calibration: CalibrationResult,
@@ -5158,6 +5244,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._reject_calibration(
                 ValueError("select at least one pipeline step")
             )
+        quick_optimization = (
+            4 in selected and self.pipeline_quick_optimization_check.isChecked()
+        )
 
         try:
             outputs = {
@@ -5193,12 +5282,19 @@ class MainWindow(QtWidgets.QMainWindow):
             direct_initial_profile = None
             optimization_root = None
             optimization_run_name = None
+            quick_calibration_output = None
             if 4 in selected:
-                if 3 not in selected:
+                optimization_source_step = 2 if quick_optimization else 3
+                if optimization_source_step not in selected:
                     optimization_calibration_input = self._pipeline_file_path(
                         self.pipeline_input_edits[4],
-                        "Encoding Optimization calibration input",
+                        f"Encoding Optimization Step {optimization_source_step} input",
                         must_exist=True,
+                    )
+                if quick_optimization:
+                    quick_calibration_output = self._pipeline_file_path(
+                        self.pipeline_quick_calibration_edit,
+                        "Quick centre calibration output",
                     )
                 if self.pipeline_profile_source_combo.currentIndex() == 1:
                     profile_path = self._pipeline_file_path(
@@ -5226,6 +5322,8 @@ class MainWindow(QtWidgets.QMainWindow):
             output_paths = list(outputs.values())
             if csv_output is not None:
                 output_paths.append(csv_output)
+            if quick_calibration_output is not None:
+                output_paths.append(quick_calibration_output)
             if len(set(output_paths)) != len(output_paths):
                 raise ValueError("every selected pipeline output must use a unique file")
             external_file_paths = list(external_inputs.values())
@@ -5261,9 +5359,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if profile_path is not None:
                     self._load_pipeline_initial_profile(profile_path)
                 if optimization_calibration_input is not None:
-                    self._load_pipeline_optimization_calibration(
-                        optimization_calibration_input
-                    )
+                    if quick_optimization:
+                        self._load_pipeline_wavelength_calibration(
+                            optimization_calibration_input,
+                            target_wavelength_nm=self.enc_center_wl_spin.value(),
+                        )
+                    else:
+                        self._load_pipeline_optimization_calibration(
+                            optimization_calibration_input
+                        )
 
             settings = {
                 step: self._step_settings(step)
@@ -5272,6 +5376,9 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             levels1 = self._step_levels(1) if 1 in selected else None
             levels3 = self._step_levels(3) if 3 in selected else None
+            quick_levels = (
+                self._step_levels(3) if quick_optimization else None
+            )
             window2 = self.step_widgets[2]["window"].value() if 2 in selected else None
             peak_nm = (
                 self.step_widgets[2]["peak_nm"].value() or None
@@ -5319,14 +5426,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 assert optimization_root is not None
                 optimization_config = OSAOptimizationConfig(
                     settings=optimization_settings,
+                    anchor_offsets=(0,) if quick_optimization else (0, -10, 10),
+                    full_validation=not quick_optimization,
                     output_root=str(optimization_root),
                     run_name=optimization_run_name,
                 )
+                if quick_optimization:
+                    quick_settings = self._step_settings(3)
+                    quick_window = self.step_widgets[3]["window"].value()
+                    quick_avg_nm = self.step_widgets[3]["avg_nm"].value() or None
+                    quick_sweep_nm = (
+                        self.step_widgets[3]["sweep_nm"].value() or None
+                    )
+                else:
+                    quick_settings = None
+                    quick_window = None
+                    quick_avg_nm = None
+                    quick_sweep_nm = None
             else:
                 center_wl = None
                 channel_width = None
                 gap_px = None
                 optimization_config = None
+                quick_settings = None
+                quick_window = None
+                quick_avg_nm = None
+                quick_sweep_nm = None
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return self._reject_calibration(exc)
 
@@ -5339,7 +5464,11 @@ class MainWindow(QtWidgets.QMainWindow):
             1: "Step 1",
             2: "Step 2",
             3: "Step 3",
-            4: "Encoding Optimization",
+            4: (
+                "Quick Single-Channel Optimization"
+                if quick_optimization
+                else "Encoding Optimization"
+            ),
         }
         sequence = " -> ".join(stage_names[step] for step in selected)
         self.pipeline_status_label.setText(f"Running steps {sequence}")
@@ -5350,6 +5479,7 @@ class MainWindow(QtWidgets.QMainWindow):
             result: CalibrationResult | None = None
             optimization_result: OptimizationResult | None = None
             optimization_layout: ChannelLayout | None = None
+            quick_target_coordinate: float | None = None
             saved_files: list[Path] = []
 
             if 1 in selected:
@@ -5423,25 +5553,101 @@ class MainWindow(QtWidgets.QMainWindow):
                 csv_path = None
 
             if 4 in selected:
-                calibration_path = (
-                    outputs[3]
-                    if 3 in selected
-                    else optimization_calibration_input
-                )
-                assert calibration_path is not None
                 assert center_wl is not None
                 assert channel_width is not None
                 assert gap_px is not None
                 assert optimization_config is not None
-                optimization_calibration = (
-                    self._load_pipeline_optimization_calibration(calibration_path)
-                )
-                optimization_layout = self._build_pipeline_encoding_layout(
-                    optimization_calibration,
-                    center_wl=center_wl,
-                    channel_width_px=channel_width,
-                    gap_px=gap_px,
-                )
+                if quick_optimization:
+                    step2_path = (
+                        outputs[2]
+                        if 2 in selected
+                        else optimization_calibration_input
+                    )
+                    assert step2_path is not None
+                    assert quick_calibration_output is not None
+                    assert quick_levels is not None
+                    assert quick_settings is not None
+                    assert quick_window is not None
+                    step2_calibration = self._load_pipeline_wavelength_calibration(
+                        step2_path, target_wavelength_nm=center_wl
+                    )
+                    quick_target_coordinate = interpolate_coordinate_for_wavelength(
+                        step2_calibration, center_wl
+                    )
+                    target_pixel = int(round(quick_target_coordinate))
+                    report(
+                        CalibrationProgress(
+                            phase="quick_center",
+                            step=0,
+                            total=1,
+                            message=(
+                                f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
+                                f"px; calibrating pixel {target_pixel}"
+                            ),
+                            x=quick_target_coordinate,
+                            y=center_wl,
+                        )
+                    )
+                    quick_seed = CalibrationResult(
+                        wavelength=np.asarray([center_wl], dtype=float),
+                        coordinates=np.asarray([target_pixel], dtype=float),
+                        max_level=step2_calibration.max_level,
+                        min_level=step2_calibration.min_level,
+                        level_range=np.asarray(quick_levels, dtype=int),
+                        wavelength_fit_coefficients=(
+                            step2_calibration.wavelength_fit_coefficients
+                        ),
+                    )
+                    quick_result = intensity_calibration(
+                        osa,
+                        controller,
+                        quick_levels,
+                        quick_settings,
+                        quick_seed,
+                        window_size=quick_window,
+                        wavelength_window_nm=quick_avg_nm,
+                        sweep_span_nm=quick_sweep_nm,
+                        coordinate_stride=1,
+                        refine_wavelength=False,
+                        region=None,
+                        stop_event=stop_event,
+                        progress_callback=report,
+                    )
+                    saved_files.append(
+                        save_calibration_result(
+                            quick_result, quick_calibration_output
+                        )
+                    )
+                    optimization_calibration = (
+                        self._load_pipeline_quick_intensity_calibration(
+                            quick_calibration_output
+                        )
+                    )
+                    optimization_layout, quick_target_coordinate = (
+                        build_single_anchor_layout(
+                            step2_calibration,
+                            optimization_calibration,
+                            target_wavelength_nm=center_wl,
+                            channel_width_px=channel_width,
+                            gap_px=gap_px,
+                        )
+                    )
+                else:
+                    calibration_path = (
+                        outputs[3]
+                        if 3 in selected
+                        else optimization_calibration_input
+                    )
+                    assert calibration_path is not None
+                    optimization_calibration = (
+                        self._load_pipeline_optimization_calibration(calibration_path)
+                    )
+                    optimization_layout = self._build_pipeline_encoding_layout(
+                        optimization_calibration,
+                        center_wl=center_wl,
+                        channel_width_px=channel_width,
+                        gap_px=gap_px,
+                    )
                 if profile_path is not None:
                     initial_l = self._load_pipeline_initial_profile(profile_path)
                 else:
@@ -5489,6 +5695,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "csv": csv_path,
                 "optimization_result": optimization_result,
                 "optimization_layout": optimization_layout,
+                "quick_target_coordinate": quick_target_coordinate,
                 "summary": f"completed steps {sequence}",
             }
 
@@ -5653,6 +5860,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline_log.appendPlainText(f"Done: {summary}")
             for path in payload.get("saved_files", []):
                 self.pipeline_log.appendPlainText(f"Saved: {path}")
+            quick_target_coordinate = payload.get("quick_target_coordinate")
+            if quick_target_coordinate is not None:
+                self.pipeline_log.appendPlainText(
+                    "Quick target: "
+                    f"{self.enc_center_wl_spin.value():g} nm -> "
+                    f"x={float(quick_target_coordinate):.3f} px "
+                    f"(physical pixel {int(round(float(quick_target_coordinate)))})"
+                )
             optimization_result = payload.get("optimization_result")
             optimization_layout = payload.get("optimization_layout")
             if optimization_result is not None and optimization_layout is not None:
