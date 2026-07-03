@@ -36,6 +36,7 @@ from ..calibration.calibration_new import (
     intensity_calibration,
     load_calibration_result,
     load_wavelength_map_csv,
+    restrict_to_measured_intensity_range,
     save_calibration_result,
     wavelength_calibration,
     write_intensity_calibration_csv,
@@ -1113,6 +1114,20 @@ class MainWindow(QtWidgets.QMainWindow):
         opt_grid.addWidget(QtWidgets.QLabel("Run name"), 8, 0)
         opt_grid.addWidget(self.pipeline_optimization_name_edit, 8, 1, 1, 2)
 
+        self.pipeline_quick_levels_edit = QtWidgets.QLineEdit("420~870+50")
+        self.pipeline_quick_levels_edit.setToolTip(
+            "SLM levels for the interpolated centre pixel, formatted as "
+            "min~max+stride, for example 420~870+50. The maximum level is "
+            "included even when the stride does not land on it exactly. After "
+            "acquisition, the measured minimum and maximum define the "
+            "off-to-on range used by encoding and optimisation."
+        )
+        self.pipeline_quick_levels_label = QtWidgets.QLabel(
+            "Quick SLM range"
+        )
+        opt_grid.addWidget(self.pipeline_quick_levels_label, 9, 0)
+        opt_grid.addWidget(self.pipeline_quick_levels_edit, 9, 1, 1, 2)
+
         self.pipeline_quick_calibration_edit = QtWidgets.QLineEdit(
             "calib_quick_center.json"
         )
@@ -1127,9 +1142,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_quick_calibration_label = QtWidgets.QLabel(
             "Quick calibration JSON"
         )
-        opt_grid.addWidget(self.pipeline_quick_calibration_label, 9, 0)
-        opt_grid.addWidget(self.pipeline_quick_calibration_edit, 9, 1)
-        opt_grid.addWidget(self.pipeline_quick_calibration_button, 9, 2)
+        opt_grid.addWidget(self.pipeline_quick_calibration_label, 10, 0)
+        opt_grid.addWidget(self.pipeline_quick_calibration_edit, 10, 1)
+        opt_grid.addWidget(self.pipeline_quick_calibration_button, 10, 2)
         opt_grid.setColumnStretch(1, 1)
         layout.addWidget(optimization)
 
@@ -1140,7 +1155,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Optimization initial profile may be entered directly or loaded "
                 "from a file. Fast single-channel mode uses the Step 2 map to "
                 "interpolate the Encoding centre wavelength (778 nm by default), "
-                "calibrates that physical pixel, and optimises only that anchor."
+                "measures the min~max+stride SLM range at that physical pixel, then "
+                "uses its measured min-to-max range for the single-anchor optimisation."
             )
         )
 
@@ -1231,6 +1247,8 @@ class MainWindow(QtWidgets.QMainWindow):
             optimization_source = "Encoding Optimization: not selected"
         self.pipeline_source_labels[4].setText(optimization_source)
         for widget in (
+            self.pipeline_quick_levels_label,
+            self.pipeline_quick_levels_edit,
             self.pipeline_quick_calibration_label,
             self.pipeline_quick_calibration_edit,
             self.pipeline_quick_calibration_button,
@@ -5136,6 +5154,28 @@ class MainWindow(QtWidgets.QMainWindow):
             values, source="initial profile input"
         )
 
+    def _parse_pipeline_quick_levels(self, text: str) -> np.ndarray:
+        """Parse the min~max+stride SLM range used by quick centre calibration."""
+        value_text = text.strip()
+        if not value_text:
+            raise ValueError("Quick SLM range is required")
+        match = re.fullmatch(r"\s*(\d+)\s*~\s*(\d+)\s*\+\s*(\d+)\s*", text)
+        if match is None:
+            raise ValueError(
+                "Quick SLM range must use min~max+stride, for example 420~870+50"
+            )
+        min_level, max_level, stride = (int(part) for part in match.groups())
+        if min_level >= max_level:
+            raise ValueError("Quick SLM range requires min < max")
+        if stride <= 0:
+            raise ValueError("Quick SLM range stride must be positive")
+        if min_level < 0 or max_level > MAX_LEVEL:
+            raise ValueError(f"Quick SLM range must be in 0..{MAX_LEVEL}")
+        levels = list(range(min_level, max_level + 1, stride))
+        if levels[-1] != max_level:
+            levels.append(max_level)
+        return np.asarray(levels, dtype=int)
+
     def _load_pipeline_initial_profile(self, path: Path) -> np.ndarray:
         """Load an 8-value initial profile or a symmetric 15-value profile."""
         if path.suffix.lower() == ".json":
@@ -5377,7 +5417,11 @@ class MainWindow(QtWidgets.QMainWindow):
             levels1 = self._step_levels(1) if 1 in selected else None
             levels3 = self._step_levels(3) if 3 in selected else None
             quick_levels = (
-                self._step_levels(3) if quick_optimization else None
+                self._parse_pipeline_quick_levels(
+                    self.pipeline_quick_levels_edit.text()
+                )
+                if quick_optimization
+                else None
             )
             window2 = self.step_widgets[2]["window"].value() if 2 in selected else None
             peak_nm = (
@@ -5480,6 +5524,7 @@ class MainWindow(QtWidgets.QMainWindow):
             optimization_result: OptimizationResult | None = None
             optimization_layout: ChannelLayout | None = None
             quick_target_coordinate: float | None = None
+            quick_measured_range: tuple[int, int] | None = None
             saved_files: list[Path] = []
 
             if 1 in selected:
@@ -5591,8 +5636,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     quick_seed = CalibrationResult(
                         wavelength=np.asarray([center_wl], dtype=float),
                         coordinates=np.asarray([target_pixel], dtype=float),
-                        max_level=step2_calibration.max_level,
-                        min_level=step2_calibration.min_level,
+                        max_level=int(quick_levels[-1]),
+                        min_level=int(quick_levels[0]),
                         level_range=np.asarray(quick_levels, dtype=int),
                         wavelength_fit_coefficients=(
                             step2_calibration.wavelength_fit_coefficients
@@ -5612,6 +5657,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         region=None,
                         stop_event=stop_event,
                         progress_callback=report,
+                    )
+                    quick_result = restrict_to_measured_intensity_range(
+                        quick_result
+                    )
+                    quick_measured_range = (
+                        int(quick_result.min_level),
+                        int(quick_result.max_level),
                     )
                     saved_files.append(
                         save_calibration_result(
@@ -5696,6 +5748,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "optimization_result": optimization_result,
                 "optimization_layout": optimization_layout,
                 "quick_target_coordinate": quick_target_coordinate,
+                "quick_measured_range": quick_measured_range,
                 "summary": f"completed steps {sequence}",
             }
 
@@ -5867,6 +5920,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{self.enc_center_wl_spin.value():g} nm -> "
                     f"x={float(quick_target_coordinate):.3f} px "
                     f"(physical pixel {int(round(float(quick_target_coordinate)))})"
+                )
+            quick_measured_range = payload.get("quick_measured_range")
+            if quick_measured_range is not None:
+                self.pipeline_log.appendPlainText(
+                    "Quick measured intensity range: "
+                    f"off level {int(quick_measured_range[0])}, "
+                    f"on level {int(quick_measured_range[1])}"
                 )
             optimization_result = payload.get("optimization_result")
             optimization_layout = payload.get("optimization_layout")

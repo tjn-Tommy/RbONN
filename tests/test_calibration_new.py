@@ -21,6 +21,7 @@ from slm_module.calibration.calibration_new import (
     load_wavelength_map_csv,
     local_peak_centroid,
     mean_near_wavelength,
+    restrict_to_measured_intensity_range,
     save_calibration_result,
     wavelength_calibration,
     write_intensity_calibration_csv,
@@ -500,6 +501,39 @@ class CalibrationNewTests(unittest.TestCase):
         )
         self.assertEqual(loaded.min_level, 20)
         self.assertEqual(loaded.max_level, 900)
+
+    def test_restricts_quick_calibration_to_measured_min_max_range(self) -> None:
+        result = CalibrationResult(
+            wavelength=np.asarray([778.0]),
+            coordinates=np.asarray([100.0]),
+            max_level=950,
+            min_level=300,
+            level_range=np.asarray([300, 420, 500, 870, 950]),
+            intensity_levels=np.asarray([[0.2, 0.1, 0.4, 1.1, 0.8]]),
+            raw_intensity_levels=np.asarray([[2.0, 1.0, 4.0, 11.0, 8.0]]),
+        )
+
+        restricted = restrict_to_measured_intensity_range(result)
+
+        self.assertEqual(restricted.min_level, 420)
+        self.assertEqual(restricted.max_level, 870)
+        np.testing.assert_array_equal(restricted.level_range, [420, 500, 870])
+        np.testing.assert_allclose(restricted.intensity_levels, [[0.0, 0.3, 1.0]])
+        np.testing.assert_allclose(
+            restricted.raw_intensity_levels, [[1.0, 4.0, 11.0]]
+        )
+
+    def test_rejects_zero_quick_calibration_range(self) -> None:
+        result = CalibrationResult(
+            wavelength=np.asarray([778.0]),
+            coordinates=np.asarray([100.0]),
+            max_level=870,
+            min_level=420,
+            level_range=np.asarray([420, 870]),
+            intensity_levels=np.asarray([[0.5, 0.5]]),
+        )
+        with self.assertRaisesRegex(ValueError, "maximum must occur"):
+            restrict_to_measured_intensity_range(result)
 
     def test_load_calibration_result_preserves_none_fields(self) -> None:
         seed = CalibrationResult(

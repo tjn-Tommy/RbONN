@@ -158,11 +158,35 @@ class MainWindowStartupTests(unittest.TestCase):
 
             self.assertFalse(window.pipeline_input_edits[4].isEnabled())
             self.assertIn("Step 2 output JSON", window.pipeline_source_labels[4].text())
+            self.assertTrue(window.pipeline_quick_levels_edit.isEnabled())
             self.assertTrue(window.pipeline_quick_calibration_edit.isEnabled())
 
             window.pipeline_checks[2].setChecked(False)
             self.assertTrue(window.pipeline_input_edits[4].isEnabled())
             self.assertIn("external Step 2 JSON", window.pipeline_source_labels[4].text())
+        finally:
+            window.close()
+
+    def test_pipeline_parses_quick_level_range(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            levels = window._parse_pipeline_quick_levels(
+                "420~870+50"
+            )
+            np.testing.assert_array_equal(
+                levels,
+                [420, 470, 520, 570, 620, 670, 720, 770, 820, 870],
+            )
+
+            levels = window._parse_pipeline_quick_levels("420~875+100")
+            np.testing.assert_array_equal(
+                levels, [420, 520, 620, 720, 820, 875]
+            )
+
+            with self.assertRaisesRegex(ValueError, "min~max\\+stride"):
+                window._parse_pipeline_quick_levels("420, 520, 870")
         finally:
             window.close()
 
@@ -508,6 +532,7 @@ class MainWindowStartupTests(unittest.TestCase):
 
                 self.assertTrue(quick_path.is_file())
                 self.assertEqual(payload["quick_target_coordinate"], 100.0)
+                self.assertEqual(payload["quick_measured_range"], (420, 870))
                 self.assertEqual(
                     payload["optimization_result"].run_dir,
                     str(output_root / "quick_test"),

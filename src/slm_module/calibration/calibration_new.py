@@ -556,6 +556,77 @@ def intensity_calibration(
     )
 
 
+def restrict_to_measured_intensity_range(
+    calibration_results: CalibrationResult,
+) -> CalibrationResult:
+    """Keep and locally normalise the measured off-to-on range at one pixel.
+
+    Quick single-channel calibration may probe an arbitrary user-supplied list
+    of SLM levels.  The level with the least measured power becomes the local
+    off level and the level with the greatest power becomes the local on level.
+    Samples outside that inclusive rising segment are discarded so downstream
+    encoding cannot accidentally use a falling or unmeasured branch.
+    """
+    levels = _validate_levels(calibration_results.level_range)
+    if levels.size < 2 or np.any(np.diff(levels) <= 0):
+        raise ValueError(
+            "quick calibration levels must contain at least two unique, "
+            "increasing values"
+        )
+    intensities = calibration_results.intensity_levels
+    if intensities is None:
+        raise ValueError("quick calibration has no measured intensity values")
+    intensities = np.asarray(intensities, dtype=float)
+    expected = (1, levels.size)
+    if intensities.shape != expected:
+        raise ValueError(
+            f"quick calibration intensity shape must be {expected}, "
+            f"got {intensities.shape}"
+        )
+
+    raw = calibration_results.raw_intensity_levels
+    measured = intensities
+    raw_array: np.ndarray | None = None
+    if raw is not None:
+        raw_array = np.asarray(raw, dtype=float)
+        if raw_array.shape != expected:
+            raise ValueError(
+                f"quick calibration raw intensity shape must be {expected}, "
+                f"got {raw_array.shape}"
+            )
+        measured = raw_array
+    if not np.all(np.isfinite(measured)):
+        raise ValueError("quick calibration contains NaN or infinity")
+
+    row = measured[0]
+    off_index = int(np.argmin(row))
+    on_index = int(np.argmax(row))
+    if off_index >= on_index:
+        raise ValueError(
+            "measured maximum must occur at a higher SLM level than the minimum"
+        )
+    denominator = float(row[on_index] - row[off_index])
+    if denominator <= np.finfo(float).eps:
+        raise ValueError("measured quick-calibration intensity range is zero")
+
+    segment = slice(off_index, on_index + 1)
+    local_intensity = np.clip(
+        (measured[:, segment] - row[off_index]) / denominator,
+        0.0,
+        1.0,
+    )
+    return replace(
+        calibration_results,
+        min_level=int(levels[off_index]),
+        max_level=int(levels[on_index]),
+        level_range=levels[segment].copy(),
+        intensity_levels=local_intensity,
+        raw_intensity_levels=(
+            None if raw_array is None else raw_array[:, segment].copy()
+        ),
+    )
+
+
 def write_intensity_calibration_csv(
     calibration_results: CalibrationResult,
     csv_path: str | Path,
