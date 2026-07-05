@@ -1,0 +1,60 @@
+{
+  "settings": {
+    "center_wl": "778nm",
+    "span": "0.8nm",
+    "sensitivity": "HIGH3",
+    "sampling_points": "1001",
+    "y_unit": "LOGarithmic",
+    "reference_level": "10uW",
+    "trace_id": "TRA",
+    "trace_mode": "WRITe"
+  },
+  "anchor_offsets": [
+    0
+  ],
+  "averages": 1,
+  "rerank_averages": 3,
+  "baseline_repeats": 10,
+  "stage2_repeats": 3,
+  "stage1_maxfev": 200,
+  "stage3_maxfev": 100,
+  "stage1_top_k": 10,
+  "stage3_top_k": 10,
+  "stage1_initial_radius": 0.12,
+  "stage3_initial_radius": 0.05,
+  "final_radius": 0.01,
+  "stage3_intensity_delta": 0.1,
+  "alternation_threshold": 0.03,
+  "max_alternations": 2,
+  "beta_eta": 1.0,
+  "beta_c": 1.0,
+  "eta_threshold": 0.87,
+  "eta_accept": 0.85,
+  "eta_scale": 0.02,
+  "c_floor_min": 1e-09,
+  "lut_amplitudes": [
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "final_lut_points": 11,
+  "lut_self_consistency": true,
+  "modulation_amplitudes": [
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "discrete_refine": true,
+  "discrete_step": 0.01,
+  "output_root": "C:\\Users\\weishan\\Desktop\\RbONN\\encoding",
+  "run_name": null,
+  "resume": false,
+  "settle_seconds": 0.0,
+  "reference_interval_candidates": 25,
+  "full_validation": false,
+  "full_validation_stride": 1,
+  "reference_profile_validation": true
+}

@@ -1,0 +1,35 @@
+{
+  "offset": 0,
+  "position": 26,
+  "anchor": {
+    "side": "x",
+    "index": 0,
+    "wavelength_nm": 778.0
+  },
+  "settings": {
+    "center_wl": "778.000000nm",
+    "span": "0.8nm",
+    "sensitivity": "HIGH3",
+    "sampling_points": "1001",
+    "y_unit": "LOGarithmic",
+    "reference_level": "10uW",
+    "trace_id": "TRA",
+    "trace_mode": "WRITe"
+  },
+  "centers_nm": [
+    777.77,
+    777.888,
+    777.9979999999999,
+    778.1080000000001,
+    778.224
+  ],
+  "edges_nm": [
+    777.711,
+    777.829,
+    777.943,
+    778.053,
+    778.166,
+    778.282
+  ],
+  "flat_main_energy": 1.0485831041690809e-08
+}
