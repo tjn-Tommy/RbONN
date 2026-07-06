@@ -99,7 +99,12 @@ class DAQController:
             np.arange(values.size, dtype=float) / settings.sample_rate
             if settings.sample_rate else np.zeros_like(values)
         )
-        return MonitorSample(value=float(values.mean()), index=index, timestamp=time.time())
+        return MonitorSample(
+            value=float(values.mean()),
+            std=float(values.std()),
+            index=index,
+            timestamp=time.time(),
+        )
 
     def __enter__(self):
         self.connect()

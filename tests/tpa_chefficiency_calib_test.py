@@ -36,17 +36,19 @@ from slm_module.tpa_pair import (  # noqa: E402
     build_sweep,
     load_tpa_pair_csv,
     measure_pair_grids,
+    save_tpa_pair_json,
     write_tpa_pair_csv,
 )
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "calib_step333.json"   # Step 3 calibration result
-PAIR_INDEX = 0                                  # which channel pair (x[i], w[i])
+CALIB_PATH = REPO_ROOT / "calib_step3_2pairs.json"  # Step 3 (near pair 0 + far pair 3)
+PAIR_INDICES = [0, 3]                           # near (cols 660/680) + far (cols 600/740)
 SWEEP_MIN = 0.3                                 # min per-side intensity in the ramp (0..1)
 SWEEP_MAX = 1.0                                 # max per-side intensity in the ramp (0..1)
 N_SWEEP_POINTS = 6                              # ramp points per side (+1 zero axis -> 7x7 grid)
-OUT_CSV = REPO_ROOT / "tpa_pair0_calibration_linear.csv"
-PLOT_PATH = REPO_ROOT / "tpa_fit.png"
+OUT_CSV = REPO_ROOT / "tpa_2pairs_chefficiency.csv"
+OUT_JSON = REPO_ROOT / "tpa_2pairs_chefficiency.json"
+PLOT_PATH = REPO_ROOT / "tpa_2pairs_fit.png"    # per-pair plot: tpa_pair{i}_2pairs_fit.png
 
 SLM_DISPLAY_NO = None           # None -> auto-detect the LCOS-SLM display (like the GUI's Detect)
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch (USB link)
@@ -186,10 +188,11 @@ def sweep_and_fit() -> None:
     """Drive the hardware grid sweep, save the CSV, then fit + report + plot."""
     calib = load_calibration_result(CALIB_PATH)
     layout = build_channel_layout(calib)
-    if not (0 <= PAIR_INDEX < layout.n_channels):
-        raise ValueError(
-            f"PAIR_INDEX={PAIR_INDEX} out of range (layout has {layout.n_channels} pairs)"
-        )
+    for pi in PAIR_INDICES:
+        if not (0 <= pi < layout.n_channels):
+            raise ValueError(
+                f"pair index {pi} out of range (layout has {layout.n_channels} pairs)"
+            )
 
     sweep = build_sweep(SWEEP_MIN, SWEEP_MAX, N_SWEEP_POINTS)
     slm = connect_slm()
@@ -197,7 +200,7 @@ def sweep_and_fit() -> None:
     try:
         result = measure_pair_grids(
             daq, slm, layout,
-            pair_indices=[PAIR_INDEX], sweep=sweep,
+            pair_indices=list(PAIR_INDICES), sweep=sweep,
             n_trials=N_TRIALS, repeats=REPEATS, settle=SETTLE_S,
             read_timeout=max(30.0, DAQ_DURATION_S * 3.0 + 10.0),
             progress_callback=lambda p: print(f"[{p.step}/{p.total}] {p.message}"),
@@ -207,11 +210,16 @@ def sweep_and_fit() -> None:
         slm.close_slm()
 
     write_tpa_pair_csv(result, OUT_CSV)
-    grid = result.channels[0]
-    print(f"\nSaved {grid.trial.size} rows to {OUT_CSV}")
-    report(grid.fit)
-    make_plot(grid.fit, PLOT_PATH)
-    print(f"Plot saved to {PLOT_PATH}")
+    save_tpa_pair_json(result, OUT_JSON)
+    total_rows = sum(int(c.trial.size) for c in result.channels)
+    print(f"\nSaved {total_rows} rows to {OUT_CSV}")
+    print(f"Saved params JSON -> {OUT_JSON}")
+    for grid in result.channels:
+        print(f"\n=== pair {grid.index} ===")
+        report(grid.fit)
+        plot_path = PLOT_PATH.with_name(f"tpa_pair{grid.index}_2pairs_fit.png")
+        make_plot(grid.fit, plot_path)
+        print(f"Plot saved to {plot_path}")
 
 
 def fit_csv(path: str | Path) -> None:

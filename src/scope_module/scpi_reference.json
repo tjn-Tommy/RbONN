@@ -141,11 +141,11 @@
 
   "measurement": {
     "_note": "On-scope averaging: a MEAN measurement returns the average signal level as one scalar, so we read a number instead of transferring the whole record.",
-    "MEASurement<mg>[:ENABle]": {"command": "MEASurement<mg>:ENABle ON", "page": 1670, "notes": "mg = 1..10 measurement group.", "set_by": "setup_mean_measurement"},
-    "MEASurement<mg>:CATegory": {"command": "MEASurement<mg>:CATegory AMPTime", "page": 1672, "set_by": "setup_mean_measurement"},
-    "MEASurement<mg>:SOURce": {"command": "MEASurement<mg>:SOURce C<ch>W1", "page": 1670, "notes": "Waveform source in Cn W m form (channel n, waveform 1).", "set_by": "setup_mean_measurement"},
-    "MEASurement<mg>:MAIN": {"command": "MEASurement<mg>:MAIN MEAN", "page": 1673, "notes": "MEAN = mean value of the waveform over its window. Many other types exist (RMS, AMPLitude, MAXimum, AREA, ...).", "set_by": "setup_mean_measurement"},
-    "MEASurement<mg>:GATE": {"command": "MEASurement<mg>:GATE:MODE ABS ; :GATE:ABSolute:STARt <s> ; :GATE:ABSolute:STOP <s> ; :GATE:STATe ON", "page": 1742, "notes": "Restrict the measurement to an absolute time window (seconds after the trigger). Used to average only the settled [hold, hold+duration] part.", "set_by": "setup_mean_measurement"},
+    "MEASurement<mg>[:ENABle]": {"command": "MEASurement<mg>:ENABle ON", "page": 1670, "notes": "mg = 1..10 measurement group. Monitor loop uses group 1 (MEAN) and group 2 (STDDev).", "set_by": "_setup_amptime_measurement"},
+    "MEASurement<mg>:CATegory": {"command": "MEASurement<mg>:CATegory AMPTime", "page": 1672, "set_by": "_setup_amptime_measurement"},
+    "MEASurement<mg>:SOURce": {"command": "MEASurement<mg>:SOURce C<ch>W1", "page": 1670, "notes": "Waveform source in Cn W m form (channel n, waveform 1).", "set_by": "_setup_amptime_measurement"},
+    "MEASurement<mg>:MAIN": {"command": "MEASurement<mg>:MAIN MEAN", "page": 1673, "notes": "MEAN = mean value of the waveform over its window; STDDev = standard deviation over the window. Many other types exist (RMS, AMPLitude, MAXimum, AREA, ...).", "set_by": "_setup_amptime_measurement"},
+    "MEASurement<mg>:GATE": {"command": "MEASurement<mg>:GATE:MODE ABS ; :GATE:ABSolute:STARt <s> ; :GATE:ABSolute:STOP <s> ; :GATE:STATe ON", "page": 1742, "notes": "Restrict the measurement to an absolute time window (seconds after the trigger). Used to average only the settled [hold, hold+duration] part.", "set_by": "_setup_amptime_measurement"},
     "MEASurement<mg>:RESult[:ACTual]?": {"command": "MEASurement<mg>:RESult:ACTual?", "page": 1746, "notes": "Current main-measurement value (one float).", "read_by": "read_measurement"},
     "MEASurement<mg>:STATistics[:ENABle]": {"command": "MEASurement<mg>:STATistics:ENABle ON", "page": 1668, "notes": "Accumulate statistics across acquisitions; then MEASurement<mg>:RESult:AVG? / :STDDev? / :WFMCount?. Needs multiple triggers (not used by the single-trigger monitor)."}
   },

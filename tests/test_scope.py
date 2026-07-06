@@ -57,8 +57,11 @@ class FakeDriver:
     def setup_mean_measurement(self, ch, *, group=1, gate_start=None, gate_stop=None):
         self.calls.append(f"meas={ch},g={group},gate={gate_start},{gate_stop}")
 
+    def setup_stddev_measurement(self, ch, *, group=2, gate_start=None, gate_stop=None):
+        self.calls.append(f"std={ch},g={group},gate={gate_start},{gate_stop}")
+
     def read_measurement(self, group=1):
-        return 0.0425
+        return 0.0425 if group == 1 else 0.0012  # group 1 = MEAN, group 2 = STDDev
 
     def single_acquisition(self) -> None:
         self.calls.append("single")
@@ -178,6 +181,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("acount=1", calls)             # single acquisition per SINGle
         self.assertIn("trange=1.1", calls)          # hold + duration
         self.assertIn("meas=1,g=1,gate=0.1,1.1", calls)  # gate = [hold, hold+dur]
+        self.assertIn("std=1,g=2,gate=0.1,1.1", calls)   # STDDev over the same gate
 
     def test_configure_monitor_auto_mode_no_gate(self):
         driver = FakeDriver()
@@ -192,6 +196,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("acount=1", calls)
         self.assertIn("trange=1.0", calls)               # duration only (no hold)
         self.assertIn("meas=1,g=1,gate=None,None", calls)  # whole-record mean
+        self.assertIn("std=1,g=2,gate=None,None", calls)   # whole-record stddev
 
     def test_monitor_cycle_returns_scope_mean(self):
         driver = FakeDriver()
@@ -200,7 +205,8 @@ class MonitorTests(unittest.TestCase):
         sample = scope.monitor_cycle(index=5, poll_interval=0.0)
         self.assertIsInstance(sample, MonitorSample)
         self.assertEqual(sample.index, 5)
-        self.assertAlmostEqual(sample.value, 0.0425)  # from FakeDriver.read_measurement
+        self.assertAlmostEqual(sample.value, 0.0425)  # group 1 (MEAN)
+        self.assertAlmostEqual(sample.std, 0.0012)    # group 2 (STDDev)
         self.assertIsNone(sample.waveform)
 
     def test_monitor_cycle_aborts_on_stop(self):

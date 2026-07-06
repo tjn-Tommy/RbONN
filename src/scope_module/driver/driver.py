@@ -364,6 +364,36 @@ class RTO6_Driver(BaseScope):
         return self.query_binary(f"CHANnel{int(channel)}:DATA?", datatype)
 
     # --- automatic measurement (on-scope averaging over the record) -------
+    def _setup_amptime_measurement(
+        self,
+        channel: int,
+        main: str,
+        *,
+        group: int,
+        gate_start: float | None = None,
+        gate_stop: float | None = None,
+    ) -> None:
+        """Configure measurement group <group> for ch<channel> <main> (AMPTime).
+
+        <main> is an amplitude/time measurement type (MEAN, STDDev, ...); the
+        scope computes it over the waveform window for us, so we read one scalar
+        instead of transferring the whole record. An optional absolute time gate
+        [gate_start, gate_stop] (seconds after the trigger) restricts it to the
+        settled part of the acquisition.
+        """
+        mg = int(group)
+        self.write(f"MEASurement{mg}:ENABle ON")
+        self.write(f"MEASurement{mg}:CATegory AMPTime")
+        self.write(f"MEASurement{mg}:SOURce C{int(channel)}W1")
+        self.write(f"MEASurement{mg}:MAIN {main}")
+        if gate_start is not None and gate_stop is not None:
+            self.write(f"MEASurement{mg}:GATE:MODE ABS")
+            self.write(f"MEASurement{mg}:GATE:ABSolute:STARt {gate_start}")
+            self.write(f"MEASurement{mg}:GATE:ABSolute:STOP {gate_stop}")
+            self.write(f"MEASurement{mg}:GATE:STATe ON")
+        else:
+            self.write(f"MEASurement{mg}:GATE:STATe OFF")
+
     def setup_mean_measurement(
         self,
         channel: int,
@@ -380,18 +410,28 @@ class RTO6_Driver(BaseScope):
         time gate [gate_start, gate_stop] (seconds after the trigger) restricts
         the mean to the settled part of the acquisition.
         """
-        mg = int(group)
-        self.write(f"MEASurement{mg}:ENABle ON")
-        self.write(f"MEASurement{mg}:CATegory AMPTime")
-        self.write(f"MEASurement{mg}:SOURce C{int(channel)}W1")
-        self.write(f"MEASurement{mg}:MAIN MEAN")
-        if gate_start is not None and gate_stop is not None:
-            self.write(f"MEASurement{mg}:GATE:MODE ABS")
-            self.write(f"MEASurement{mg}:GATE:ABSolute:STARt {gate_start}")
-            self.write(f"MEASurement{mg}:GATE:ABSolute:STOP {gate_stop}")
-            self.write(f"MEASurement{mg}:GATE:STATe ON")
-        else:
-            self.write(f"MEASurement{mg}:GATE:STATe OFF")
+        self._setup_amptime_measurement(
+            channel, "MEAN", group=group, gate_start=gate_start, gate_stop=gate_stop
+        )
+
+    def setup_stddev_measurement(
+        self,
+        channel: int,
+        *,
+        group: int = 2,
+        gate_start: float | None = None,
+        gate_stop: float | None = None,
+    ) -> None:
+        """Configure measurement group <group> to return ch<channel> STDDev.
+
+        STDDev is the standard deviation of the waveform samples over the (gated)
+        window -- the within-shot spread/noise of the signal, read as one scalar
+        alongside the MEAN. Uses the same absolute time gate so it covers the
+        identical settled window the mean is averaged over.
+        """
+        self._setup_amptime_measurement(
+            channel, "STDDev", group=group, gate_start=gate_start, gate_stop=gate_stop
+        )
 
     def read_measurement(self, group: int = 1) -> float:
         """Return the current main-measurement result of a group as a float."""

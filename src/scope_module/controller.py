@@ -77,6 +77,7 @@ class MonitorSample:
     """One triggered reading: the scope-computed mean of the settled window."""
 
     value: float                           # volts (gated MEAN of the channel)
+    std: float | None = None               # volts (gated STDDev over the window)
     index: int = 0                         # sequence number in the monitor run
     timestamp: float = 0.0                 # time.time() when read
     waveform: "Waveform | None" = None     # optional captured trace
@@ -331,7 +332,11 @@ class ScopeController:
                 mode="NORMal",
             )
             driver.set_time_range(settings.total_window)
+            # group 1 = gated MEAN, group 2 = gated STDDev over the same window
             driver.setup_mean_measurement(
+                ch, gate_start=settings.hold, gate_stop=settings.total_window
+            )
+            driver.setup_stddev_measurement(
                 ch, gate_start=settings.hold, gate_stop=settings.total_window
             )
         else:
@@ -341,6 +346,7 @@ class ScopeController:
             driver.set_trigger_mode("AUTO")
             driver.set_time_range(settings.duration)
             driver.setup_mean_measurement(ch)
+            driver.setup_stddev_measurement(ch)
         self._monitor_settings = settings
 
     def monitor_cycle(
@@ -352,11 +358,13 @@ class ScopeController:
         stop_event: threading.Event | None = None,
         want_waveform: bool = False,
     ) -> MonitorSample | None:
-        """Wait for one trigger, then return the gated MEAN as a MonitorSample.
+        """Wait for one trigger, then return the gated MEAN (and STDDev).
 
         Returns None if stop_event fires before a trigger arrives. Assumes
         configure_monitor() has already run. ``timeout`` must exceed the worst
-        case wait for a trigger plus the acquisition window.
+        case wait for a trigger plus the acquisition window. Both the mean
+        (group 1) and its within-window standard deviation (group 2) come from
+        the one completed acquisition.
         """
         settings = getattr(self, "_monitor_settings", None)
         completed = self.run_single_acquisition(
@@ -365,11 +373,12 @@ class ScopeController:
         if not completed:
             return None
         value = self.driver.read_measurement(group=1)
+        std = self.driver.read_measurement(group=2)
         waveform = None
         if want_waveform and settings is not None:
             waveform = self.download(settings.channel)
         return MonitorSample(
-            value=value, index=index, timestamp=time.time(), waveform=waveform
+            value=value, std=std, index=index, timestamp=time.time(), waveform=waveform
         )
 
     def __enter__(self):

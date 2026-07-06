@@ -626,6 +626,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daq_controller: DAQController | None = None
         self.monitor_stop_event: threading.Event | None = None
         self._monitor_values: list[float] = []
+        self._monitor_stds: list[float] = []
         self.hold_stop_event: threading.Event | None = None
 
         self.setWindowTitle("Santec SLM Control")
@@ -2616,15 +2617,25 @@ class MainWindow(QtWidgets.QMainWindow):
             and self.monitor_stop_event is None   # not already running the trigger loop
         )
 
-    def _enc_read_monitor_after_send(self) -> None:
-        """After the pattern is displayed, wait the hold then read one averaged
-        value from whichever instrument (scope or DAQ) is connected."""
+    def _enc_acquire_sample(self, *, label: str, on_finish=None) -> None:
+        """Read one averaged (mean+std) sample from the connected instrument and
+        append it to the record.
+
+        Shared by the manual Acquire button and the auto-read-after-send path.
+        ``on_finish`` runs on the GUI thread once the read settles (ok or err) --
+        e.g. to re-enable whichever button kicked it off.
+        """
+        def done() -> None:
+            if on_finish is not None:
+                on_finish()
+
         active = self._enc_active_monitor()
         if active is None:
-            self.enc_send_button.setEnabled(True)
+            self._mon_status("No instrument connected (connect Scope or DAQ).")
+            done()
             return
         kind, ctrl = active
-        self._mon_status(f"Reading {kind} after send…")
+        self._mon_status(f"Reading {kind} ({label})…")
 
         if kind == "scope":
             # AUTO free-run with no armed edge: the SINGle self-triggers and
@@ -2635,7 +2646,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def work() -> MonitorSample | None:
                 ctrl.configure_monitor(settings)
-                time.sleep(settings.hold)          # settle after the SLM pattern change
+                time.sleep(settings.hold)          # settle before the read
                 return ctrl.monitor_cycle(
                     index=len(self._monitor_values), timeout=read_timeout
                 )
@@ -2653,17 +2664,39 @@ class MainWindow(QtWidgets.QMainWindow):
         def ok(sample: MonitorSample | None) -> None:
             if sample is not None:
                 self._on_monitor_sample(sample)
-                if kind == "daq":
-                    self._draw_current_waveform(ctrl.last_times, ctrl.last_values)
             else:
                 self._mon_status(f"{kind.capitalize()} read returned nothing.")
-            self.enc_send_button.setEnabled(True)
+            done()
 
         def err(_error: str) -> None:
             self._mon_status(f"{kind.capitalize()} read failed (see Status log).")
-            self.enc_send_button.setEnabled(True)
+            done()
 
-        self._run_task(f"{kind.capitalize()} read on send", work, ok, err)
+        self._run_task(f"{kind.capitalize()} read ({label})", work, ok, err)
+
+    def _enc_read_monitor_after_send(self) -> None:
+        """After the pattern is displayed, read one sample and keep Send disabled
+        until the read finishes."""
+        active = self._enc_active_monitor()
+        if active is None:
+            self.enc_send_button.setEnabled(True)
+            return
+        self._enc_acquire_sample(
+            label="on send",
+            on_finish=lambda: self.enc_send_button.setEnabled(True),
+        )
+
+    def _enc_acquire_clicked(self) -> None:
+        """Manual Acquire: read one sample now, without needing an SLM send."""
+        if self._enc_active_monitor() is None:
+            self._mon_status("No instrument connected (connect Scope or DAQ).")
+            return
+        if self.monitor_stop_event is not None:
+            self._mon_status("A monitor loop is already running.")
+            return
+        self.mon_acquire_button.setEnabled(False)
+        # _sync_monitor_source re-enables it only if an instrument is still connected
+        self._enc_acquire_sample(label="manual", on_finish=self._sync_monitor_source)
 
     # ==================================================================
     # Edge Ratio page: per-column edge-taper ratio + OSA optimisation hook
@@ -3590,9 +3623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_pair_index = self._spin(0, 63, 0)
         self.tpa_pair_index.setToolTip("Which channel pair (x[i], w[i]) to calibrate")
         self.tpa_all_pairs = QtWidgets.QCheckBox("All pairs")
-        self.tpa_all_pairs.setToolTip("Sweep every pair (0..n-1) using the stride below")
-        self.tpa_stride = self._spin(1, 64, 1)
-        self.tpa_stride.setToolTip("With 'All pairs': measure only every Nth pair")
+        self.tpa_all_pairs.setToolTip("Sweep every pair (0..n-1) instead of just the index above")
         self.tpa_sweep_min = QtWidgets.QDoubleSpinBox()
         self.tpa_sweep_min.setRange(0.0, 1.0); self.tpa_sweep_min.setSingleStep(0.05)
         self.tpa_sweep_min.setDecimals(2); self.tpa_sweep_min.setValue(0.30)
@@ -3614,9 +3645,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_repeats.setToolTip("Monitor reads averaged per grid point within a trial")
         widgets = [
             ("Pair index", self.tpa_pair_index), ("", self.tpa_all_pairs),
-            ("Stride", self.tpa_stride), ("Sweep min", self.tpa_sweep_min),
-            ("Sweep max", self.tpa_sweep_max), ("Ramp points", self.tpa_points),
-            ("Trials", self.tpa_trials), ("Repeats", self.tpa_repeats),
+            ("Sweep min", self.tpa_sweep_min), ("Sweep max", self.tpa_sweep_max),
+            ("Ramp points", self.tpa_points), ("Trials", self.tpa_trials),
+            ("Repeats", self.tpa_repeats),
         ]
         for i, (label, widget) in enumerate(widgets):
             r, c = i // 2, (i % 2) * 2
@@ -3686,7 +3717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Pairs to sweep from the controls, or None if the index is out of range."""
         n = layout.n_channels
         if self.tpa_all_pairs.isChecked():
-            return list(range(0, n, max(1, self.tpa_stride.value())))
+            return list(range(n))
         idx = self.tpa_pair_index.value()
         if idx >= n:
             return None
@@ -4045,9 +4076,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mon_source_label.setObjectName("PageSubtitle")
         v.addWidget(self.mon_source_label)
 
-        # config : current-waveform : average-per-pattern share leftover
-        # height 1:2:2 (only the visible one of the two config panels counts,
-        # the hidden one takes no space -- see _sync_monitor_source)
+        # config : average-per-pattern share leftover height 1:2 (only the
+        # visible one of the two config panels counts, the hidden one takes no
+        # space -- see _sync_monitor_source)
         self.scope_monitor_cfg = self._build_scope_monitor_config()
         self.daq_monitor_cfg = self._build_daq_monitor_config()
         v.addWidget(self.scope_monitor_cfg, 1)
@@ -4058,18 +4089,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mon_count_label.setAlignment(QtCore.Qt.AlignCenter)
         v.addWidget(self.mon_count_label)
 
-        # DAQ-only: the raw trace behind the latest averaged reading.
-        self.mon_waveform_fig = Figure(figsize=(4, 1.8), tight_layout=True)
-        self.mon_waveform_canvas = FigureCanvas(self.mon_waveform_fig)
-        v.addWidget(self._panel_with_widget("Current Waveform", self.mon_waveform_canvas), 2)
-        self._draw_current_waveform(None, None)
-
         self.mon_fig = Figure(figsize=(4, 1.8), tight_layout=True)
         self.mon_canvas = FigureCanvas(self.mon_fig)
-        v.addWidget(self._panel_with_widget("Average per pattern", self.mon_canvas), 2)
+        v.addWidget(self._panel_with_widget("Mean \N{PLUS-MINUS SIGN} std per pattern", self.mon_canvas), 2)
 
-        # This readout is a behaviour recorder, not a live monitor: each pattern
-        # you send appends one (pattern #, average) point via auto-read-on-send.
+        # This readout is a behaviour recorder, not a live monitor: each reading
+        # appends one (pattern #, mean, std) point -- either automatically after
+        # an SLM send, or on demand via the Acquire button.
+        self.mon_acquire_button = QtWidgets.QPushButton("Acquire")
+        self.mon_acquire_button.setToolTip(
+            "Read one averaged (mean \N{PLUS-MINUS SIGN} std) sample now from the connected "
+            "instrument (scope or DAQ) and append it to the record -- no SLM send needed."
+        )
+        self.mon_acquire_button.clicked.connect(self._enc_acquire_clicked)
         self.mon_clear_button = QtWidgets.QPushButton("Clear")
         self.mon_clear_button.setProperty("variant", "ghost")
         self.mon_clear_button.clicked.connect(self._monitor_clear)
@@ -4084,7 +4116,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "it to the record."
         )
         v.addWidget(self.mon_read_on_send)
-        row = QtWidgets.QHBoxLayout(); row.addWidget(self.mon_clear_button); row.addWidget(self.mon_save_button)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)   # push the buttons to the right at their natural width
+        row.addWidget(self.mon_acquire_button)
+        row.addWidget(self.mon_clear_button)
+        row.addWidget(self.mon_save_button)
         v.addLayout(row)
         self._sync_monitor_source()
         return w
@@ -4159,10 +4195,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show the config panel for whichever instrument is connected."""
         if not hasattr(self, "scope_monitor_cfg"):
             return
+        connected = self._enc_active_monitor() is not None
+        # manual Acquire only makes sense when an instrument is connected
+        self.mon_acquire_button.setEnabled(connected)
         if self.scope_controller is not None and self.scope_controller.is_connected:
             self.scope_monitor_cfg.setVisible(True)
             self.daq_monitor_cfg.setVisible(False)
-            self._draw_current_waveform(None, None)  # only the DAQ path fills this in
             self.mon_source_label.setText("Source: Scope (R&S RTO6)")
         elif self.daq_controller is not None and self.daq_controller.is_connected:
             self.scope_monitor_cfg.setVisible(False)
@@ -4171,7 +4209,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.scope_monitor_cfg.setVisible(True)
             self.daq_monitor_cfg.setVisible(False)
-            self._draw_current_waveform(None, None)
             self.mon_source_label.setText("Source: (none connected — connect Scope or DAQ)")
 
     def _monitor_settings(self, trigger_mode: str = "NORMal") -> MonitorSettings:
@@ -4207,21 +4244,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_monitor_sample(self, sample: MonitorSample) -> None:
         self._monitor_values.append(sample.value)
+        # std is per-window noise (None if the source doesn't report it); NaN
+        # keeps the record aligned 1:1 with the mean list for plotting/saving
+        self._monitor_stds.append(sample.std if sample.std is not None else float("nan"))
         self.mon_count_label.setText(f"{len(self._monitor_values)} patterns")
-        self._mon_status(f"pattern #{len(self._monitor_values)}: {sample.value*1000:.4f} mV")
+        n = len(self._monitor_values)
+        if sample.std is not None:
+            self._mon_status(
+                f"pattern #{n}: {sample.value*1000:.4f} \N{PLUS-MINUS SIGN} "
+                f"{sample.std*1000:.4f} mV"
+            )
+        else:
+            self._mon_status(f"pattern #{n}: {sample.value*1000:.4f} mV")
         self._monitor_draw()
-
-    def _draw_current_waveform(self, times: np.ndarray | None, values: np.ndarray | None) -> None:
-        """DAQ-only: plot the raw trace behind the latest averaged reading."""
-        self.mon_waveform_fig.clear()
-        self.mon_waveform_fig.patch.set_facecolor("#101820")
-        ax = self.mon_waveform_fig.add_subplot(111)
-        self._style_dark_axes(ax)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Voltage (mV)")
-        if times is not None and values is not None and len(values):
-            ax.plot(times, values * 1000.0, linewidth=0.7, color="#47b8e0")
-        self.mon_waveform_canvas.draw_idle()
 
     def _monitor_draw(self) -> None:
         self.mon_fig.clear()
@@ -4229,12 +4264,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ax = self.mon_fig.add_subplot(111)
         self._style_dark_axes(ax)
         ax.set_xlabel("Pattern # (send order)")
-        ax.set_ylabel("Average (mV)")
+        ax.set_ylabel("Mean \N{PLUS-MINUS SIGN} std (mV)")
         if self._monitor_values:
             n = len(self._monitor_values)
-            xs = range(1, n + 1)
-            ax.plot(xs, [v * 1000 for v in self._monitor_values],
-                    marker="o", ms=3, color="#47b8e0", linewidth=0.8)
+            xs = list(range(1, n + 1))
+            ys = [v * 1000 for v in self._monitor_values]
+            # per-point std as error bars (mV); NaN entries render bar-less
+            yerr = [s * 1000 for s in self._monitor_stds]
+            ax.errorbar(xs, ys, yerr=yerr, marker="o", ms=3, color="#47b8e0",
+                        linewidth=0.8, ecolor="#6f8ea0", elinewidth=0.8, capsize=2)
             # integer-only ticks on the pattern axis (1, 2, 3, …)
             ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             ax.set_xlim(0.5, n + 0.5)
@@ -4242,6 +4280,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _monitor_clear(self) -> None:
         self._monitor_values = []
+        self._monitor_stds = []
         self.mon_count_label.setText("0 patterns")
         self._monitor_draw()
 
@@ -4257,9 +4296,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         with open(path, "w", encoding="utf-8", newline="") as f:
             writer = _csv.writer(f)
-            writer.writerow(["pattern", "mean_V"])
-            for i, v in enumerate(self._monitor_values, start=1):
-                writer.writerow([i, v])
+            writer.writerow(["pattern", "mean_V", "std_V"])
+            for i, (v, s) in enumerate(
+                zip(self._monitor_values, self._monitor_stds), start=1
+            ):
+                writer.writerow([i, v, "" if s != s else s])  # blank for NaN std
         self._log(f"Pattern readings saved: {path}")
 
     def _page_shell(self, title: str) -> QtWidgets.QWidget:
