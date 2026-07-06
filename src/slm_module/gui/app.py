@@ -897,6 +897,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_background_tab(), "Step 6 · BG Scatter")
         tabs.addTab(self._build_tpa_tab(), "Step 7 · TPA Efficiency")
         tabs.insertTab(0, self._build_pipeline_page(), "Pipeline")
+        tabs.addTab(self._build_stage3_reopt_page(), "Step 4b - Stage3 Reopt")
         self.calibration_tabs = tabs
         lay.addWidget(tabs)
 
@@ -907,6 +908,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_widgets[3]["run"],
             self.run_all_button,
             self.pipeline_run_button,
+            self.stage3_reopt_run_button,
         ]
         return page
 
@@ -1148,6 +1150,82 @@ class MainWindow(QtWidgets.QMainWindow):
         opt_grid.setColumnStretch(1, 1)
         layout.addWidget(optimization)
 
+        reopt = self._panel("Stage 3 Re-optimization")
+        reopt_grid = QtWidgets.QGridLayout(reopt)
+        self.pipeline_stage3_only_check = QtWidgets.QCheckBox(
+            "Use supplied Stage 1 level/profile data and skip Stage 1 search"
+        )
+        self.pipeline_stage3_only_check.setToolTip(
+            "Start from an existing 8-value Stage 1 level/profile JSON, rebuild "
+            "the amplitude LUT, and run Stage 3 with the scan settings below."
+        )
+        self.pipeline_stage3_only_check.toggled.connect(self._refresh_pipeline_ui)
+        reopt_grid.addWidget(self.pipeline_stage3_only_check, 0, 0, 1, 4)
+
+        self.pipeline_reopt_profile_edit = QtWidgets.QLineEdit()
+        self.pipeline_reopt_profile_edit.setPlaceholderText(
+            "stage1_result.json, final_result.json, or an 8-value profile file"
+        )
+        self.pipeline_reopt_profile_edit.setToolTip(
+            "JSON may be an array or use l, l_init, initial_l, final_l, "
+            "final_profile, or profile."
+        )
+        self.pipeline_reopt_profile_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_reopt_profile_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.pipeline_reopt_profile_edit,
+                "Select Stage 1 level/profile data",
+                "Profile Files (*.json *.csv *.txt)",
+            )
+        )
+        reopt_grid.addWidget(QtWidgets.QLabel("Stage 1 level/profile"), 1, 0)
+        reopt_grid.addWidget(self.pipeline_reopt_profile_edit, 1, 1, 1, 2)
+        reopt_grid.addWidget(self.pipeline_reopt_profile_button, 1, 3)
+
+        self.pipeline_reopt_calibration_edit = QtWidgets.QLineEdit()
+        self.pipeline_reopt_calibration_edit.setPlaceholderText(
+            "Existing quick intensity calibration JSON"
+        )
+        self.pipeline_reopt_calibration_edit.setToolTip(
+            "Fast single-channel re-optimization can reuse a saved one-pixel "
+            "quick intensity calibration instead of measuring the SLM range again."
+        )
+        self.pipeline_reopt_calibration_button = QtWidgets.QPushButton("Browse")
+        self.pipeline_reopt_calibration_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.pipeline_reopt_calibration_edit,
+                "Select quick intensity calibration",
+                "JSON Files (*.json)",
+            )
+        )
+        self.pipeline_reopt_calibration_label = QtWidgets.QLabel(
+            "Quick calibration input"
+        )
+        reopt_grid.addWidget(self.pipeline_reopt_calibration_label, 2, 0)
+        reopt_grid.addWidget(self.pipeline_reopt_calibration_edit, 2, 1, 1, 2)
+        reopt_grid.addWidget(self.pipeline_reopt_calibration_button, 2, 3)
+
+        self.pipeline_reopt_sensitivity_combo = QtWidgets.QComboBox()
+        self.pipeline_reopt_sensitivity_combo.addItems(
+            ["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"]
+        )
+        self.pipeline_reopt_sensitivity_combo.setCurrentText("HIGH1")
+        self.pipeline_reopt_averages_spin = self._spin(1, 20, 1)
+        self.pipeline_reopt_stage2_repeats_spin = self._spin(1, 20, 3)
+        self.pipeline_reopt_stage3_maxfev_spin = self._spin(1, 500, 100)
+        self.pipeline_reopt_rerank_averages_spin = self._spin(1, 20, 3)
+        reopt_grid.addWidget(QtWidgets.QLabel("Sensitivity"), 3, 0)
+        reopt_grid.addWidget(self.pipeline_reopt_sensitivity_combo, 3, 1)
+        reopt_grid.addWidget(QtWidgets.QLabel("OSA averages"), 3, 2)
+        reopt_grid.addWidget(self.pipeline_reopt_averages_spin, 3, 3)
+        reopt_grid.addWidget(QtWidgets.QLabel("Stage3 baseline repeats"), 4, 0)
+        reopt_grid.addWidget(self.pipeline_reopt_stage2_repeats_spin, 4, 1)
+        reopt_grid.addWidget(QtWidgets.QLabel("Stage3 max evals"), 4, 2)
+        reopt_grid.addWidget(self.pipeline_reopt_stage3_maxfev_spin, 4, 3)
+        reopt_grid.addWidget(QtWidgets.QLabel("Rerank averages"), 5, 0)
+        reopt_grid.addWidget(self.pipeline_reopt_rerank_averages_spin, 5, 1)
+        reopt_grid.setColumnStretch(1, 1)
+
         layout.addWidget(
             self._caption(
                 "A selected prerequisite supplies its output file. A skipped "
@@ -1218,6 +1296,9 @@ class MainWindow(QtWidgets.QMainWindow):
         quick_optimization = (
             optimize_selected and self.pipeline_quick_optimization_check.isChecked()
         )
+        stage3_only = (
+            optimize_selected and self.pipeline_stage3_only_check.isChecked()
+        )
         source_step = 2 if quick_optimization else 3
         source_step_selected = source_step in selected
         optimization_external = optimize_selected and not source_step_selected
@@ -1253,14 +1334,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pipeline_quick_calibration_edit,
             self.pipeline_quick_calibration_button,
         ):
-            widget.setEnabled(quick_optimization)
+            widget.setEnabled(quick_optimization and not stage3_only)
         profile_from_file = self.pipeline_profile_source_combo.currentIndex() == 1
         self.pipeline_profile_source_combo.setEnabled(optimize_selected)
         self.pipeline_profile_values_edit.setEnabled(
-            optimize_selected and not profile_from_file
+            optimize_selected and not profile_from_file and not stage3_only
         )
-        self.pipeline_profile_edit.setEnabled(optimize_selected and profile_from_file)
-        self.pipeline_profile_button.setEnabled(optimize_selected and profile_from_file)
+        self.pipeline_profile_edit.setEnabled(
+            optimize_selected and profile_from_file and not stage3_only
+        )
+        self.pipeline_profile_button.setEnabled(
+            optimize_selected and profile_from_file and not stage3_only
+        )
+        self.pipeline_stage3_only_check.setEnabled(optimize_selected)
+        reopt_enabled = optimize_selected and stage3_only
+        for widget in (
+            self.pipeline_reopt_profile_edit,
+            self.pipeline_reopt_profile_button,
+            self.pipeline_reopt_sensitivity_combo,
+            self.pipeline_reopt_averages_spin,
+            self.pipeline_reopt_stage2_repeats_spin,
+            self.pipeline_reopt_stage3_maxfev_spin,
+            self.pipeline_reopt_rerank_averages_spin,
+        ):
+            widget.setEnabled(reopt_enabled)
+        reopt_quick_calibration_enabled = reopt_enabled and quick_optimization
+        for widget in (
+            self.pipeline_reopt_calibration_label,
+            self.pipeline_reopt_calibration_edit,
+            self.pipeline_reopt_calibration_button,
+        ):
+            widget.setEnabled(reopt_quick_calibration_enabled)
         for widget in (
             self.pipeline_optimization_root_edit,
             self.pipeline_optimization_root_button,
@@ -1281,6 +1385,153 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if path:
             self.pipeline_optimization_root_edit.setText(path)
+
+    def _build_stage3_reopt_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.addWidget(
+            self._caption(
+                "Standalone Stage 3 re-optimization. Provide a Step 2 wavelength "
+                "map, an existing one-pixel quick intensity calibration, and a "
+                "Stage 1 level/profile file. The run skips Stage 1 search and "
+                "rebuilds the LUT + Stage 3 optimisation with the settings below."
+            )
+        )
+
+        inputs = self._panel("Input files")
+        grid = QtWidgets.QGridLayout(inputs)
+        self.stage3_reopt_step2_edit = QtWidgets.QLineEdit()
+        self.stage3_reopt_step2_edit.setPlaceholderText("calib_step2.json")
+        self.stage3_reopt_step2_button = QtWidgets.QPushButton("Browse")
+        self.stage3_reopt_step2_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.stage3_reopt_step2_edit,
+                "Select Step 2 wavelength map",
+                "JSON Files (*.json)",
+            )
+        )
+        self.stage3_reopt_quick_calib_edit = QtWidgets.QLineEdit()
+        self.stage3_reopt_quick_calib_edit.setPlaceholderText(
+            "calib_quick_center.json"
+        )
+        self.stage3_reopt_quick_calib_button = QtWidgets.QPushButton("Browse")
+        self.stage3_reopt_quick_calib_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.stage3_reopt_quick_calib_edit,
+                "Select quick intensity calibration",
+                "JSON Files (*.json)",
+            )
+        )
+        self.stage3_reopt_profile_edit = QtWidgets.QLineEdit()
+        self.stage3_reopt_profile_edit.setPlaceholderText(
+            "stage1_result.json or another 8-value profile file"
+        )
+        self.stage3_reopt_profile_button = QtWidgets.QPushButton("Browse")
+        self.stage3_reopt_profile_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.stage3_reopt_profile_edit,
+                "Select Stage 1 level/profile data",
+                "Profile Files (*.json *.csv *.txt)",
+            )
+        )
+        grid.addWidget(QtWidgets.QLabel("Step 2 map"), 0, 0)
+        grid.addWidget(self.stage3_reopt_step2_edit, 0, 1)
+        grid.addWidget(self.stage3_reopt_step2_button, 0, 2)
+        grid.addWidget(QtWidgets.QLabel("Quick calibration"), 1, 0)
+        grid.addWidget(self.stage3_reopt_quick_calib_edit, 1, 1)
+        grid.addWidget(self.stage3_reopt_quick_calib_button, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Stage 1 level/profile"), 2, 0)
+        grid.addWidget(self.stage3_reopt_profile_edit, 2, 1)
+        grid.addWidget(self.stage3_reopt_profile_button, 2, 2)
+        grid.setColumnStretch(1, 1)
+        layout.addWidget(inputs)
+
+        cfg = self._panel("Target and scan settings")
+        cfg_grid = QtWidgets.QGridLayout(cfg)
+        self.stage3_reopt_center_wl_spin = self._double_spin(
+            700.0, 900.0, 778.0, " nm", 2
+        )
+        self.stage3_reopt_width_spin = self._spin(1, 256, 15)
+        self.stage3_reopt_gap_spin = self._spin(0, 64, 5)
+        self.stage3_reopt_span_edit = QtWidgets.QLineEdit("0.8nm")
+        self.stage3_reopt_sensitivity_combo = QtWidgets.QComboBox()
+        self.stage3_reopt_sensitivity_combo.addItems(
+            ["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"]
+        )
+        self.stage3_reopt_sensitivity_combo.setCurrentText("HIGH1")
+        self.stage3_reopt_ref_level_edit = QtWidgets.QLineEdit("10uW")
+        self.stage3_reopt_yunit_combo = QtWidgets.QComboBox()
+        self.stage3_reopt_yunit_combo.addItems(["LOG (dBm)", "LIN (W)"])
+        self.stage3_reopt_averages_spin = self._spin(1, 20, 1)
+        self.stage3_reopt_baseline_repeats_spin = self._spin(1, 20, 3)
+        self.stage3_reopt_maxeval_spin = self._spin(1, 500, 100)
+        self.stage3_reopt_rerank_averages_spin = self._spin(1, 20, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Centre wavelength"), 0, 0)
+        cfg_grid.addWidget(self.stage3_reopt_center_wl_spin, 0, 1)
+        cfg_grid.addWidget(QtWidgets.QLabel("Channel width"), 0, 2)
+        cfg_grid.addWidget(self.stage3_reopt_width_spin, 0, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Gap px"), 0, 4)
+        cfg_grid.addWidget(self.stage3_reopt_gap_spin, 0, 5)
+        cfg_grid.addWidget(QtWidgets.QLabel("Span"), 1, 0)
+        cfg_grid.addWidget(self.stage3_reopt_span_edit, 1, 1)
+        cfg_grid.addWidget(QtWidgets.QLabel("Sensitivity"), 1, 2)
+        cfg_grid.addWidget(self.stage3_reopt_sensitivity_combo, 1, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Ref level"), 1, 4)
+        cfg_grid.addWidget(self.stage3_reopt_ref_level_edit, 1, 5)
+        cfg_grid.addWidget(QtWidgets.QLabel("Y unit"), 2, 0)
+        cfg_grid.addWidget(self.stage3_reopt_yunit_combo, 2, 1)
+        cfg_grid.addWidget(QtWidgets.QLabel("OSA averages"), 2, 2)
+        cfg_grid.addWidget(self.stage3_reopt_averages_spin, 2, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Stage3 baseline repeats"), 3, 0)
+        cfg_grid.addWidget(self.stage3_reopt_baseline_repeats_spin, 3, 1)
+        cfg_grid.addWidget(QtWidgets.QLabel("Stage3 max evals"), 3, 2)
+        cfg_grid.addWidget(self.stage3_reopt_maxeval_spin, 3, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Rerank averages"), 3, 4)
+        cfg_grid.addWidget(self.stage3_reopt_rerank_averages_spin, 3, 5)
+        layout.addWidget(cfg)
+
+        out = self._panel("Output")
+        out_grid = QtWidgets.QGridLayout(out)
+        self.stage3_reopt_root_edit = QtWidgets.QLineEdit("data/osa_optimization")
+        self.stage3_reopt_root_button = QtWidgets.QPushButton("Browse")
+        self.stage3_reopt_root_button.clicked.connect(
+            self._browse_stage3_reopt_root
+        )
+        self.stage3_reopt_name_edit = QtWidgets.QLineEdit()
+        self.stage3_reopt_name_edit.setPlaceholderText(
+            "Optional; blank uses a timestamped run directory"
+        )
+        out_grid.addWidget(QtWidgets.QLabel("Output root"), 0, 0)
+        out_grid.addWidget(self.stage3_reopt_root_edit, 0, 1)
+        out_grid.addWidget(self.stage3_reopt_root_button, 0, 2)
+        out_grid.addWidget(QtWidgets.QLabel("Run name"), 1, 0)
+        out_grid.addWidget(self.stage3_reopt_name_edit, 1, 1, 1, 2)
+        out_grid.setColumnStretch(1, 1)
+        layout.addWidget(out)
+
+        self.stage3_reopt_status_label = QtWidgets.QLabel("Ready")
+        self.stage3_reopt_run_button = QtWidgets.QPushButton("Run Stage 3 Reopt")
+        self.stage3_reopt_run_button.clicked.connect(self._run_stage3_reoptimization)
+        self.stage3_reopt_stop_button = QtWidgets.QPushButton("Stop")
+        self.stage3_reopt_stop_button.setProperty("variant", "danger")
+        self.stage3_reopt_stop_button.setEnabled(False)
+        self.stage3_reopt_stop_button.clicked.connect(self._stop_full_calibration)
+        action = QtWidgets.QHBoxLayout()
+        action.addWidget(self.stage3_reopt_status_label, 1)
+        action.addWidget(self.stage3_reopt_run_button)
+        action.addWidget(self.stage3_reopt_stop_button)
+        layout.addLayout(action)
+        layout.addStretch(1)
+        return page
+
+    def _browse_stage3_reopt_root(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Stage 3 re-optimization output root",
+            self.stage3_reopt_root_edit.text().strip() or ".",
+        )
+        if path:
+            self.stage3_reopt_root_edit.setText(path)
 
     def _build_step3_page(self) -> QtWidgets.QWidget:
         """Step 3 (intensity) config + Run-All + the calibration fit/plots (full page)."""
@@ -4823,6 +5074,8 @@ class MainWindow(QtWidgets.QMainWindow):
             button.setEnabled(connected and not running)
         self.stop_cal_button.setEnabled(running)
         self.pipeline_stop_button.setEnabled(running)
+        if hasattr(self, "stage3_reopt_stop_button"):
+            self.stage3_reopt_stop_button.setEnabled(running)
         self.osa_connect_button.setEnabled(not running and not connected)
         self.osa_disconnect_button.setEnabled(not running and connected)
         self._refresh_pipeline_ui()
@@ -5182,6 +5435,7 @@ class MainWindow(QtWidgets.QMainWindow):
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 for key in (
+                    "l",
                     "l_init",
                     "final_l",
                     "final_profile",
@@ -5193,7 +5447,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
                 else:
                     raise ValueError(
-                        "profile JSON must contain l_init, initial_l, final_l, "
+                        "profile JSON must contain l, l_init, initial_l, final_l, "
                         "final_profile, or profile"
                     )
             values = payload
@@ -5270,6 +5524,161 @@ class MainWindow(QtWidgets.QMainWindow):
             center_wl=center_wl,
         )
 
+    def _run_stage3_reoptimization(self) -> None:
+        """Standalone quick Stage-3 re-optimisation from saved files."""
+        osa = self._osa_ready()
+        if osa is None:
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            return self._reject_calibration(
+                ValueError("open the SLM before running Stage 3 re-optimization")
+            )
+        try:
+            center_wl = self.stage3_reopt_center_wl_spin.value()
+            channel_width = self.stage3_reopt_width_spin.value()
+            gap_px = self.stage3_reopt_gap_spin.value()
+            if channel_width != 15:
+                raise ValueError(
+                    "Stage 3 re-optimization requires a 15 px channel width"
+                )
+            step2_path = self._pipeline_file_path(
+                self.stage3_reopt_step2_edit,
+                "Stage 3 re-optimization Step 2 map",
+                must_exist=True,
+            )
+            quick_calibration_path = self._pipeline_file_path(
+                self.stage3_reopt_quick_calib_edit,
+                "Stage 3 re-optimization quick calibration",
+                must_exist=True,
+            )
+            profile_path = self._pipeline_file_path(
+                self.stage3_reopt_profile_edit,
+                "Stage 3 re-optimization profile",
+                must_exist=True,
+            )
+            initial_l = self._load_pipeline_initial_profile(profile_path)
+            step2_calibration = self._load_pipeline_wavelength_calibration(
+                step2_path, target_wavelength_nm=center_wl
+            )
+            quick_calibration = self._load_pipeline_quick_intensity_calibration(
+                quick_calibration_path
+            )
+            optimization_layout, quick_target_coordinate = build_single_anchor_layout(
+                step2_calibration,
+                quick_calibration,
+                target_wavelength_nm=center_wl,
+                channel_width_px=channel_width,
+                gap_px=gap_px,
+            )
+            output_root = self._pipeline_directory_path(
+                self.stage3_reopt_root_edit,
+                "Stage 3 re-optimization output root",
+            )
+            run_name = self.stage3_reopt_name_edit.text().strip() or None
+            if run_name is not None and (
+                Path(run_name).name != run_name or run_name in (".", "..")
+            ):
+                raise ValueError("Stage 3 re-optimization run name must be one directory name")
+            y_unit = (
+                "LOGarithmic"
+                if self.stage3_reopt_yunit_combo.currentText().startswith("LOG")
+                else "LINear"
+            )
+            optimization_settings = MeasurementSettings(
+                center_wl=f"{center_wl:g}nm",
+                span=self.stage3_reopt_span_edit.text().strip() or "0.8nm",
+                sensitivity=self.stage3_reopt_sensitivity_combo.currentText(),
+                sampling_points="1001",
+                y_unit=y_unit,
+                reference_level=(
+                    self.stage3_reopt_ref_level_edit.text().strip() or "10uW"
+                ),
+            )
+            optimization_config = OSAOptimizationConfig(
+                settings=optimization_settings,
+                anchor_offsets=(0,),
+                full_validation=False,
+                output_root=str(output_root),
+                run_name=run_name,
+                averages=self.stage3_reopt_averages_spin.value(),
+                rerank_averages=self.stage3_reopt_rerank_averages_spin.value(),
+                stage2_repeats=self.stage3_reopt_baseline_repeats_spin.value(),
+                stage3_maxfev=self.stage3_reopt_maxeval_spin.value(),
+                skip_stage1=True,
+            )
+            quick_measured_range = (
+                int(quick_calibration.min_level),
+                int(quick_calibration.max_level),
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return self._reject_calibration(exc)
+
+        self.stage3_reopt_status_label.setText("Running Stage 3 re-optimization")
+        self._edge_gain_running(True)
+        self.edge_gain_bar.setRange(0, 0)
+        self.edge_gain_status.setText(
+            "Stage 3 re-optimization running from standalone panel"
+        )
+
+        def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
+            report(
+                CalibrationProgress(
+                    phase="stage3_reopt_setup",
+                    step=0,
+                    total=1,
+                    message=(
+                        f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} px; "
+                        "using supplied Stage 1 profile"
+                    ),
+                    x=quick_target_coordinate,
+                    y=center_wl,
+                )
+            )
+
+            def report_optimization(progress: OptimizationProgress) -> None:
+                self.edge_optimization_progress.emit(progress)
+                report(
+                    CalibrationProgress(
+                        phase=f"optimization: {progress.stage}",
+                        step=progress.step,
+                        total=max(progress.total, 1),
+                        message=progress.message,
+                        x=float(progress.step),
+                        y=progress.best_loss,
+                    )
+                )
+
+            try:
+                optimization_result = optimize_from_osa(
+                    optimization_layout,
+                    osa=osa,
+                    slm=controller,
+                    initial_l=initial_l,
+                    config=optimization_config,
+                    stop_event=stop_event,
+                    progress_callback=report_optimization,
+                )
+            except OptimizationAborted:
+                return {"status": "aborted"}
+            final_path = Path(
+                optimization_result.run_dir, "final_result.json"
+            ).resolve()
+            return {
+                "status": "ok",
+                "step": "stage3_reopt",
+                "result": quick_calibration,
+                "saved": final_path,
+                "optimization_result": optimization_result,
+                "optimization_layout": optimization_layout,
+                "quick_target_coordinate": quick_target_coordinate,
+                "quick_measured_range": quick_measured_range,
+                "summary": "Stage 3 re-optimization complete",
+            }
+
+        self._launch_calibration("Stage 3 re-optimization", work)
+        self.edge_gain_stop_event = self.calibration_stop_event
+
     def _run_pipeline(self) -> None:
         """Run any selected steps, using files as the only inter-step boundary."""
         osa = self._osa_ready()
@@ -5286,6 +5695,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         quick_optimization = (
             4 in selected and self.pipeline_quick_optimization_check.isChecked()
+        )
+        stage3_only = (
+            4 in selected and self.pipeline_stage3_only_check.isChecked()
         )
 
         try:
@@ -5323,6 +5735,7 @@ class MainWindow(QtWidgets.QMainWindow):
             optimization_root = None
             optimization_run_name = None
             quick_calibration_output = None
+            quick_calibration_input = None
             if 4 in selected:
                 optimization_source_step = 2 if quick_optimization else 3
                 if optimization_source_step not in selected:
@@ -5331,12 +5744,24 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Encoding Optimization Step {optimization_source_step} input",
                         must_exist=True,
                     )
-                if quick_optimization:
+                if quick_optimization and stage3_only:
+                    quick_calibration_input = self._pipeline_file_path(
+                        self.pipeline_reopt_calibration_edit,
+                        "Quick centre calibration input",
+                        must_exist=True,
+                    )
+                elif quick_optimization:
                     quick_calibration_output = self._pipeline_file_path(
                         self.pipeline_quick_calibration_edit,
                         "Quick centre calibration output",
                     )
-                if self.pipeline_profile_source_combo.currentIndex() == 1:
+                if stage3_only:
+                    profile_path = self._pipeline_file_path(
+                        self.pipeline_reopt_profile_edit,
+                        "Stage 1 level/profile data",
+                        must_exist=True,
+                    )
+                elif self.pipeline_profile_source_combo.currentIndex() == 1:
                     profile_path = self._pipeline_file_path(
                         self.pipeline_profile_edit,
                         "Encoding Optimization initial profile",
@@ -5369,6 +5794,8 @@ class MainWindow(QtWidgets.QMainWindow):
             external_file_paths = list(external_inputs.values())
             if optimization_calibration_input is not None:
                 external_file_paths.append(optimization_calibration_input)
+            if quick_calibration_input is not None:
+                external_file_paths.append(quick_calibration_input)
             if profile_path is not None:
                 external_file_paths.append(profile_path)
             collisions = set(output_paths).intersection(external_file_paths)
@@ -5398,6 +5825,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if 4 in selected:
                 if profile_path is not None:
                     self._load_pipeline_initial_profile(profile_path)
+                if quick_calibration_input is not None:
+                    self._load_pipeline_quick_intensity_calibration(
+                        quick_calibration_input
+                    )
                 if optimization_calibration_input is not None:
                     if quick_optimization:
                         self._load_pipeline_wavelength_calibration(
@@ -5420,7 +5851,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._parse_pipeline_quick_levels(
                     self.pipeline_quick_levels_edit.text()
                 )
-                if quick_optimization
+                if quick_optimization and not stage3_only
                 else None
             )
             window2 = self.step_widgets[2]["window"].value() if 2 in selected else None
@@ -5457,10 +5888,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Encoding Optimization requires a 15 px channel width"
                     )
                 ana = self._ana_settings()
+                opt_sensitivity = (
+                    self.pipeline_reopt_sensitivity_combo.currentText()
+                    if stage3_only
+                    else ana.sensitivity
+                )
                 optimization_settings = MeasurementSettings(
                     center_wl=f"{center_wl:g}nm",
                     span="0.8nm",
-                    sensitivity=ana.sensitivity,
+                    sensitivity=opt_sensitivity,
                     sampling_points="1001",
                     y_unit=ana.y_unit,
                     reference_level=ana.reference_level,
@@ -5474,6 +5910,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     full_validation=not quick_optimization,
                     output_root=str(optimization_root),
                     run_name=optimization_run_name,
+                    averages=(
+                        self.pipeline_reopt_averages_spin.value()
+                        if stage3_only
+                        else OSAOptimizationConfig.averages
+                    ),
+                    rerank_averages=(
+                        self.pipeline_reopt_rerank_averages_spin.value()
+                        if stage3_only
+                        else OSAOptimizationConfig.rerank_averages
+                    ),
+                    stage2_repeats=(
+                        self.pipeline_reopt_stage2_repeats_spin.value()
+                        if stage3_only
+                        else OSAOptimizationConfig.stage2_repeats
+                    ),
+                    stage3_maxfev=(
+                        self.pipeline_reopt_stage3_maxfev_spin.value()
+                        if stage3_only
+                        else OSAOptimizationConfig.stage3_maxfev
+                    ),
+                    skip_stage1=stage3_only,
                 )
                 if quick_optimization:
                     quick_settings = self._step_settings(3)
@@ -5509,9 +5966,17 @@ class MainWindow(QtWidgets.QMainWindow):
             2: "Step 2",
             3: "Step 3",
             4: (
-                "Quick Single-Channel Optimization"
-                if quick_optimization
-                else "Encoding Optimization"
+                "Quick Stage 3 Re-optimization"
+                if quick_optimization and stage3_only
+                else (
+                    "Stage 3 Re-optimization"
+                    if stage3_only
+                    else (
+                        "Quick Single-Channel Optimization"
+                        if quick_optimization
+                        else "Encoding Optimization"
+                    )
+                )
             ),
         }
         sequence = " -> ".join(stage_names[step] for step in selected)
@@ -5609,10 +6074,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         else optimization_calibration_input
                     )
                     assert step2_path is not None
-                    assert quick_calibration_output is not None
-                    assert quick_levels is not None
-                    assert quick_settings is not None
-                    assert quick_window is not None
                     step2_calibration = self._load_pipeline_wavelength_calibration(
                         step2_path, target_wavelength_nm=center_wl
                     )
@@ -5620,61 +6081,90 @@ class MainWindow(QtWidgets.QMainWindow):
                         step2_calibration, center_wl
                     )
                     target_pixel = int(round(quick_target_coordinate))
-                    report(
-                        CalibrationProgress(
-                            phase="quick_center",
-                            step=0,
-                            total=1,
-                            message=(
-                                f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
-                                f"px; calibrating pixel {target_pixel}"
+                    if stage3_only:
+                        assert quick_calibration_input is not None
+                        report(
+                            CalibrationProgress(
+                                phase="quick_center",
+                                step=0,
+                                total=1,
+                                message=(
+                                    f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
+                                    f"px; reusing saved quick calibration"
+                                ),
+                                x=quick_target_coordinate,
+                                y=center_wl,
+                            )
+                        )
+                        optimization_calibration = (
+                            self._load_pipeline_quick_intensity_calibration(
+                                quick_calibration_input
+                            )
+                        )
+                        quick_measured_range = (
+                            int(optimization_calibration.min_level),
+                            int(optimization_calibration.max_level),
+                        )
+                    else:
+                        assert quick_calibration_output is not None
+                        assert quick_levels is not None
+                        assert quick_settings is not None
+                        assert quick_window is not None
+                        report(
+                            CalibrationProgress(
+                                phase="quick_center",
+                                step=0,
+                                total=1,
+                                message=(
+                                    f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
+                                    f"px; calibrating pixel {target_pixel}"
+                                ),
+                                x=quick_target_coordinate,
+                                y=center_wl,
+                            )
+                        )
+                        quick_seed = CalibrationResult(
+                            wavelength=np.asarray([center_wl], dtype=float),
+                            coordinates=np.asarray([target_pixel], dtype=float),
+                            max_level=int(quick_levels[-1]),
+                            min_level=int(quick_levels[0]),
+                            level_range=np.asarray(quick_levels, dtype=int),
+                            wavelength_fit_coefficients=(
+                                step2_calibration.wavelength_fit_coefficients
                             ),
-                            x=quick_target_coordinate,
-                            y=center_wl,
                         )
-                    )
-                    quick_seed = CalibrationResult(
-                        wavelength=np.asarray([center_wl], dtype=float),
-                        coordinates=np.asarray([target_pixel], dtype=float),
-                        max_level=int(quick_levels[-1]),
-                        min_level=int(quick_levels[0]),
-                        level_range=np.asarray(quick_levels, dtype=int),
-                        wavelength_fit_coefficients=(
-                            step2_calibration.wavelength_fit_coefficients
-                        ),
-                    )
-                    quick_result = intensity_calibration(
-                        osa,
-                        controller,
-                        quick_levels,
-                        quick_settings,
-                        quick_seed,
-                        window_size=quick_window,
-                        wavelength_window_nm=quick_avg_nm,
-                        sweep_span_nm=quick_sweep_nm,
-                        coordinate_stride=1,
-                        refine_wavelength=False,
-                        region=None,
-                        stop_event=stop_event,
-                        progress_callback=report,
-                    )
-                    quick_result = restrict_to_measured_intensity_range(
-                        quick_result
-                    )
-                    quick_measured_range = (
-                        int(quick_result.min_level),
-                        int(quick_result.max_level),
-                    )
-                    saved_files.append(
-                        save_calibration_result(
-                            quick_result, quick_calibration_output
+                        quick_result = intensity_calibration(
+                            osa,
+                            controller,
+                            quick_levels,
+                            quick_settings,
+                            quick_seed,
+                            window_size=quick_window,
+                            wavelength_window_nm=quick_avg_nm,
+                            sweep_span_nm=quick_sweep_nm,
+                            coordinate_stride=1,
+                            refine_wavelength=False,
+                            region=None,
+                            stop_event=stop_event,
+                            progress_callback=report,
                         )
-                    )
-                    optimization_calibration = (
-                        self._load_pipeline_quick_intensity_calibration(
-                            quick_calibration_output
+                        quick_result = restrict_to_measured_intensity_range(
+                            quick_result
                         )
-                    )
+                        quick_measured_range = (
+                            int(quick_result.min_level),
+                            int(quick_result.max_level),
+                        )
+                        saved_files.append(
+                            save_calibration_result(
+                                quick_result, quick_calibration_output
+                            )
+                        )
+                        optimization_calibration = (
+                            self._load_pipeline_quick_intensity_calibration(
+                                quick_calibration_output
+                            )
+                        )
                     optimization_layout, quick_target_coordinate = (
                         build_single_anchor_layout(
                             step2_calibration,
@@ -5893,6 +6383,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if active_label == "Run pipeline":
                 self.pipeline_status_label.setText("Stopped")
                 self.pipeline_log.appendPlainText("Pipeline stopped")
+            if active_label == "Stage 3 re-optimization":
+                self.stage3_reopt_status_label.setText("Stopped")
+                self.edge_gain_stop_event = None
+                self._edge_gain_running(False)
+                self.edge_gain_bar.setRange(0, 100)
+                self.edge_gain_bar.setValue(0)
+                self.edge_gain_status.setText(
+                    "Stage 3 re-optimization stopped; checkpoints were retained."
+                )
             if self.calibration_dialog is not None:
                 self.calibration_dialog.finish(False, "Calibration stopped")
             return
@@ -5957,6 +6456,42 @@ class MainWindow(QtWidgets.QMainWindow):
                         "the candidate profile and LUT were not applied."
                     )
                 self.pipeline_log.appendPlainText(message)
+        elif step == "stage3_reopt":
+            self.stage3_reopt_status_label.setText(f"Done - {summary}")
+            quick_target_coordinate = payload.get("quick_target_coordinate")
+            quick_measured_range = payload.get("quick_measured_range")
+            if quick_target_coordinate is not None:
+                self._log(
+                    "Stage 3 reopt target: "
+                    f"x={float(quick_target_coordinate):.3f} px "
+                    f"(physical pixel {int(round(float(quick_target_coordinate)))})"
+                )
+            if quick_measured_range is not None:
+                self._log(
+                    "Stage 3 reopt quick range: "
+                    f"off {int(quick_measured_range[0])}, "
+                    f"on {int(quick_measured_range[1])}"
+                )
+            optimization_result = payload.get("optimization_result")
+            optimization_layout = payload.get("optimization_layout")
+            if optimization_result is not None and optimization_layout is not None:
+                self.edge_gain_stop_event = None
+                self._enc_calib_override = result
+                self.encoding_layout = optimization_layout
+                self._enc_populate_val_table(optimization_layout)
+                self._edge_sync_layout(optimization_layout)
+                self.enc_calib_label.setText(
+                    "Calibration: Stage 3 reopt quick calibration"
+                )
+                self.enc_layout_status.setText(
+                    f"Stage 3 reopt layout: {optimization_layout.n_channels} "
+                    f"channels/side, width {optimization_layout.channel_width_px} px, "
+                    f"pitch {optimization_layout.pitch_px} px"
+                )
+                self.enc_generate_button.setEnabled(True)
+                self._edge_optimization_finished(
+                    {"status": "ok", "result": optimization_result}
+                )
         if saved is not None:
             self._log(f"Saved {saved}")
 
@@ -5964,6 +6499,8 @@ class MainWindow(QtWidgets.QMainWindow):
             label = "Run all"
         elif step == "pipeline":
             label = "Pipeline"
+        elif step == "stage3_reopt":
+            label = "Stage 3 re-optimization"
         else:
             label = f"Step {step}"
         self._log(f"{label} done: {summary}")
@@ -5989,6 +6526,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if active_label == "Run pipeline":
             self.pipeline_status_label.setText("Failed")
             self.pipeline_log.appendPlainText("Pipeline failed; see the main log.")
+        if active_label == "Stage 3 re-optimization":
+            self.stage3_reopt_status_label.setText("Failed")
+            self.edge_gain_stop_event = None
+            self._edge_gain_running(False)
+            self.edge_gain_bar.setRange(0, 100)
+            self.edge_gain_bar.setValue(0)
+            self.edge_gain_status.setText("Stage 3 re-optimization failed.")
         if self._pipeline_optimization_active:
             self._pipeline_optimization_active = False
             self.edge_gain_stop_event = None

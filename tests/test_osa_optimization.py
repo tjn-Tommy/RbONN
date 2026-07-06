@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -352,6 +353,47 @@ class EvaluatorIntegrationTests(unittest.TestCase):
             np.testing.assert_allclose(loaded.final_l, result.final_l)
             self.assertEqual(set(loaded.final_luts), set(result.final_luts))
             self.assertEqual(loaded.accepted, result.accepted)
+
+    def test_skip_stage1_uses_supplied_profile_as_stage1_result(self) -> None:
+        layout = _hardware_layout()
+        slm = _HardwareSLM()
+        osa = _HardwareOSA(slm, layout)
+        initial = np.linspace(0.7, 1.0, 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = OSAOptimizationConfig(
+                settings=MeasurementSettings(
+                    center_wl="778nm", span="0.8nm", sampling_points="1001",
+                    y_unit="LINear"
+                ),
+                anchor_offsets=(0,),
+                averages=1,
+                rerank_averages=1,
+                baseline_repeats=2,
+                stage2_repeats=1,
+                stage1_maxfev=5,
+                stage3_maxfev=1,
+                stage1_top_k=1,
+                stage3_top_k=1,
+                max_alternations=1,
+                final_lut_points=5,
+                lut_self_consistency=False,
+                discrete_refine=False,
+                reference_interval_candidates=0,
+                skip_stage1=True,
+                output_root=tmp,
+                run_name="skip_stage1",
+            )
+            result = run_osa_optimization(
+                osa, slm, layout, initial, config=config
+            )
+            np.testing.assert_allclose(result.stage1_l, initial)
+            stage1_payload = json.loads(
+                Path(result.run_dir, "stage1_result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(stage1_payload["skipped"])
+            np.testing.assert_allclose(stage1_payload["l"], initial)
 
 
 if __name__ == "__main__":

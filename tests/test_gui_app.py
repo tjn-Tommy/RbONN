@@ -148,6 +148,42 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_pipeline_loads_stage1_result_profile_key(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            expected = np.linspace(0.2, 0.9, 8)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "stage1_result.json"
+                path.write_text(
+                    json.dumps({"l": expected.tolist(), "skipped": True}),
+                    encoding="utf-8",
+                )
+                parsed = window._load_pipeline_initial_profile(path)
+            np.testing.assert_allclose(parsed, expected)
+        finally:
+            window.close()
+
+    def test_pipeline_stage3_reoptimization_controls(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            self.assertFalse(window.pipeline_stage3_only_check.isEnabled())
+
+            window.pipeline_checks[4].setChecked(True)
+            window.pipeline_stage3_only_check.setChecked(True)
+            self.assertTrue(window.pipeline_reopt_profile_edit.isEnabled())
+            self.assertTrue(window.pipeline_reopt_sensitivity_combo.isEnabled())
+            self.assertFalse(window.pipeline_profile_values_edit.isEnabled())
+
+            window.pipeline_quick_optimization_check.setChecked(True)
+            self.assertTrue(window.pipeline_reopt_calibration_edit.isEnabled())
+            self.assertFalse(window.pipeline_quick_levels_edit.isEnabled())
+        finally:
+            window.close()
+
     def test_pipeline_quick_optimization_uses_step2_source(self) -> None:
         from slm_module.gui.app import MainWindow
 

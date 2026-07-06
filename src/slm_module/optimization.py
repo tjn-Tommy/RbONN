@@ -399,6 +399,7 @@ class OSAOptimizationConfig:
     modulation_amplitudes: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     discrete_refine: bool = True
     discrete_step: float = 0.01
+    skip_stage1: bool = False
     output_root: str = "data/osa_optimization"
     run_name: str | None = None
     resume: bool = False
@@ -1631,8 +1632,15 @@ class OptimizationRunner:
         self.evaluator.calibrate_all()
         self._measure_initial_baseline()
 
-        stage1_l = self._run_stage1()
-        self.store.write_json("stage1_result.json", {"l": stage1_l})
+        if self.config.skip_stage1:
+            stage1_l = self.initial_l.copy()
+            self.store.write_json(
+                "stage1_result.json",
+                {"l": stage1_l, "skipped": True},
+            )
+        else:
+            stage1_l = self._run_stage1()
+            self.store.write_json("stage1_result.json", {"l": stage1_l})
 
         self.evaluator.refresh_all_references(stage="stage2_reference")
         references = self._build_luts(stage1_l, stage="stage2_lut")
@@ -1743,7 +1751,10 @@ class OptimizationRunner:
                     acceptance_issues.append(
                         f"anchor {offset:+d}: RMSE did not match the initial profile within 2 sigma"
                     )
-                if initial_metric.c_total - final_metric.c_total <= self.c_floor:
+                if (
+                    not self.config.skip_stage1
+                    and initial_metric.c_total - final_metric.c_total <= self.c_floor
+                ):
                     acceptance_issues.append(
                         f"anchor {offset:+d}: crosstalk improvement did not exceed 2-sigma floor"
                     )
