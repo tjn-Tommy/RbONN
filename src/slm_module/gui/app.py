@@ -624,6 +624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_gain_stop_event: threading.Event | None = None
         self._qt_test: dict[str, ChannelSpectrum] | None = None  # quick-test A/B result
         self.qt_test_stop_event: threading.Event | None = None
+        self.qt_layout: ChannelLayout | None = None  # quick-test layout from picked calib
         self.osa_view_trace = None                # last OSA viewer trace (for save)
         self.osa_view_stop_event: threading.Event | None = None
         self._enc_wheel_step = 0.2   # scroll sensitivity for channel value cells
@@ -3708,14 +3709,90 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle.setWordWrap(True)
         page.layout().addWidget(subtitle)
 
+        # --- calibration source (Quick-Test-local layout) ---
+        src = self._panel("Calibration source")
+        src_v = QtWidgets.QVBoxLayout(src)
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("Source"))
+        self.qt_calib_mode = QtWidgets.QComboBox()
+        self.qt_calib_mode.addItems([
+            "TPA Encoding page (built layout)",
+            "Step 3 file (complete)",
+            "Step 1 + Step 2 files (coarse)",
+        ])
+        self.qt_calib_mode.setToolTip(
+            "Where this page's channel layout comes from. A Step 3 file carries the "
+            "full measured intensity curves; Step 1 + Step 2 has no intensity data, "
+            "so a coarse linear curve is synthesised from Step 1's min/max levels."
+        )
+        self.qt_calib_mode.currentIndexChanged.connect(self._qt_calib_mode_changed)
+        mode_row.addWidget(self.qt_calib_mode, 1)
+        src_v.addLayout(mode_row)
+
+        json_filt = "Calibration JSON (*.json);;All files (*)"
+        self.qt_calib_s3_edit = QtWidgets.QLineEdit()
+        self.qt_calib_s3_edit.setPlaceholderText("calib_step3.json  (coordinates + intensity)")
+        self.qt_calib_s3_row = self._qt_file_row(
+            "Step 3 file", self.qt_calib_s3_edit,
+            lambda: self._browse_open_into(
+                self.qt_calib_s3_edit, "Open Step 3 calibration", json_filt),
+        )
+        src_v.addWidget(self.qt_calib_s3_row)
+
+        self.qt_calib_s1_edit = QtWidgets.QLineEdit()
+        self.qt_calib_s1_edit.setPlaceholderText("calib_step1.json  (min/max levels)")
+        self.qt_calib_s2_edit = QtWidgets.QLineEdit()
+        self.qt_calib_s2_edit.setPlaceholderText("calib_step2.json  (wavelength map)")
+        self.qt_calib_s12_row = QtWidgets.QWidget()
+        s12v = QtWidgets.QVBoxLayout(self.qt_calib_s12_row)
+        s12v.setContentsMargins(0, 0, 0, 0)
+        s12v.addWidget(self._qt_file_row(
+            "Step 1 (min/max)", self.qt_calib_s1_edit,
+            lambda: self._browse_open_into(
+                self.qt_calib_s1_edit, "Open Step 1 calibration", json_filt)))
+        s12v.addWidget(self._qt_file_row(
+            "Step 2 (wavelength)", self.qt_calib_s2_edit,
+            lambda: self._browse_open_into(
+                self.qt_calib_s2_edit, "Open Step 2 calibration", json_filt)))
+        src_v.addWidget(self.qt_calib_s12_row)
+
+        # layout geometry, used only when building from files
+        self.qt_calib_params = QtWidgets.QWidget()
+        pv = QtWidgets.QHBoxLayout(self.qt_calib_params)
+        pv.setContentsMargins(0, 0, 0, 0)
+        self.qt_calib_center = self._double_spin(700.0, 900.0, 778.0, " nm", 2)
+        self.qt_calib_width = self._spin(1, 256, 15)
+        self.qt_calib_pad = self._spin(0, 64, 5)
+        pv.addWidget(QtWidgets.QLabel("Center λ")); pv.addWidget(self.qt_calib_center)
+        pv.addWidget(QtWidgets.QLabel("Width px")); pv.addWidget(self.qt_calib_width)
+        pv.addWidget(QtWidgets.QLabel("Pad px")); pv.addWidget(self.qt_calib_pad)
+        pv.addStretch(1)
+        src_v.addWidget(self.qt_calib_params)
+
+        build_row = QtWidgets.QHBoxLayout()
+        self.qt_calib_build_btn = QtWidgets.QPushButton("Build layout from calibration")
+        self.qt_calib_build_btn.clicked.connect(self._qt_build_layout)
+        build_row.addWidget(self.qt_calib_build_btn)
+        build_row.addStretch(1)
+        src_v.addLayout(build_row)
+
+        self.qt_calib_label = QtWidgets.QLabel(
+            "Using the layout built on the TPA Encoding page."
+        )
+        self.qt_calib_label.setObjectName("PageSubtitle")
+        self.qt_calib_label.setWordWrap(True)
+        src_v.addWidget(self.qt_calib_label)
+        page.layout().addWidget(src)
+
         # --- test target controls ---
         cfg = self._panel("Test Target")
         grid = QtWidgets.QGridLayout(cfg)
-        self.qt_side_combo = QtWidgets.QComboBox()
-        self.qt_side_combo.addItems(["x", "w"])
-        self.qt_side_combo.setToolTip("Which side of the grid to probe (x or w)")
-        self.qt_index_spin = self._spin(0, 63, 0)
-        self.qt_index_spin.setToolTip("Channel index on that side (0 = nearest centre)")
+        self.qt_channel_combo = QtWidgets.QComboBox()
+        self.qt_channel_combo.setToolTip(
+            "Pick which encoding channel to probe. The list is filled from the "
+            "layout built on the TPA Encoding page, sorted by wavelength."
+        )
+        self.qt_channel_combo.setMinimumWidth(240)
         self.qt_averages = self._spin(1, 20, 1)
         self.qt_bg_check = QtWidgets.QCheckBox("Subtract background")
         self.qt_bg_check.setChecked(True)
@@ -3723,13 +3800,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Take an all-off trace at the channel centre and subtract it for a "
             "cleaner low-level crosstalk floor"
         )
-        grid.addWidget(QtWidgets.QLabel("Side"), 0, 0)
-        grid.addWidget(self.qt_side_combo, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Channel index"), 0, 2)
-        grid.addWidget(self.qt_index_spin, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0)
+        grid.addWidget(self.qt_channel_combo, 0, 1, 1, 3)
         grid.addWidget(QtWidgets.QLabel("Averages"), 0, 4)
         grid.addWidget(self.qt_averages, 0, 5)
-        grid.addWidget(self.qt_bg_check, 1, 0, 1, 3)
+        grid.addWidget(self.qt_bg_check, 1, 0, 1, 4)
         page.layout().addWidget(cfg)
 
         self.qt_layout_label = QtWidgets.QLabel(
@@ -3770,38 +3845,215 @@ class MainWindow(QtWidgets.QMainWindow):
         self.qt_table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.Stretch
         )
+        # tall enough to show every metric row without its own inner scrollbar
+        self.qt_table.setMinimumHeight(300)
+        self.qt_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
 
         # --- overlaid spectra plot ---
         self.qt_figure = Figure(figsize=(10, 2.8), tight_layout=True)
         self.qt_canvas = FigureCanvas(self.qt_figure)
-        self.qt_canvas.setMinimumHeight(200)
+        self.qt_canvas.setMinimumHeight(260)
 
         results = self._panel("A/B crosstalk from OSA data")
         results_layout = QtWidgets.QVBoxLayout(results)
         results_layout.addLayout(run_row)
         results_layout.addWidget(self.qt_bar)
         results_layout.addWidget(self.qt_status)
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        split.addWidget(self.qt_table)
-        split.addWidget(self.qt_canvas)
-        split.setSizes([260, 240])
-        results_layout.addWidget(split, 1)
+        results_layout.addWidget(self.qt_table)
+        results_layout.addWidget(self.qt_canvas, 1)
         page.layout().addWidget(results, 1)
 
         self._qt_draw(None, None)
-        return page
+        self._qt_calib_mode_changed()  # set initial file-row visibility
+
+        # The page is tall (calibration · target · run controls · table · plot), so
+        # wrap it in a scroll area — on short windows the plot at the bottom stays
+        # reachable instead of being squeezed to nothing.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _qt_file_row(
+        self, label_text: str, edit: QtWidgets.QLineEdit, browse_slot
+    ) -> QtWidgets.QWidget:
+        """label + line-edit + Browse, packed into one widget for show/hide."""
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        lbl = QtWidgets.QLabel(label_text)
+        lbl.setMinimumWidth(120)
+        btn = QtWidgets.QPushButton("Browse")
+        btn.setProperty("variant", "ghost")
+        btn.clicked.connect(browse_slot)
+        h.addWidget(lbl)
+        h.addWidget(edit, 1)
+        h.addWidget(btn)
+        return row
+
+    def _qt_active_layout(self) -> ChannelLayout | None:
+        """Layout the Quick Test uses: the TPA Encoding one, or a picked-calib one."""
+        if self.qt_calib_mode.currentIndex() == 0:
+            return self.encoding_layout
+        return self.qt_layout
 
     def _qt_sync_layout(self, layout: ChannelLayout) -> None:
-        """Refresh the quick-test target range/label when a layout is built."""
-        spin = getattr(self, "qt_index_spin", None)
-        if spin is None:
+        """Called when the TPA Encoding page builds a layout; mirror it only if
+        Quick Test is set to follow that page."""
+        if getattr(self, "qt_calib_mode", None) is None:
             return
-        spin.setMaximum(max(0, layout.n_channels - 1))
+        if self.qt_calib_mode.currentIndex() == 0:
+            self._qt_refresh_channels()
+
+    def _qt_refresh_channels(self) -> None:
+        """Repopulate the channel picker + grid label from the active layout."""
+        combo = getattr(self, "qt_channel_combo", None)
+        if combo is None:
+            return
+        layout = self._qt_active_layout()
+        prev = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        if layout is not None:
+            for ch in sorted(layout.all_channels, key=lambda c: c.wavelength_nm):
+                combo.addItem(
+                    f"{ch.side}[{ch.index}]  ·  {ch.wavelength_nm:.3f} nm",
+                    (ch.side, ch.index),
+                )
+            if prev is not None:
+                for i in range(combo.count()):
+                    if combo.itemData(i) == prev:
+                        combo.setCurrentIndex(i)
+                        break
+        combo.blockSignals(False)
+        if layout is None:
+            self.qt_layout_label.setText(
+                "Grid: (no layout — pick a calibration source above or build one "
+                "on the TPA Encoding page)"
+            )
+            return
         note = "" if layout.channel_width_px == 15 else "  (not 15 px — shape is flat)"
         self.qt_layout_label.setText(
             f"Grid: {layout.n_channels} channels/side · {layout.channel_width_px} px "
             f"wide · center {layout.center_wl:.3f} nm{note}"
         )
+
+    def _qt_calib_mode_changed(self, *_args) -> None:
+        mode = self.qt_calib_mode.currentIndex()
+        self.qt_calib_s3_row.setVisible(mode == 1)
+        self.qt_calib_s12_row.setVisible(mode == 2)
+        file_mode = mode in (1, 2)
+        self.qt_calib_params.setVisible(file_mode)
+        self.qt_calib_build_btn.setVisible(file_mode)
+        if mode == 0:
+            self.qt_calib_label.setText(
+                "Using the layout built on the TPA Encoding page."
+            )
+        self._qt_refresh_channels()
+
+    @staticmethod
+    def _synth_calib_from_min_max(
+        step1: CalibrationResult, step2: CalibrationResult
+    ) -> CalibrationResult:
+        """Coarse calibration from Step 1 (min/max) + Step 2 (wavelength map).
+
+        Step 1/Step 2 carry no per-coordinate intensity curves, so every
+        coordinate is given the *same* synthetic linear transfer curve rising
+        from Step 1's min level to its max level. The encoder then maps power
+        linearly onto SLM level (much coarser than a real Step 3 sweep).
+        """
+        coords = np.asarray(step2.coordinates, dtype=float)
+        wls = np.asarray(step2.wavelength, dtype=float)
+        if coords.size == 0 or wls.size == 0:
+            raise ValueError("Step 2 file has no coordinate → wavelength map")
+        try:
+            lo = int(np.asarray(step1.min_level).flat[0])
+            hi = int(np.asarray(step1.max_level).flat[0])
+        except (ValueError, IndexError, TypeError):
+            raise ValueError("Step 1 file has no min/max levels")
+        if hi <= lo:
+            raise ValueError("Step 1 max_level must exceed min_level")
+        levels = np.arange(lo, hi + 1, dtype=int)
+        ramp = np.linspace(0.0, 1.0, levels.size)
+        intensity = np.tile(ramp, (coords.size, 1))
+        return CalibrationResult(
+            wavelength=wls, coordinates=coords,
+            max_level=hi, min_level=lo,
+            level_range=levels, intensity_levels=intensity,
+        )
+
+    def _layout_from_calib(
+        self, calib: CalibrationResult, *,
+        center_wl: float, channel_width_px: int, gap_px: int,
+    ) -> ChannelLayout:
+        """Build a channel layout from a calibration, sizing n_channels to fit."""
+        if calib is None or calib.intensity_levels is None:
+            raise ValueError("calibration has no intensity data")
+        coords = np.asarray(calib.coordinates, dtype=float)
+        wls = np.asarray(calib.wavelength, dtype=float)
+        if coords.size == 0 or wls.size == 0:
+            raise ValueError("calibration has no coordinate → wavelength map")
+        a, b = np.polyfit(coords, wls, 1)
+        cx = (center_wl - b) / a
+        pitch = channel_width_px + gap_px
+        n_ch = int(min(cx - coords.min(), coords.max() - cx) / pitch)
+        if n_ch < 1:
+            raise ValueError(
+                "pitch too large, or centre wavelength outside the calibrated range"
+            )
+        return build_channel_layout(
+            calib, n_channels=n_ch, channel_width_px=channel_width_px,
+            gap_px=gap_px, center_wl=center_wl,
+        )
+
+    def _qt_build_layout(self) -> None:
+        mode = self.qt_calib_mode.currentIndex()
+        try:
+            if mode == 1:
+                path = self.qt_calib_s3_edit.text().strip()
+                if not path:
+                    raise ValueError("choose a Step 3 calibration file")
+                calib = load_calibration_result(path)
+                if calib.intensity_levels is None:
+                    raise ValueError(
+                        "that file has no intensity_levels — it is not a Step 3 result"
+                    )
+            elif mode == 2:
+                p1 = self.qt_calib_s1_edit.text().strip()
+                p2 = self.qt_calib_s2_edit.text().strip()
+                if not p1 or not p2:
+                    raise ValueError(
+                        "choose both a Step 1 (min/max) and a Step 2 (wavelength) file"
+                    )
+                calib = self._synth_calib_from_min_max(
+                    load_calibration_result(p1), load_calibration_result(p2)
+                )
+            else:
+                return
+            layout = self._layout_from_calib(
+                calib,
+                center_wl=self.qt_calib_center.value(),
+                channel_width_px=self.qt_calib_width.value(),
+                gap_px=self.qt_calib_pad.value(),
+            )
+        except Exception as exc:
+            self.qt_layout = None
+            self.qt_calib_label.setText(f"Layout error: {exc}")
+            self._log(f"Quick test calibration load failed: {exc}")
+            self._qt_refresh_channels()
+            return
+        self.qt_layout = layout
+        src = "Step 3 file" if mode == 1 else "Step 1 + Step 2 (coarse)"
+        self.qt_calib_label.setText(
+            f"{src}: {layout.n_channels} ch/side · {layout.channel_width_px} px · "
+            f"center {layout.center_wl:.3f} nm — layout ready."
+        )
+        self._log(
+            f"Quick test layout built from {src.lower()}: {layout.n_channels} ch/side."
+        )
+        self._qt_refresh_channels()
 
     def _qt_set_running(self, running: bool) -> None:
         self.qt_run_button.setEnabled(not running)
@@ -3809,9 +4061,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.qt_save_button.setEnabled(not running and self._qt_test is not None)
 
     def _qt_run(self) -> None:
-        layout = self.encoding_layout
+        layout = self._qt_active_layout()
         if layout is None:
-            self.qt_status.setText("No channel grid — build one on the TPA Encoding page.")
+            if self.qt_calib_mode.currentIndex() == 0:
+                self.qt_status.setText(
+                    "No channel grid — build one on the TPA Encoding page, or pick a "
+                    "calibration file above."
+                )
+            else:
+                self.qt_status.setText(
+                    "No layout — click 'Build layout from calibration' above first."
+                )
             return
         osa = self._osa_ready()
         if osa is None:
@@ -3821,11 +4081,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(controller, "is_open", False):
             self.qt_status.setText("Open the SLM (Connections page) first.")
             return
-        side = self.qt_side_combo.currentText()
-        index = self.qt_index_spin.value()
-        if index >= layout.n_channels:
+        data = self.qt_channel_combo.currentData()
+        if data is None:
             self.qt_status.setText(
-                f"Channel index {index} is out of range (0–{layout.n_channels - 1})."
+                "No channel selected — build a layout on the TPA Encoding page."
+            )
+            return
+        side, index = data
+        if side not in ("x", "w") or index >= layout.n_channels:
+            self.qt_status.setText(
+                f"Channel {side}[{index}] is out of range for this layout — "
+                "rebuild the grid on the TPA Encoding page."
             )
             return
         opt_ratio = self._default_col_ratio(layout.channel_width_px)
