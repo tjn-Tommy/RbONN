@@ -34,10 +34,13 @@ from ..calibration.calibration_new import (
     CalibrationAborted,
     CalibrationProgress,
     CalibrationResult,
+    batch_intensity_calibration,
+    build_channel_calibration_grid,
     find_min_max_intensity_levels,
     intensity_calibration,
     load_calibration_result,
     load_wavelength_map_csv,
+    refine_center_coordinate_with_osa,
     restrict_to_measured_intensity_range,
     save_calibration_result,
     wavelength_calibration,
@@ -213,6 +216,16 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
             "Step 3 / 3 · Intensity vs level",
             "Level",
             "Normalized intensity",
+        ),
+        "fast_center": (
+            "Fast channel setup - 778 nm center",
+            "x coordinate (px)",
+            "Wavelength (nm)",
+        ),
+        "batch_intensity": (
+            "Fast channel calibration",
+            "Level",
+            "Mean normalized intensity",
         ),
     }
 
@@ -922,6 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_step1_tab(), "Step 1 · Min/Max")
         tabs.addTab(self._build_step2_tab(), "Step 2 · Wavelength")
         tabs.addTab(self._build_step3_page(), "Step 3 · Intensity")
+        tabs.addTab(self._build_fast_channel_calibration_page(), "Step 3b - Fast Channels")
         tabs.addTab(self._build_analysis_page(), "Step 4 · Mod Error")
         tabs.addTab(self._build_scope_holding_tab(), "Step 5 · Holding")
         tabs.addTab(self._build_tpa_tab(), "Step 6 · TPA Efficiency")
@@ -936,6 +950,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step_widgets[2]["run"],
             self.step_widgets[3]["run"],
             self.run_all_button,
+            self.fast_channel_run_button,
             self.pipeline_run_button,
             self.stage3_reopt_run_button,
         ]
@@ -1557,6 +1572,186 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if path:
             self.stage3_reopt_root_edit.setText(path)
+
+    def _build_fast_channel_calibration_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.addWidget(
+            self._caption(
+                "Use a Step 2 wavelength map to locate the 778 nm center, optionally "
+                "fine tune that center with one OSA trace, generate 15 px + 5 px "
+                "channel centers, then calibrate non-neighboring channel groups from "
+                "full-span OSA sweeps."
+            )
+        )
+
+        source = self._panel("Step 2 source")
+        source_grid = QtWidgets.QGridLayout(source)
+        self.fast_channel_source_combo = QtWidgets.QComboBox()
+        self.fast_channel_source_combo.addItems(["Step 2 result (memory)", "From file"])
+        self.fast_channel_source_combo.currentIndexChanged.connect(
+            self._toggle_fast_channel_source
+        )
+        self.fast_channel_step2_edit = QtWidgets.QLineEdit()
+        self.fast_channel_step2_edit.setPlaceholderText("calib_step2.json")
+        self.fast_channel_step2_button = QtWidgets.QPushButton("Browse")
+        self.fast_channel_step2_button.clicked.connect(
+            lambda: self._browse_open_into(
+                self.fast_channel_step2_edit,
+                "Select Step 2 wavelength map",
+                "Calibration (*.json *.csv)",
+            )
+        )
+        self.fast_channel_min_spin = self._spin(0, 1023, 0)
+        self.fast_channel_max_spin = self._spin(0, 1023, 1023)
+        source_grid.addWidget(QtWidgets.QLabel("Source"), 0, 0)
+        source_grid.addWidget(self.fast_channel_source_combo, 0, 1)
+        source_grid.addWidget(self.fast_channel_step2_edit, 1, 1)
+        source_grid.addWidget(self.fast_channel_step2_button, 1, 2)
+        source_grid.addWidget(QtWidgets.QLabel("CSV min/max"), 2, 0)
+        source_grid.addWidget(self.fast_channel_min_spin, 2, 1)
+        source_grid.addWidget(self.fast_channel_max_spin, 2, 2)
+        source_grid.setColumnStretch(1, 1)
+        layout.addWidget(source)
+
+        grid_panel = self._panel("Channel grid")
+        grid = QtWidgets.QGridLayout(grid_panel)
+        self.fast_channel_target_spin = self._double_spin(
+            700.0, 900.0, 778.0, " nm", 3
+        )
+        self.fast_channel_width_spin = self._spin(1, 256, 15)
+        self.fast_channel_gap_spin = self._spin(0, 256, 5)
+        self.fast_channel_count_spin = self._spin(1, 200, 20)
+        self.fast_channel_skip_spin = self._spin(0, 20, 2)
+        self.fast_channel_fine_check = QtWidgets.QCheckBox("OSA fine tune center")
+        self.fast_channel_fine_check.setChecked(True)
+        self.fast_channel_peak_nm_spin = self._double_spin(0.001, 50.0, 0.2, " nm", 3)
+        self.fast_channel_peak_nm_spin.setToolTip(
+            "Half-window around the target wavelength for center peak centroiding."
+        )
+        self.fast_channel_refine_check = QtWidgets.QCheckBox("Refine channel wavelengths")
+        self.fast_channel_refine_check.setChecked(True)
+        self.fast_channel_refine_nm_spin = self._double_spin(0.001, 50.0, 0.2, " nm", 3)
+        self.fast_channel_refine_nm_spin.setToolTip(
+            "Half-window around each channel for wavelength refinement."
+        )
+        self.fast_channel_guard_check = QtWidgets.QCheckBox("Min-level guard bands")
+        self.fast_channel_guard_check.setChecked(True)
+        self.fast_channel_guard_wl_edit = QtWidgets.QLineEdit("780, 776")
+        self.fast_channel_guard_wl_edit.setToolTip(
+            "Comma/space separated guard center wavelengths in nm."
+        )
+        self.fast_channel_guard_nm_spin = self._double_spin(0.001, 5.0, 0.06, " nm", 3)
+        self.fast_channel_guard_nm_spin.setToolTip(
+            "Half-width around each guard wavelength forced to the minimum level."
+        )
+        grid.addWidget(QtWidgets.QLabel("Target center"), 0, 0)
+        grid.addWidget(self.fast_channel_target_spin, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Channel width"), 0, 2)
+        grid.addWidget(self.fast_channel_width_spin, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Gap px"), 0, 4)
+        grid.addWidget(self.fast_channel_gap_spin, 0, 5)
+        grid.addWidget(QtWidgets.QLabel("Channels/side"), 1, 0)
+        grid.addWidget(self.fast_channel_count_spin, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Skip between active"), 1, 2)
+        grid.addWidget(self.fast_channel_skip_spin, 1, 3)
+        grid.addWidget(self.fast_channel_fine_check, 2, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Center peak half-window"), 2, 2)
+        grid.addWidget(self.fast_channel_peak_nm_spin, 2, 3)
+        grid.addWidget(self.fast_channel_refine_check, 3, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Refine half-window"), 3, 2)
+        grid.addWidget(self.fast_channel_refine_nm_spin, 3, 3)
+        grid.addWidget(self.fast_channel_guard_check, 4, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Guard centers"), 4, 2)
+        grid.addWidget(self.fast_channel_guard_wl_edit, 4, 3)
+        grid.addWidget(QtWidgets.QLabel("Guard half-width"), 4, 4)
+        grid.addWidget(self.fast_channel_guard_nm_spin, 4, 5)
+        layout.addWidget(grid_panel)
+
+        scan = self._panel("OSA and level sweep")
+        scan_grid = QtWidgets.QGridLayout(scan)
+        self.fast_channel_center_edit = QtWidgets.QLineEdit("778nm")
+        self.fast_channel_span_edit = QtWidgets.QLineEdit("8nm")
+        self.fast_channel_sensitivity_combo = QtWidgets.QComboBox()
+        self.fast_channel_sensitivity_combo.addItems(
+            ["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"]
+        )
+        self.fast_channel_sensitivity_combo.setCurrentText("HIGH3")
+        self.fast_channel_ref_level_edit = QtWidgets.QLineEdit("10uW")
+        self.fast_channel_sampling_edit = QtWidgets.QLineEdit("AUTO")
+        self.fast_channel_avg_nm_spin = self._double_spin(0.0, 50.0, 0.1, " nm", 3)
+        self.fast_channel_avg_nm_spin.setToolTip(
+            "Intensity averaging window around each channel wavelength. 0 uses "
+            "nearest OSA samples."
+        )
+        self.fast_channel_level_start_spin = self._spin(0, 1023, 0)
+        self.fast_channel_level_stop_spin = self._spin(0, 1023, 1023)
+        self.fast_channel_level_step_spin = self._spin(1, 1023, 32)
+        scan_grid.addWidget(QtWidgets.QLabel("OSA center"), 0, 0)
+        scan_grid.addWidget(self.fast_channel_center_edit, 0, 1)
+        scan_grid.addWidget(QtWidgets.QLabel("Span"), 0, 2)
+        scan_grid.addWidget(self.fast_channel_span_edit, 0, 3)
+        scan_grid.addWidget(QtWidgets.QLabel("Sensitivity"), 0, 4)
+        scan_grid.addWidget(self.fast_channel_sensitivity_combo, 0, 5)
+        scan_grid.addWidget(QtWidgets.QLabel("Ref level"), 1, 0)
+        scan_grid.addWidget(self.fast_channel_ref_level_edit, 1, 1)
+        scan_grid.addWidget(QtWidgets.QLabel("Sampling"), 1, 2)
+        scan_grid.addWidget(self.fast_channel_sampling_edit, 1, 3)
+        scan_grid.addWidget(QtWidgets.QLabel("Avg window"), 1, 4)
+        scan_grid.addWidget(self.fast_channel_avg_nm_spin, 1, 5)
+        scan_grid.addWidget(QtWidgets.QLabel("Levels"), 2, 0)
+        scan_grid.addWidget(self.fast_channel_level_start_spin, 2, 1)
+        scan_grid.addWidget(self.fast_channel_level_stop_spin, 2, 2)
+        scan_grid.addWidget(QtWidgets.QLabel("step"), 2, 3)
+        scan_grid.addWidget(self.fast_channel_level_step_spin, 2, 4)
+        layout.addWidget(scan)
+
+        out = self._panel("Output")
+        out_grid = QtWidgets.QGridLayout(out)
+        self.fast_channel_json_edit = QtWidgets.QLineEdit("calib_fast_channels.json")
+        self.fast_channel_json_button = QtWidgets.QPushButton("Browse")
+        self.fast_channel_json_button.clicked.connect(
+            lambda: self._browse_save_into(
+                self.fast_channel_json_edit,
+                "calib_fast_channels.json",
+                "JSON Files (*.json)",
+            )
+        )
+        self.fast_channel_csv_edit = QtWidgets.QLineEdit("calibration_fast_channels.csv")
+        self.fast_channel_csv_button = QtWidgets.QPushButton("Browse")
+        self.fast_channel_csv_button.clicked.connect(
+            lambda: self._browse_save_into(
+                self.fast_channel_csv_edit,
+                "calibration_fast_channels.csv",
+                "CSV Files (*.csv)",
+            )
+        )
+        out_grid.addWidget(QtWidgets.QLabel("Output JSON"), 0, 0)
+        out_grid.addWidget(self.fast_channel_json_edit, 0, 1)
+        out_grid.addWidget(self.fast_channel_json_button, 0, 2)
+        out_grid.addWidget(QtWidgets.QLabel("Output CSV"), 1, 0)
+        out_grid.addWidget(self.fast_channel_csv_edit, 1, 1)
+        out_grid.addWidget(self.fast_channel_csv_button, 1, 2)
+        out_grid.setColumnStretch(1, 1)
+        layout.addWidget(out)
+
+        self.fast_channel_status_label = QtWidgets.QLabel("Ready")
+        self.fast_channel_run_button = QtWidgets.QPushButton("Run Fast Channel Calibration")
+        self.fast_channel_run_button.setEnabled(False)
+        self.fast_channel_run_button.clicked.connect(self._run_fast_channel_calibration)
+        self.fast_channel_stop_button = QtWidgets.QPushButton("Stop")
+        self.fast_channel_stop_button.setProperty("variant", "danger")
+        self.fast_channel_stop_button.setEnabled(False)
+        self.fast_channel_stop_button.clicked.connect(self._stop_full_calibration)
+        action = QtWidgets.QHBoxLayout()
+        action.addWidget(self.fast_channel_status_label, 1)
+        action.addWidget(self.fast_channel_run_button)
+        action.addWidget(self.fast_channel_stop_button)
+        layout.addLayout(action)
+        layout.addStretch(1)
+        self._toggle_fast_channel_source()
+        return page
 
     def _build_step3_page(self) -> QtWidgets.QWidget:
         """Step 3 (intensity) config + Run-All + the calibration fit/plots (full page)."""
@@ -5963,6 +6158,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # manual min/max only matter for a bare wavelength-map CSV source
         self.step_widgets[3]["manual_row"].setVisible(index == 1)
 
+    def _toggle_fast_channel_source(self) -> None:
+        if not hasattr(self, "fast_channel_source_combo"):
+            return
+        from_file = self.fast_channel_source_combo.currentIndex() == 1
+        self.fast_channel_step2_edit.setEnabled(from_file)
+        self.fast_channel_step2_button.setEnabled(from_file)
+        self.fast_channel_min_spin.setEnabled(from_file)
+        self.fast_channel_max_spin.setEnabled(from_file)
+
     def _connect_osa(self) -> None:
         host = self.osa_host_edit.text().strip()
         if not host:
@@ -6006,6 +6210,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_stop_button.setEnabled(running)
         if hasattr(self, "stage3_reopt_stop_button"):
             self.stage3_reopt_stop_button.setEnabled(running)
+        if hasattr(self, "fast_channel_stop_button"):
+            self.fast_channel_stop_button.setEnabled(running)
         self.osa_connect_button.setEnabled(not running and not connected)
         self.osa_disconnect_button.setEnabled(not running and connected)
         self._refresh_pipeline_ui()
@@ -6034,6 +6240,49 @@ class MainWindow(QtWidgets.QMainWindow):
         if levels[-1] != stop:
             levels.append(stop)
         return levels
+
+    def _fast_channel_settings(self) -> MeasurementSettings:
+        return MeasurementSettings(
+            center_wl=self.fast_channel_center_edit.text().strip() or "778nm",
+            span=self.fast_channel_span_edit.text().strip() or "8nm",
+            sensitivity=self.fast_channel_sensitivity_combo.currentText(),
+            sampling_points=self.fast_channel_sampling_edit.text().strip() or "AUTO",
+            reference_level=self.fast_channel_ref_level_edit.text().strip() or "10uW",
+            y_unit="LINear",
+        )
+
+    def _fast_channel_levels(self) -> list[int]:
+        start = self.fast_channel_level_start_spin.value()
+        stop = self.fast_channel_level_stop_spin.value()
+        step_size = self.fast_channel_level_step_spin.value()
+        if stop < start:
+            raise ValueError("fast channel level stop must be >= level start")
+        levels = list(range(start, stop + 1, step_size))
+        if not levels:
+            levels = [start]
+        if levels[-1] != stop:
+            levels.append(stop)
+        return levels
+
+    def _fast_channel_guard_bands(self) -> list[tuple[float, float]]:
+        if not self.fast_channel_guard_check.isChecked():
+            return []
+        value_text = self.fast_channel_guard_wl_edit.text().strip()
+        if not value_text:
+            raise ValueError("guard center wavelengths are required")
+        parts = [part for part in re.split(r"[\s,;]+", value_text) if part]
+        if not parts:
+            raise ValueError("guard center wavelengths are required")
+        try:
+            centers = [float(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError("guard center wavelengths must be numbers in nm") from exc
+        if not all(np.isfinite(center) for center in centers):
+            raise ValueError("guard center wavelengths must be finite")
+        half_width = self.fast_channel_guard_nm_spin.value()
+        if half_width <= 0.0:
+            raise ValueError("guard half-width must be positive")
+        return [(center, half_width) for center in centers]
 
     def _step_region(self, step: int) -> tuple[int, int] | None:
         widgets = self.step_widgets[step]
@@ -6103,6 +6352,36 @@ class MainWindow(QtWidgets.QMainWindow):
             or np.asarray(result.wavelength).size == 0
         ):
             raise ValueError("the wavelength source has no coordinate -> wavelength map")
+        self._require_levels(result)
+        return result
+
+    def _resolve_fast_channel_step2_input(self) -> CalibrationResult:
+        if self.fast_channel_source_combo.currentIndex() == 1:
+            path = self.fast_channel_step2_edit.text().strip()
+            if not path:
+                raise ValueError("choose a Step 2 result or wavelength-map CSV")
+            if path.lower().endswith(".csv"):
+                min_level = self.fast_channel_min_spin.value()
+                max_level = self.fast_channel_max_spin.value()
+                if max_level < min_level:
+                    raise ValueError("CSV max level must be >= min level")
+                result = load_wavelength_map_csv(
+                    path,
+                    min_level=min_level,
+                    max_level=max_level,
+                )
+            else:
+                result = load_calibration_result(path)
+        else:
+            result = self.calibration_result
+            if result is None:
+                raise ValueError("run Step 2 first, or choose a Step 2 file")
+
+        if (
+            np.asarray(result.coordinates).size == 0
+            or np.asarray(result.wavelength).size == 0
+        ):
+            raise ValueError("the Step 2 source has no coordinate -> wavelength map")
         self._require_levels(result)
         return result
 
@@ -6245,6 +6524,130 @@ class MainWindow(QtWidgets.QMainWindow):
             }
 
         self._launch_calibration("Run step 3", work)
+
+    def _run_fast_channel_calibration(self) -> None:
+        osa = self._osa_ready()
+        if osa is None:
+            return
+        try:
+            settings = self._fast_channel_settings()
+            step2_mapping = self._resolve_fast_channel_step2_input()
+            levels = self._fast_channel_levels()
+            target_wavelength = self.fast_channel_target_spin.value()
+            channel_width = self.fast_channel_width_spin.value()
+            gap_px = self.fast_channel_gap_spin.value()
+            n_channels = self.fast_channel_count_spin.value()
+            group_skip = self.fast_channel_skip_spin.value()
+            fine_tune_center = self.fast_channel_fine_check.isChecked()
+            peak_half_window_nm = self.fast_channel_peak_nm_spin.value()
+            avg_nm = self.fast_channel_avg_nm_spin.value() or None
+            refine = self.fast_channel_refine_check.isChecked()
+            refine_half_window_nm = (
+                self.fast_channel_refine_nm_spin.value() if refine else None
+            )
+            guard_bands = self._fast_channel_guard_bands()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return self._reject_calibration(exc)
+
+        out_json = self._resolve_output_path(
+            self.fast_channel_json_edit.text(), "calib_fast_channels.json"
+        )
+        out_csv = self._resolve_output_path(
+            self.fast_channel_csv_edit.text(), "calibration_fast_channels.csv"
+        )
+        controller = self._controller()
+        pitch_px = channel_width + gap_px
+        self.fast_channel_status_label.setText("Running fast channel calibration")
+        self._log(
+            "Fast channel calibration started: "
+            f"{2 * n_channels} channels, pitch {pitch_px} px, "
+            f"active skip {group_skip}"
+        )
+        if guard_bands:
+            guard_text = ", ".join(f"{center:g}±{half:g} nm" for center, half in guard_bands)
+            self._log(f"Fast channel guard bands: {guard_text} -> min level")
+
+        def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
+            slm_width, _slm_height = controller.get_slm_info()
+            measured_peak = None
+            coarse_center = None
+            refined_center = None
+            if fine_tune_center:
+                refined_center, measured_peak, coarse_center = (
+                    refine_center_coordinate_with_osa(
+                        osa,
+                        controller,
+                        settings,
+                        step2_mapping,
+                        target_wavelength_nm=target_wavelength,
+                        window_size=channel_width,
+                        peak_half_window_nm=peak_half_window_nm,
+                        stop_event=stop_event,
+                        progress_callback=report,
+                    )
+                )
+
+            grid_seed, center_coordinate = build_channel_calibration_grid(
+                step2_mapping,
+                target_wavelength_nm=target_wavelength,
+                center_coordinate=refined_center,
+                n_channels_per_side=n_channels,
+                channel_width_px=channel_width,
+                gap_px=gap_px,
+                slm_width=slm_width,
+                guard_bands_nm=guard_bands,
+            )
+            if not fine_tune_center:
+                report(
+                    CalibrationProgress(
+                        phase="fast_center",
+                        step=0,
+                        total=1,
+                        message=(
+                            f"Step 2 predicts {target_wavelength:.4f} nm at "
+                            f"x={center_coordinate:.3f} px"
+                        ),
+                        x=center_coordinate,
+                        y=target_wavelength,
+                    )
+                )
+
+            final = batch_intensity_calibration(
+                osa,
+                controller,
+                levels,
+                settings,
+                grid_seed,
+                window_size=channel_width,
+                wavelength_window_nm=avg_nm,
+                group_skip_channels=group_skip,
+                guard_bands_nm=guard_bands,
+                refine_wavelength=refine,
+                refine_half_window_nm=refine_half_window_nm,
+                stop_event=stop_event,
+                progress_callback=report,
+            )
+            save_calibration_result(final, out_json)
+            csv_path = write_intensity_calibration_csv(final, out_csv)
+            group_count = min(group_skip + 1, int(final.coordinates.size))
+            return {
+                "status": "ok",
+                "step": "fast_channels",
+                "result": final,
+                "saved": out_json,
+                "csv": csv_path,
+                "center_coordinate": center_coordinate,
+                "coarse_center": coarse_center,
+                "measured_peak": measured_peak,
+                "pitch_px": pitch_px,
+                "group_count": group_count,
+                "summary": (
+                    f"{final.coordinates.size} channels, pitch {pitch_px} px, "
+                    f"{group_count} channel groups"
+                ),
+            }
+
+        self._launch_calibration("Fast channel calibration", work)
 
     def _pipeline_file_path(
         self,
@@ -7322,6 +7725,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.edge_gain_status.setText(
                     "Stage 3 re-optimization stopped; checkpoints were retained."
                 )
+            if active_label == "Fast channel calibration":
+                self.fast_channel_status_label.setText("Stopped")
             if self.calibration_dialog is not None:
                 self.calibration_dialog.finish(False, "Calibration stopped")
             return
@@ -7422,6 +7827,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._edge_optimization_finished(
                     {"status": "ok", "result": optimization_result}
                 )
+        elif step == "fast_channels":
+            self.fast_channel_status_label.setText(f"Done - {summary}")
+            if saved is not None and not self.fast_channel_json_edit.text().strip():
+                self.fast_channel_json_edit.setText(str(saved))
+            csv_saved = payload.get("csv")
+            if csv_saved is not None and not self.fast_channel_csv_edit.text().strip():
+                self.fast_channel_csv_edit.setText(str(csv_saved))
+            center_coordinate = payload.get("center_coordinate")
+            if center_coordinate is not None:
+                self._log(
+                    "Fast channel center: "
+                    f"x={float(center_coordinate):.3f} px "
+                    f"(physical pixel {int(round(float(center_coordinate)))})"
+                )
+            measured_peak = payload.get("measured_peak")
+            coarse_center = payload.get("coarse_center")
+            if measured_peak is not None and coarse_center is not None:
+                self._log(
+                    "Fast channel OSA fine tune: "
+                    f"coarse x={float(coarse_center):.3f} px, "
+                    f"measured peak {float(measured_peak):.4f} nm"
+                )
         if saved is not None:
             self._log(f"Saved {saved}")
 
@@ -7431,6 +7858,8 @@ class MainWindow(QtWidgets.QMainWindow):
             label = "Pipeline"
         elif step == "stage3_reopt":
             label = "Stage 3 re-optimization"
+        elif step == "fast_channels":
+            label = "Fast channel calibration"
         else:
             label = f"Step {step}"
         self._log(f"{label} done: {summary}")
@@ -7463,6 +7892,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.edge_gain_bar.setRange(0, 100)
             self.edge_gain_bar.setValue(0)
             self.edge_gain_status.setText("Stage 3 re-optimization failed.")
+        if active_label == "Fast channel calibration":
+            self.fast_channel_status_label.setText("Failed")
         if self._pipeline_optimization_active:
             self._pipeline_optimization_active = False
             self.edge_gain_stop_event = None

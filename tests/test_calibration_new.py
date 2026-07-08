@@ -16,11 +16,15 @@ from slm_module.calibration.calibration import load_calibration_csv
 from slm_module.calibration.calibration_new import (
     CalibrationAborted,
     CalibrationResult,
+    batch_intensity_calibration,
+    build_channel_calibration_grid,
     intensity_calibration,
     load_calibration_result,
     load_wavelength_map_csv,
     local_peak_centroid,
+    local_peak_centroid_near,
     mean_near_wavelength,
+    refine_center_coordinate_with_osa,
     restrict_to_measured_intensity_range,
     save_calibration_result,
     wavelength_calibration,
@@ -93,6 +97,201 @@ class CalibrationNewTests(unittest.TestCase):
         value = mean_near_wavelength(wavelengths, intensity, 101.2, half_window_points=1)
 
         self.assertEqual(value, 3.0)
+
+    def test_local_peak_centroid_near_uses_target_window(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0])
+        intensity = np.asarray([10.0, 1.0, 3.0, 1.0])
+
+        center, idx, strength = local_peak_centroid_near(
+            wavelengths,
+            intensity,
+            102.0,
+            half_window_nm=0.6,
+        )
+
+        self.assertEqual(idx, 2)
+        self.assertEqual(strength, 3.0)
+        self.assertAlmostEqual(center, 102.0)
+
+    def test_channel_calibration_grid_is_centered_on_target_gap(self) -> None:
+        step2 = CalibrationResult(
+            wavelength=np.asarray([783.0, 778.0, 773.0]),
+            coordinates=np.asarray([0.0, 50.0, 100.0]),
+            max_level=900,
+            min_level=100,
+            level_range=np.asarray([100, 900]),
+        )
+
+        grid, center = build_channel_calibration_grid(
+            step2,
+            target_wavelength_nm=778.0,
+            n_channels_per_side=2,
+            channel_width_px=15,
+            gap_px=5,
+            slm_width=120,
+        )
+
+        self.assertAlmostEqual(center, 50.0)
+        np.testing.assert_allclose(grid.coordinates, np.asarray([20.0, 40.0, 60.0, 80.0]))
+        np.testing.assert_allclose(grid.wavelength, np.asarray([781.0, 779.0, 777.0, 775.0]))
+        np.testing.assert_allclose(grid.wavelength_fit_coefficients, np.asarray([-0.1, 783.0]))
+
+        refined_grid, refined_center = build_channel_calibration_grid(
+            step2,
+            target_wavelength_nm=778.0,
+            center_coordinate=52.0,
+            n_channels_per_side=1,
+            channel_width_px=15,
+            gap_px=5,
+            slm_width=120,
+        )
+        self.assertAlmostEqual(refined_center, 52.0)
+        np.testing.assert_allclose(refined_grid.coordinates, np.asarray([42.0, 62.0]))
+        np.testing.assert_allclose(refined_grid.wavelength, np.asarray([779.0, 777.0]))
+        np.testing.assert_allclose(
+            refined_grid.wavelength_fit_coefficients,
+            np.asarray([-0.1, 783.2]),
+        )
+
+    def test_channel_calibration_grid_skips_guard_overlap_channels(self) -> None:
+        step2 = CalibrationResult(
+            wavelength=np.asarray([788.0, 778.0, 766.0]),
+            coordinates=np.asarray([0.0, 100.0, 220.0]),
+            max_level=900,
+            min_level=100,
+            level_range=np.asarray([100, 900]),
+        )
+
+        grid, center = build_channel_calibration_grid(
+            step2,
+            target_wavelength_nm=778.0,
+            n_channels_per_side=2,
+            channel_width_px=15,
+            gap_px=5,
+            slm_width=240,
+            guard_bands_nm=[(779.0, 0.01)],
+        )
+
+        self.assertAlmostEqual(center, 100.0)
+        np.testing.assert_allclose(
+            grid.coordinates,
+            np.asarray([50.0, 70.0, 110.0, 130.0]),
+        )
+        self.assertNotIn(90.0, set(grid.coordinates.tolist()))
+
+    def test_refine_center_coordinate_with_osa_uses_linear_slope(self) -> None:
+        step2 = CalibrationResult(
+            wavelength=np.asarray([783.0, 778.0, 773.0]),
+            coordinates=np.asarray([0.0, 50.0, 100.0]),
+            max_level=900,
+            min_level=100,
+            level_range=np.asarray([100, 900]),
+        )
+        wavelengths = np.asarray([777.8, 778.0, 778.2, 778.4])
+        traces = [
+            make_trace(wavelengths, [0.0, 0.0, 0.0, 0.0]),
+            make_trace(wavelengths, [0.0, 0.2, 1.0, 0.2]),
+        ]
+        osa = FakeNarrowOSA(traces)
+
+        refined, measured, coarse = refine_center_coordinate_with_osa(
+            osa,
+            FakeSLM(size=(120, 2)),
+            MeasurementSettings(),
+            step2,
+            target_wavelength_nm=778.0,
+            window_size=15,
+            peak_half_window_nm=0.4,
+        )
+
+        self.assertAlmostEqual(coarse, 50.0)
+        self.assertAlmostEqual(measured, 778.2)
+        self.assertAlmostEqual(refined, 52.0)
+        self.assertEqual(len(osa.configured), 1)
+
+    def test_batch_intensity_calibration_measures_multiple_channels_per_trace(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+            make_trace(wavelengths, [0, 0.2, 0, 0.3, 0]),
+            make_trace(wavelengths, [0, 0.6, 0, 0.7, 0]),
+            make_trace(wavelengths, [0, 0, 0.4, 0, 0.5]),
+            make_trace(wavelengths, [0, 0, 0.8, 0, 0.9]),
+        ]
+        osa = FakeNarrowOSA(traces)
+        seed = CalibrationResult(
+            wavelength=np.asarray([101.0, 102.0, 103.0, 104.0]),
+            coordinates=np.asarray([1.0, 2.0, 3.0, 4.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+            wavelength_fit_coefficients=np.asarray([1.0, 100.0]),
+        )
+
+        result = batch_intensity_calibration(
+            osa,
+            FakeSLM(size=(6, 2)),
+            [0, 100],
+            MeasurementSettings(),
+            seed,
+            window_size=1,
+            average_half_window=0,
+            group_skip_channels=1,
+        )
+
+        expected = np.asarray(
+            [
+                [0.2, 0.6],
+                [0.4, 0.8],
+                [0.3, 0.7],
+                [0.5, 0.9],
+            ]
+        )
+        np.testing.assert_allclose(result.intensity_levels, expected)
+        np.testing.assert_allclose(result.raw_intensity_levels, expected)
+        self.assertEqual(osa.measure_calls, 6)  # 2 references + 2 groups * 2 levels
+        self.assertEqual(len(osa.configured), 1)
+
+    def test_batch_intensity_calibration_guard_bands_force_min_level(self) -> None:
+        wavelengths = np.arange(100.0, 110.0)
+        traces = [
+            make_trace(wavelengths, [0.0] * wavelengths.size),
+            make_trace(wavelengths, [1.0] * wavelengths.size),
+            make_trace(wavelengths, [0.5] * wavelengths.size),
+            make_trace(wavelengths, [0.7] * wavelengths.size),
+        ]
+        osa = FakeNarrowOSA(traces)
+        slm = FakeSLM(size=(10, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([103.0, 107.0]),
+            coordinates=np.asarray([3.0, 7.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([50]),
+        )
+
+        batch_intensity_calibration(
+            osa,
+            slm,
+            [50],
+            MeasurementSettings(),
+            seed,
+            window_size=3,
+            average_half_window=0,
+            group_skip_channels=1,
+            guard_bands_nm=[(103.0, 0.01)],
+        )
+
+        bright = slm.arrays[1]
+        self.assertTrue(np.all(bright[:, 3] == 0))
+        self.assertEqual(int(bright[0, 2]), 100)
+        self.assertEqual(int(bright[0, 4]), 100)
+
+        active = slm.arrays[2]
+        self.assertEqual(int(active[0, 2]), 50)
+        self.assertEqual(int(active[0, 3]), 0)
+        self.assertEqual(int(active[0, 4]), 50)
 
     def test_intensity_calibration_uses_calibrated_wavelength_neighborhood(self) -> None:
         wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])

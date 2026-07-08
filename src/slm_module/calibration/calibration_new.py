@@ -195,6 +195,57 @@ def local_peak_centroid(
     return center, idx, peak_strength
 
 
+def local_peak_centroid_near(
+    wavelengths_nm: np.ndarray,
+    intensity_W: np.ndarray,
+    target_wavelength_nm: float,
+    *,
+    half_window_nm: float,
+) -> tuple[float, int, float]:
+    """Centroid the strongest local peak inside a target-centered nm window."""
+
+    wavelengths = np.asarray(wavelengths_nm, dtype=float)
+    intensity = np.asarray(intensity_W, dtype=float)
+    target = float(target_wavelength_nm)
+    window = float(half_window_nm)
+    if wavelengths.ndim != 1 or intensity.ndim != 1:
+        raise ValueError("wavelengths_nm and intensity_W must be 1D arrays")
+    if wavelengths.size != intensity.size:
+        raise ValueError(
+            f"wavelengths and intensity size mismatch: "
+            f"{wavelengths.size} vs {intensity.size}"
+        )
+    if wavelengths.size == 0:
+        raise ValueError("Empty trace.")
+    if not np.isfinite(target):
+        raise ValueError("target_wavelength_nm must be finite")
+    if not np.isfinite(window) or window <= 0.0:
+        raise ValueError("half_window_nm must be positive")
+
+    tolerance = np.finfo(float).eps * max(1.0, abs(target), window) * 8.0
+    local_indices = np.flatnonzero(np.abs(wavelengths - target) <= window + tolerance)
+    if local_indices.size == 0:
+        local_indices = np.asarray([int(np.argmin(np.abs(wavelengths - target)))])
+
+    x_local = wavelengths[local_indices]
+    y_local = np.nan_to_num(
+        intensity[local_indices], nan=0.0, posinf=0.0, neginf=0.0
+    )
+    y_local = np.clip(y_local, 0.0, None)
+    local_peak_offset = int(np.argmax(y_local))
+    peak_index = int(local_indices[local_peak_offset])
+    peak_strength = float(y_local[local_peak_offset])
+
+    y_weights = y_local - float(np.min(y_local))
+    y_weights = np.clip(y_weights, 0.0, None)
+    weight_sum = float(np.sum(y_weights))
+    if weight_sum <= 0.0:
+        return float(wavelengths[peak_index]), peak_index, peak_strength
+
+    center = float(np.sum(x_local * y_weights) / weight_sum)
+    return center, peak_index, peak_strength
+
+
 def mean_near_wavelength(
     wavelengths_nm: np.ndarray,
     intensity: np.ndarray,
@@ -556,6 +607,380 @@ def intensity_calibration(
     )
 
 
+def build_channel_calibration_grid(
+    calibration_results: CalibrationResult,
+    *,
+    target_wavelength_nm: float = 778.0,
+    center_coordinate: float | None = None,
+    n_channels_per_side: int = 20,
+    channel_width_px: int = 15,
+    gap_px: int = 5,
+    slm_width: int | None = None,
+    guard_bands_nm: Iterable[tuple[float, float]] | None = None,
+) -> tuple[CalibrationResult, float]:
+    """Generate a Step-3 seed only at channel centers around a target wavelength.
+
+    The center coordinate is the middle of the gap between the nearest two
+    channels.  For the default 15 px channel plus 5 px gap, the first channels
+    sit at center +/- 10 px, leaving the target wavelength 2.5 px from each
+    inner channel edge.
+
+    When ``center_coordinate`` is supplied, the linear wavelength map is shifted
+    so that this refined coordinate is exactly ``target_wavelength_nm``.  That
+    keeps OSA center fine tuning compatible with the very linear Step-2 fit.
+
+    If guard bands are supplied, any candidate channel whose active window
+    overlaps one of those wavelength bands is skipped and the next pitch outward
+    is tried. The requested number of channels per side is preserved when the
+    Step-2 range is wide enough.
+    """
+
+    target = float(target_wavelength_nm)
+    if not np.isfinite(target):
+        raise ValueError("target_wavelength_nm must be finite")
+    n_channels = _validate_non_negative_int(
+        n_channels_per_side, "n_channels_per_side"
+    )
+    if n_channels <= 0:
+        raise ValueError("n_channels_per_side must be positive")
+    width = _validate_non_negative_int(channel_width_px, "channel_width_px")
+    if width <= 0:
+        raise ValueError("channel_width_px must be positive")
+    gap = _validate_non_negative_int(gap_px, "gap_px")
+    pitch = width + gap
+    if pitch <= 0:
+        raise ValueError("channel pitch must be positive")
+
+    source_coordinates, _source_wavelengths = _calibrated_mapping(
+        calibration_results
+    )
+    slope, intercept = _linear_wavelength_fit(calibration_results)
+    if center_coordinate is None:
+        center = (target - intercept) / slope
+    else:
+        center = float(center_coordinate)
+        if not np.isfinite(center):
+            raise ValueError("center_coordinate must be finite")
+        intercept = target - slope * center
+
+    if slm_width is not None:
+        slm_width = _validate_non_negative_int(slm_width, "slm_width")
+        if slm_width <= 0:
+            raise ValueError("slm_width must be positive")
+
+    guard_bands = (
+        []
+        if guard_bands_nm is None
+        else _validate_guard_bands_nm(guard_bands_nm)
+    )
+    coord_min = float(source_coordinates[0])
+    coord_max = float(source_coordinates[-1])
+
+    def valid_channel(coordinate: float) -> bool:
+        if coordinate < coord_min or coordinate > coord_max:
+            return False
+        if slm_width is not None:
+            start, end = _channel_window_bounds(coordinate, width)
+            if start < 0 or end > slm_width:
+                return False
+        return not _channel_window_overlaps_guard(
+            coordinate, width, slope, intercept, guard_bands
+        )
+
+    left = _collect_guarded_channel_side(
+        center,
+        -1,
+        pitch,
+        n_channels,
+        valid_channel,
+        coord_min,
+        coord_max,
+    )
+    right = _collect_guarded_channel_side(
+        center,
+        1,
+        pitch,
+        n_channels,
+        valid_channel,
+        coord_min,
+        coord_max,
+    )
+    if len(left) < n_channels or len(right) < n_channels:
+        raise ValueError(
+            "not enough non-guard channel centers fit inside the Step 2 range "
+            f"(left {len(left)}/{n_channels}, right {len(right)}/{n_channels})"
+        )
+    channel_coordinates = np.asarray(sorted(left + right), dtype=float)
+
+    channel_wavelengths = slope * channel_coordinates + intercept
+    return (
+        CalibrationResult(
+            wavelength=channel_wavelengths,
+            coordinates=channel_coordinates,
+            max_level=calibration_results.max_level,
+            min_level=calibration_results.min_level,
+            level_range=np.asarray(calibration_results.level_range, dtype=int),
+            wavelength_fit_coefficients=np.asarray([slope, intercept], dtype=float),
+        ),
+        float(center),
+    )
+
+
+def refine_center_coordinate_with_osa(
+    osa: OSAController,
+    slm: SLMController,
+    measure_settings: MeasurementSettings,
+    calibration_results: CalibrationResult,
+    *,
+    target_wavelength_nm: float = 778.0,
+    window_size: int = 15,
+    peak_half_window_nm: float = 0.2,
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[float, float, float]:
+    """Refine the target coordinate by measuring the target window once on OSA.
+
+    Returns ``(refined_coordinate, measured_peak_nm, coarse_coordinate)``.
+    The coordinate correction is ``(target - measured_peak) / linear_slope``.
+    """
+
+    target = float(target_wavelength_nm)
+    if not np.isfinite(target):
+        raise ValueError("target_wavelength_nm must be finite")
+    peak_window = float(peak_half_window_nm)
+    if not np.isfinite(peak_window) or peak_window <= 0.0:
+        raise ValueError("peak_half_window_nm must be positive")
+
+    slope, intercept = _linear_wavelength_fit(calibration_results)
+    coarse_center = (target - intercept) / slope
+    if not np.isfinite(coarse_center):
+        raise ValueError("could not locate target wavelength from Step 2")
+
+    slm_width, slm_height = slm.get_slm_info()
+    window_size = _validate_window_size(window_size, slm_width)
+    min_level = _level_value(calibration_results.min_level, "min_level")
+    max_level = _level_value(calibration_results.max_level, "max_level")
+
+    measure = _configured_measurement(osa, measure_settings)
+    dark_pattern = np.full(slm_width, min_level, dtype=int)
+    _display_1d_pattern(slm, dark_pattern, slm_height)
+    _check_stop(stop_event)
+    background_trace = measure()
+    background_power = _trace_power_w(background_trace)
+
+    _report(
+        progress_callback,
+        "fast_center",
+        0,
+        2,
+        f"Step 2 predicts {target:.4f} nm at x={coarse_center:.3f} px",
+        x=float(coarse_center),
+        y=target,
+    )
+
+    x_start = _window_start_from_coordinate(coarse_center, window_size, slm_width)
+    pattern = dark_pattern.copy()
+    pattern[x_start : x_start + window_size] = max_level
+    _display_1d_pattern(slm, pattern, slm_height)
+    _check_stop(stop_event)
+    trace = measure()
+    count = min(trace.wavelengths_nm.size, trace.powers.size, background_power.size)
+    if count <= 0:
+        raise ValueError("OSA center refinement trace is empty")
+    signal = np.clip(
+        _trace_power_w(trace)[:count] - background_power[:count],
+        0.0,
+        None,
+    )
+    measured_peak, _idx, _strength = local_peak_centroid_near(
+        trace.wavelengths_nm[:count],
+        signal,
+        target,
+        half_window_nm=peak_window,
+    )
+    refined_center = coarse_center + (target - measured_peak) / slope
+    if not np.isfinite(refined_center):
+        raise ValueError("OSA center refinement produced an invalid coordinate")
+
+    _report(
+        progress_callback,
+        "fast_center",
+        1,
+        2,
+        (
+            f"OSA peak {measured_peak:.4f} nm -> refined center "
+            f"x={refined_center:.3f} px"
+        ),
+        x=float(refined_center),
+        y=target,
+    )
+    return float(refined_center), float(measured_peak), float(coarse_center)
+
+
+def batch_intensity_calibration(
+    osa: OSAController,
+    slm: SLMController,
+    levels: Iterable[int],
+    measure_settings: MeasurementSettings,
+    calibration_results: CalibrationResult,
+    window_size: int,
+    *,
+    average_half_window: int = 2,
+    wavelength_window_nm: float | None = None,
+    group_skip_channels: int = 2,
+    guard_bands_nm: Iterable[tuple[float, float]] | None = None,
+    refine_wavelength: bool = False,
+    refine_half_window_nm: float | None = None,
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> CalibrationResult:
+    """Calibrate several non-neighboring channels from each full-span OSA trace.
+
+    Channels are split into groups by sorted coordinate index.  With the default
+    ``group_skip_channels=2``, one trace measures channels 0, 3, 6, ... while
+    leaving two channel pitches between simultaneously active windows to reduce
+    crosstalk.  Each trace is reduced at every active channel wavelength, so the
+    output shape and normalization match :func:`intensity_calibration`.
+    """
+
+    level_values = _validate_levels(levels)
+    coordinates, wavelengths = _calibrated_mapping(calibration_results)
+    if coordinates.size == 0:
+        raise ValueError("batch calibration needs at least one channel coordinate")
+    slm_width, slm_height = slm.get_slm_info()
+    window_size = _validate_window_size(window_size, slm_width)
+    average_half_window = _validate_non_negative_int(
+        average_half_window, "average_half_window"
+    )
+    group_skip = _validate_non_negative_int(
+        group_skip_channels, "group_skip_channels"
+    )
+    group_step = group_skip + 1
+    min_level = _level_value(calibration_results.min_level, "min_level")
+    max_level = _level_value(calibration_results.max_level, "max_level")
+    guard_mask = _wavelength_guard_mask(slm_width, calibration_results, guard_bands_nm)
+
+    measure = _configured_measurement(osa, measure_settings)
+    dark_pattern = np.full(slm_width, min_level, dtype=int)
+    _display_1d_pattern(slm, dark_pattern, slm_height)
+    _check_stop(stop_event)
+    background_trace = measure()
+    background_power = _trace_power_w(background_trace)
+
+    bright_pattern = np.full(slm_width, max_level, dtype=int)
+    bright_pattern[guard_mask] = min_level
+    _display_1d_pattern(slm, bright_pattern, slm_height)
+    _check_stop(stop_event)
+    reference_trace = measure()
+    reference_power = _trace_power_w(reference_trace)
+
+    intensity_levels = np.zeros((coordinates.size, level_values.size), dtype=float)
+    raw_intensity_levels = np.zeros((coordinates.size, level_values.size), dtype=float)
+    refined_wavelengths = np.array(wavelengths, dtype=float)
+    best_strength = np.full(coordinates.size, -np.inf, dtype=float)
+    best_wavelengths: list[np.ndarray | None] = [None] * coordinates.size
+    best_signal: list[np.ndarray | None] = [None] * coordinates.size
+
+    groups = [
+        np.arange(offset, coordinates.size, group_step, dtype=int)
+        for offset in range(group_step)
+    ]
+    groups = [group for group in groups if group.size]
+    total = int(len(groups) * level_values.size)
+    step = 0
+
+    for group_number, group in enumerate(groups, start=1):
+        for level_index, level in enumerate(level_values):
+            _check_stop(stop_event)
+            pattern = dark_pattern.copy()
+            for channel_index in group:
+                x_start = _window_start_from_coordinate(
+                    coordinates[channel_index], window_size, slm_width
+                )
+                pattern[x_start : x_start + window_size] = int(level)
+            pattern[guard_mask] = min_level
+            _display_1d_pattern(slm, pattern, slm_height)
+
+            trace = measure()
+            trace_wavelengths, signal, normalized = _reduce_trace(
+                trace,
+                _trace_power_w(trace),
+                background_power,
+                reference_power,
+            )
+            group_values: list[float] = []
+            for channel_index in group:
+                wavelength_nm = float(wavelengths[channel_index])
+                raw_value = mean_near_wavelength(
+                    trace_wavelengths,
+                    signal,
+                    wavelength_nm,
+                    half_window_points=average_half_window,
+                    window_nm=wavelength_window_nm,
+                )
+                normalized_value = mean_near_wavelength(
+                    trace_wavelengths,
+                    normalized,
+                    wavelength_nm,
+                    half_window_points=average_half_window,
+                    window_nm=wavelength_window_nm,
+                )
+                raw_intensity_levels[channel_index, level_index] = raw_value
+                intensity_levels[channel_index, level_index] = normalized_value
+                group_values.append(normalized_value)
+                if refine_wavelength and raw_value > best_strength[channel_index]:
+                    best_strength[channel_index] = raw_value
+                    best_wavelengths[channel_index] = trace_wavelengths.copy()
+                    best_signal[channel_index] = signal.copy()
+
+            mean_value = float(np.mean(group_values)) if group_values else 0.0
+            _report(
+                progress_callback,
+                "batch_intensity",
+                step,
+                total,
+                (
+                    f"group {group_number}/{len(groups)}, level {int(level)} -> "
+                    f"{len(group)} channels"
+                ),
+                x=float(level),
+                y=mean_value,
+            )
+            step += 1
+
+    if refine_wavelength:
+        half_window = _resolve_refine_half_window_nm(
+            wavelengths,
+            refine_half_window_nm,
+        )
+        for channel_index, (wl_axis, sig) in enumerate(
+            zip(best_wavelengths, best_signal)
+        ):
+            if wl_axis is None or sig is None:
+                continue
+            refined_center, _idx, _strength = local_peak_centroid_near(
+                wl_axis,
+                sig,
+                float(wavelengths[channel_index]),
+                half_window_nm=half_window,
+            )
+            refined_wavelengths[channel_index] = refined_center
+        _, fit_coefficients = _fit_wavelength_mapping(coordinates, refined_wavelengths)
+    else:
+        fit_coefficients = calibration_results.wavelength_fit_coefficients
+
+    return CalibrationResult(
+        wavelength=refined_wavelengths,
+        coordinates=coordinates,
+        max_level=max_level,
+        min_level=min_level,
+        level_range=level_values,
+        intensity_levels=intensity_levels,
+        raw_intensity_levels=raw_intensity_levels,
+        wavelength_fit_coefficients=fit_coefficients,
+    )
+
+
 def restrict_to_measured_intensity_range(
     calibration_results: CalibrationResult,
 ) -> CalibrationResult:
@@ -905,6 +1330,146 @@ def _fit_wavelength_mapping(
     degree = min(3, coordinates.size - 1)
     coeffs = np.polyfit(coordinates, wavelengths_nm, deg=degree)
     return np.polyval(coeffs, coordinates), coeffs
+
+
+def _linear_wavelength_fit(
+    calibration_results: CalibrationResult,
+) -> tuple[float, float]:
+    coordinates, wavelengths = _calibrated_mapping(calibration_results)
+    if coordinates.size < 2:
+        raise ValueError("at least two Step 2 points are required for a linear fit")
+    slope, intercept = np.polyfit(coordinates, wavelengths, 1)
+    slope = float(slope)
+    intercept = float(intercept)
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        raise ValueError("Step 2 linear fit is invalid")
+    if abs(slope) <= np.finfo(float).eps:
+        raise ValueError("Step 2 wavelength slope is zero")
+    return slope, intercept
+
+
+def _configured_measurement(
+    osa: OSAController,
+    settings: MeasurementSettings,
+) -> Callable[[], TraceData]:
+    """Configure once when the OSA object supports it, then reuse the settings."""
+
+    configure = getattr(osa, "configure", None)
+    if callable(configure):
+        configure(settings)
+        return lambda: osa.measure()
+    return lambda: osa.measure(settings)
+
+
+def _resolve_refine_half_window_nm(
+    wavelengths: np.ndarray,
+    requested: float | None,
+) -> float:
+    if requested is not None:
+        window = float(requested)
+        if not np.isfinite(window) or window <= 0.0:
+            raise ValueError("refine_half_window_nm must be positive")
+        return window
+
+    ordered = np.sort(np.asarray(wavelengths, dtype=float))
+    diffs = np.abs(np.diff(ordered))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+    if diffs.size:
+        return max(float(np.min(diffs)) * 0.45, 1e-6)
+    return 0.2
+
+
+def _wavelength_guard_mask(
+    slm_width: int,
+    calibration_results: CalibrationResult,
+    guard_bands_nm: Iterable[tuple[float, float]] | None,
+) -> np.ndarray:
+    mask = np.zeros(int(slm_width), dtype=bool)
+    if guard_bands_nm is None:
+        return mask
+
+    bands = _validate_guard_bands_nm(guard_bands_nm)
+    if not bands:
+        return mask
+
+    slope, intercept = _linear_wavelength_fit(calibration_results)
+    columns = np.arange(int(slm_width), dtype=float)
+    wavelengths = slope * columns + intercept
+    tolerance = np.finfo(float).eps * max(1.0, float(np.max(np.abs(wavelengths)))) * 8.0
+    for center_nm, half_width_nm in bands:
+        mask |= np.abs(wavelengths - center_nm) <= half_width_nm + tolerance
+    return mask
+
+
+def _channel_window_bounds(coordinate: float, channel_width_px: int) -> tuple[int, int]:
+    start = int(round(float(coordinate))) - int(channel_width_px) // 2
+    return start, start + int(channel_width_px)
+
+
+def _channel_window_overlaps_guard(
+    coordinate: float,
+    channel_width_px: int,
+    slope: float,
+    intercept: float,
+    guard_bands: list[tuple[float, float]],
+) -> bool:
+    if not guard_bands:
+        return False
+    start, end = _channel_window_bounds(coordinate, channel_width_px)
+    if end <= start:
+        return False
+    wavelengths = slope * np.arange(start, end, dtype=float) + intercept
+    if wavelengths.size == 0:
+        return False
+    tolerance = np.finfo(float).eps * max(1.0, float(np.max(np.abs(wavelengths)))) * 8.0
+    for center_nm, half_width_nm in guard_bands:
+        if np.any(np.abs(wavelengths - center_nm) <= half_width_nm + tolerance):
+            return True
+    return False
+
+
+def _collect_guarded_channel_side(
+    center: float,
+    direction: int,
+    pitch_px: int,
+    desired_count: int,
+    is_valid: Callable[[float], bool],
+    coord_min: float,
+    coord_max: float,
+) -> list[float]:
+    channels: list[float] = []
+    index = 0
+    while len(channels) < desired_count:
+        coordinate = center + int(direction) * (index + 0.5) * pitch_px
+        if direction < 0 and coordinate < coord_min:
+            break
+        if direction > 0 and coordinate > coord_max:
+            break
+        if is_valid(coordinate):
+            channels.append(float(coordinate))
+        index += 1
+    return channels
+
+
+def _validate_guard_bands_nm(
+    guard_bands_nm: Iterable[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    bands: list[tuple[float, float]] = []
+    for index, band in enumerate(guard_bands_nm):
+        try:
+            center_nm, half_width_nm = band
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "guard_bands_nm entries must be (center_nm, half_width_nm) pairs"
+            ) from exc
+        center = float(center_nm)
+        half_width = float(half_width_nm)
+        if not np.isfinite(center):
+            raise ValueError(f"guard band {index} center must be finite")
+        if not np.isfinite(half_width) or half_width <= 0.0:
+            raise ValueError(f"guard band {index} half-width must be positive")
+        bands.append((center, half_width))
+    return bands
 
 
 def _calibrated_mapping(
