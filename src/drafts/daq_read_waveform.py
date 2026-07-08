@@ -16,7 +16,7 @@ from nidaqmx.constants import AcquisitionType
 
 # Edit these to match your setup (see NI-MAX for the device name).
 DEVICE = "Dev1"
-CHANNEL = "ai1"
+CHANNEL = "ai0"
 SAMPLE_RATE_HZ = 100_000  # 100 kS/s
 DURATION_S = 2
 MIN_VAL_V = -0.010
