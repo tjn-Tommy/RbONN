@@ -83,6 +83,10 @@ class ChannelLayout:
     # per-column background so padding columns sit at their local off level
     calib_coords: np.ndarray = field(repr=False)
     calib_off_levels: np.ndarray = field(repr=False)
+    # inclusive px ranges forced dark (never covered by a channel): the two
+    # wavelength guard bands plus the centre divider column. Kept for
+    # inspection / preview; the renderer leaves them at their off level anyway.
+    dark_px_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
 
     @property
     def all_channels(self) -> list[EncodingChannel]:
@@ -112,6 +116,159 @@ def _nearest_index_sorted(sorted_values: np.ndarray, queries: np.ndarray) -> np.
     return np.where(choose_left, idx - 1, idx)
 
 
+@dataclass
+class ChannelGeometry:
+    """Pixel span + wavelength of one channel, without any measured curve."""
+    index: int
+    side: str           # 'x' (wl > center) or 'w' (wl < center)
+    x_center: int
+    x_start: int        # inclusive
+    x_end: int          # exclusive
+    wavelength_nm: float
+
+
+@dataclass
+class LayoutGeometry:
+    """Pure geometry of a channel layout (no transfer curves attached).
+
+    Shared by build_channel_layout -- which snaps each channel to a calibration
+    coordinate and attaches its measured transfer curve -- and by UI previews
+    that only have the Step-2 wavelength map and want to show the pixel/channel
+    layout before any Step-3 intensity data exists.
+    """
+    x: list[ChannelGeometry]            # x[0] nearest the centre
+    w: list[ChannelGeometry]            # mirror of x[i] about the centre column
+    center_wl: float
+    center_x: float                     # exact fractional centre pixel
+    c0: int                             # rounded centre pixel (pad midpoint)
+    channel_width_px: int
+    pitch_px: int
+    nm_per_px: float                    # |slope| of the x->wavelength fit
+    dark_px_ranges: list[tuple[int, int]]  # inclusive guard px ranges, always dark
+
+    @property
+    def n_channels(self) -> int:
+        return len(self.x)
+
+
+def compute_channel_geometry(
+    coordinates: np.ndarray,
+    wavelengths: np.ndarray,
+    *,
+    n_channels: int = 20,
+    channel_width_px: int = 15,
+    gap_px: int = 5,
+    center_wl: float = 778.0,
+    dark_wl_bands: tuple[tuple[float, float], ...] = (
+        (779.9, 780.1),
+        (775.9, 776.1),
+    ),
+) -> LayoutGeometry:
+    """Tile symmetric channel pairs around center_wl from a Step-2 wl<->px map.
+
+    This is the geometry half of build_channel_layout (steps 1-5 of its
+    docstring). It needs only the coordinate -> wavelength mapping, so a UI can
+    preview the layout from a Step-2 result before any Step-3 sweep has run.
+    """
+    coords = np.asarray(coordinates, dtype=float).reshape(-1)
+    wl = np.asarray(wavelengths, dtype=float).reshape(-1)
+    if coords.size < 2 or coords.size != wl.size:
+        raise ValueError("need at least two matching coordinate/wavelength points")
+
+    # 1. wl = a*x + b  (a < 0: higher x -> lower wavelength)
+    a, b = np.polyfit(coords, wl, 1)
+    if a == 0.0 or not np.isfinite(a) or not np.isfinite(b):
+        raise ValueError("degenerate wavelength fit (need a sloped x->wl map)")
+
+    # 2. centre anchor. Round to an integer pixel so x/w pairs placed at
+    # c0 -/+ m are exactly mirror-symmetric about the centre column (and thus,
+    # under the linear fit, symmetric in wavelength about center_wl). The centre
+    # sits in the middle of a pad, so no channel covers it.
+    center_x = (center_wl - b) / a
+    c0 = int(round(center_x))
+
+    pitch_px = int(channel_width_px) + int(gap_px)
+    half_w   = int(channel_width_px) // 2
+    coord_lo = int(np.ceil(coords.min()))
+    coord_hi = int(np.floor(coords.max()))
+
+    # 3. wavelength guard bands -> inclusive px ranges that must stay dark
+    def _wl_to_px(w: float) -> float:
+        return (w - b) / a
+
+    guard_ranges: list[tuple[int, int]] = []
+    for lo_wl, hi_wl in dark_wl_bands:
+        p1, p2 = _wl_to_px(lo_wl), _wl_to_px(hi_wl)
+        guard_ranges.append((int(np.floor(min(p1, p2))), int(np.ceil(max(p1, p2)))))
+
+    def _clear_offset(m: int) -> int:
+        """Smallest offset >= m whose x-channel (c0-m) AND w-channel (c0+m)
+        windows both clear every guard band.
+
+        A single shared offset keeps the pair mirror-symmetric: whenever either
+        side's window would cover a guard, m is pushed outward past it (using the
+        larger requirement of the two sides). Each push strictly increases m past
+        a guard, so this terminates.
+        """
+        while True:
+            need = m
+            for lo, hi in guard_ranges:
+                # w side, centre c0 + m: clear when x_start >= hi + 1
+                if (c0 + m - half_w) <= hi and (c0 + m + half_w) >= lo:
+                    need = max(need, hi + 1 + half_w - c0)
+                # x side, centre c0 - m: clear when x_end - 1 <= lo - 1
+                if (c0 - m - half_w) <= hi and (c0 - m + half_w) >= lo:
+                    need = max(need, c0 - lo + half_w + 1)
+            if need == m:
+                return m
+            m = need
+
+    def _geo(index: int, side: str, x_c: int) -> ChannelGeometry:
+        x_start = x_c - half_w
+        return ChannelGeometry(
+            index=index,
+            side=side,
+            x_center=x_c,
+            x_start=x_start,
+            x_end=x_start + int(channel_width_px),
+            wavelength_nm=float(a * x_c + b),
+        )
+
+    # 4/5. Tile a single shared offset outward from the centre pad (half-pitch
+    # start). Each step places a mirror pair c0-m (x, wl > center) and c0+m (w,
+    # wl < center). If either window would cover a guard band, m jumps past it
+    # (both sides move together, so the pair stays symmetric); tiling then
+    # resumes from the jumped offset. Stops when either side leaves the
+    # calibrated range, keeping the two sides equal length.
+    x_geo: list[ChannelGeometry] = []
+    w_geo: list[ChannelGeometry] = []
+    offset = 0.5 * pitch_px
+    while len(x_geo) < n_channels:
+        m = int(round(offset))
+        cleared = _clear_offset(m)
+        if cleared != m:
+            m = cleared
+            offset = float(m)
+        if (c0 - m - half_w) < coord_lo or (c0 + m + half_w) > coord_hi:
+            break
+        idx = len(x_geo)
+        x_geo.append(_geo(idx, "x", c0 - m))
+        w_geo.append(_geo(idx, "w", c0 + m))
+        offset += pitch_px
+
+    return LayoutGeometry(
+        x=x_geo,
+        w=w_geo,
+        center_wl=center_wl,
+        center_x=center_x,
+        c0=c0,
+        channel_width_px=int(channel_width_px),
+        pitch_px=pitch_px,
+        nm_per_px=abs(float(a)),
+        dark_px_ranges=list(guard_ranges),
+    )
+
+
 def build_channel_layout(
     calib: CalibrationResult,
     *,
@@ -119,23 +276,42 @@ def build_channel_layout(
     channel_width_px: int = 15,
     gap_px: int = 5,
     center_wl: float = 778.0,
+    dark_wl_bands: tuple[tuple[float, float], ...] = (
+        (779.9, 780.1),
+        (775.9, 776.1),
+    ),
 ) -> ChannelLayout:
-    """Build a 2*n_channels encoding layout centred at center_wl.
+    """Build an encoding layout centred at center_wl with dark guard bands.
 
-    x-channels: wavelength > center_wl (lower SLM x values).
-    w-channels: wavelength < center_wl (higher SLM x values).
-    x[0] and w[0] are the pair closest to the centre wavelength.
+    Geometry (see the numbered plan this implements):
+      1. Fit wl = a*x + b over the Step-2 mapping (a < 0: higher x -> lower wl).
+      2. Anchor the centre pixel c0 = round((center_wl - b) / a). The centre sits
+         in the middle of a pad (a ``gap_px``-wide dark gap straddling c0), not on
+         a channel edge, so no channel covers it.
+      3. Convert each ``dark_wl_bands`` wavelength range to an inclusive px range;
+         those columns must stay dark (they are the Rb guard lines, ~780 & ~776).
+      4. Tile a single shared offset m outward from c0 with a half-pitch start
+         (pitch = width + gap), placing at each step a mirror pair:
+             x-channel (wl > center_wl) centred at c0 - m,
+             w-channel (wl < center_wl) centred at c0 + m.
+         Because both use the same m, x[i] and w[i] are exactly symmetric about
+         the centre column -- and, under the linear fit, about center_wl.
+      5. If either window of a pair would cover a guard band, m jumps outward
+         past it (both sides move together, so the pair stays symmetric) and
+         channels end up on both sides of the Rb line; tiling resumes from the
+         jumped offset. Tiling stops when either side leaves the calibrated
+         range, so the two sides are always equal length (the encoder's x/w
+         pairing contract).
 
-    Each encoding channel is snapped to the nearest calibration coordinate and
-    carries that coordinate's full measured transfer curve, which the encoder
-    inverts directly (nearest-neighbour on measured power). gap_px is the
-    padding *between* adjacent channels, so pitch = channel_width_px + gap_px.
+    Each kept channel snaps to the nearest calibration coordinate and carries
+    that coordinate's measured transfer curve, which the encoder inverts.
+    ``n_channels`` is the maximum per side; fewer are returned when the guard
+    bands or the calibrated range cut the tiling short.
     """
     if calib.intensity_levels is None:
         raise ValueError("CalibrationResult has no intensity data (Step 3 not run)")
 
     coords  = np.asarray(calib.coordinates,      dtype=float)
-    wls     = np.asarray(calib.wavelength,       dtype=float)
     intens  = np.asarray(calib.intensity_levels, dtype=float)  # (n_calib, n_levels)
     levels  = np.asarray(calib.level_range,      dtype=int)
 
@@ -146,46 +322,40 @@ def build_channel_layout(
 
     off_per_coord = levels[np.argmin(intens, axis=1)]   # (n_calib,) for background
 
-    # wl = a*x + b  (a < 0: higher x -> lower wavelength)
-    a, b = np.polyfit(np.asarray(calib.coordinates, dtype=float),
-                      np.asarray(calib.wavelength, dtype=float), 1)
-    center_x = (center_wl - b) / a
+    geom = compute_channel_geometry(
+        np.asarray(calib.coordinates, dtype=float),
+        np.asarray(calib.wavelength, dtype=float),
+        n_channels=n_channels,
+        channel_width_px=channel_width_px,
+        gap_px=gap_px,
+        center_wl=center_wl,
+        dark_wl_bands=dark_wl_bands,
+    )
 
-    pitch_px = channel_width_px + gap_px
-    half_w   = channel_width_px // 2
-
-    def _make(index: int, side: str, x_c: int) -> EncodingChannel:
-        nearest = int(np.argmin(np.abs(coords - x_c)))
+    def _make(g: ChannelGeometry) -> EncodingChannel:
+        nearest = int(np.argmin(np.abs(coords - g.x_center)))
         return EncodingChannel(
-            index=index,
-            side=side,
-            x_center=x_c,
-            x_start=x_c - half_w,
-            x_end=x_c - half_w + channel_width_px,
-            wavelength_nm=float(a * x_c + b),
+            index=g.index,
+            side=g.side,
+            x_center=g.x_center,
+            x_start=g.x_start,
+            x_end=g.x_end,
+            wavelength_nm=g.wavelength_nm,
             levels=levels.copy(),
             intensity_curve=intens[nearest].copy(),
         )
 
-    x_channels = [
-        _make(i, "x", int(round(center_x - (i + 0.5) * pitch_px)))
-        for i in range(n_channels)
-    ]
-    w_channels = [
-        _make(i, "w", int(round(center_x + (i + 0.5) * pitch_px)))
-        for i in range(n_channels)
-    ]
-
     return ChannelLayout(
-        x_channels=x_channels,
-        w_channels=w_channels,
+        x_channels=[_make(g) for g in geom.x],
+        w_channels=[_make(g) for g in geom.w],
         center_wl=center_wl,
-        center_x=center_x,
-        channel_width_px=channel_width_px,
-        pitch_px=pitch_px,
-        nm_per_px=abs(float(a)),
+        center_x=geom.center_x,
+        channel_width_px=geom.channel_width_px,
+        pitch_px=geom.pitch_px,
+        nm_per_px=geom.nm_per_px,
         calib_coords=coords,
         calib_off_levels=off_per_coord,
+        dark_px_ranges=list(geom.dark_px_ranges),
     )
 
 

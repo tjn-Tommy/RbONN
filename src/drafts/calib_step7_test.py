@@ -2,9 +2,9 @@
 
 Not a pytest test (no mocks, needs real hardware) -- run it directly::
 
-    python tests/tpa_phase_calibration_test.py            # Table 1 sweep + fit + plot (all targets)
-    python tests/tpa_phase_calibration_test.py --symmetry # Table 1, THEN also the 3x3 symmetry check (Table 2)
-    python tests/tpa_phase_calibration_test.py some.csv    # re-fit an existing Table-1 CSV offline
+    python src/drafts/calib_step7_test.py            # Table 1 sweep + fit + plot (all targets)
+    python src/drafts/calib_step7_test.py --symmetry # Table 1, THEN also the 3x3 symmetry check (Table 2)
+    python src/drafts/calib_step7_test.py some.csv    # re-fit an existing Table-1 CSV offline
 
 Prereq: every pair used here (reference + targets) must already have a step-6
 (:mod:`slm_module.tpa_pair`) efficiency calibration -- that's where ``eta`` and
@@ -20,11 +20,14 @@ full reachable half turn, since the measured Step-3 transfer curve is monotonic
 (intensity 1 == phi = pi).  The fit floats a, b and dPhi_comb in
 
     Y = a^2 + b^2 sin^4(theta2/2)
-      + 2ab sin^2(theta2/2) cos(dPhi_comb - pi + theta2) + d
+      + 2ab sin^2(theta2/2) cos(dPhi_comb - pi + theta2)
+      + step-6 single-beam(theta2) + d
 
-with a := R_1 (reference), b := eta_2 Cx_2 Cw_2 (target) and d the dark; it
-returns pair k's phase relative to pair 0 (Phi_0 == 0 by definition).  Looping
-over the targets builds the spectrum {Phi_k}.
+with a := R_1 (reference), b := eta_2 Cx_2 Cw_2 (target) and d the dark.  a and b
+are boxed to +/-100% of the step-6 eta_ref/eta_tgt, and the two pairs' step-6
+single-beam response is folded in as a FIXED background (so b is not forced to
+absorb the ~g single-beam ramp).  The fit returns pair k's phase relative to
+pair 0 (Phi_0 == 0 by definition); looping over the targets builds {Phi_k}.
 
 Table 2 (--symmetry, one-time spot check): a 3x3 grid on the target's individual
 channel phases {90, 135, 180} deg, verifying swap invariance (phase depends only
@@ -40,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from daq_module.controller import DAQController, DAQMonitorSettings  # noqa: E402
@@ -60,15 +63,18 @@ from slm_module.tpa_phase import (  # noqa: E402
 )
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "calib_step3_2pairs.json"  # Step 3 two-pair calib -> channel layout
+CALIB_PATH = REPO_ROOT / "src/calib_data"          # data directory: inputs + outputs live here
 REF_INDEX = 0                                      # common reference pair (Phi_0 == 0)
 TGT_INDICES = [3]                                  # far pair 3 vs near pair 0 (crosstalk test)
+
+IN_STEP3 = CALIB_PATH / "calib_step3_pair0-3_meas.json"  # Step 3 two-pair calib -> channel layout
 
 # Step-6 eta + background per pair. JSON (save_tpa_pair_json) or raw step-6 CSV;
 # the CSV is re-fit with the same algorithm, so a JSON is optional.  This single
 # two-pair ch-efficiency JSON carries both pair 0 and pair 3 in its channels list.
 STEP6_SOURCES = [
-    REPO_ROOT / "tpa_2pairs_chefficiency.json",             # pairs 0 (ref) + 3 (target)
+    CALIB_PATH / "calib_step6_pair0_result.json",
+    CALIB_PATH / "calib_step6_pair3_result.json",  # pairs 0 (ref) + 3 (target)
 ]
 
 SWEEP_POINTS = 15                # Table 1 points over phi in [PHI_START, PHI_STOP]
@@ -76,9 +82,9 @@ PHI_START_DEG = 0.0
 PHI_STOP_DEG = 180.0             # capped at 180: the reachable half turn
 REF_PHASE_DEG = 180.0            # reference held fully-on (intensity 1)
 
-OUT_DIR = REPO_ROOT
-SPECTRUM_JSON = REPO_ROOT / "tpa_phase_spectrum.json"
-PLOT_PATH = REPO_ROOT / "tpa_phase_fit.png"
+OUT_DIR = CALIB_PATH             # all step-7 outputs live in the data directory
+SPECTRUM_JSON = CALIB_PATH / "calib_step7_result.json"
+PLOT_PATH = CALIB_PATH / "calib_step7_refit_result.png"     # offline-refit single-pair plot
 
 SLM_DISPLAY_NO = None            # None -> auto-detect the LCOS-SLM display (like the GUI's Detect)
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch (USB link)
@@ -90,6 +96,19 @@ DAQ_DURATION_S = 1.0             # DAQ averaging window per reading
 SETTLE_S = 0.15                  # wait after each SLM pattern change, before reading
 REPEATS = 1                      # repeated monitor readings averaged per point
 N_TRIALS = 10                    # times the whole sweep is repeated (statistics)
+
+# Amplitude handling for the dPhi_comb fit.  None -> unconstrained closed-form
+# fit; a number LOCKS the ratio a:b (= eta_ref:eta_tgt) from step 6 and floats a
+# single shared scale s boxed to +/- this fraction about 1 (1.0 == s in [0, 2]),
+# so a and b cannot diverge -- only a common gain drift between step 6 and 7 is
+# allowed.  report()/make_plot() flag when s hits its box.
+BOUND_FRAC = 1.0
+
+# Fold in the step-6 single-beam response as a FIXED background.  Table 1 holds
+# the reference (pair 0) fully on -> its single-beam is a constant; only the
+# target (pair 3) is swept -> only its single-beam ramps with the sweep.  Keeps
+# the fringe from having to absorb the single-beam ramp.
+SINGLE_BEAM_BG = True
 
 
 def detect_slm_display() -> int:
@@ -146,14 +165,26 @@ def _sigma(value: float, err: float) -> float:
     return abs(value) / err if err else float("nan")
 
 
+def _bound_note(value: float, eta: float, frac: float, at_bound: bool) -> str:
+    """Deviation from the step-6 eta plus an '[AT +/-100% BOUND]' warning tag."""
+    dev = (value / eta - 1.0) * 100.0 if eta else float("nan")
+    tag = f"  [AT +/-{frac*100:.0f}% BOUND]" if at_bound else ""
+    return f"  ({dev:+.0f}% vs eta {eta*1e3:.4f}){tag}"
+
+
 def report(fit: PhaseFit, tgt: int, ref: int) -> None:
-    """Print dPhi_comb (rad + deg), the fitted amplitudes a/b and the fit quality."""
-    print("Model:  Y = a^2 + b^2 sin^4(t2/2) + 2ab sin^2(t2/2) cos(dPhi_comb - pi + t2) + d")
+    """Print dPhi_comb (rad + deg), the ratio-locked amplitudes a/b and fit quality."""
+    print("Model:  Y = s^2 (a^2 + b^2 sin^4(t2/2) + 2ab sin^2(t2/2) cos(dPhi_comb - pi + t2))")
+    print("            + step6 single-beam(t2) + d     "
+          f"(a:b locked to step-6 eta ratio; scale s boxed +/-{fit.bound_frac*100:.0f}%)")
     print(f"Pair {tgt} vs reference {ref}  (value +/- error, Birge-scaled):")
     print(f"  dPhi_comb = {fit.dphi_comb:+.4f} +/- {fit.dphi_comb_err:.4f} rad"
           f"   ( {fit.dphi_comb_deg:+.2f} +/- {np.degrees(fit.dphi_comb_err):.2f} deg )")
-    print(f"  a (ref R_1)      = {fit.a*1e3:.4f} +/- {fit.a_err*1e3:.4f} mV^0.5")
-    print(f"  b (tgt eta CxCw) = {fit.b*1e3:.4f} +/- {fit.b_err*1e3:.4f} mV^0.5")
+    print(f"  a (ref R_1)      = {fit.a*1e3:.4f} +/- {fit.a_err*1e3:.4f} mV^0.5"
+          + _bound_note(fit.a, fit.eta_ref, fit.bound_frac, fit.a_at_bound))
+    print(f"  b (tgt eta CxCw) = {fit.b*1e3:.4f} +/- {fit.b_err*1e3:.4f} mV^0.5"
+          + _bound_note(fit.b, fit.eta_tgt, fit.bound_frac, fit.b_at_bound))
+    print(f"  fringe amp 2ab   = {fit.amp*1e3:.4f} +/- {fit.amp_err*1e3:.4f} mV")
     print(f"  residual dark d  = {fit.offset*1e3:+.4f} +/- {fit.offset_err*1e3:.4f} mV"
           f"   (should be ~0 after per-row dark subtraction)")
     print(f"  chi2/dof = {fit.chi2_red:.2f}  (dof={fit.dof})  -> Birge x{fit.birge:.2f} "
@@ -172,14 +203,16 @@ def make_plot(fit: PhaseFit, tgt: int, path) -> None:
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # smooth model over the reachable half turn theta2 in [0, 180] deg
+    # smooth model over the reachable half turn theta2 in [0, 180] deg;
+    # includes the pinned step-6 single-beam background bg0 + bg1 g + bg2 g^2
     th = np.radians(np.linspace(0.0, 180.0, 400))
     g = np.sin(th / 2.0) ** 2                    # sin^2(theta2/2)
     dslm = th - np.pi
     model = (fit.a**2 + fit.b**2 * g**2
-             + 2.0 * fit.a * fit.b * g * np.cos(dslm + fit.dphi_comb) + fit.offset)
+             + 2.0 * fit.a * fit.b * g * np.cos(dslm + fit.dphi_comb)
+             + fit.bg0 + fit.bg1 * g + fit.bg2 * g**2 + fit.offset)
     ax1.plot(np.degrees(dslm), model * 1e3, "-", color="tab:blue", lw=1.6,
-             label=r"fit: $a^2+b^2\sin^4+2ab\sin^2\cos(\Delta\Phi_{comb}-\pi+\theta_2)$")
+             label=r"fit: $a^2+b^2\sin^4+2ab\sin^2\cos+\mathrm{sb}(\theta_2)$")
     ax1.errorbar(dphi, fit.y * 1e3, yerr=fit.sem * 1e3, fmt="o", ms=5, color="tab:orange",
                  ecolor="lightgray", elinewidth=1, capsize=2, zorder=3,
                  label="measured (dark-subtracted)")
@@ -196,11 +229,13 @@ def make_plot(fit: PhaseFit, tgt: int, path) -> None:
     ax2.set_title(f"Pulls  ($\\chi^2$/dof = {fit.chi2_red:.2f})")
     ax2.legend(loc="upper right", fontsize=8)
 
+    bflag = ("  [a@bound]" if fit.a_at_bound else "") + ("  [b@bound]" if fit.b_at_bound else "")
     txt = (
         f"$\\Delta\\Phi_{{comb}}$ = {fit.dphi_comb_deg:+.2f} $\\pm$ "
         f"{np.degrees(fit.dphi_comb_err):.2f} deg  "
         f"({_sigma(fit.dphi_comb, fit.dphi_comb_err):.0f}$\\sigma$)\n"
-        f"a = {fit.a*1e3:.3f}, b = {fit.b*1e3:.3f} mV$^{{1/2}}$\n"
+        f"a = {fit.a*1e3:.3f} ($\\eta$ {fit.eta_ref*1e3:.3f}), "
+        f"b = {fit.b*1e3:.3f} ($\\eta$ {fit.eta_tgt*1e3:.3f}) mV$^{{1/2}}${bflag}\n"
         f"d = {fit.offset*1e3:+.3f} mV  (should be $\\approx$0)\n"
         f"$\\chi^2$/dof = {fit.chi2_red:.2f} (Birge x{fit.birge:.2f})"
     )
@@ -268,11 +303,14 @@ def make_report(result, tgt: int, ref: int, path, *, subtitle: str = "") -> None
     ax1.legend(loc="lower right", fontsize=8)
     fig.colorbar(sc, ax=ax1).set_label(r"$x\cdot w$")
 
+    bflag = ("  [a@bound]" if fit.a_at_bound else "") + ("  [b@bound]" if fit.b_at_bound else "")
     txt = (
         f"$\\Delta\\Phi_{{comb}}$ = {fit.dphi_comb_deg:+.1f} $\\pm$ "
         f"{np.degrees(fit.dphi_comb_err):.1f} deg\n"
         f"a = {fit.a*1e3:.3f} $\\pm$ {fit.a_err*1e3:.3f},  "
-        f"b = {fit.b*1e3:.3f} $\\pm$ {fit.b_err*1e3:.3f} mV$^{{1/2}}$\n"
+        f"b = {fit.b*1e3:.3f} $\\pm$ {fit.b_err*1e3:.3f} mV$^{{1/2}}${bflag}\n"
+        f"(boxed to $\\pm${fit.bound_frac*100:.0f}% of $\\eta$; "
+        f"$\\eta_{{ref}}$={fit.eta_ref*1e3:.3f}, $\\eta_{{tgt}}$={fit.eta_tgt*1e3:.3f})\n"
         f"d = {fit.offset*1e3:+.2f} mV  (should be $\\approx$0)\n"
         f"$\\chi^2$/dof = {fit.chi2_red:.1f} (Birge x{fit.birge:.2f})"
     )
@@ -308,7 +346,7 @@ def sweep_and_fit() -> None:
     """Table 1 for every target pair vs pair 0; save per-pair + spectrum, plot."""
     import json
 
-    calib = load_calibration_result(CALIB_PATH)
+    calib = load_calibration_result(IN_STEP3)
     layout = build_channel_layout(calib)
     models = load_models(layout)
 
@@ -328,22 +366,25 @@ def sweep_and_fit() -> None:
                 drive=drive, tgt_model=models[k], ref_model=models[REF_INDEX],
                 n_trials=N_TRIALS, repeats=REPEATS, settle=SETTLE_S,
                 read_timeout=max(30.0, DAQ_DURATION_S * 3.0 + 10.0),
+                frac=BOUND_FRAC, single_beam_bg=SINGLE_BEAM_BG,
                 progress_callback=lambda p: print(f"[{p.step}/{p.total}] {p.message}"),
             )
-            csv_path = OUT_DIR / f"tpa_phase_pair{k}_vs{REF_INDEX}.csv"
-            json_path = OUT_DIR / f"tpa_phase_pair{k}_vs{REF_INDEX}.json"
+            csv_path = OUT_DIR / f"calib_step7_pair{k}_vs{REF_INDEX}.csv"
+            json_path = OUT_DIR / f"calib_step7_pair{k}_vs{REF_INDEX}.json"
             write_phase_csv(result, csv_path)
             save_phase_json(result, json_path)
             report(result.fit, k, REF_INDEX)
-            make_plot(result.fit, k, OUT_DIR / f"tpa_phase_pair{k}_fit.png")
+            make_plot(result.fit, k, OUT_DIR / f"calib_step7_pair{k}_fit.png")
             make_report(result, k, REF_INDEX,
-                        OUT_DIR / f"tpa_phase_pair{k}_report.png",
+                        OUT_DIR / f"calib_step7_pair{k}_report.png",
                         subtitle="Table 1 (half-fringe sweep, phi_x = phi_w)")
             spectrum[k] = {
                 "dphi_comb_deg": result.fit.dphi_comb_deg,
                 "dphi_comb_err_deg": float(np.degrees(result.fit.dphi_comb_err)),
                 "a": result.fit.a,
                 "b": result.fit.b,
+                "a_at_bound": result.fit.a_at_bound,
+                "b_at_bound": result.fit.b_at_bound,
                 "csv": str(csv_path),
             }
     finally:
@@ -365,7 +406,7 @@ def sweep_and_fit() -> None:
 
 def symmetry_check() -> None:
     """Table 2: one-time 3x3 symmetry / functional-form check on TGT_INDICES[0]."""
-    calib = load_calibration_result(CALIB_PATH)
+    calib = load_calibration_result(IN_STEP3)
     layout = build_channel_layout(calib)
     models = load_models(layout)
     k = TGT_INDICES[0]
@@ -381,21 +422,22 @@ def symmetry_check() -> None:
             drive=drive, tgt_model=models[k], ref_model=models[REF_INDEX],
             n_trials=N_TRIALS, repeats=REPEATS, settle=SETTLE_S,
             read_timeout=max(30.0, DAQ_DURATION_S * 3.0 + 10.0),
+            frac=BOUND_FRAC, single_beam_bg=SINGLE_BEAM_BG,
             progress_callback=lambda p: print(f"[{p.step}/{p.total}] {p.message}"),
         )
     finally:
         daq.disconnect()
         slm.close_slm()
 
-    write_phase_csv(result, OUT_DIR / f"tpa_phase_pair{k}_symmetry.csv")
+    write_phase_csv(result, OUT_DIR / f"calib_step7_pair{k}_symmetry.csv")
     make_report(result, k, REF_INDEX,
-                OUT_DIR / f"tpa_phase_pair{k}_symmetry_report.png",
+                OUT_DIR / f"calib_step7_pair{k}_symmetry_report.png",
                 subtitle="Table 2 (symmetry grid, phi_x vs phi_w)")
     sw = swap_invariance(result)
     n_asym = sum(1 for *_, diff, sem in sw if diff > 3 * sem)
     print("\nSwap invariance  |Z(x=a,w=b) - Z(x=b,w=a)|  on the CLEAN interference")
-    print("term (step-6 dark + single-beam + self-TPA removed, a_x/a_w kept on their")
-    print("own channels)  (should be <~ combined SEM):")
+    print("term (a^2 + b^2 g^2 + step-6 single-beam + d all removed via fit.known)")
+    print("(should be <~ combined SEM):")
     for a, b, z, z_sw, diff, sem in sw:
         flag = "  <-- ASYMMETRIC" if diff > 3 * sem else ""
         print(f"  x={a:.3f} w={b:.3f}: Z={z*1e3:.4f} vs {z_sw*1e3:.4f} mV  "
@@ -425,7 +467,8 @@ def fit_csv(path) -> None:
     """Re-fit an already-recorded Table-1 CSV offline (no hardware)."""
     models = load_models()
     k = TGT_INDICES[0]
-    result = load_phase_csv(path, models[k], models[REF_INDEX])
+    result = load_phase_csv(path, models[k], models[REF_INDEX],
+                            frac=BOUND_FRAC, single_beam_bg=SINGLE_BEAM_BG)
     dts = result.per_trial_darks()
     drift = f" +/- {dts.std(ddof=1)*1e3:.4f} drift" if dts.size > 1 else ""
     print(f"Loaded {path}: {result.trial.size} rows, "

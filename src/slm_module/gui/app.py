@@ -70,6 +70,7 @@ from ..encoding import (
     ChannelLayout,
     build_channel_layout,
     build_single_anchor_layout,
+    compute_channel_geometry,
     encode_to_pattern,
     interpolate_coordinate_for_wavelength,
     optimize_from_osa,
@@ -1581,7 +1582,34 @@ class MainWindow(QtWidgets.QMainWindow):
         run_row.addWidget(self.stop_cal_button)
         lay.addLayout(run_row)
 
-        # --- fit from a saved calibration CSV ---
+        # The "Fit from CSV" controls and the fit-parameter / fit-curve /
+        # intensity-map result windows are no longer shown on this page (replaced
+        # by the channel-map preview below), but they are still built and kept
+        # alive off-screen: the calibration run pipeline (_handle_calibration_*,
+        # Run All) drives this fit + plot flow, so their widgets must exist.
+        fit_backing = self._build_step3_fit_backing()
+        fit_backing.setVisible(False)
+        lay.addWidget(fit_backing)
+
+        # --- channel map preview (replaces the old bottom result windows) ---
+        # Added with no stretch so it stays short; the trailing stretch soaks up
+        # extra vertical space, keeping the config widgets above at natural size.
+        lay.addWidget(self._build_channel_map_panel())
+        lay.addStretch(1)
+        self._update_channel_map_button()
+        return page
+
+    def _build_step3_fit_backing(self) -> QtWidgets.QWidget:
+        """Off-screen container for the legacy Fit-from-CSV controls + plots.
+
+        These widgets are hidden on the Step-3 page but still populated by the
+        calibration run/Run-All flow, so they are created here to keep those code
+        paths (and their attribute references) working.
+        """
+        backing = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(backing)
+        outer.setContentsMargins(0, 0, 0, 0)
+
         controls = self._panel("Fit from CSV")
         controls_layout = QtWidgets.QGridLayout(controls)
         self.calibration_path_edit = QtWidgets.QLineEdit()
@@ -1600,9 +1628,8 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.save_fit_button, 0, 3)
         controls_layout.addWidget(QtWidgets.QLabel("Wavelength"), 1, 0)
         controls_layout.addWidget(self.wavelength_combo, 1, 1, 1, 3)
-        lay.addWidget(controls)
+        outer.addWidget(controls)
 
-        # --- results: fit parameters + fit curve / intensity map ---
         self.fit_table = QtWidgets.QTableWidget(0, 2)
         self.fit_table.setHorizontalHeaderLabels(["Metric", "Value"])
         self.fit_table.horizontalHeader().setStretchLastSection(True)
@@ -1636,8 +1663,37 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(self._panel_with_widget("Fit Parameters", self.fit_table))
         split.addWidget(right_tabs)
         split.setSizes([360, 720])
-        lay.addWidget(split, 1)
-        return page
+        outer.addWidget(split, 1)
+        return backing
+
+    def _build_channel_map_panel(self) -> QtWidgets.QGroupBox:
+        """Panel with a 'Generate channel map' button and its preview canvas."""
+        panel = self._panel("Channel Map")
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        row = QtWidgets.QHBoxLayout()
+        self.channel_map_button = QtWidgets.QPushButton("Generate channel map")
+        self.channel_map_button.setToolTip(
+            "Preview the encoding channel layout (from the Step-2 wavelength map, "
+            "the Window px, and the Pad px). Enabled once a Step-2 source is set."
+        )
+        self.channel_map_button.clicked.connect(self._generate_channel_map)
+        self.channel_map_status = QtWidgets.QLabel("\N{EN DASH}")
+        self.channel_map_status.setObjectName("PageSubtitle")
+        self.channel_map_status.setWordWrap(True)
+        row.addWidget(self.channel_map_button)
+        row.addWidget(self.channel_map_status, 1)
+        layout.addLayout(row)
+
+        # Short, fixed-height strip: the layout is a single horizontal band, so
+        # it does not need much height, and keeping it small leaves room for the
+        # config widgets above.
+        self.channel_map_figure = Figure(figsize=(8, 2.0), tight_layout=True)
+        self.channel_map_canvas = FigureCanvas(self.channel_map_figure)
+        self.channel_map_canvas.setMinimumHeight(140)
+        self.channel_map_canvas.setMaximumHeight(220)
+        layout.addWidget(self.channel_map_canvas)
+        return panel
 
     def _build_measurement_group(self, step: int, defaults: dict[str, str]) -> QtWidgets.QGroupBox:
         """OSA measurement settings (center λ / span / sensitivity / ref) for a step."""
@@ -1849,19 +1905,42 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets["daq_group"] = self._build_step3_daq_group()
         layout.addWidget(widgets["daq_group"])
 
-        # shared config: window px + coordinate stride
+        # shared config: window px + encoding pad + coordinate stride
         cfg = QtWidgets.QHBoxLayout()
-        widgets["window"] = self._spin(1, 8191, 3)
+        widgets["window"] = self._spin(1, 8191, 15)
+        widgets["pad"] = self._spin(0, 8191, 5)
+        widgets["pad"].setToolTip(
+            "Dark gap between encoding channels. Used to preview the channel map; "
+            "does not affect the Step-3 sweep itself."
+        )
         widgets["stride"] = self._spin(1, 8191, 1)
         widgets["stride"].setToolTip(
             "Measure only every Nth calibrated coordinate (1 = every coordinate)."
         )
+        widgets["channels_only"] = QtWidgets.QCheckBox("Channels only")
+        widgets["channels_only"].setToolTip(
+            "Scan only where an encoding channel exists: light each channel window "
+            "(Window px wide, Pad px apart \N{EM DASH} the same geometry as the "
+            "channel map) at its centre pixel, sweep the levels, then jump to the "
+            "next channel centre. Skips the dark pads and Rb guard bands, so the "
+            "sweep is far shorter than walking every calibrated coordinate. Stride "
+            "is ignored in this mode."
+        )
         cfg.addWidget(QtWidgets.QLabel("Window px"))
         cfg.addWidget(widgets["window"])
+        cfg.addWidget(QtWidgets.QLabel("Pad px"))
+        cfg.addWidget(widgets["pad"])
         cfg.addWidget(QtWidgets.QLabel("Stride"))
         cfg.addWidget(widgets["stride"])
+        cfg.addWidget(widgets["channels_only"])
         cfg.addStretch(1)
         layout.addLayout(cfg)
+        # re-check the channel-map button when the window/pad geometry changes
+        widgets["window"].valueChanged.connect(self._update_channel_map_button)
+        widgets["pad"].valueChanged.connect(self._update_channel_map_button)
+        # stride is meaningless when scanning channel centres, so grey it out there
+        widgets["channels_only"].toggled.connect(self._toggle_step3_channels_only)
+        self._toggle_step3_channels_only()
 
         # OSA measurement settings + extras. Step 3's own run is DAQ-only, but the
         # Pipeline tab and Run All still drive an OSA intensity sweep and reuse
@@ -1900,6 +1979,8 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets["in_row"] = self._input_file_row(
             3, "Open Step 2 result or λ-map CSV", "Calibration (*.json *.csv)"
         )
+        # typing/browsing a Step-2 file re-checks the channel-map button
+        widgets["in_path"].textChanged.connect(self._update_channel_map_button)
         layout.addWidget(widgets["in_row"])
         widgets["manual_row"] = self._min_max_row(3, "min/max for CSV source")
         layout.addWidget(widgets["manual_row"])
@@ -2728,19 +2809,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.enc_layout_status.setText(f"Layout error: {exc}")
             return
 
+        placed = layout.n_channels
+        if placed < 1:
+            self.enc_layout_status.setText(
+                "No channels fit between the centre and the dark guard bands."
+            )
+            self.enc_generate_button.setEnabled(False)
+            return
+
         self.encoding_layout = layout
         self._edge_optimization_result = None
         self.enc_use_optimized_lut.setChecked(False)
         self.enc_use_optimized_lut.setEnabled(False)
         self._enc_populate_val_table(layout)
         self._edge_sync_layout(layout)
+        dropped = "" if placed == n_ch else f" ({n_ch - placed} dropped at guard bands)"
         self.enc_layout_status.setText(
-            f"{n_ch} ch/side  |  pitch {layout.pitch_px} px  |  "
+            f"{placed} ch/side{dropped}  |  pitch {layout.pitch_px} px  |  "
             f"pad {layout.pitch_px - layout.channel_width_px} px"
         )
         self.enc_generate_button.setEnabled(True)
         self._enc_log(
-            f"Layout built: {n_ch} channels/side, width "
+            f"Layout built: {placed} channels/side, width "
             f"{layout.channel_width_px} px, padding {layout.pitch_px - layout.channel_width_px} px. "
             "Edit values in the table, then Generate & Preview."
         )
@@ -6012,6 +6102,148 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step_widgets[3]["in_row"].setVisible(index == 1)
         # manual min/max only matter for a bare wavelength-map CSV source
         self.step_widgets[3]["manual_row"].setVisible(index == 1)
+        self._update_channel_map_button()
+
+    def _step3_wavelength_source_available(self) -> bool:
+        """True when a Step-2 wavelength source is set (memory result or a file)."""
+        widgets = self.step_widgets.get(3)
+        if not widgets or "source" not in widgets:
+            return False
+        if widgets["source"].currentIndex() == 1:  # from file
+            return bool(widgets["in_path"].text().strip())
+        return self.calibration_result is not None  # in-memory Step-2 result
+
+    def _toggle_step3_channels_only(self) -> None:
+        """Channels-only scans use the channel geometry, not per-coordinate
+        subsampling, so grey out Stride while the mode is active."""
+        widgets = self.step_widgets.get(3, {})
+        if "channels_only" not in widgets or "stride" not in widgets:
+            return
+        widgets["stride"].setEnabled(not widgets["channels_only"].isChecked())
+
+    def _step3_channel_mapping(
+        self, mapping: CalibrationResult, window: int, pad: int
+    ) -> CalibrationResult:
+        """Reduce a Step-2 mapping to just the encoding-channel centres.
+
+        Builds the channel-map geometry (Window px = channel width, Pad px = the
+        inter-channel gap) and returns a copy of ``mapping`` whose coordinates /
+        wavelength are the centre pixel and fitted wavelength of every channel, in
+        ascending pixel order. Feeding this to intensity_calibration_daq makes the
+        sweep light one channel window at a time and hop between channel centres,
+        skipping the dark pads and Rb guard bands in between.
+        """
+        from dataclasses import replace
+
+        geom = compute_channel_geometry(
+            np.asarray(mapping.coordinates, dtype=float),
+            np.asarray(mapping.wavelength, dtype=float),
+            n_channels=100_000,  # fill the calibrated range; tiling self-limits
+            channel_width_px=int(window),
+            gap_px=int(pad),
+        )
+        channels = sorted(geom.x + geom.w, key=lambda g: g.x_center)
+        if not channels:
+            raise ValueError(
+                "channels-only scan: no channels fit the calibrated range "
+                "(check Window/Pad against the Step-2 coordinate span)"
+            )
+        centers = np.array([g.x_center for g in channels], dtype=float)
+        wavelengths = np.array([g.wavelength_nm for g in channels], dtype=float)
+        return replace(mapping, coordinates=centers, wavelength=wavelengths)
+
+    def _update_channel_map_button(self) -> None:
+        """Enable the channel-map button once window, pad, and a Step-2 source exist."""
+        if not hasattr(self, "channel_map_button"):
+            return
+        widgets = self.step_widgets.get(3, {})
+        has_geom = (
+            "window" in widgets
+            and widgets["window"].value() >= 1
+            and "pad" in widgets
+        )
+        self.channel_map_button.setEnabled(
+            has_geom and self._step3_wavelength_source_available()
+        )
+
+    def _generate_channel_map(self) -> None:
+        """Preview the encoding channel layout from the Step-2 wavelength map."""
+        try:
+            mapping = self._resolve_step_input(3)
+        except ValueError as exc:
+            self.channel_map_status.setText(str(exc))
+            return
+        coords = np.asarray(mapping.coordinates, dtype=float)
+        wavelengths = np.asarray(mapping.wavelength, dtype=float)
+        window = self.step_widgets[3]["window"].value()
+        pad = self.step_widgets[3]["pad"].value()
+        try:
+            geom = compute_channel_geometry(
+                coords,
+                wavelengths,
+                n_channels=100_000,  # fill the calibrated range; tiling self-limits
+                channel_width_px=window,
+                gap_px=pad,
+            )
+        except ValueError as exc:
+            self.channel_map_status.setText(f"Cannot build layout: {exc}")
+            return
+
+        wl_at_c0 = float(np.polyval(np.polyfit(coords, wavelengths, 1), geom.c0))
+        self.channel_map_status.setText(
+            f"{geom.n_channels} pairs \N{MIDDLE DOT} width {window} px, "
+            f"pad {pad} px \N{MIDDLE DOT} {geom.center_wl:g} nm at px {geom.c0} "
+            f"(fit {wl_at_c0:.4f} nm) \N{MIDDLE DOT} "
+            f"{len(geom.dark_px_ranges)} dark guard band(s)"
+        )
+        self._draw_channel_map(geom, coords)
+
+    def _draw_channel_map(self, geom: Any, coords: np.ndarray) -> None:
+        """Render the pixel -> channel map: x/w bands, guard bands, 778 centre."""
+        self.channel_map_figure.clear()
+        self.channel_map_figure.patch.set_facecolor("#101820")
+        axes = self.channel_map_figure.add_subplot(111)
+        self._style_dark_axes(axes)
+
+        # dark guard bands span the full height
+        for i, (lo, hi) in enumerate(geom.dark_px_ranges):
+            axes.axvspan(
+                lo, hi + 1, color="#5a5a5a", alpha=0.55,
+                label="Dark guard band" if i == 0 else None,
+            )
+        # x (wl > centre) and w (wl < centre) share one band; colour tells them
+        # apart (they never overlap in x, so no vertical separation is needed).
+        band = (0.05, 0.9)
+        if geom.x:
+            axes.broken_barh(
+                [(c.x_start, c.x_end - c.x_start) for c in geom.x],
+                band, facecolors="#4c9be8",
+                edgecolor="#0d1b2a", label="x (λ > centre)",
+            )
+        if geom.w:
+            axes.broken_barh(
+                [(c.x_start, c.x_end - c.x_start) for c in geom.w],
+                band, facecolors="#e8794c",
+                edgecolor="#2a130d", label="w (λ < centre)",
+            )
+        # 778 nm centre pixel
+        axes.axvline(
+            geom.c0, color="#f2c14e", linewidth=1.6, linestyle="--",
+            label=f"{geom.center_wl:g} nm centre (px {geom.c0})",
+        )
+
+        lo = min(coords.min(), geom.x[-1].x_start if geom.x else coords.min())
+        hi = max(coords.max(), geom.w[-1].x_end if geom.w else coords.max())
+        axes.set_xlim(lo - 5, hi + 5)
+        axes.set_ylim(0.0, 1.0)
+        axes.set_yticks([])
+        axes.set_xlabel("SLM pixel column")
+        # legend above the axes so it never overlaps the full-height bars
+        axes.legend(
+            loc="lower center", bbox_to_anchor=(0.5, 1.0),
+            ncol=4, fontsize=8, frameon=False,
+        )
+        self.channel_map_canvas.draw_idle()
 
     def _connect_osa(self) -> None:
         host = self.osa_host_edit.text().strip()
@@ -6297,9 +6529,16 @@ class MainWindow(QtWidgets.QMainWindow):
             mapping = self._resolve_step_input(3)
             levels = self._step_levels(3)
             window = self.step_widgets[3]["window"].value()
+            pad = self.step_widgets[3]["pad"].value()
             stride = self.step_widgets[3]["stride"].value()
             region = self._step_region(3)
             daq_settings = self._step3_daq_settings()
+            channels_only = self.step_widgets[3]["channels_only"].isChecked()
+            if channels_only:
+                # Scan only the channel centres; stride subsamples coordinates,
+                # which no longer applies once the set is the channels themselves.
+                mapping = self._step3_channel_mapping(mapping, window, pad)
+                stride = 1
         except ValueError as exc:
             return self._reject_calibration(exc)
         out_json = self._resolve_output_path(
@@ -6311,11 +6550,18 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self._controller()
         daq.configure_monitor(daq_settings)
         read_timeout = max(30.0, daq_settings.duration * 3.0 + 10.0)
+        scan_desc = (
+            f"{mapping.coordinates.size} channels"
+            if channels_only
+            else f"stride {stride}"
+        )
         self._log(
             f"Step 3 (DAQ) started: {len(levels)} levels, window {window} px, "
+            f"{scan_desc}, "
             f"{daq_settings.channel} @ {daq_settings.sample_rate:g} S/s, "
             f"avg {daq_settings.duration:g}s"
         )
+        noun = "channels" if channels_only else "coordinates"
 
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
             result = intensity_calibration_daq(
@@ -6328,7 +6574,8 @@ class MainWindow(QtWidgets.QMainWindow):
             csv_path = write_intensity_calibration_csv(result, out_csv)
             return {
                 "status": "ok", "step": 3, "result": result, "saved": out_json,
-                "csv": csv_path, "summary": f"{result.coordinates.size} coordinates",
+                "csv": csv_path,
+                "summary": f"{result.coordinates.size} {noun}",
             }
 
         self._launch_calibration("Run step 3 (DAQ)", work)
@@ -7418,6 +7665,8 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = payload.get("summary", "")
         saved = payload.get("saved")
         self.calibration_result = result
+        # a fresh Step-2 result enables the "memory" channel-map source
+        self._update_channel_map_button()
 
         if step in (1, 2, 3):
             self.step_widgets[step]["status"].setText(f"Done \N{MIDDLE DOT} {summary}")

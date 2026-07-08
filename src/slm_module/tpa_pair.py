@@ -255,6 +255,42 @@ def build_sweep(sweep_min: float, sweep_max: float, n_points: int) -> np.ndarray
     return np.concatenate(([0.0], ramp))
 
 
+def build_pair_points(
+    sweep_min: float, sweep_max: float, n_points: int
+) -> list[tuple[float, float]]:
+    """Reduced 1-D calibration curves for a pair (not the full 2-D grid).
+
+    Rather than the ``(n+1) x (n+1)`` outer-product grid, this measures only the
+    lines that each fit term needs, ``n_points`` per line plus one shared dark
+    point::
+
+        dark    (0, 0)   -- anchors the offset d
+        x-only  (r, 0)   -- only x on -> pins a_x, q_x
+        w-only  (0, r)   -- only w on -> pins a_w, q_w
+        cross   (1, r)   -- x pinned at 1, w swept -> the ONLY points with
+                            x*w != 0, so they pin eta once the single-beam
+                            terms above are known
+
+    ``r`` runs over ``linspace(sweep_min, sweep_max, n_points)``.  The full
+    TPA model stays identifiable because the w-only line sees ``a_w``/``q_w``
+    but carries ``x*w = 0``, so it separates the single-beam ``w`` response
+    from the ``eta^2*(x*w)`` cross term measured on the ``x=1`` line.  Points
+    are de-duplicated so a level shared across lines is measured once.
+    """
+    ramp = np.linspace(float(sweep_min), float(sweep_max), int(n_points))
+    pts: list[tuple[float, float]] = [(0.0, 0.0)]
+    pts += [(float(r), 0.0) for r in ramp]   # x-only  -> a_x, q_x
+    pts += [(0.0, float(r)) for r in ramp]   # w-only  -> a_w, q_w
+    pts += [(1.0, float(r)) for r in ramp]   # cross (x=1) -> eta
+    seen: set[tuple[float, float]] = set()
+    unique: list[tuple[float, float]] = []
+    for p in pts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
 def measure_pair_grids(
     monitor,
     slm,
@@ -262,6 +298,7 @@ def measure_pair_grids(
     *,
     pair_indices: Sequence[int],
     sweep: Sequence[float],
+    points: Sequence[tuple[float, float]] | None = None,
     n_trials: int = 1,
     repeats: int = 1,
     settle: float = 0.15,
@@ -270,20 +307,26 @@ def measure_pair_grids(
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> TPAPairResult:
-    """Sweep each requested pair's (x, w) grid and fit eta for each.
+    """Sweep each requested pair's (x, w) points and fit eta for each.
 
     ``monitor`` must already be configured (the caller runs
     ``configure_monitor``); this only calls ``monitor_cycle``.  For each pair the
-    full outer-product grid of ``sweep`` x ``sweep`` is measured ``n_trials``
-    times (all other channels held off), then the pair's grid is fit to the TPA
-    model.  ``settle`` seconds are waited after every pattern change before
-    reading.  ``col_ratio`` is the per-column encoding shape forwarded to
+    ``(x, w)`` points are measured ``n_trials`` times (all other channels held
+    off), then the pair's data is fit to the TPA model.  By default the points
+    are the full outer-product grid of ``sweep`` x ``sweep``; pass ``points`` to
+    measure an explicit list instead (e.g. the reduced 1-D curves from
+    :func:`build_pair_points`), in which case ``sweep`` is only recorded as the
+    ramp on the result.  ``settle`` seconds are waited after every pattern change
+    before reading.  ``col_ratio`` is the per-column encoding shape forwarded to
     :func:`encode_to_pattern` so the calibration is measured with the same
     channel taper that will be deployed (``None`` = flat band).  Raises
     :class:`TPAPairAborted` if ``stop_event`` is set.
     """
     sweep_arr = np.asarray(list(sweep), dtype=float)
-    grid_pts = [(float(x), float(w)) for x in sweep_arr for w in sweep_arr]
+    if points is not None:
+        grid_pts = [(float(x), float(w)) for x, w in points]
+    else:
+        grid_pts = [(float(x), float(w)) for x in sweep_arr for w in sweep_arr]
     indices = list(pair_indices)
     n = layout.n_channels
     zeros = np.zeros(n)
@@ -512,6 +555,7 @@ __all__ = [
     "fit_grid",
     "recompute_fits",
     "build_sweep",
+    "build_pair_points",
     "measure_pair_grids",
     "write_tpa_pair_csv",
     "load_tpa_pair_csv",
