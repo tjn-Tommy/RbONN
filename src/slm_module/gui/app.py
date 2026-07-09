@@ -3342,7 +3342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.shape_enabled_check = QtWidgets.QCheckBox(
             "Use encoding shape  (uncheck → flat band everywhere)"
         )
-        self.shape_enabled_check.setChecked(True)
+        self.shape_enabled_check.setChecked(False)
         self.shape_enabled_check.setToolTip(
             "Global switch. On: every encoding step uses the per-column shape "
             "below. Off: every step uses the flat band (col_ratio = None), as if "
@@ -3365,6 +3365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.edge_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.edge_table.setFixedHeight(104)
+        self.edge_table.setEnabled(self.shape_enabled_check.isChecked())
         self.edge_table.setToolTip(
             "Ratio per column across the channel width (left→right). 1.0 = full "
             "value, 0.0 = channel's measured background."

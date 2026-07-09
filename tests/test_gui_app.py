@@ -86,6 +86,17 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_encoding_shape_defaults_to_off(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            self.assertFalse(window.shape_enabled_check.isChecked())
+            self.assertFalse(window.edge_table.isEnabled())
+            self.assertIsNone(window._active_col_ratio())
+        finally:
+            window.close()
+
     def test_pipeline_tab_supports_skipped_prerequisites(self) -> None:
         from slm_module.gui.app import MainWindow
 
