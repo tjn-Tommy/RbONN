@@ -100,6 +100,13 @@ from ..tpa_pair import (
     save_tpa_pair_json,
     write_tpa_pair_csv,
 )
+from ..tpa_center import (
+    TPACenterAborted,
+    TPACenterProgress,
+    TPACenterResult,
+    average_trace_points,
+    measure_center_scan,
+)
 from ..keepalive import SLMKeepAlive
 from .style import DARK_STYLESHEET
 
@@ -595,6 +602,7 @@ class MainWindow(QtWidgets.QMainWindow):
     calibration_progress = QtCore.pyqtSignal(object)
     analysis_progress = QtCore.pyqtSignal(object)
     tpa_progress = QtCore.pyqtSignal(object)
+    tpa_center_progress = QtCore.pyqtSignal(object)
     edge_gain_progress = QtCore.pyqtSignal(int, int, str)
     edge_optimization_progress = QtCore.pyqtSignal(object)
     qt_test_progress = QtCore.pyqtSignal(int, int, str)
@@ -648,6 +656,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ana_capture_dir: str | None = None
         self.tpa_result: TPAPairResult | None = None
         self.tpa_stop_event: threading.Event | None = None
+        self.tpa_center_result: TPACenterResult | None = None
+        self.tpa_center_stop_event: threading.Event | None = None
         self.scope_controller: ScopeController | None = None
         self.scope_stop_event: threading.Event | None = None
         self.daq_controller: DAQController | None = None
@@ -667,6 +677,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_progress.connect(self._on_calibration_progress)
         self.analysis_progress.connect(self._on_analysis_progress)
         self.tpa_progress.connect(self._on_tpa_progress)
+        self.tpa_center_progress.connect(self._on_tpa_center_progress)
         self.edge_gain_progress.connect(self._edge_gain_progress)
         self.edge_optimization_progress.connect(self._edge_optimization_progress)
         self.qt_test_progress.connect(self._qt_test_progress)
@@ -941,6 +952,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_analysis_page(), "Step 4 · Mod Error")
         tabs.addTab(self._build_scope_holding_tab(), "Step 5 · Holding")
         tabs.addTab(self._build_tpa_tab(), "Step 6 · TPA Efficiency")
+        tabs.addTab(self._build_tpa_center_tab(), "Step 6b · TPA Center")
         tabs.insertTab(0, self._build_pipeline_page(), "Pipeline")
         tabs.addTab(self._build_stage3_reopt_page(), "Step 4b - Stage3 Reopt")
         self.calibration_tabs = tabs
@@ -5515,6 +5527,371 @@ class MainWindow(QtWidgets.QMainWindow):
         csv_path = write_tpa_pair_csv(self.tpa_result, base.with_suffix(".csv"))
         js = save_tpa_pair_json(self.tpa_result, base.with_suffix(".json"))
         self.tpa_status.setText(f"Saved {Path(csv_path).name}  +  {Path(js).name}")
+
+    def _build_tpa_center_tab(self) -> QtWidgets.QWidget:
+        page = self._page_shell("TPA Centre-Wavelength Calibration")
+        subtitle = QtWidgets.QLabel(
+            "Scan the symmetric layout centre wavelength, read the TPA fluorescence "
+            "brightness from the connected scope or DAQ, and fit the peak with a "
+            "weighted quadratic. Build the channel grid on the TPA Encoding page "
+            "first; this scan reuses its width, spacing and channel count."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        page.layout().addWidget(subtitle)
+
+        cfg = self._panel("Scan Settings")
+        grid = QtWidgets.QGridLayout(cfg)
+        self.tpa_center_pair_index = self._spin(0, 63, 0)
+        self.tpa_center_pair_index.setToolTip("Which symmetric x/w pair to keep on")
+        self.tpa_center_drive = QtWidgets.QDoubleSpinBox()
+        self.tpa_center_drive.setRange(0.0, 1.0)
+        self.tpa_center_drive.setSingleStep(0.05)
+        self.tpa_center_drive.setDecimals(2)
+        self.tpa_center_drive.setValue(1.0)
+        self.tpa_center_drive.setToolTip("Per-side drive level for the selected pair")
+        self.tpa_center_start = self._double_spin(700.0, 900.0, 777.8, " nm", 4)
+        self.tpa_center_stop = self._double_spin(700.0, 900.0, 778.2, " nm", 4)
+        self.tpa_center_points = self._spin(3, 51, 9)
+        self.tpa_center_trials = self._spin(1, 500, 5)
+        self.tpa_center_repeats = self._spin(1, 20, 1)
+        self.tpa_center_bg_check = QtWidgets.QCheckBox("Subtract all-off background")
+        self.tpa_center_bg_check.setChecked(True)
+        self.tpa_center_bg_check.setToolTip(
+            "Measure an all-off pattern at each centre first and subtract it."
+        )
+        widgets = [
+            ("Pair index", self.tpa_center_pair_index),
+            ("Drive", self.tpa_center_drive),
+            ("Start λ", self.tpa_center_start),
+            ("Stop λ", self.tpa_center_stop),
+            ("Points", self.tpa_center_points),
+            ("Trials", self.tpa_center_trials),
+            ("Repeats", self.tpa_center_repeats),
+        ]
+        for i, (label, widget) in enumerate(widgets):
+            r, c = i // 2, (i % 2) * 2
+            grid.addWidget(QtWidgets.QLabel(label), r, c)
+            grid.addWidget(widget, r, c + 1)
+        grid.addWidget(self.tpa_center_bg_check, 4, 0, 1, 4)
+        page.layout().addWidget(cfg)
+
+        self.tpa_center_fig = Figure(figsize=(8, 3.4), tight_layout=True)
+        self.tpa_center_canvas = FigureCanvas(self.tpa_center_fig)
+        page.layout().addWidget(
+            self._panel_with_widget("Brightness vs centre wavelength", self.tpa_center_canvas),
+            1,
+        )
+
+        self.tpa_center_report = QtWidgets.QLabel("Centre: (run a scan)")
+        self.tpa_center_report.setObjectName("PageSubtitle")
+        self.tpa_center_report.setWordWrap(True)
+        self.tpa_center_apply_button = QtWidgets.QPushButton("Apply to TPA Encoding")
+        self.tpa_center_apply_button.setProperty("variant", "ghost")
+        self.tpa_center_apply_button.setEnabled(False)
+        self.tpa_center_apply_button.clicked.connect(self._tpa_center_apply)
+        report_row = QtWidgets.QHBoxLayout()
+        report_row.addWidget(self.tpa_center_report, 1)
+        report_row.addWidget(self.tpa_center_apply_button)
+        page.layout().addLayout(report_row)
+
+        self.tpa_center_bar = QtWidgets.QProgressBar()
+        self.tpa_center_bar.setValue(0)
+        self.tpa_center_status = QtWidgets.QLabel("\N{EN DASH}")
+        self.tpa_center_run_button = QtWidgets.QPushButton("Run Centre Scan")
+        self.tpa_center_run_button.clicked.connect(self._tpa_center_run)
+        self.tpa_center_stop_button = QtWidgets.QPushButton("Stop")
+        self.tpa_center_stop_button.setProperty("variant", "danger")
+        self.tpa_center_stop_button.setEnabled(False)
+        self.tpa_center_stop_button.clicked.connect(self._tpa_center_stop)
+        ctrl = QtWidgets.QHBoxLayout()
+        ctrl.addWidget(self.tpa_center_status, 1)
+        ctrl.addWidget(self.tpa_center_run_button)
+        ctrl.addWidget(self.tpa_center_stop_button)
+        page.layout().addWidget(self.tpa_center_bar)
+        page.layout().addLayout(ctrl)
+
+        self._tpa_center_draw(None)
+        return page
+
+    def _tpa_center_set_running(self, running: bool) -> None:
+        self.tpa_center_run_button.setEnabled(not running)
+        self.tpa_center_stop_button.setEnabled(running)
+        can_apply = (
+            not running
+            and self.tpa_center_result is not None
+            and self.tpa_center_result.fit is not None
+            and self.tpa_center_result.fit.valid
+        )
+        self.tpa_center_apply_button.setEnabled(can_apply)
+
+    def _tpa_center_run(self) -> None:
+        from dataclasses import replace
+
+        layout = self.encoding_layout
+        if layout is None:
+            self.tpa_center_status.setText(
+                "No channel grid — build a layout on the TPA Encoding page first."
+            )
+            return
+        calib = self._enc_get_calib()
+        if calib is None or calib.intensity_levels is None:
+            self.tpa_center_status.setText(
+                "No Step 3 calibration available for rebuilding the layout."
+            )
+            return
+        pair_index = self.tpa_center_pair_index.value()
+        if pair_index >= layout.n_channels:
+            self.tpa_center_status.setText(
+                f"Pair index out of range (layout has {layout.n_channels} pairs)."
+            )
+            return
+        start = self.tpa_center_start.value()
+        stop = self.tpa_center_stop.value()
+        if stop <= start:
+            self.tpa_center_status.setText("Stop λ must be greater than start λ.")
+            return
+
+        active = self._enc_active_monitor()
+        if active is None:
+            self.tpa_center_status.setText("Connect the scope or DAQ first (Scope / DAQ page).")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.tpa_center_status.setText("Open the SLM on the SLM Control page first.")
+            return
+
+        centers = np.linspace(start, stop, self.tpa_center_points.value())
+        n_trials = self.tpa_center_trials.value()
+        repeats = self.tpa_center_repeats.value()
+        subtract_bg = self.tpa_center_bg_check.isChecked()
+        total = max(n_trials * centers.size * (2 if subtract_bg else 1), 1)
+        gap_px = layout.pitch_px - layout.channel_width_px
+
+        kind, monitor = active
+        if kind == "scope":
+            settings = self._monitor_settings(trigger_mode="AUTO")
+        else:
+            settings = self._daq_monitor_settings()
+        settle = float(settings.hold)
+        read_timeout = max(30.0, settings.duration * 3.0 + 10.0)
+        settings0 = replace(settings, hold=0.0)
+
+        self.tpa_center_bar.setMaximum(total)
+        self.tpa_center_bar.setValue(0)
+        self.tpa_center_status.setText(
+            f"Starting… pair[{pair_index}] · {start:.4f}–{stop:.4f} nm · "
+            f"{centers.size} points via {kind}"
+        )
+        self._tpa_center_set_running(True)
+
+        stop_event = threading.Event()
+        self.tpa_center_stop_event = stop_event
+
+        def report(progress: TPACenterProgress) -> None:
+            self.tpa_center_progress.emit(progress)
+
+        def work() -> dict[str, Any]:
+            monitor.configure_monitor(settings0)
+            try:
+                result = measure_center_scan(
+                    monitor,
+                    controller,
+                    calib,
+                    center_wavelengths_nm=centers,
+                    n_channels=layout.n_channels,
+                    channel_width_px=layout.channel_width_px,
+                    gap_px=gap_px,
+                    pair_index=pair_index,
+                    drive_level=self.tpa_center_drive.value(),
+                    n_trials=n_trials,
+                    repeats=repeats,
+                    settle=settle,
+                    read_timeout=read_timeout,
+                    col_ratio=self._active_col_ratio(),
+                    subtract_background=subtract_bg,
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+            except TPACenterAborted:
+                return {"status": "aborted"}
+            return {"status": "ok", "result": result}
+
+        self._run_slm_task(
+            "TPA centre scan", work, self._tpa_center_finished, self._tpa_center_error
+        )
+
+    def _tpa_center_stop(self) -> None:
+        if self.tpa_center_stop_event is not None:
+            self.tpa_center_stop_event.set()
+            self.tpa_center_status.setText("Stopping…")
+
+    def _on_tpa_center_progress(self, progress: TPACenterProgress) -> None:
+        self.tpa_center_bar.setMaximum(max(progress.total, 1))
+        self.tpa_center_bar.setValue(min(progress.step, progress.total))
+        self.tpa_center_status.setText(progress.message)
+
+    def _tpa_center_finished(self, payload: dict[str, Any]) -> None:
+        self.tpa_center_stop_event = None
+        self._tpa_center_set_running(False)
+        if payload.get("status") == "aborted":
+            self.tpa_center_status.setText("Centre scan stopped.")
+            return
+        result = payload["result"]
+        self.tpa_center_result = result
+        self._tpa_center_update_report(result)
+        self._tpa_center_draw(result)
+        fit = result.fit
+        if fit is not None and fit.valid:
+            center_x = self._tpa_center_wavelength_to_x(fit.center_wl_nm, result)
+            if center_x is None:
+                self.tpa_center_status.setText(
+                    f"Done · centre {fit.center_wl_nm:.4f} nm"
+                )
+            else:
+                self.tpa_center_status.setText(
+                    f"Done · centre {fit.center_wl_nm:.4f} nm (x={center_x:.3f} px)"
+                )
+        elif fit is not None:
+            self.tpa_center_status.setText(
+                f"Scan finished · best sampled {fit.best_sample_center_wl_nm:.4f} nm "
+                f"({fit.message})"
+            )
+        else:
+            self.tpa_center_status.setText("Scan finished.")
+        self._tpa_center_set_running(False)
+
+    def _tpa_center_error(self, _error: str) -> None:
+        self.tpa_center_stop_event = None
+        self._tpa_center_set_running(False)
+        self.tpa_center_status.setText("TPA centre scan failed (see Status log)")
+
+    def _tpa_center_wavelength_to_x(
+        self,
+        wavelength_nm: float,
+        result: TPACenterResult | None = None,
+    ) -> float | None:
+        if not np.isfinite(wavelength_nm):
+            return None
+        calib = self._enc_get_calib()
+        if calib is not None:
+            try:
+                return float(interpolate_coordinate_for_wavelength(calib, wavelength_nm))
+            except Exception:
+                pass
+        if result is None or result.center_wl_nm.size == 0:
+            return None
+        grouped: dict[float, list[float]] = {}
+        for wl, x in zip(result.center_wl_nm, result.center_x_px):
+            grouped.setdefault(float(wl), []).append(float(x))
+        wl_sorted = np.array(sorted(grouped), dtype=float)
+        x_sorted = np.array(
+            [float(np.mean(grouped[float(wl)])) for wl in wl_sorted],
+            dtype=float,
+        )
+        if wavelength_nm < wl_sorted.min() or wavelength_nm > wl_sorted.max():
+            return None
+        return float(np.interp(wavelength_nm, wl_sorted, x_sorted))
+
+    def _tpa_center_update_report(self, result: TPACenterResult | None) -> None:
+        if result is None or result.fit is None:
+            self.tpa_center_report.setText("Centre: (run a scan)")
+            self.tpa_center_apply_button.setEnabled(False)
+            return
+        fit = result.fit
+        if fit.valid:
+            center_x = self._tpa_center_wavelength_to_x(fit.center_wl_nm, result)
+            x_text = f"x = {center_x:.3f} px   " if center_x is not None else ""
+            self.tpa_center_report.setText(
+                f"centre λ = {fit.center_wl_nm:.4f} ± {fit.center_wl_err_nm:.4f} nm   "
+                f"{x_text}"
+                f"peak = {fit.peak_signal_v * 1000:.4f} ± "
+                f"{fit.peak_signal_err_v * 1000:.4f} mV   "
+                f"χ²/dof = {fit.chi2_red:.2f} (Birge ×{fit.birge:.2f})"
+            )
+        else:
+            best_x = self._tpa_center_wavelength_to_x(fit.best_sample_center_wl_nm, result)
+            x_text = f"x = {best_x:.3f} px   " if best_x is not None else ""
+            self.tpa_center_report.setText(
+                f"best sampled λ = {fit.best_sample_center_wl_nm:.4f} nm   "
+                f"{x_text}"
+                f"signal = {fit.best_sample_signal_v * 1000:.4f} mV   "
+                f"fit invalid: {fit.message}"
+            )
+        self.tpa_center_apply_button.setEnabled(fit.valid and self.tpa_center_stop_event is None)
+
+    def _tpa_center_draw(self, result: TPACenterResult | None) -> None:
+        self.tpa_center_fig.clear()
+        self.tpa_center_fig.patch.set_facecolor("#101820")
+        ax = self.tpa_center_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("Centre wavelength (nm)")
+        ax.set_ylabel("Net signal (mV)")
+        if result is None:
+            ax.text(0.5, 0.5, "Run a centre scan", ha="center", va="center",
+                    transform=ax.transAxes, color="#d8dee9")
+            self.tpa_center_canvas.draw_idle()
+            return
+
+        fit = result.fit
+        if fit is not None:
+            wl = fit.center_wl
+            signal = fit.signal_v
+            sem = fit.sem_v
+        else:
+            wl, signal, sem = average_trace_points(result.center_wl_nm, result.net_signal_v)
+        signal_mv = signal * 1e3
+        sem_mv = sem * 1e3
+        ax.errorbar(
+            wl,
+            signal_mv,
+            yerr=sem_mv,
+            fmt="o",
+            color="#88c0d0",
+            ecolor="#41515c",
+            capsize=3,
+            label="measured",
+        )
+        if fit is not None:
+            dense = np.linspace(float(np.min(wl)), float(np.max(wl)), 200)
+            a, b, c = fit.coeffs
+            curve_mv = (a * dense**2 + b * dense + c) * 1e3
+            ax.plot(dense, curve_mv, color="#ebcb8b", linewidth=1.4, label="quadratic fit")
+            if fit.valid:
+                ax.axvline(fit.center_wl_nm, color="#e05a5a", linestyle="--", linewidth=1.0)
+                ax.plot(
+                    [fit.center_wl_nm],
+                    [fit.peak_signal_v * 1e3],
+                    "o",
+                    color="#e05a5a",
+                    markersize=6,
+                    label="fit centre",
+                )
+            else:
+                ax.plot(
+                    [fit.best_sample_center_wl_nm],
+                    [fit.best_sample_signal_v * 1e3],
+                    "s",
+                    color="#e0a447",
+                    markersize=5,
+                    label="best sample",
+                )
+        ax.legend(loc="best", fontsize=8)
+        self.tpa_center_canvas.draw_idle()
+
+    def _tpa_center_apply(self) -> None:
+        result = self.tpa_center_result
+        fit = None if result is None else result.fit
+        if fit is None or not fit.valid:
+            return
+        self.enc_center_wl_spin.setValue(fit.center_wl_nm)
+        self._enc_build_layout()
+        self.tpa_center_status.setText(
+            f"Applied {fit.center_wl_nm:.4f} nm to the TPA Encoding layout."
+        )
+        self._enc_log(
+            f"TPA centre scan applied fitted centre {fit.center_wl_nm:.4f} nm."
+        )
 
     # ===================== Scope (RTO6) page =========================
     def _connect_scope(self) -> None:
