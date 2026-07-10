@@ -12,7 +12,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
-from slm_module.calibration.calibration import load_calibration_csv
+from slm_module.calibration.calibration import intensity_model, load_calibration_csv
+from slm_module.calibration.outliers import OutlierRemeasurePolicy
 from slm_module.calibration.calibration_new import (
     CalibrationAborted,
     CalibrationResult,
@@ -152,6 +153,58 @@ class CalibrationNewTests(unittest.TestCase):
         np.testing.assert_allclose(
             refined_grid.wavelength_fit_coefficients,
             np.asarray([-0.1, 783.2]),
+        )
+
+    def test_channel_calibration_grid_center_gap_matches_geometry(self) -> None:
+        from slm_module.encoding import compute_channel_geometry
+
+        step2 = CalibrationResult(
+            wavelength=np.asarray([783.0, 778.0, 773.0]),
+            coordinates=np.asarray([0.0, 50.0, 100.0]),
+            max_level=900,
+            min_level=100,
+            level_range=np.asarray([100, 900]),
+        )
+
+        # first offset ceil((15+10)/2) = 13 -> coordinates center -/+ 13, 33
+        grid, center = build_channel_calibration_grid(
+            step2,
+            target_wavelength_nm=778.0,
+            n_channels_per_side=2,
+            channel_width_px=15,
+            gap_px=5,
+            center_gap_px=10,
+            slm_width=120,
+        )
+        self.assertAlmostEqual(center, 50.0)
+        np.testing.assert_allclose(
+            grid.coordinates, np.asarray([17.0, 37.0, 63.0, 83.0])
+        )
+
+        # the measured coordinates must coincide with the encoding layout's
+        # channel centers built from the same map + center_gap_px
+        geom = compute_channel_geometry(
+            step2.coordinates, step2.wavelength,
+            n_channels=2, channel_width_px=15, gap_px=5,
+            center_gap_px=10, center_wl=778.0, dark_wl_bands=(),
+        )
+        geo_centers = sorted(
+            [c.x_center for c in geom.x] + [c.x_center for c in geom.w]
+        )
+        np.testing.assert_allclose(grid.coordinates, np.asarray(geo_centers, dtype=float))
+
+        # center_gap_px equal to gap_px reproduces the legacy half-pitch grid
+        legacy_grid, _ = build_channel_calibration_grid(
+            step2,
+            target_wavelength_nm=778.0,
+            n_channels_per_side=2,
+            channel_width_px=15,
+            gap_px=5,
+            center_gap_px=5,
+            slm_width=120,
+        )
+        np.testing.assert_allclose(
+            legacy_grid.coordinates, np.asarray([20.0, 40.0, 60.0, 80.0])
         )
 
     def test_channel_calibration_grid_skips_guard_overlap_channels(self) -> None:
@@ -913,6 +966,174 @@ class IntensityCalibrationDaqTests(unittest.TestCase):
                 daq, slm, [400, 600, 900], self._seed(), window_size=8,
                 stop_event=stop,
             )
+
+
+class _SimWindowOSA:
+    """Deterministic step-2 sim: the trace peak position follows the displayed
+    bright window, so re-measurements are consistent no matter the order.
+
+    Window start i (0..10) -> delta peak at trace index 10 + 8*i (wl 710+8i nm,
+    linear in coordinate). The FIRST measurement of window start
+    ``bogus_start`` instead peaks at index 90 (wl 790) -- the injected outlier.
+    """
+
+    WLS = np.arange(700.0, 801.0)  # 101 samples, 1 nm apart
+
+    def __init__(self, slm: FakeSLM, bogus_start: int):
+        self.slm = slm
+        self.bogus_start = bogus_start
+        self.bogus_pending = True
+        self.measure_calls = 0
+
+    def measure(self, settings: MeasurementSettings) -> TraceData:
+        del settings
+        self.measure_calls += 1
+        row = np.asarray(self.slm.arrays[-1])[0]
+        powers = np.zeros(self.WLS.size)
+        if np.all(row == 0):                      # dark background reference
+            pass
+        elif np.all(row == row.max()) and row.max() > 0:   # bright reference
+            powers[:] = 1.0
+        else:
+            start = int(np.flatnonzero(row == row.max())[0])
+            index = 10 + 8 * start
+            if start == self.bogus_start and self.bogus_pending:
+                self.bogus_pending = False
+                index = 90                        # bogus centroid, once
+            powers[index] = 1.0
+        return make_trace(self.WLS, powers.tolist())
+
+
+class _SimTransferOSA:
+    """Deterministic step-3 sim: the channel value follows the displayed level
+    through the sin^2 transfer model. The FIRST measurement at ``bogus_level``
+    returns a spiked value instead -- the injected outlier.
+    """
+
+    WLS = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])
+
+    def __init__(self, slm: FakeSLM, column: int, max_level: int,
+                 bogus_level: int, bogus_value: float):
+        self.slm = slm
+        self.column = column
+        self.max_level = max_level
+        self.bogus_level = bogus_level
+        self.bogus_value = bogus_value
+        self.bogus_pending = True
+        self.measure_calls = 0
+
+    def configure(self, settings: MeasurementSettings) -> None:
+        pass
+
+    def measure(self, settings: MeasurementSettings | None = None) -> TraceData:
+        del settings
+        self.measure_calls += 1
+        row = np.asarray(self.slm.arrays[-1])[0]
+        powers = np.zeros(self.WLS.size)
+        if np.all(row == 0):                      # dark background reference
+            pass
+        elif np.all(row == self.max_level):       # bright reference
+            powers[:] = 1.0
+        else:
+            level = int(row[self.column])
+            value = float(
+                intensity_model(level, 1.0, np.pi / self.max_level, 0.0)
+            )
+            if level == self.bogus_level and self.bogus_pending:
+                self.bogus_pending = False
+                value = self.bogus_value
+            powers[2] = value                     # channel wavelength = 102 nm
+        return make_trace(self.WLS, powers.tolist())
+
+
+class OutlierRemeasureTests(unittest.TestCase):
+    POLICY = OutlierRemeasurePolicy(k_sigma=4.0, max_retries=3, min_points=8)
+
+    def _step2_seed(self) -> CalibrationResult:
+        return CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+    def test_wavelength_outlier_is_remeasured_and_replaced(self) -> None:
+        # width 12, window 2 -> 11 window starts; start 5 is bogus once
+        slm = FakeSLM(size=(12, 2))
+        osa = _SimWindowOSA(slm, bogus_start=5)
+
+        result = wavelength_calibration(
+            osa, slm, [], MeasurementSettings(), self._step2_seed(),
+            window_size=2, peak_half_window_nm=1.0,
+            outlier_policy=self.POLICY,
+        )
+
+        # bg + ref + 11 sweep + 1 recheck of the flagged point
+        self.assertEqual(osa.measure_calls, 14)
+        # measured points are exactly linear after replacement: wl = 8*x + 702
+        # (the mapping fit is cubic, so the higher-order terms collapse to ~0)
+        coeffs = result.wavelength_fit_coefficients
+        self.assertAlmostEqual(float(coeffs[-2]), 8.0, places=6)
+        self.assertAlmostEqual(float(coeffs[-1]), 702.0, places=4)
+        self.assertAlmostEqual(float(result.wavelength[5]), 750.0, places=4)
+
+    def test_wavelength_no_policy_keeps_outlier_and_call_count(self) -> None:
+        slm = FakeSLM(size=(12, 2))
+        osa = _SimWindowOSA(slm, bogus_start=5)
+
+        result = wavelength_calibration(
+            osa, slm, [], MeasurementSettings(), self._step2_seed(),
+            window_size=2, peak_half_window_nm=1.0,
+        )
+
+        self.assertEqual(osa.measure_calls, 13)   # no recheck reads
+        # the bogus point drags the fitted curve well away from the clean 750
+        self.assertGreater(abs(float(result.wavelength[5]) - 750.0), 5.0)
+
+    def _step3_seed(self) -> CalibrationResult:
+        return CalibrationResult(
+            wavelength=np.asarray([102.0]),
+            coordinates=np.asarray([2.0]),
+            max_level=1000,
+            min_level=0,
+            level_range=np.asarray([0, 1000]),
+            wavelength_fit_coefficients=np.asarray([1.0, 100.0]),
+        )
+
+    def test_batch_intensity_outlier_is_remeasured_and_replaced(self) -> None:
+        levels = list(range(0, 1100, 100))        # 11 levels
+        slm = FakeSLM(size=(5, 2))
+        osa = _SimTransferOSA(slm, column=2, max_level=1000,
+                              bogus_level=500, bogus_value=0.9)
+
+        result = batch_intensity_calibration(
+            osa, slm, levels, MeasurementSettings(), self._step3_seed(),
+            window_size=1, average_half_window=0,
+            outlier_policy=self.POLICY,
+        )
+
+        expected = intensity_model(
+            np.asarray(levels, dtype=float), 1.0, np.pi / 1000.0, 0.0
+        )
+        np.testing.assert_allclose(result.intensity_levels[0], expected, atol=1e-9)
+        # bg + ref + 11 sweep + at least the one recheck read
+        self.assertGreaterEqual(osa.measure_calls, 14)
+        self.assertFalse(osa.bogus_pending)       # the spike was re-measured
+
+    def test_batch_intensity_no_policy_keeps_outlier(self) -> None:
+        levels = list(range(0, 1100, 100))
+        slm = FakeSLM(size=(5, 2))
+        osa = _SimTransferOSA(slm, column=2, max_level=1000,
+                              bogus_level=500, bogus_value=0.9)
+
+        result = batch_intensity_calibration(
+            osa, slm, levels, MeasurementSettings(), self._step3_seed(),
+            window_size=1, average_half_window=0,
+        )
+
+        self.assertEqual(osa.measure_calls, 13)
+        self.assertAlmostEqual(float(result.intensity_levels[0, 5]), 0.9)
 
 
 if __name__ == "__main__":

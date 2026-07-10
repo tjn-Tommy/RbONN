@@ -222,6 +222,55 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(MonitorSettings(hold=0.1, duration=1.0).total_window, 1.1)
 
 
+class SampleListenerTests(unittest.TestCase):
+    def _scope(self) -> ScopeController:
+        scope = ScopeController(driver=FakeDriver())
+        scope.configure_monitor(MonitorSettings())
+        return scope
+
+    def test_monitor_cycle_notifies_listener_with_returned_sample(self):
+        scope = self._scope()
+        seen: list[MonitorSample] = []
+        scope.add_sample_listener(seen.append)
+        sample = scope.monitor_cycle(index=2, poll_interval=0.0)
+        self.assertEqual(seen, [sample])
+
+    def test_aborted_cycle_does_not_notify(self):
+        scope = self._scope()
+        scope.driver.complete_after = 10_000
+        seen: list[MonitorSample] = []
+        scope.add_sample_listener(seen.append)
+        stop = threading.Event()
+        stop.set()
+        self.assertIsNone(scope.monitor_cycle(poll_interval=0.0, stop_event=stop))
+        self.assertEqual(seen, [])
+
+    def test_listener_exception_never_breaks_the_cycle(self):
+        scope = self._scope()
+        seen: list[MonitorSample] = []
+
+        def bad(_sample) -> None:
+            raise RuntimeError("display bug")
+
+        scope.add_sample_listener(bad)
+        scope.add_sample_listener(seen.append)
+        sample = scope.monitor_cycle(poll_interval=0.0)
+        self.assertIsInstance(sample, MonitorSample)
+        self.assertEqual(seen, [sample])
+
+    def test_duplicate_add_and_remove_semantics(self):
+        scope = self._scope()
+        seen: list[MonitorSample] = []
+        scope.add_sample_listener(seen.append)
+        scope.add_sample_listener(seen.append)      # dedupe: still one call
+        scope.monitor_cycle(poll_interval=0.0)
+        self.assertEqual(len(seen), 1)
+        scope.remove_sample_listener(seen.append)
+        scope.remove_sample_listener(seen.append)   # no-op when absent
+        scope.monitor_cycle(poll_interval=0.0)
+        self.assertEqual(len(seen), 1)
+
+
 class DriverConstructionTests(unittest.TestCase):
     def test_default_resource_is_hislip(self):
         drv = RTO6_Driver(host="192.168.1.2")

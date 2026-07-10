@@ -126,5 +126,59 @@ class MeasureCenterScanTests(unittest.TestCase):
         self.assertTrue(all(c is ratio for c in seen))
 
 
+class SaveLoadJsonTests(unittest.TestCase):
+    def _scan_result(self):
+        from slm_module import tpa_center as tpa_center_module
+
+        calib = _make_calibration()
+        centers = np.array([777.95, 778.00, 778.05, 778.10, 778.15], dtype=float)
+        bg = 0.001
+        net = 0.004 - 0.1 * (centers - 778.1) ** 2
+        reads: list[float] = []
+        for value in net:
+            reads.extend([bg, bg + float(value)])
+        return tpa_center_module.measure_center_scan(
+            _FakeMonitor(reads), _FakeSLM(), calib,
+            center_wavelengths_nm=centers,
+            n_channels=1, channel_width_px=15, gap_px=5,
+            pair_index=0, n_trials=1, repeats=1, settle=0.0,
+            subtract_background=True,
+        )
+
+    def test_round_trip_preserves_rows_and_fit(self) -> None:
+        import tempfile
+
+        from slm_module.tpa_center import load_tpa_center_json, save_tpa_center_json
+
+        result = self._scan_result()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "center.json"
+            save_tpa_center_json(result, path)
+            loaded = load_tpa_center_json(path)
+
+        np.testing.assert_allclose(loaded.center_wl_nm, result.center_wl_nm)
+        np.testing.assert_allclose(loaded.net_signal_v, result.net_signal_v)
+        np.testing.assert_allclose(loaded.background_v, result.background_v)
+        self.assertEqual(loaded.pair_index, result.pair_index)
+        self.assertEqual(loaded.subtract_background, result.subtract_background)
+        self.assertIsNotNone(loaded.fit)
+        self.assertEqual(loaded.fit.valid, result.fit.valid)
+        self.assertAlmostEqual(loaded.fit.center_wl_nm, result.fit.center_wl_nm)
+        self.assertAlmostEqual(loaded.fit.chi2_red, result.fit.chi2_red)
+        np.testing.assert_allclose(loaded.fit.signal_v, result.fit.signal_v)
+
+    def test_load_rejects_wrong_schema(self) -> None:
+        import json
+        import tempfile
+
+        from slm_module.tpa_center import load_tpa_center_json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.json"
+            path.write_text(json.dumps({"schema": "nope"}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema"):
+                load_tpa_center_json(path)
+
+
 if __name__ == "__main__":
     unittest.main()

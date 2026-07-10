@@ -7,7 +7,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -80,6 +79,7 @@ from ..encoding import (
 )
 from ..optimization import (
     OPTIMIZED_ENCODING_SHAPE,
+    OSABatchVariant,
     OSAOptimizationConfig,
     OptimizationAborted,
     OptimizationProgress,
@@ -88,6 +88,7 @@ from ..optimization import (
     amplitudes_to_intensity_commands,
     load_optimization_result,
     mirror_intensity_profile,
+    run_osa_optimization_batch,
     validate_independent_profile,
 )
 from ..tpa_pair import (
@@ -108,6 +109,16 @@ from ..tpa_center import (
     measure_center_scan,
 )
 from ..keepalive import SLMKeepAlive
+from .common import (
+    CalibrationProgressDialog,
+    FunctionWorker,
+    WorkerSignals,
+    _format_duration,
+)
+from .daq_monitor import LiveSampleView, MonitorSampleBridge
+from .live_plots import BatchResultsTable, LiveLossCanvas
+from .osa_monitor import LiveSpectrumView, OSATraceBridge
+from .pipeline_page import PipelinePage
 from .style import DARK_STYLESHEET
 
 
@@ -154,37 +165,6 @@ def _pattern_to_qimage_color(data: np.ndarray) -> QtGui.QImage:
     return image.copy()
 
 
-def _format_duration(seconds: float) -> str:
-    """Format a duration as m:ss, or h:mm:ss once it passes an hour."""
-    if not np.isfinite(seconds) or seconds < 0:
-        return "—"
-    total = int(round(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
-class WorkerSignals(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-
-
-class FunctionWorker(QtCore.QRunnable):
-    def __init__(self, func: Callable[[], Any]):
-        super().__init__()
-        self.func = func
-        self.signals = WorkerSignals()
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            self.signals.finished.emit(self.func())
-        except Exception:
-            self.signals.error.emit(traceback.format_exc())
-
-
 class WheelSpinBox(QtWidgets.QDoubleSpinBox):
     """Double spin box with an independent (large) mouse-wheel step.
 
@@ -204,195 +184,6 @@ class WheelSpinBox(QtWidgets.QDoubleSpinBox):
             event.accept()
         else:
             super().wheelEvent(event)
-
-
-class CalibrationProgressDialog(QtWidgets.QDialog):
-    """Live view of an OSA calibration run: phase, progress bar, log and plot.
-
-    update_progress() is called on the GUI thread for every measured step; the
-    plot itself is redrawn on a timer so a fast stream of points cannot flood
-    the event loop. finish() freezes the view and enables Close.
-    """
-
-    _PHASES = {
-        "min_max": ("Step 1 / 3 · Min/Max level sweep", "Level", "Output power (W)"),
-        "wavelength": (
-            "Step 2 / 3 · Wavelength mapping",
-            "x coordinate (px)",
-            "Wavelength (nm)",
-        ),
-        "intensity": (
-            "Step 3 / 3 · Intensity vs level",
-            "Level",
-            "Normalized intensity",
-        ),
-        "fast_center": (
-            "Fast channel setup - 778 nm center",
-            "x coordinate (px)",
-            "Wavelength (nm)",
-        ),
-        "batch_intensity": (
-            "Fast channel calibration",
-            "Level",
-            "Mean normalized intensity",
-        ),
-    }
-
-    def __init__(
-        self,
-        parent: QtWidgets.QWidget | None = None,
-        on_stop: Callable[[], None] | None = None,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("Calibration Progress")
-        self.setModal(False)
-        self.resize(760, 600)
-        self._on_stop = on_stop
-        self._running = True
-        self._phase: str | None = None
-        self._phase_start: float | None = None
-        self._xs: list[float] = []
-        self._ys: list[float] = []
-        self._dirty = False
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        self.phase_label = QtWidgets.QLabel("Preparing…")
-        self.phase_label.setObjectName("PageSubtitle")
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("%v / %m  (%p%)")
-        self.eta_label = QtWidgets.QLabel("Elapsed 0:00 · ETA —")
-        self.status_label = QtWidgets.QLabel("\N{EN DASH}")
-        self.status_label.setWordWrap(True)
-
-        self.figure = Figure(figsize=(6, 3.2), tight_layout=True)
-        self.canvas = FigureCanvas(self.figure)
-        self.axes = self.figure.add_subplot(111)
-        self._style_axes()
-
-        self.log = QtWidgets.QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setObjectName("LogBox")
-        self.log.setMaximumHeight(140)
-
-        self.stop_button = QtWidgets.QPushButton("Stop")
-        self.stop_button.setProperty("variant", "danger")
-        self.close_button = QtWidgets.QPushButton("Close")
-        self.close_button.setEnabled(False)
-        self.stop_button.clicked.connect(self._handle_stop)
-        self.close_button.clicked.connect(self.close)
-        buttons = QtWidgets.QHBoxLayout()
-        buttons.addStretch(1)
-        buttons.addWidget(self.stop_button)
-        buttons.addWidget(self.close_button)
-
-        layout.addWidget(self.phase_label)
-        layout.addWidget(self.progress_bar)
-        layout.addWidget(self.eta_label)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.canvas, 1)
-        layout.addWidget(self.log)
-        layout.addLayout(buttons)
-
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self._redraw)
-        self._timer.start(120)
-
-    def _style_axes(self) -> None:
-        self.figure.patch.set_facecolor("#101820")
-        axes = self.axes
-        axes.set_facecolor("#101820")
-        axes.grid(True, color="#2b3a42", linewidth=0.7)
-        axes.tick_params(colors="#d8dee9")
-        axes.xaxis.label.set_color("#d8dee9")
-        axes.yaxis.label.set_color("#d8dee9")
-        for spine in axes.spines.values():
-            spine.set_color("#41515c")
-
-    def update_progress(self, progress: CalibrationProgress) -> None:
-        if progress.phase != self._phase:
-            self._enter_phase(progress.phase)
-        total = max(int(progress.total), 1)
-        done = min(int(progress.step) + 1, total)
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(done)
-        self.status_label.setText(progress.message)
-        self._update_eta(done, total)
-        if progress.x is not None and progress.y is not None:
-            self._xs.append(float(progress.x))
-            self._ys.append(float(progress.y))
-            self._dirty = True
-
-    def _enter_phase(self, phase: str) -> None:
-        self._phase = phase
-        self._phase_start = time.perf_counter()
-        self._xs.clear()
-        self._ys.clear()
-        title, _xlabel, _ylabel = self._PHASES.get(phase, (phase, "x", "y"))
-        self.phase_label.setText(title)
-        self.log.appendPlainText(f"\N{BLACK RIGHT-POINTING TRIANGLE} {title}")
-        self.eta_label.setText("Elapsed 0:00 · ETA —")
-        self._dirty = True
-
-    def _update_eta(self, done: int, total: int) -> None:
-        """Estimate time remaining from the average pace of this phase so far."""
-        if self._phase_start is None:
-            return
-        elapsed = time.perf_counter() - self._phase_start
-        if done <= 0:
-            self.eta_label.setText(f"Elapsed {_format_duration(elapsed)} · ETA —")
-            return
-        remaining = (elapsed / done) * max(total - done, 0)
-        self.eta_label.setText(
-            f"Elapsed {_format_duration(elapsed)} · ETA {_format_duration(remaining)}"
-        )
-
-    def _redraw(self) -> None:
-        if not self._dirty:
-            return
-        self._dirty = False
-        self.axes.clear()
-        self._style_axes()
-        phase = self._phase or ""
-        _title, xlabel, ylabel = self._PHASES.get(phase, (phase, "x", "y"))
-        self.axes.set_xlabel(xlabel)
-        self.axes.set_ylabel(ylabel)
-        if self._xs:
-            self.axes.plot(
-                self._xs,
-                self._ys,
-                color="#47b8e0",
-                marker="o",
-                markersize=3,
-                linewidth=1.0,
-            )
-        self.canvas.draw_idle()
-
-    def finish(self, success: bool, message: str) -> None:
-        self._running = False
-        self._timer.stop()
-        self._dirty = True
-        self._redraw()
-        self.status_label.setText(message)
-        self.log.appendPlainText(message)
-        self.stop_button.setEnabled(False)
-        self.close_button.setEnabled(True)
-        if success:
-            self.progress_bar.setValue(self.progress_bar.maximum())
-
-    def _handle_stop(self) -> None:
-        self.stop_button.setEnabled(False)
-        self.status_label.setText("Stopping…")
-        if self._on_stop is not None:
-            self._on_stop()
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        # closing mid-run requests a stop but still lets the window close
-        if self._running and self._on_stop is not None:
-            self._on_stop()
-        self._timer.stop()
-        super().closeEvent(event)
 
 
 class SLMMonitorView(QtWidgets.QWidget):
@@ -606,7 +397,6 @@ class MainWindow(QtWidgets.QMainWindow):
     edge_gain_progress = QtCore.pyqtSignal(int, int, str)
     edge_optimization_progress = QtCore.pyqtSignal(object)
     qt_test_progress = QtCore.pyqtSignal(int, int, str)
-    osa_trace_ready = QtCore.pyqtSignal(object)
     monitor_sample = QtCore.pyqtSignal(object)
     hold_progress = QtCore.pyqtSignal(int, int)
 
@@ -642,7 +432,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.enc_col_ratio: np.ndarray | None = None  # per-column edge-ratio profile
         self._edge_gain: EncodingGain | None = None
         self._edge_optimization_result: OptimizationResult | None = None
-        self._pipeline_optimization_active = False
         self.edge_gain_stop_event: threading.Event | None = None
         self._qt_test: dict[str, ChannelSpectrum] | None = None  # quick-test A/B result
         self.qt_test_stop_event: threading.Event | None = None
@@ -681,11 +470,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_gain_progress.connect(self._edge_gain_progress)
         self.edge_optimization_progress.connect(self._edge_optimization_progress)
         self.qt_test_progress.connect(self._qt_test_progress)
-        self.osa_trace_ready.connect(self._osa_view_on_trace)
         self.monitor_sample.connect(self._on_monitor_sample)
         self.hold_progress.connect(self._on_hold_progress)
 
+        # Live OSA monitor: measure() notifies the bridge from the worker
+        # thread; the queued signal repaints the viewer page and the dock for
+        # EVERY sweep, no matter which module triggered it.
+        self._osa_bridge = OSATraceBridge(self)
+        self._osa_bridge.trace_ready.connect(self._osa_view_on_trace)
+        self._osa_bridge.trace_ready.connect(self.osa_monitor_view.set_trace)
+
+        # Live DAQ/scope monitor: every monitor_cycle() (TPA centre scan,
+        # step 6/7, pipeline stages, encoder-page reads) notifies the bridge
+        # from the worker thread; the queued signal appends the sample to the
+        # dock's rolling strip chart.
+        self._monitor_bridge = MonitorSampleBridge(self)
+        self._monitor_bridge.sample_ready.connect(self.daq_monitor_view.add_sample)
+
     def _build_ui(self) -> None:
+        # Dockable live OSA monitor (hidden until toggled from the OSA Viewer
+        # page); built first so page builders may reference it.
+        self.osa_monitor_view = LiveSpectrumView(self)
+        self.osa_monitor_dock = QtWidgets.QDockWidget("OSA Monitor", self)
+        self.osa_monitor_dock.setObjectName("OSAMonitorDock")
+        self.osa_monitor_dock.setWidget(self.osa_monitor_view)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.osa_monitor_dock)
+        self.osa_monitor_dock.hide()
+
+        # Dockable live DAQ/scope monitor (hidden until toggled from the TPA
+        # encoder page): a rolling strip chart of every monitor_cycle() sample.
+        self.daq_monitor_view = LiveSampleView(self)
+        self.daq_monitor_dock = QtWidgets.QDockWidget("DAQ/Scope Monitor", self)
+        self.daq_monitor_dock.setObjectName("DAQMonitorDock")
+        self.daq_monitor_dock.setWidget(self.daq_monitor_view)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.daq_monitor_dock)
+        self.daq_monitor_dock.hide()
+
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -953,493 +773,24 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_scope_holding_tab(), "Step 5 · Holding")
         tabs.addTab(self._build_tpa_tab(), "Step 6 · TPA Efficiency")
         tabs.addTab(self._build_tpa_center_tab(), "Step 6b · TPA Center")
-        tabs.insertTab(0, self._build_pipeline_page(), "Pipeline")
+        self.pipeline_page = PipelinePage(self)
+        tabs.insertTab(0, self.pipeline_page, "Pipeline")
         tabs.addTab(self._build_stage3_reopt_page(), "Step 4b - Stage3 Reopt")
         self.calibration_tabs = tabs
         lay.addWidget(tabs)
 
-        # every Run button, toggled together by _set_calibration_running
+        # every OSA-gated Run button, toggled together by
+        # _set_calibration_running (the unified pipeline page gates its own
+        # Run button: it may legitimately run without the OSA)
         self.calibration_run_buttons = [
             self.step_widgets[1]["run"],
             self.step_widgets[2]["run"],
             self.step_widgets[3]["run"],
             self.run_all_button,
             self.fast_channel_run_button,
-            self.pipeline_run_button,
             self.stage3_reopt_run_button,
         ]
         return page
-
-    def _build_pipeline_page(self) -> QtWidgets.QWidget:
-        """Build the file-only calibration and encoding-optimisation runner."""
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.addWidget(
-            self._caption(
-                "Select any stages to run in dependency order. Every "
-                "handoff is saved and reloaded from a file; no in-memory result is "
-                "used as a step input. Step settings come from the corresponding tabs."
-            )
-        )
-
-        flow = self._panel("Pipeline steps and files")
-        grid = QtWidgets.QGridLayout(flow)
-        grid.addWidget(QtWidgets.QLabel("Run"), 0, 0)
-        grid.addWidget(QtWidgets.QLabel("Step"), 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Input"), 0, 2, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Output JSON"), 0, 4, 1, 2)
-
-        self.pipeline_checks: dict[int, QtWidgets.QCheckBox] = {}
-        self.pipeline_input_edits: dict[int, QtWidgets.QLineEdit] = {}
-        self.pipeline_input_buttons: dict[int, QtWidgets.QPushButton] = {}
-        self.pipeline_source_labels: dict[int, QtWidgets.QLabel] = {}
-        self.pipeline_output_edits: dict[int, QtWidgets.QLineEdit] = {}
-        self.pipeline_output_buttons: dict[int, QtWidgets.QPushButton] = {}
-
-        step_names = {
-            1: "Step 1 - Min/Max",
-            2: "Step 2 - Wavelength",
-            3: "Step 3 - Intensity",
-        }
-        output_names = {step: self._default_calib_name(step) for step in (1, 2, 3)}
-        for row, step in enumerate((1, 2, 3), start=1):
-            check = QtWidgets.QCheckBox()
-            check.setChecked(True)
-            check.toggled.connect(self._refresh_pipeline_ui)
-            self.pipeline_checks[step] = check
-            grid.addWidget(check, row, 0, QtCore.Qt.AlignCenter)
-            grid.addWidget(QtWidgets.QLabel(step_names[step]), row, 1)
-
-            if step == 1:
-                no_input = QtWidgets.QLabel("No input")
-                no_input.setObjectName("PageSubtitle")
-                grid.addWidget(no_input, row, 2, 1, 2)
-            else:
-                input_edit = QtWidgets.QLineEdit()
-                input_edit.setPlaceholderText(
-                    "Required when the preceding step is not selected"
-                )
-                input_button = QtWidgets.QPushButton("Browse")
-                input_filter = (
-                    "JSON Files (*.json)"
-                    if step == 2
-                    else "Calibration Files (*.json *.csv)"
-                )
-                input_button.clicked.connect(
-                    lambda _checked=False, edit=input_edit, number=step,
-                    filt=input_filter: self._browse_open_into(
-                        edit, f"Select Step {number} input", filt
-                    )
-                )
-                self.pipeline_input_edits[step] = input_edit
-                self.pipeline_input_buttons[step] = input_button
-                grid.addWidget(input_edit, row, 2)
-                grid.addWidget(input_button, row, 3)
-
-            output_edit = QtWidgets.QLineEdit(output_names[step])
-            output_button = QtWidgets.QPushButton("Browse")
-            output_button.clicked.connect(
-                lambda _checked=False, edit=output_edit, name=output_names[step]:
-                self._browse_save_into(edit, name, "JSON Files (*.json)")
-            )
-            self.pipeline_output_edits[step] = output_edit
-            self.pipeline_output_buttons[step] = output_button
-            grid.addWidget(output_edit, row, 4)
-            grid.addWidget(output_button, row, 5)
-
-        for row, step in enumerate((2, 3), start=4):
-            source_label = QtWidgets.QLabel()
-            source_label.setObjectName("PageSubtitle")
-            self.pipeline_source_labels[step] = source_label
-            grid.addWidget(source_label, row, 2, 1, 4)
-
-        self.pipeline_csv_edit = QtWidgets.QLineEdit("calibration.csv")
-        self.pipeline_csv_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_csv_button.clicked.connect(
-            lambda: self._browse_save_into(
-                self.pipeline_csv_edit, "calibration.csv", "CSV Files (*.csv)"
-            )
-        )
-        grid.addWidget(QtWidgets.QLabel("Step 3 output CSV"), 6, 1)
-        grid.addWidget(self.pipeline_csv_edit, 6, 4)
-        grid.addWidget(self.pipeline_csv_button, 6, 5)
-        grid.setColumnStretch(2, 1)
-        grid.setColumnStretch(4, 1)
-        layout.addWidget(flow)
-
-        optimization = self._panel("Encoding Optimization")
-        opt_grid = QtWidgets.QGridLayout(optimization)
-        self.pipeline_checks[4] = QtWidgets.QCheckBox("Run Encoding Optimization")
-        self.pipeline_checks[4].setChecked(False)
-        self.pipeline_checks[4].toggled.connect(self._refresh_pipeline_ui)
-        opt_grid.addWidget(self.pipeline_checks[4], 0, 0, 1, 3)
-
-        self.pipeline_quick_optimization_check = QtWidgets.QCheckBox(
-            "Fast single-channel mode at the Encoding centre wavelength"
-        )
-        self.pipeline_quick_optimization_check.setToolTip(
-            "Use a Step 2 wavelength map to interpolate the centre pixel, run "
-            "a local intensity calibration there, and optimise only that one "
-            "OSA anchor. Full three-anchor mode remains the default."
-        )
-        self.pipeline_quick_optimization_check.toggled.connect(
-            self._refresh_pipeline_ui
-        )
-        opt_grid.addWidget(self.pipeline_quick_optimization_check, 1, 0, 1, 3)
-
-        self.pipeline_input_edits[4] = QtWidgets.QLineEdit()
-        self.pipeline_input_edits[4].setPlaceholderText(
-            "External Step 3 calibration JSON when Step 3 is not selected"
-        )
-        self.pipeline_input_buttons[4] = QtWidgets.QPushButton("Browse")
-        self.pipeline_input_buttons[4].clicked.connect(
-            lambda: self._browse_open_into(
-                self.pipeline_input_edits[4],
-                "Select encoding calibration",
-                "JSON Files (*.json)",
-            )
-        )
-        self.pipeline_optimization_input_label = QtWidgets.QLabel(
-            "Calibration input"
-        )
-        opt_grid.addWidget(self.pipeline_optimization_input_label, 2, 0)
-        opt_grid.addWidget(self.pipeline_input_edits[4], 2, 1)
-        opt_grid.addWidget(self.pipeline_input_buttons[4], 2, 2)
-
-        self.pipeline_source_labels[4] = QtWidgets.QLabel()
-        self.pipeline_source_labels[4].setObjectName("PageSubtitle")
-        opt_grid.addWidget(self.pipeline_source_labels[4], 3, 1, 1, 2)
-
-        self.pipeline_profile_source_combo = QtWidgets.QComboBox()
-        self.pipeline_profile_source_combo.addItems(["Direct values", "From file"])
-        self.pipeline_profile_source_combo.currentIndexChanged.connect(
-            self._refresh_pipeline_ui
-        )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile source"), 4, 0)
-        opt_grid.addWidget(self.pipeline_profile_source_combo, 4, 1, 1, 2)
-
-        self.pipeline_profile_values_edit = QtWidgets.QLineEdit(
-            "1, 1, 1, 1, 1, 1, 1, 1"
-        )
-        self.pipeline_profile_values_edit.setPlaceholderText(
-            "8 values, or a symmetric 15-value profile"
-        )
-        self.pipeline_profile_values_edit.setToolTip(
-            "Normalised intensity ratios in [0, 1], separated by commas or spaces."
-        )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile values"), 5, 0)
-        opt_grid.addWidget(self.pipeline_profile_values_edit, 5, 1, 1, 2)
-
-        self.pipeline_profile_edit = QtWidgets.QLineEdit()
-        self.pipeline_profile_edit.setPlaceholderText(
-            "8-value l_init or symmetric 15-value profile"
-        )
-        self.pipeline_profile_edit.setToolTip(
-            "JSON may be an array or use l_init, initial_l, final_l, final_profile, "
-            "or profile. CSV/TXT may contain 8 numeric values or a symmetric 15-value "
-            "intensity profile."
-        )
-        self.pipeline_profile_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_profile_button.clicked.connect(
-            lambda: self._browse_open_into(
-                self.pipeline_profile_edit,
-                "Select initial encoding profile",
-                "Profile Files (*.json *.csv *.txt)",
-            )
-        )
-        opt_grid.addWidget(QtWidgets.QLabel("Initial profile file"), 6, 0)
-        opt_grid.addWidget(self.pipeline_profile_edit, 6, 1)
-        opt_grid.addWidget(self.pipeline_profile_button, 6, 2)
-
-        self.pipeline_optimization_root_edit = QtWidgets.QLineEdit(
-            "data/osa_optimization"
-        )
-        self.pipeline_optimization_root_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_optimization_root_button.clicked.connect(
-            self._browse_pipeline_optimization_root
-        )
-        opt_grid.addWidget(QtWidgets.QLabel("Output root"), 7, 0)
-        opt_grid.addWidget(self.pipeline_optimization_root_edit, 7, 1)
-        opt_grid.addWidget(self.pipeline_optimization_root_button, 7, 2)
-
-        self.pipeline_optimization_name_edit = QtWidgets.QLineEdit()
-        self.pipeline_optimization_name_edit.setPlaceholderText(
-            "Optional; blank uses a timestamped run directory"
-        )
-        opt_grid.addWidget(QtWidgets.QLabel("Run name"), 8, 0)
-        opt_grid.addWidget(self.pipeline_optimization_name_edit, 8, 1, 1, 2)
-
-        self.pipeline_quick_levels_edit = QtWidgets.QLineEdit("420~870+50")
-        self.pipeline_quick_levels_edit.setToolTip(
-            "SLM levels for the interpolated centre pixel, formatted as "
-            "min~max+stride, for example 420~870+50. The maximum level is "
-            "included even when the stride does not land on it exactly. After "
-            "acquisition, the measured minimum and maximum define the "
-            "off-to-on range used by encoding and optimisation."
-        )
-        self.pipeline_quick_levels_label = QtWidgets.QLabel(
-            "Quick SLM range"
-        )
-        opt_grid.addWidget(self.pipeline_quick_levels_label, 9, 0)
-        opt_grid.addWidget(self.pipeline_quick_levels_edit, 9, 1, 1, 2)
-
-        self.pipeline_quick_calibration_edit = QtWidgets.QLineEdit(
-            "calib_quick_center.json"
-        )
-        self.pipeline_quick_calibration_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_quick_calibration_button.clicked.connect(
-            lambda: self._browse_save_into(
-                self.pipeline_quick_calibration_edit,
-                "calib_quick_center.json",
-                "JSON Files (*.json)",
-            )
-        )
-        self.pipeline_quick_calibration_label = QtWidgets.QLabel(
-            "Quick calibration JSON"
-        )
-        opt_grid.addWidget(self.pipeline_quick_calibration_label, 10, 0)
-        opt_grid.addWidget(self.pipeline_quick_calibration_edit, 10, 1)
-        opt_grid.addWidget(self.pipeline_quick_calibration_button, 10, 2)
-        opt_grid.setColumnStretch(1, 1)
-        layout.addWidget(optimization)
-
-        reopt = self._panel("Stage 3 Re-optimization")
-        reopt_grid = QtWidgets.QGridLayout(reopt)
-        self.pipeline_stage3_only_check = QtWidgets.QCheckBox(
-            "Use supplied Stage 1 level/profile data and skip Stage 1 search"
-        )
-        self.pipeline_stage3_only_check.setToolTip(
-            "Start from an existing 8-value Stage 1 level/profile JSON, rebuild "
-            "the amplitude LUT, and run Stage 3 with the scan settings below."
-        )
-        self.pipeline_stage3_only_check.toggled.connect(self._refresh_pipeline_ui)
-        reopt_grid.addWidget(self.pipeline_stage3_only_check, 0, 0, 1, 4)
-
-        self.pipeline_reopt_profile_edit = QtWidgets.QLineEdit()
-        self.pipeline_reopt_profile_edit.setPlaceholderText(
-            "stage1_result.json, final_result.json, or an 8-value profile file"
-        )
-        self.pipeline_reopt_profile_edit.setToolTip(
-            "JSON may be an array or use l, l_init, initial_l, final_l, "
-            "final_profile, or profile."
-        )
-        self.pipeline_reopt_profile_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_reopt_profile_button.clicked.connect(
-            lambda: self._browse_open_into(
-                self.pipeline_reopt_profile_edit,
-                "Select Stage 1 level/profile data",
-                "Profile Files (*.json *.csv *.txt)",
-            )
-        )
-        reopt_grid.addWidget(QtWidgets.QLabel("Stage 1 level/profile"), 1, 0)
-        reopt_grid.addWidget(self.pipeline_reopt_profile_edit, 1, 1, 1, 2)
-        reopt_grid.addWidget(self.pipeline_reopt_profile_button, 1, 3)
-
-        self.pipeline_reopt_calibration_edit = QtWidgets.QLineEdit()
-        self.pipeline_reopt_calibration_edit.setPlaceholderText(
-            "Existing quick intensity calibration JSON"
-        )
-        self.pipeline_reopt_calibration_edit.setToolTip(
-            "Fast single-channel re-optimization can reuse a saved one-pixel "
-            "quick intensity calibration instead of measuring the SLM range again."
-        )
-        self.pipeline_reopt_calibration_button = QtWidgets.QPushButton("Browse")
-        self.pipeline_reopt_calibration_button.clicked.connect(
-            lambda: self._browse_open_into(
-                self.pipeline_reopt_calibration_edit,
-                "Select quick intensity calibration",
-                "JSON Files (*.json)",
-            )
-        )
-        self.pipeline_reopt_calibration_label = QtWidgets.QLabel(
-            "Quick calibration input"
-        )
-        reopt_grid.addWidget(self.pipeline_reopt_calibration_label, 2, 0)
-        reopt_grid.addWidget(self.pipeline_reopt_calibration_edit, 2, 1, 1, 2)
-        reopt_grid.addWidget(self.pipeline_reopt_calibration_button, 2, 3)
-
-        self.pipeline_reopt_sensitivity_combo = QtWidgets.QComboBox()
-        self.pipeline_reopt_sensitivity_combo.addItems(
-            ["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"]
-        )
-        self.pipeline_reopt_sensitivity_combo.setCurrentText("HIGH1")
-        self.pipeline_reopt_averages_spin = self._spin(1, 20, 1)
-        self.pipeline_reopt_stage2_repeats_spin = self._spin(1, 20, 3)
-        self.pipeline_reopt_stage3_maxfev_spin = self._spin(1, 500, 100)
-        self.pipeline_reopt_rerank_averages_spin = self._spin(1, 20, 3)
-        reopt_grid.addWidget(QtWidgets.QLabel("Sensitivity"), 3, 0)
-        reopt_grid.addWidget(self.pipeline_reopt_sensitivity_combo, 3, 1)
-        reopt_grid.addWidget(QtWidgets.QLabel("OSA averages"), 3, 2)
-        reopt_grid.addWidget(self.pipeline_reopt_averages_spin, 3, 3)
-        reopt_grid.addWidget(QtWidgets.QLabel("Stage3 baseline repeats"), 4, 0)
-        reopt_grid.addWidget(self.pipeline_reopt_stage2_repeats_spin, 4, 1)
-        reopt_grid.addWidget(QtWidgets.QLabel("Stage3 max evals"), 4, 2)
-        reopt_grid.addWidget(self.pipeline_reopt_stage3_maxfev_spin, 4, 3)
-        reopt_grid.addWidget(QtWidgets.QLabel("Rerank averages"), 5, 0)
-        reopt_grid.addWidget(self.pipeline_reopt_rerank_averages_spin, 5, 1)
-        reopt_grid.setColumnStretch(1, 1)
-        layout.addWidget(reopt)
-
-        layout.addWidget(
-            self._caption(
-                "A selected prerequisite supplies its output file. A skipped "
-                "prerequisite must be supplied as an external file. The Encoding "
-                "Optimization initial profile may be entered directly or loaded "
-                "from a file. Fast single-channel mode uses the Step 2 map to "
-                "interpolate the Encoding centre wavelength (778 nm by default), "
-                "measures the min~max+stride SLM range at that physical pixel, then "
-                "uses its measured min-to-max range for the single-anchor optimisation."
-            )
-        )
-
-        self.pipeline_log = QtWidgets.QPlainTextEdit()
-        self.pipeline_log.setReadOnly(True)
-        self.pipeline_log.setObjectName("LogBox")
-        self.pipeline_log.setPlaceholderText("Pipeline activity will appear here.")
-        layout.addWidget(self._panel_with_widget("Pipeline log", self.pipeline_log), 1)
-
-        action_row = QtWidgets.QHBoxLayout()
-        self.pipeline_status_label = QtWidgets.QLabel("Ready")
-        self.pipeline_run_button = QtWidgets.QPushButton("Run Pipeline")
-        self.pipeline_run_button.setEnabled(False)
-        self.pipeline_run_button.clicked.connect(self._run_pipeline)
-        self.pipeline_stop_button = QtWidgets.QPushButton("Stop")
-        self.pipeline_stop_button.setProperty("variant", "danger")
-        self.pipeline_stop_button.setEnabled(False)
-        self.pipeline_stop_button.clicked.connect(self._stop_full_calibration)
-        action_row.addWidget(self.pipeline_status_label, 1)
-        action_row.addWidget(self.pipeline_run_button)
-        action_row.addWidget(self.pipeline_stop_button)
-        layout.addLayout(action_row)
-        self._refresh_pipeline_ui()
-        return page
-
-    def _refresh_pipeline_ui(self) -> None:
-        """Update file-source hints and controls after the selection changes."""
-        if not hasattr(self, "pipeline_checks"):
-            return
-        selected = {
-            step for step, check in self.pipeline_checks.items() if check.isChecked()
-        }
-        for step in (1, 2, 3):
-            enabled = step in selected
-            self.pipeline_output_edits[step].setEnabled(enabled)
-            self.pipeline_output_buttons[step].setEnabled(enabled)
-        for step in (2, 3):
-            predecessor = step - 1
-            chained = step in selected and predecessor in selected
-            external = step in selected and not chained
-            self.pipeline_input_edits[step].setEnabled(external)
-            self.pipeline_input_buttons[step].setEnabled(external)
-            if chained:
-                source = (
-                    f"Step {step} input: Step {predecessor} output file "
-                    "(saved, then reloaded)"
-                )
-            elif step in selected:
-                source = f"Step {step} input: external file (required)"
-            else:
-                source = f"Step {step}: not selected"
-            self.pipeline_source_labels[step].setText(source)
-
-        step3_selected = 3 in selected
-        self.pipeline_csv_edit.setEnabled(step3_selected)
-        self.pipeline_csv_button.setEnabled(step3_selected)
-        optimize_selected = 4 in selected
-        self.pipeline_quick_optimization_check.setEnabled(optimize_selected)
-        quick_optimization = (
-            optimize_selected and self.pipeline_quick_optimization_check.isChecked()
-        )
-        stage3_only = (
-            optimize_selected and self.pipeline_stage3_only_check.isChecked()
-        )
-        source_step = 2 if quick_optimization else 3
-        source_step_selected = source_step in selected
-        optimization_external = optimize_selected and not source_step_selected
-        self.pipeline_input_edits[4].setEnabled(optimization_external)
-        self.pipeline_input_buttons[4].setEnabled(optimization_external)
-        if quick_optimization:
-            self.pipeline_optimization_input_label.setText("Step 2 input")
-            self.pipeline_input_edits[4].setPlaceholderText(
-                "External Step 2 calibration JSON when Step 2 is not selected"
-            )
-        else:
-            self.pipeline_optimization_input_label.setText("Calibration input")
-            self.pipeline_input_edits[4].setPlaceholderText(
-                "External Step 3 calibration JSON when Step 3 is not selected"
-            )
-        if optimize_selected and source_step_selected:
-            optimization_source = (
-                f"Optimization calibration: Step {source_step} output JSON "
-                "(saved, then reloaded)"
-            )
-        elif optimize_selected:
-            optimization_source = (
-                f"Optimization calibration: external Step {source_step} JSON "
-                "(required)"
-            )
-        else:
-            optimization_source = "Encoding Optimization: not selected"
-        self.pipeline_source_labels[4].setText(optimization_source)
-        for widget in (
-            self.pipeline_quick_levels_label,
-            self.pipeline_quick_levels_edit,
-            self.pipeline_quick_calibration_label,
-            self.pipeline_quick_calibration_edit,
-            self.pipeline_quick_calibration_button,
-        ):
-            widget.setEnabled(quick_optimization and not stage3_only)
-        profile_from_file = self.pipeline_profile_source_combo.currentIndex() == 1
-        self.pipeline_profile_source_combo.setEnabled(optimize_selected)
-        self.pipeline_profile_values_edit.setEnabled(
-            optimize_selected and not profile_from_file and not stage3_only
-        )
-        self.pipeline_profile_edit.setEnabled(
-            optimize_selected and profile_from_file and not stage3_only
-        )
-        self.pipeline_profile_button.setEnabled(
-            optimize_selected and profile_from_file and not stage3_only
-        )
-        self.pipeline_stage3_only_check.setEnabled(optimize_selected)
-        reopt_enabled = optimize_selected and stage3_only
-        for widget in (
-            self.pipeline_reopt_profile_edit,
-            self.pipeline_reopt_profile_button,
-            self.pipeline_reopt_sensitivity_combo,
-            self.pipeline_reopt_averages_spin,
-            self.pipeline_reopt_stage2_repeats_spin,
-            self.pipeline_reopt_stage3_maxfev_spin,
-            self.pipeline_reopt_rerank_averages_spin,
-        ):
-            widget.setEnabled(reopt_enabled)
-        reopt_quick_calibration_enabled = reopt_enabled and quick_optimization
-        for widget in (
-            self.pipeline_reopt_calibration_label,
-            self.pipeline_reopt_calibration_edit,
-            self.pipeline_reopt_calibration_button,
-        ):
-            widget.setEnabled(reopt_quick_calibration_enabled)
-        for widget in (
-            self.pipeline_optimization_root_edit,
-            self.pipeline_optimization_root_button,
-            self.pipeline_optimization_name_edit,
-        ):
-            widget.setEnabled(optimize_selected)
-        self.pipeline_run_button.setEnabled(
-            bool(selected)
-            and self.osa_controller is not None
-            and not self._calibration_is_running
-        )
-
-    def _browse_pipeline_optimization_root(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "Select optimization output root",
-            self.pipeline_optimization_root_edit.text().strip() or ".",
-        )
-        if path:
-            self.pipeline_optimization_root_edit.setText(path)
 
     def _build_stage3_reopt_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -1515,6 +866,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.stage3_reopt_sensitivity_combo.setCurrentText("HIGH1")
         self.stage3_reopt_ref_level_edit = QtWidgets.QLineEdit("10uW")
+        self.stage3_reopt_sampling_edit = QtWidgets.QLineEdit("1001")
+        self.stage3_reopt_sampling_edit.setToolTip(
+            "Sampling points: AUTO or a count like 1001"
+        )
         self.stage3_reopt_yunit_combo = QtWidgets.QComboBox()
         self.stage3_reopt_yunit_combo.addItems(["LOG (dBm)", "LIN (W)"])
         self.stage3_reopt_averages_spin = self._spin(1, 20, 1)
@@ -1537,6 +892,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_grid.addWidget(self.stage3_reopt_yunit_combo, 2, 1)
         cfg_grid.addWidget(QtWidgets.QLabel("OSA averages"), 2, 2)
         cfg_grid.addWidget(self.stage3_reopt_averages_spin, 2, 3)
+        cfg_grid.addWidget(QtWidgets.QLabel("Points"), 2, 4)
+        cfg_grid.addWidget(self.stage3_reopt_sampling_edit, 2, 5)
         cfg_grid.addWidget(QtWidgets.QLabel("Stage3 baseline repeats"), 3, 0)
         cfg_grid.addWidget(self.stage3_reopt_baseline_repeats_spin, 3, 1)
         cfg_grid.addWidget(QtWidgets.QLabel("Stage3 max evals"), 3, 2)
@@ -1913,6 +1270,12 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets["sensitivity"].addItems(["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"])
         widgets["sensitivity"].setCurrentText(defaults.get("sensitivity", "HIGH2"))
         widgets["ref_level"] = QtWidgets.QLineEdit(defaults.get("ref_level", "10uW"))
+        widgets["sampling_points"] = QtWidgets.QLineEdit(
+            defaults.get("sampling_points", "AUTO")
+        )
+        widgets["sampling_points"].setToolTip(
+            "Sampling points: AUTO or a count like 1001"
+        )
         grid.addWidget(QtWidgets.QLabel("Center λ"), 0, 0)
         grid.addWidget(widgets["center_wl"], 0, 1)
         grid.addWidget(QtWidgets.QLabel("Span"), 0, 2)
@@ -1921,6 +1284,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(widgets["sensitivity"], 1, 1)
         grid.addWidget(QtWidgets.QLabel("Ref level"), 1, 2)
         grid.addWidget(widgets["ref_level"], 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Points"), 2, 0)
+        grid.addWidget(widgets["sampling_points"], 2, 1)
         return box
 
     def _level_sweep_row(self, step: int, *, stop: int = 1023, stepv: int = 64) -> QtWidgets.QWidget:
@@ -2726,6 +2091,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.enc_center_wl_spin = self._double_spin(700.0, 900.0, 778.0, " nm", 2)
         self.enc_width_spin = self._spin(1, 256, 15)
         self.enc_pad_spin   = self._spin(0, 64, 5)
+        self.enc_center_gap_check = QtWidgets.QCheckBox("Centre gap")
+        self.enc_center_gap_check.setToolTip(
+            "Widen the dark pad between the innermost x/w pair (crosstalk "
+            "reduction); unchecked keeps the legacy pad = padding px"
+        )
+        self.enc_center_gap_spin = self._spin(0, 200, 10)
+        self.enc_center_gap_spin.setEnabled(False)
+        self.enc_center_gap_check.toggled.connect(
+            self.enc_center_gap_spin.setEnabled
+        )
 
         self.enc_calib_label = QtWidgets.QLabel("Calibration: (none loaded)")
         self.enc_calib_label.setObjectName("PageSubtitle")
@@ -2751,6 +2126,9 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_grid.addWidget(QtWidgets.QLabel("px   Padding"),  0, 4)
         cfg_grid.addWidget(self.enc_pad_spin,                 0, 5)
         cfg_grid.addWidget(QtWidgets.QLabel("px"),            0, 6)
+        cfg_grid.addWidget(self.enc_center_gap_check,         0, 7)
+        cfg_grid.addWidget(self.enc_center_gap_spin,          0, 8)
+        cfg_grid.addWidget(QtWidgets.QLabel("px"),            0, 9)
         # calibration source + the shortened channel/pitch/pad summary share one
         # row (right after the loaded-json label) so the panel needs no third row
         cfg_grid.addWidget(self.enc_calib_label,             1, 0, 1, 3)
@@ -2983,6 +2361,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._enc_log(f"Loaded calibration override: {path}")
         self._enc_build_layout()
 
+    def _enc_center_gap(self) -> int | None:
+        """The optional widened centre dark pad (None = legacy gap_px pad)."""
+        if getattr(self, "enc_center_gap_check", None) is None:
+            return None
+        if not self.enc_center_gap_check.isChecked():
+            return None
+        return int(self.enc_center_gap_spin.value())
+
     def _enc_build_layout(self) -> None:
         calib = self._enc_get_calib()
         if calib is None or calib.intensity_levels is None:
@@ -3010,6 +2396,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 n_channels=n_ch,
                 channel_width_px=self.enc_width_spin.value(),
                 gap_px=self.enc_pad_spin.value(),
+                center_gap_px=self._enc_center_gap(),
                 center_wl=self.enc_center_wl_spin.value(),
             )
         except Exception as exc:
@@ -3480,6 +2867,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_log.setObjectName("LogBox")
         self.edge_log.setMaximumHeight(90)
 
+        # --- OSA optimisation settings: span / sampling points / batch mode ---
+        self.edge_osa_span_edit = QtWidgets.QLineEdit("0.8nm")
+        self.edge_osa_span_edit.setMaximumWidth(70)
+        self.edge_osa_points_edit = QtWidgets.QLineEdit("1001")
+        self.edge_osa_points_edit.setMaximumWidth(70)
+        self.edge_osa_points_edit.setToolTip(
+            "Sampling points: AUTO or a count like 1001"
+        )
+        self.edge_batch_check = QtWidgets.QCheckBox("Batch over sampling points")
+        self.edge_batch_check.setToolTip(
+            "Run the full optimisation once per sampling-point count and "
+            "compare the outcomes"
+        )
+        self.edge_batch_points_edit = QtWidgets.QLineEdit("501, 1001, 2001")
+        self.edge_batch_points_edit.setEnabled(False)
+        self.edge_batch_check.toggled.connect(
+            self.edge_batch_points_edit.setEnabled
+        )
+        osa_cfg_row = QtWidgets.QHBoxLayout()
+        osa_cfg_row.addWidget(QtWidgets.QLabel("Opt. span"))
+        osa_cfg_row.addWidget(self.edge_osa_span_edit)
+        osa_cfg_row.addWidget(QtWidgets.QLabel("points"))
+        osa_cfg_row.addWidget(self.edge_osa_points_edit)
+        osa_cfg_row.addSpacing(16)
+        osa_cfg_row.addWidget(self.edge_batch_check)
+        osa_cfg_row.addWidget(self.edge_batch_points_edit, 1)
+
+        self.edge_live_canvas = LiveLossCanvas(self)
+        self.edge_batch_table = BatchResultsTable(self)
+        self.edge_batch_table.hide()
+
         gain_panel = self._panel("Encoding Gain  (Modulation Error A/B: flat vs taper)")
         gain_layout = QtWidgets.QVBoxLayout(gain_panel)
         gain_row = QtWidgets.QHBoxLayout()
@@ -3490,8 +2908,11 @@ class MainWindow(QtWidgets.QMainWindow):
         gain_row.addWidget(self.edge_load_optimization_button)
         gain_row.addWidget(self.edge_osa_button)
         gain_layout.addLayout(gain_row)
+        gain_layout.addLayout(osa_cfg_row)
         gain_layout.addWidget(self.edge_gain_bar)
         gain_layout.addWidget(self.edge_gain_status)
+        gain_layout.addWidget(self.edge_live_canvas)
+        gain_layout.addWidget(self.edge_batch_table)
         gain_layout.addWidget(self.edge_gain_table, 1)
         gain_layout.addWidget(self.edge_log)
 
@@ -3710,9 +3131,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ana = self._ana_settings()
         settings = MeasurementSettings(
             center_wl="778nm",
-            span="0.8nm",
+            span=self.edge_osa_span_edit.text().strip() or "0.8nm",
             sensitivity=ana.sensitivity,
-            sampling_points="1001",
+            sampling_points=self.edge_osa_points_edit.text().strip() or "1001",
             y_unit=ana.y_unit,
             reference_level=ana.reference_level,
             trace_id=ana.trace_id,
@@ -3720,18 +3141,60 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         config = OSAOptimizationConfig(settings=settings)
         initial_l = ratio[:8].copy()
+
+        from dataclasses import replace
+
+        batch_variants: list[OSABatchVariant] = []
+        if self.edge_batch_check.isChecked():
+            counts = [
+                part.strip()
+                for part in self.edge_batch_points_edit.text().replace(";", ",").split(",")
+                if part.strip()
+            ]
+            if not counts:
+                self._edge_log("Batch mode needs at least one sampling-point count.")
+                return
+            batch_variants = [
+                OSABatchVariant(
+                    f"sp{count}", replace(settings, sampling_points=count)
+                )
+                for count in counts
+            ]
+
         stop_event = threading.Event()
         self.edge_gain_stop_event = stop_event
         self._edge_gain_running(True)
         self.edge_gain_bar.setRange(0, 0)
         self.edge_gain_status.setText("Preparing fixed OSA bins and references…")
+        self.edge_live_canvas.reset()
+        self.edge_batch_table.setVisible(bool(batch_variants))
+        self.edge_batch_table.setRowCount(0)
         self._edge_log(
             "OSA optimisation started with 8 intensity ratios: "
             + np.array2string(initial_l, precision=4)
+            + (f"  ·  batch: {[v.label for v in batch_variants]}"
+               if batch_variants else "")
         )
 
         def report(progress: OptimizationProgress) -> None:
             self.edge_optimization_progress.emit(progress)
+
+        if batch_variants:
+            def work() -> dict[str, Any]:
+                outcomes = run_osa_optimization_batch(
+                    osa, controller, layout, initial_l,
+                    base_config=config, variants=batch_variants,
+                    stop_event=stop_event, progress_callback=report,
+                )
+                return {"status": "ok", "outcomes": outcomes}
+
+            self._run_slm_task(
+                "OSA batch optimisation",
+                work,
+                self._edge_batch_finished,
+                self._edge_optimization_error,
+            )
+            return
 
         def work() -> dict[str, Any]:
             try:
@@ -3755,6 +3218,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self._edge_optimization_error,
         )
 
+    def _edge_batch_finished(self, payload: dict[str, Any]) -> None:
+        """Show the per-variant comparison; profiles are NOT auto-applied."""
+        self.edge_gain_stop_event = None
+        self._edge_gain_running(False)
+        self.edge_gain_bar.setRange(0, 100)
+        self.edge_gain_bar.setValue(0)
+        outcomes = payload.get("outcomes", [])
+        self.edge_batch_table.show()
+        self.edge_batch_table.show_outcomes(outcomes)
+        finished = sum(1 for o in outcomes if o.result is not None)
+        stopped = any(o.stopped for o in outcomes)
+        state = "stopped early" if stopped else "done"
+        self.edge_gain_status.setText(
+            f"Batch {state}: {finished}/{len(outcomes)} variants completed. "
+            "Use 'Load optimized result…' on a run dir to apply a profile."
+        )
+        for outcome in outcomes:
+            self._edge_log(
+                f"batch {outcome.variant.label}: "
+                + (outcome.error or ("stopped" if outcome.stopped
+                   else f"accepted={outcome.result.accepted} -> {outcome.run_dir}"))
+            )
+
     def _edge_optimization_progress(self, progress: OptimizationProgress) -> None:
         if progress.total > 0:
             self.edge_gain_bar.setRange(0, progress.total)
@@ -3767,6 +3253,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_gain_status.setText(
             f"{counter}{progress.stage}: {progress.message}{best}"
         )
+        # stream per-evaluation metrics + the flat reference into the live plot
+        self.edge_live_canvas.on_progress(progress)
 
     def _edge_optimization_finished(self, payload: dict[str, Any]) -> None:
         self.edge_gain_stop_event = None
@@ -4644,11 +4132,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.osv_logy_check.toggled.connect(
             lambda _=None: self._osa_view_plot(self.osa_view_trace)
         )
+        self.osv_dock_button = QtWidgets.QPushButton("Monitor dock")
+        self.osv_dock_button.setProperty("variant", "ghost")
+        self.osv_dock_button.setCheckable(True)
+        self.osv_dock_button.setToolTip(
+            "Show the dockable live monitor that follows every OSA sweep, "
+            "from any page"
+        )
+        self.osv_dock_button.toggled.connect(self.osa_monitor_dock.setVisible)
+        self.osa_monitor_dock.visibilityChanged.connect(
+            self.osv_dock_button.setChecked
+        )
         ctrl.addWidget(self.osv_single_button)
         ctrl.addWidget(self.osv_cont_button)
         ctrl.addWidget(self.osv_stop_button)
         ctrl.addWidget(self.osv_save_button)
         ctrl.addWidget(self.osv_logy_check)
+        ctrl.addWidget(self.osv_dock_button)
         ctrl.addStretch(1)
         page.layout().addLayout(ctrl)
 
@@ -4741,14 +4241,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.osv_status.setText("Continuous sweeping… press Stop to end.")
 
         def work() -> dict[str, Any]:
+            # display happens via the controller's trace listener; this loop
+            # only drives the sweeps
             try:
                 while not stop_event.is_set():
-                    trace = osa.measure(
-                        settings, averages=averages, stop_event=stop_event
-                    )
-                    if stop_event.is_set():
-                        break
-                    self.osa_trace_ready.emit(trace)
+                    osa.measure(settings, averages=averages, stop_event=stop_event)
             except OSAError as exc:
                 if not stop_event.is_set():
                     return {"status": "error", "message": str(exc)}
@@ -5703,6 +5200,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     n_channels=layout.n_channels,
                     channel_width_px=layout.channel_width_px,
                     gap_px=gap_px,
+                    center_gap_px=layout.center_gap_px,
                     pair_index=pair_index,
                     drive_level=self.tpa_center_drive.value(),
                     n_trials=n_trials,
@@ -5915,6 +5413,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_daq()
             self._log("DAQ disconnected automatically (scope connected)")
         self.scope_controller = scope
+        scope.add_sample_listener(self._monitor_bridge.on_sample)
         self._set_status(self.scope_status_label, "Scope: open", "ok")
         self.scope_connect_button.setEnabled(False)
         self.scope_disconnect_button.setEnabled(True)
@@ -5932,6 +5431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_connect_button.setEnabled(True)
         self.scope_disconnect_button.setEnabled(False)
         if scope is not None:
+            scope.remove_sample_listener(self._monitor_bridge.on_sample)
             self._run_task("Disconnect scope", scope.disconnect)
         self._sync_monitor_source()
 
@@ -5956,6 +5456,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_scope()
             self._log("Scope disconnected automatically (DAQ connected)")
         self.daq_controller = daq
+        daq.add_sample_listener(self._monitor_bridge.on_sample)
         self._set_status(self.daq_status_label, "DAQ: open", "ok")
         self.daq_connect_button.setEnabled(False)
         self.daq_disconnect_button.setEnabled(True)
@@ -5974,6 +5475,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daq_connect_button.setEnabled(True)
         self.daq_disconnect_button.setEnabled(False)
         if daq is not None:
+            daq.remove_sample_listener(self._monitor_bridge.on_sample)
             self._run_task("Disconnect DAQ", daq.disconnect)
         self._sync_monitor_source()
 
@@ -6045,8 +5547,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "it to the record."
         )
         v.addWidget(self.mon_read_on_send)
+        self.mon_dock_button = QtWidgets.QPushButton("Live dock")
+        self.mon_dock_button.setProperty("variant", "ghost")
+        self.mon_dock_button.setCheckable(True)
+        self.mon_dock_button.setToolTip(
+            "Show the dockable live monitor: every scope/DAQ reading from any "
+            "module (TPA scans, step 6/7, pipeline, this page) streams into "
+            "its rolling chart, visible from every page."
+        )
+        self.mon_dock_button.toggled.connect(self.daq_monitor_dock.setVisible)
+        self.daq_monitor_dock.visibilityChanged.connect(
+            self.mon_dock_button.setChecked
+        )
         row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)   # push the buttons to the right at their natural width
+        row.addWidget(self.mon_dock_button)
+        row.addStretch(1)   # push the action buttons to the right at their natural width
         row.addWidget(self.mon_acquire_button)
         row.addWidget(self.mon_clear_button)
         row.addWidget(self.mon_save_button)
@@ -6845,6 +6360,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_osa_connected(self, payload: tuple[OSAController, str]) -> None:
         osa, identity = payload
         self.osa_controller = osa
+        # every measure() from any module now streams to the live monitor
+        osa.add_trace_listener(self._osa_bridge.on_trace)
         self._set_status(self.osa_status_label, "OSA: open", "ok")
         self._set_calibration_running(False)
         self._log(f"OSA connected: {identity.strip()}")
@@ -6859,6 +6376,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(self.osa_status_label, "OSA: closed", "off")
         self._set_calibration_running(False)
         if osa is not None:
+            osa.remove_trace_listener(self._osa_bridge.on_trace)
             self._run_task("Disconnect OSA", osa.disconnect)
 
     def _set_calibration_running(self, running: bool) -> None:
@@ -6867,17 +6385,19 @@ class MainWindow(QtWidgets.QMainWindow):
         for button in getattr(self, "calibration_run_buttons", []):
             button.setEnabled(connected and not running)
         self.stop_cal_button.setEnabled(running)
-        self.pipeline_stop_button.setEnabled(running)
         if hasattr(self, "stage3_reopt_stop_button"):
             self.stage3_reopt_stop_button.setEnabled(running)
         if hasattr(self, "fast_channel_stop_button"):
             self.fast_channel_stop_button.setEnabled(running)
         self.osa_connect_button.setEnabled(not running and not connected)
         self.osa_disconnect_button.setEnabled(not running and connected)
+        # The unified pipeline may run without the OSA (TPA stages only), so
+        # its Run button is not tied to the OSA connection like the others.
+        if hasattr(self, "pipeline_page"):
+            self.pipeline_page.run_button.setEnabled(not running)
         # Step 3 may run on the DAQ instead of the OSA, so its Run button is
         # gated on whichever detector it currently targets.
         self._refresh_step3_run_button()
-        self._refresh_pipeline_ui()
 
     def _refresh_step3_run_button(self) -> None:
         """Step 3 reads the DAQ, so its Run button is gated on the DAQ, not the OSA."""
@@ -6898,6 +6418,10 @@ class MainWindow(QtWidgets.QMainWindow):
             center_wl=widgets["center_wl"].text().strip() or "778nm",
             span=widgets["span"].text().strip() or "8nm",
             sensitivity=widgets["sensitivity"].currentText(),
+            sampling_points=(
+                widgets["sampling_points"].text().strip() or "AUTO"
+                if "sampling_points" in widgets else "AUTO"
+            ),
             reference_level=widgets["ref_level"].text().strip() or "10uW",
             y_unit="LINear",
         )
@@ -7379,33 +6903,6 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError(f"{label} must be a file: {path}")
         return path
 
-    def _load_pipeline_input(
-        self,
-        step: int,
-        path: Path,
-        *,
-        csv_min_level: int,
-        csv_max_level: int,
-    ) -> CalibrationResult:
-        """Load and validate one step input without consulting in-memory state."""
-        if step == 3 and path.suffix.lower() == ".csv":
-            result = load_wavelength_map_csv(
-                path,
-                min_level=csv_min_level,
-                max_level=csv_max_level,
-            )
-        else:
-            result = load_calibration_result(path)
-        self._require_levels(result)
-        if step == 3 and (
-            np.asarray(result.coordinates).size == 0
-            or np.asarray(result.wavelength).size == 0
-        ):
-            raise ValueError(
-                "Step 3 input file has no coordinate -> wavelength mapping"
-            )
-        return result
-
     def _pipeline_directory_path(
         self, edit: QtWidgets.QLineEdit, label: str
     ) -> Path:
@@ -7429,50 +6926,6 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{source} must contain 8 values or a symmetric 15-value profile; "
             f"found {values.size}"
         )
-
-    def _parse_pipeline_initial_profile(self, text: str) -> np.ndarray:
-        """Parse direct comma/space-separated profile values from the UI."""
-        value_text = text.strip()
-        if not value_text:
-            raise ValueError("Encoding Optimization initial profile values are required")
-        if value_text.startswith("["):
-            try:
-                values = json.loads(value_text)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid initial profile JSON: {exc.msg}") from exc
-        else:
-            parts = [part for part in re.split(r"[\s,;]+", value_text) if part]
-            try:
-                values = [float(part) for part in parts]
-            except ValueError as exc:
-                raise ValueError(
-                    "initial profile values must be numbers separated by commas or spaces"
-                ) from exc
-        return self._validate_pipeline_initial_profile(
-            values, source="initial profile input"
-        )
-
-    def _parse_pipeline_quick_levels(self, text: str) -> np.ndarray:
-        """Parse the min~max+stride SLM range used by quick centre calibration."""
-        value_text = text.strip()
-        if not value_text:
-            raise ValueError("Quick SLM range is required")
-        match = re.fullmatch(r"\s*(\d+)\s*~\s*(\d+)\s*\+\s*(\d+)\s*", text)
-        if match is None:
-            raise ValueError(
-                "Quick SLM range must use min~max+stride, for example 420~870+50"
-            )
-        min_level, max_level, stride = (int(part) for part in match.groups())
-        if min_level >= max_level:
-            raise ValueError("Quick SLM range requires min < max")
-        if stride <= 0:
-            raise ValueError("Quick SLM range stride must be positive")
-        if min_level < 0 or max_level > MAX_LEVEL:
-            raise ValueError(f"Quick SLM range must be in 0..{MAX_LEVEL}")
-        levels = list(range(min_level, max_level + 1, stride))
-        if levels[-1] != max_level:
-            levels.append(max_level)
-        return np.asarray(levels, dtype=int)
 
     def _load_pipeline_initial_profile(self, path: Path) -> np.ndarray:
         """Load an 8-value initial profile or a symmetric 15-value profile."""
@@ -7506,20 +6959,6 @@ class MainWindow(QtWidgets.QMainWindow):
             values, source="initial profile file"
         )
 
-    def _load_pipeline_optimization_calibration(
-        self, path: Path
-    ) -> CalibrationResult:
-        result = load_calibration_result(path)
-        self._require_levels(result)
-        if result.intensity_levels is None:
-            raise ValueError("Encoding Optimization requires a Step 3 intensity result")
-        if (
-            np.asarray(result.coordinates).size < 2
-            or np.asarray(result.wavelength).size < 2
-        ):
-            raise ValueError("Encoding Optimization calibration has too few coordinates")
-        return result
-
     def _load_pipeline_wavelength_calibration(
         self, path: Path, *, target_wavelength_nm: float
     ) -> CalibrationResult:
@@ -7542,32 +6981,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "quick optimization requires a one-coordinate intensity calibration"
             )
         return result
-
-    def _build_pipeline_encoding_layout(
-        self,
-        calibration: CalibrationResult,
-        *,
-        center_wl: float,
-        channel_width_px: int,
-        gap_px: int,
-    ) -> ChannelLayout:
-        coords = np.asarray(calibration.coordinates, dtype=float)
-        wavelengths = np.asarray(calibration.wavelength, dtype=float)
-        slope, intercept = np.polyfit(coords, wavelengths, 1)
-        if not np.isfinite(slope) or abs(float(slope)) < 1e-12:
-            raise ValueError("calibration wavelength slope is zero or invalid")
-        center_x = (center_wl - intercept) / slope
-        pitch = channel_width_px + gap_px
-        n_channels = int(min(center_x - coords.min(), coords.max() - center_x) / pitch)
-        if n_channels < 1:
-            raise ValueError("no encoding channels fit inside the calibrated range")
-        return build_channel_layout(
-            calibration,
-            n_channels=n_channels,
-            channel_width_px=channel_width_px,
-            gap_px=gap_px,
-            center_wl=center_wl,
-        )
 
     def _run_stage3_reoptimization(self) -> None:
         """Standalone quick Stage-3 re-optimisation from saved files."""
@@ -7634,7 +7047,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 center_wl=f"{center_wl:g}nm",
                 span=self.stage3_reopt_span_edit.text().strip() or "0.8nm",
                 sensitivity=self.stage3_reopt_sensitivity_combo.currentText(),
-                sampling_points="1001",
+                sampling_points=(
+                    self.stage3_reopt_sampling_edit.text().strip() or "1001"
+                ),
                 y_unit=y_unit,
                 reference_level=(
                     self.stage3_reopt_ref_level_edit.text().strip() or "10uW"
@@ -7723,578 +7138,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._launch_calibration("Stage 3 re-optimization", work)
         self.edge_gain_stop_event = self.calibration_stop_event
-
-    def _run_pipeline(self) -> None:
-        """Run any selected steps, using files as the only inter-step boundary."""
-        osa = self._osa_ready()
-        if osa is None:
-            return
-        selected = tuple(
-            step
-            for step in (1, 2, 3, 4)
-            if self.pipeline_checks[step].isChecked()
-        )
-        if not selected:
-            return self._reject_calibration(
-                ValueError("select at least one pipeline step")
-            )
-        quick_optimization = (
-            4 in selected and self.pipeline_quick_optimization_check.isChecked()
-        )
-        stage3_only = (
-            4 in selected and self.pipeline_stage3_only_check.isChecked()
-        )
-
-        try:
-            outputs = {
-                step: self._pipeline_file_path(
-                    self.pipeline_output_edits[step], f"Step {step} output"
-                )
-                for step in selected
-                if step in (1, 2, 3)
-            }
-            csv_output = (
-                self._pipeline_file_path(
-                    self.pipeline_csv_edit, "Step 3 CSV output"
-                )
-                if 3 in selected
-                else None
-            )
-            external_inputs: dict[int, Path] = {}
-            if 2 in selected and 1 not in selected:
-                external_inputs[2] = self._pipeline_file_path(
-                    self.pipeline_input_edits[2],
-                    "Step 2 input",
-                    must_exist=True,
-                )
-            if 3 in selected and 2 not in selected:
-                external_inputs[3] = self._pipeline_file_path(
-                    self.pipeline_input_edits[3],
-                    "Step 3 input",
-                    must_exist=True,
-                )
-
-            optimization_calibration_input = None
-            profile_path = None
-            direct_initial_profile = None
-            optimization_root = None
-            optimization_run_name = None
-            quick_calibration_output = None
-            quick_calibration_input = None
-            if 4 in selected:
-                optimization_source_step = 2 if quick_optimization else 3
-                if optimization_source_step not in selected:
-                    optimization_calibration_input = self._pipeline_file_path(
-                        self.pipeline_input_edits[4],
-                        f"Encoding Optimization Step {optimization_source_step} input",
-                        must_exist=True,
-                    )
-                if quick_optimization and stage3_only:
-                    quick_calibration_input = self._pipeline_file_path(
-                        self.pipeline_reopt_calibration_edit,
-                        "Quick centre calibration input",
-                        must_exist=True,
-                    )
-                elif quick_optimization:
-                    quick_calibration_output = self._pipeline_file_path(
-                        self.pipeline_quick_calibration_edit,
-                        "Quick centre calibration output",
-                    )
-                if stage3_only:
-                    profile_path = self._pipeline_file_path(
-                        self.pipeline_reopt_profile_edit,
-                        "Stage 1 level/profile data",
-                        must_exist=True,
-                    )
-                elif self.pipeline_profile_source_combo.currentIndex() == 1:
-                    profile_path = self._pipeline_file_path(
-                        self.pipeline_profile_edit,
-                        "Encoding Optimization initial profile",
-                        must_exist=True,
-                    )
-                else:
-                    direct_initial_profile = self._parse_pipeline_initial_profile(
-                        self.pipeline_profile_values_edit.text()
-                    )
-                optimization_root = self._pipeline_directory_path(
-                    self.pipeline_optimization_root_edit,
-                    "Encoding Optimization output root",
-                )
-                optimization_run_name = (
-                    self.pipeline_optimization_name_edit.text().strip() or None
-                )
-                if optimization_run_name is not None and (
-                    Path(optimization_run_name).name != optimization_run_name
-                    or optimization_run_name in (".", "..")
-                ):
-                    raise ValueError("optimization run name must be one directory name")
-
-            output_paths = list(outputs.values())
-            if csv_output is not None:
-                output_paths.append(csv_output)
-            if quick_calibration_output is not None:
-                output_paths.append(quick_calibration_output)
-            if len(set(output_paths)) != len(output_paths):
-                raise ValueError("every selected pipeline output must use a unique file")
-            external_file_paths = list(external_inputs.values())
-            if optimization_calibration_input is not None:
-                external_file_paths.append(optimization_calibration_input)
-            if quick_calibration_input is not None:
-                external_file_paths.append(quick_calibration_input)
-            if profile_path is not None:
-                external_file_paths.append(profile_path)
-            collisions = set(output_paths).intersection(external_file_paths)
-            if collisions:
-                collision = next(iter(collisions))
-                raise ValueError(
-                    f"external input cannot also be a pipeline output: {collision}"
-                )
-
-            # A bare wavelength-map CSV does not carry min/max levels. Reuse the
-            # existing Step 3 panel values instead of maintaining duplicate state.
-            csv_min_level = self.step_widgets[3]["min"].value()
-            csv_max_level = self.step_widgets[3]["max"].value()
-            if csv_max_level < csv_min_level:
-                raise ValueError("Step 3 CSV max level must be >= min level")
-
-            # Validate external files before starting hardware acquisition. The worker
-            # reloads them again at the actual step boundary.
-            for step, input_path in external_inputs.items():
-                self._load_pipeline_input(
-                    step,
-                    input_path,
-                    csv_min_level=csv_min_level,
-                    csv_max_level=csv_max_level,
-                )
-
-            if 4 in selected:
-                if profile_path is not None:
-                    self._load_pipeline_initial_profile(profile_path)
-                if quick_calibration_input is not None:
-                    self._load_pipeline_quick_intensity_calibration(
-                        quick_calibration_input
-                    )
-                if optimization_calibration_input is not None:
-                    if quick_optimization:
-                        self._load_pipeline_wavelength_calibration(
-                            optimization_calibration_input,
-                            target_wavelength_nm=self.enc_center_wl_spin.value(),
-                        )
-                    else:
-                        self._load_pipeline_optimization_calibration(
-                            optimization_calibration_input
-                        )
-
-            settings = {
-                step: self._step_settings(step)
-                for step in selected
-                if step in (1, 2, 3)
-            }
-            levels1 = self._step_levels(1) if 1 in selected else None
-            levels3 = self._step_levels(3) if 3 in selected else None
-            quick_levels = (
-                self._parse_pipeline_quick_levels(
-                    self.pipeline_quick_levels_edit.text()
-                )
-                if quick_optimization and not stage3_only
-                else None
-            )
-            window2 = self.step_widgets[2]["window"].value() if 2 in selected else None
-            peak_nm = (
-                self.step_widgets[2]["peak_nm"].value() or None
-                if 2 in selected
-                else None
-            )
-            region2 = self._step_region(2) if 2 in selected else None
-            window3 = self.step_widgets[3]["window"].value() if 3 in selected else None
-            avg_nm = (
-                self.step_widgets[3]["avg_nm"].value() or None
-                if 3 in selected
-                else None
-            )
-            sweep_nm = (
-                self.step_widgets[3]["sweep_nm"].value() or None
-                if 3 in selected
-                else None
-            )
-            stride = self.step_widgets[3]["stride"].value() if 3 in selected else None
-            refine = (
-                self.step_widgets[3]["refine"].isChecked()
-                if 3 in selected
-                else None
-            )
-            region3 = self._step_region(3) if 3 in selected else None
-            if 4 in selected:
-                center_wl = self.enc_center_wl_spin.value()
-                channel_width = self.enc_width_spin.value()
-                gap_px = self.enc_pad_spin.value()
-                if channel_width != 15:
-                    raise ValueError(
-                        "Encoding Optimization requires a 15 px channel width"
-                    )
-                ana = self._ana_settings()
-                opt_sensitivity = (
-                    self.pipeline_reopt_sensitivity_combo.currentText()
-                    if stage3_only
-                    else ana.sensitivity
-                )
-                optimization_settings = MeasurementSettings(
-                    center_wl=f"{center_wl:g}nm",
-                    span="0.8nm",
-                    sensitivity=opt_sensitivity,
-                    sampling_points="1001",
-                    y_unit=ana.y_unit,
-                    reference_level=ana.reference_level,
-                    trace_id=ana.trace_id,
-                    trace_mode=ana.trace_mode,
-                )
-                assert optimization_root is not None
-                optimization_config = OSAOptimizationConfig(
-                    settings=optimization_settings,
-                    anchor_offsets=(0,) if quick_optimization else (0, -10, 10),
-                    full_validation=not quick_optimization,
-                    output_root=str(optimization_root),
-                    run_name=optimization_run_name,
-                    averages=(
-                        self.pipeline_reopt_averages_spin.value()
-                        if stage3_only
-                        else OSAOptimizationConfig.averages
-                    ),
-                    rerank_averages=(
-                        self.pipeline_reopt_rerank_averages_spin.value()
-                        if stage3_only
-                        else OSAOptimizationConfig.rerank_averages
-                    ),
-                    stage2_repeats=(
-                        self.pipeline_reopt_stage2_repeats_spin.value()
-                        if stage3_only
-                        else OSAOptimizationConfig.stage2_repeats
-                    ),
-                    stage3_maxfev=(
-                        self.pipeline_reopt_stage3_maxfev_spin.value()
-                        if stage3_only
-                        else OSAOptimizationConfig.stage3_maxfev
-                    ),
-                    skip_stage1=stage3_only,
-                )
-                if quick_optimization:
-                    quick_settings = self._step_settings(3)
-                    quick_window = self.step_widgets[3]["window"].value()
-                    quick_avg_nm = self.step_widgets[3]["avg_nm"].value() or None
-                    quick_sweep_nm = (
-                        self.step_widgets[3]["sweep_nm"].value() or None
-                    )
-                else:
-                    quick_settings = None
-                    quick_window = None
-                    quick_avg_nm = None
-                    quick_sweep_nm = None
-            else:
-                center_wl = None
-                channel_width = None
-                gap_px = None
-                optimization_config = None
-                quick_settings = None
-                quick_window = None
-                quick_avg_nm = None
-                quick_sweep_nm = None
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            return self._reject_calibration(exc)
-
-        controller = self._controller()
-        if 4 in selected and not getattr(controller, "is_open", False):
-            return self._reject_calibration(
-                ValueError("open the SLM before running Encoding Optimization")
-            )
-        stage_names = {
-            1: "Step 1",
-            2: "Step 2",
-            3: "Step 3",
-            4: (
-                "Quick Stage 3 Re-optimization"
-                if quick_optimization and stage3_only
-                else (
-                    "Stage 3 Re-optimization"
-                    if stage3_only
-                    else (
-                        "Quick Single-Channel Optimization"
-                        if quick_optimization
-                        else "Encoding Optimization"
-                    )
-                )
-            ),
-        }
-        sequence = " -> ".join(stage_names[step] for step in selected)
-        self.pipeline_status_label.setText(f"Running steps {sequence}")
-        self.pipeline_log.appendPlainText(f"Starting pipeline: {sequence}")
-        self._log(f"Pipeline started (steps {sequence}, file-only handoffs)")
-
-        def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
-            result: CalibrationResult | None = None
-            optimization_result: OptimizationResult | None = None
-            optimization_layout: ChannelLayout | None = None
-            quick_target_coordinate: float | None = None
-            quick_measured_range: tuple[int, int] | None = None
-            saved_files: list[Path] = []
-
-            if 1 in selected:
-                assert levels1 is not None
-                _mn, _mx, min_level, max_level, _rec = find_min_max_intensity_levels(
-                    osa,
-                    controller,
-                    levels1,
-                    settings[1],
-                    stop_event=stop_event,
-                    progress_callback=report,
-                )
-                result = CalibrationResult(
-                    wavelength=np.asarray([]),
-                    coordinates=np.asarray([]),
-                    max_level=max_level,
-                    min_level=min_level,
-                    level_range=np.asarray(levels1, dtype=int),
-                )
-                saved_files.append(save_calibration_result(result, outputs[1]))
-
-            if 2 in selected:
-                input_path = outputs[1] if 1 in selected else external_inputs[2]
-                seed = self._load_pipeline_input(
-                    2,
-                    input_path,
-                    csv_min_level=csv_min_level,
-                    csv_max_level=csv_max_level,
-                )
-                result = wavelength_calibration(
-                    osa,
-                    controller,
-                    [],
-                    settings[2],
-                    seed,
-                    window_size=window2,
-                    peak_half_window_nm=peak_nm,
-                    region=region2,
-                    stop_event=stop_event,
-                    progress_callback=report,
-                )
-                saved_files.append(save_calibration_result(result, outputs[2]))
-
-            if 3 in selected:
-                input_path = outputs[2] if 2 in selected else external_inputs[3]
-                mapping = self._load_pipeline_input(
-                    3,
-                    input_path,
-                    csv_min_level=csv_min_level,
-                    csv_max_level=csv_max_level,
-                )
-                assert levels3 is not None and csv_output is not None
-                result = intensity_calibration(
-                    osa,
-                    controller,
-                    levels3,
-                    settings[3],
-                    mapping,
-                    window_size=window3,
-                    wavelength_window_nm=avg_nm,
-                    sweep_span_nm=sweep_nm,
-                    coordinate_stride=stride,
-                    refine_wavelength=refine,
-                    region=region3,
-                    stop_event=stop_event,
-                    progress_callback=report,
-                )
-                saved_files.append(save_calibration_result(result, outputs[3]))
-                csv_path = write_intensity_calibration_csv(result, csv_output)
-            else:
-                csv_path = None
-
-            if 4 in selected:
-                assert center_wl is not None
-                assert channel_width is not None
-                assert gap_px is not None
-                assert optimization_config is not None
-                if quick_optimization:
-                    step2_path = (
-                        outputs[2]
-                        if 2 in selected
-                        else optimization_calibration_input
-                    )
-                    assert step2_path is not None
-                    step2_calibration = self._load_pipeline_wavelength_calibration(
-                        step2_path, target_wavelength_nm=center_wl
-                    )
-                    quick_target_coordinate = interpolate_coordinate_for_wavelength(
-                        step2_calibration, center_wl
-                    )
-                    target_pixel = int(round(quick_target_coordinate))
-                    if stage3_only:
-                        assert quick_calibration_input is not None
-                        report(
-                            CalibrationProgress(
-                                phase="quick_center",
-                                step=0,
-                                total=1,
-                                message=(
-                                    f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
-                                    f"px; reusing saved quick calibration"
-                                ),
-                                x=quick_target_coordinate,
-                                y=center_wl,
-                            )
-                        )
-                        optimization_calibration = (
-                            self._load_pipeline_quick_intensity_calibration(
-                                quick_calibration_input
-                            )
-                        )
-                        quick_measured_range = (
-                            int(optimization_calibration.min_level),
-                            int(optimization_calibration.max_level),
-                        )
-                    else:
-                        assert quick_calibration_output is not None
-                        assert quick_levels is not None
-                        assert quick_settings is not None
-                        assert quick_window is not None
-                        report(
-                            CalibrationProgress(
-                                phase="quick_center",
-                                step=0,
-                                total=1,
-                                message=(
-                                    f"{center_wl:g} nm -> x={quick_target_coordinate:.3f} "
-                                    f"px; calibrating pixel {target_pixel}"
-                                ),
-                                x=quick_target_coordinate,
-                                y=center_wl,
-                            )
-                        )
-                        quick_seed = CalibrationResult(
-                            wavelength=np.asarray([center_wl], dtype=float),
-                            coordinates=np.asarray([target_pixel], dtype=float),
-                            max_level=int(quick_levels[-1]),
-                            min_level=int(quick_levels[0]),
-                            level_range=np.asarray(quick_levels, dtype=int),
-                            wavelength_fit_coefficients=(
-                                step2_calibration.wavelength_fit_coefficients
-                            ),
-                        )
-                        quick_result = intensity_calibration(
-                            osa,
-                            controller,
-                            quick_levels,
-                            quick_settings,
-                            quick_seed,
-                            window_size=quick_window,
-                            wavelength_window_nm=quick_avg_nm,
-                            sweep_span_nm=quick_sweep_nm,
-                            coordinate_stride=1,
-                            refine_wavelength=False,
-                            region=None,
-                            stop_event=stop_event,
-                            progress_callback=report,
-                        )
-                        quick_result = restrict_to_measured_intensity_range(
-                            quick_result
-                        )
-                        quick_measured_range = (
-                            int(quick_result.min_level),
-                            int(quick_result.max_level),
-                        )
-                        saved_files.append(
-                            save_calibration_result(
-                                quick_result, quick_calibration_output
-                            )
-                        )
-                        optimization_calibration = (
-                            self._load_pipeline_quick_intensity_calibration(
-                                quick_calibration_output
-                            )
-                        )
-                    optimization_layout, quick_target_coordinate = (
-                        build_single_anchor_layout(
-                            step2_calibration,
-                            optimization_calibration,
-                            target_wavelength_nm=center_wl,
-                            channel_width_px=channel_width,
-                            gap_px=gap_px,
-                        )
-                    )
-                else:
-                    calibration_path = (
-                        outputs[3]
-                        if 3 in selected
-                        else optimization_calibration_input
-                    )
-                    assert calibration_path is not None
-                    optimization_calibration = (
-                        self._load_pipeline_optimization_calibration(calibration_path)
-                    )
-                    optimization_layout = self._build_pipeline_encoding_layout(
-                        optimization_calibration,
-                        center_wl=center_wl,
-                        channel_width_px=channel_width,
-                        gap_px=gap_px,
-                    )
-                if profile_path is not None:
-                    initial_l = self._load_pipeline_initial_profile(profile_path)
-                else:
-                    assert direct_initial_profile is not None
-                    initial_l = direct_initial_profile.copy()
-
-                def report_optimization(progress: OptimizationProgress) -> None:
-                    self.edge_optimization_progress.emit(progress)
-                    report(
-                        CalibrationProgress(
-                            phase=f"optimization: {progress.stage}",
-                            step=progress.step,
-                            total=max(progress.total, 1),
-                            message=progress.message,
-                            x=float(progress.step),
-                            y=progress.best_loss,
-                        )
-                    )
-
-                try:
-                    optimization_result = optimize_from_osa(
-                        optimization_layout,
-                        osa=osa,
-                        slm=controller,
-                        initial_l=initial_l,
-                        config=optimization_config,
-                        stop_event=stop_event,
-                        progress_callback=report_optimization,
-                    )
-                except OptimizationAborted:
-                    return {"status": "aborted"}
-                result = optimization_calibration
-                saved_files.append(
-                    Path(optimization_result.run_dir, "final_result.json").resolve()
-                )
-
-            if result is None:  # guarded by the non-empty selection check
-                raise RuntimeError("pipeline completed without a result")
-            return {
-                "status": "ok",
-                "step": "pipeline",
-                "result": result,
-                "saved": saved_files[-1],
-                "saved_files": saved_files,
-                "csv": csv_path,
-                "optimization_result": optimization_result,
-                "optimization_layout": optimization_layout,
-                "quick_target_coordinate": quick_target_coordinate,
-                "quick_measured_range": quick_measured_range,
-                "summary": f"completed steps {sequence}",
-            }
-
-        self._pipeline_optimization_active = 4 in selected
-        if self._pipeline_optimization_active:
-            self._edge_gain_running(True)
-            self.edge_gain_bar.setRange(0, 0)
-            self.edge_gain_status.setText("Encoding Optimization running from Pipeline")
-        self._launch_calibration("Run pipeline", work)
-        if self._pipeline_optimization_active:
-            self.edge_gain_stop_event = self.calibration_stop_event
 
     def _run_all(self) -> None:
         osa = self._osa_ready()
@@ -8416,18 +7259,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_calibration_running(False)
         if payload.get("status") == "aborted":
             self._log("Calibration stopped")
-            if self._pipeline_optimization_active:
-                self._pipeline_optimization_active = False
-                self.edge_gain_stop_event = None
-                self._edge_gain_running(False)
-                self.edge_gain_bar.setRange(0, 100)
-                self.edge_gain_bar.setValue(0)
-                self.edge_gain_status.setText(
-                    "Pipeline optimization stopped; checkpoints were retained."
-                )
-            if active_label == "Run pipeline":
-                self.pipeline_status_label.setText("Stopped")
-                self.pipeline_log.appendPlainText("Pipeline stopped")
             if active_label == "Stage 3 re-optimization":
                 self.stage3_reopt_status_label.setText("Stopped")
                 self.edge_gain_stop_event = None
@@ -8456,55 +7287,6 @@ class MainWindow(QtWidgets.QMainWindow):
             out_edit = self.step_widgets[step]["out"]
             if saved is not None and not out_edit.text().strip():
                 out_edit.setText(str(saved))
-        elif step == "pipeline":
-            self.pipeline_status_label.setText(f"Done - {summary}")
-            self.pipeline_log.appendPlainText(f"Done: {summary}")
-            for path in payload.get("saved_files", []):
-                self.pipeline_log.appendPlainText(f"Saved: {path}")
-            quick_target_coordinate = payload.get("quick_target_coordinate")
-            if quick_target_coordinate is not None:
-                self.pipeline_log.appendPlainText(
-                    "Quick target: "
-                    f"{self.enc_center_wl_spin.value():g} nm -> "
-                    f"x={float(quick_target_coordinate):.3f} px "
-                    f"(physical pixel {int(round(float(quick_target_coordinate)))})"
-                )
-            quick_measured_range = payload.get("quick_measured_range")
-            if quick_measured_range is not None:
-                self.pipeline_log.appendPlainText(
-                    "Quick measured intensity range: "
-                    f"off level {int(quick_measured_range[0])}, "
-                    f"on level {int(quick_measured_range[1])}"
-                )
-            optimization_result = payload.get("optimization_result")
-            optimization_layout = payload.get("optimization_layout")
-            if optimization_result is not None and optimization_layout is not None:
-                self._pipeline_optimization_active = False
-                self._enc_calib_override = result
-                self.encoding_layout = optimization_layout
-                self._enc_populate_val_table(optimization_layout)
-                self._edge_sync_layout(optimization_layout)
-                self.enc_calib_label.setText("Calibration: Pipeline calibration JSON")
-                self.enc_layout_status.setText(
-                    f"{optimization_layout.n_channels} ch/side  |  "
-                    f"pitch {optimization_layout.pitch_px} px  |  "
-                    f"pad {optimization_layout.pitch_px - optimization_layout.channel_width_px} px"
-                )
-                self.enc_generate_button.setEnabled(True)
-                self._edge_optimization_finished(
-                    {"status": "ok", "result": optimization_result}
-                )
-                if optimization_result.accepted:
-                    message = (
-                        "Accepted encoding profile and LUT applied to the Encoding "
-                        "and Shape pages."
-                    )
-                else:
-                    message = (
-                        "Optimization was not accepted; the layout was loaded but "
-                        "the candidate profile and LUT were not applied."
-                    )
-                self.pipeline_log.appendPlainText(message)
         elif step == "stage3_reopt":
             self.stage3_reopt_status_label.setText(f"Done - {summary}")
             quick_target_coordinate = payload.get("quick_target_coordinate")
@@ -8568,8 +7350,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if step == "all":
             label = "Run all"
-        elif step == "pipeline":
-            label = "Pipeline"
         elif step == "stage3_reopt":
             label = "Stage 3 re-optimization"
         elif step == "fast_channels":
@@ -8596,9 +7376,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_calibration_label = None
         self.calibration_stop_event = None
         self._set_calibration_running(False)
-        if active_label == "Run pipeline":
-            self.pipeline_status_label.setText("Failed")
-            self.pipeline_log.appendPlainText("Pipeline failed; see the main log.")
         if active_label == "Stage 3 re-optimization":
             self.stage3_reopt_status_label.setText("Failed")
             self.edge_gain_stop_event = None
@@ -8608,13 +7385,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.edge_gain_status.setText("Stage 3 re-optimization failed.")
         if active_label == "Fast channel calibration":
             self.fast_channel_status_label.setText("Failed")
-        if self._pipeline_optimization_active:
-            self._pipeline_optimization_active = False
-            self.edge_gain_stop_event = None
-            self._edge_gain_running(False)
-            self.edge_gain_bar.setRange(0, 100)
-            self.edge_gain_bar.setValue(0)
-            self.edge_gain_status.setText("Pipeline optimization failed.")
         if self.calibration_dialog is not None:
             self.calibration_dialog.finish(False, "Calibration failed")
 

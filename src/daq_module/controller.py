@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -50,6 +50,8 @@ class DAQController:
         self._settings: DAQMonitorSettings | None = None
         self.last_times: np.ndarray | None = None
         self.last_values: np.ndarray | None = None
+        self._sample_listeners: list[Callable[[MonitorSample], None]] = []
+        self._sample_listener_lock = threading.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -66,6 +68,39 @@ class DAQController:
 
     def configure_monitor(self, settings: DAQMonitorSettings) -> None:
         self._settings = settings
+
+    def add_sample_listener(
+        self, listener: Callable[[MonitorSample], None]
+    ) -> None:
+        """Register a callback fired once per completed monitor_cycle().
+
+        The listener runs on the *calling* (worker) thread with the returned
+        MonitorSample, so it must only hand the sample off (e.g. emit a queued
+        Qt signal), never touch widgets. Listener exceptions are swallowed so
+        a display bug can never abort a measurement.
+        """
+        with self._sample_listener_lock:
+            if listener not in self._sample_listeners:
+                self._sample_listeners.append(listener)
+
+    def remove_sample_listener(
+        self, listener: Callable[[MonitorSample], None]
+    ) -> None:
+        """Unregister a sample listener (no-op if it is not registered)."""
+        with self._sample_listener_lock:
+            try:
+                self._sample_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_sample_listeners(self, sample: MonitorSample) -> None:
+        with self._sample_listener_lock:
+            listeners = tuple(self._sample_listeners)
+        for listener in listeners:
+            try:
+                listener(sample)
+            except Exception:
+                pass  # a monitor must never break the measurement
 
     def monitor_cycle(
         self,
@@ -99,12 +134,14 @@ class DAQController:
             np.arange(values.size, dtype=float) / settings.sample_rate
             if settings.sample_rate else np.zeros_like(values)
         )
-        return MonitorSample(
+        sample = MonitorSample(
             value=float(values.mean()),
             std=float(values.std()),
             index=index,
             timestamp=time.time(),
         )
+        self._notify_sample_listeners(sample)
+        return sample
 
     def __enter__(self):
         self.connect()
