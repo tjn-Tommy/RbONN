@@ -398,6 +398,7 @@ class MainWindow(QtWidgets.QMainWindow):
     edge_optimization_progress = QtCore.pyqtSignal(object)
     qt_test_progress = QtCore.pyqtSignal(int, int, str)
     monitor_sample = QtCore.pyqtSignal(object)
+    daq_monitor_sample = QtCore.pyqtSignal(object)
     hold_progress = QtCore.pyqtSignal(int, int)
 
     def __init__(
@@ -453,6 +454,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.monitor_stop_event: threading.Event | None = None
         self._monitor_values: list[float] = []
         self._monitor_stds: list[float] = []
+        # live DAQ Monitor page (strip-chart history)
+        self.daq_monitor_stop_event: threading.Event | None = None
+        self._daqmon_t0: float | None = None
+        self._daqmon_times: list[float] = []
+        self._daqmon_values: list[float] = []
+        self._daqmon_stds: list[float] = []
+        self._daqmon_sems: list[float] = []
         self.hold_stop_event: threading.Event | None = None
 
         self.setWindowTitle("Santec SLM Control")
@@ -471,6 +479,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_optimization_progress.connect(self._edge_optimization_progress)
         self.qt_test_progress.connect(self._qt_test_progress)
         self.monitor_sample.connect(self._on_monitor_sample)
+        self.daq_monitor_sample.connect(self._on_daq_monitor_sample)
         self.hold_progress.connect(self._on_hold_progress)
 
         # Live OSA monitor: measure() notifies the bridge from the worker
@@ -542,6 +551,8 @@ class MainWindow(QtWidgets.QMainWindow):
              "A/B crosstalk test: flat vs optimised encoding shape from OSA data"),
             ("\N{SATELLITE ANTENNA}  OSA Viewer",
              "Live OSA spectrum viewer: single / continuous sweeps with settings"),
+            ("\N{BAR CHART}  DAQ Monitor",
+             "Live continuous strip-chart readout of the NI-DAQ analog input"),
         )
         for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
@@ -560,6 +571,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_edge_ratio_page())
         self.stack.addWidget(self._build_quick_test_page())
         self.stack.addWidget(self._build_osa_viewer_page())
+        self.stack.addWidget(self._build_daq_monitor_page())
 
         layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
@@ -5479,6 +5491,261 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_task("Disconnect DAQ", daq.disconnect)
         self._sync_monitor_source()
 
+    # ===================== DAQ live monitor page ========================
+    def _build_daq_monitor_page(self) -> QtWidgets.QWidget:
+        """Dedicated page: stream the DAQ analog input continuously.
+
+        Unlike the encoder page's behaviour recorder (one point per SLM send),
+        this reads back-to-back averaged samples from the connected DAQ and
+        scrolls them on a strip chart -- a live voltmeter with a per-window SEM
+        band. Connect the DAQ on the Connections page first.
+        """
+        page = self._page_shell("DAQ Monitor")
+        subtitle = QtWidgets.QLabel(
+            "Live continuous readout of the NI-DAQ analog input. Each point is one "
+            "averaged acquisition over the window below; the shaded band is "
+            "\N{PLUS-MINUS SIGN}SEM (std / \N{SQUARE ROOT}n_eff, "
+            "n_eff = 2\N{MIDDLE DOT}window\N{MIDDLE DOT}f_cut). Connect the DAQ on "
+            "the Connections page first."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        page.layout().addWidget(subtitle)
+
+        # --- acquisition parameters ---
+        self.daqmon_cfg = self._panel("Acquisition")
+        grid = QtWidgets.QGridLayout(self.daqmon_cfg)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self.daqmon_channel = QtWidgets.QLineEdit("ai0")
+        self.daqmon_channel.setMaximumWidth(90)
+        self.daqmon_sample_rate = QtWidgets.QDoubleSpinBox()
+        self.daqmon_sample_rate.setRange(1.0, 2_000_000.0)
+        self.daqmon_sample_rate.setDecimals(0)
+        self.daqmon_sample_rate.setValue(1000.0)
+        self.daqmon_sample_rate.setSuffix(" S/s")
+        self.daqmon_range = QtWidgets.QComboBox()
+        for lo, hi in self._DAQ_RANGES:
+            self.daqmon_range.addItem(f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
+        self.daqmon_range.setCurrentIndex(0)   # smallest / most sensitive by default
+        self.daqmon_duration = QtWidgets.QDoubleSpinBox()
+        self.daqmon_duration.setRange(0.001, 10.0)
+        self.daqmon_duration.setDecimals(3)
+        self.daqmon_duration.setValue(0.100)
+        self.daqmon_duration.setSuffix(" s")
+        self.daqmon_duration.setToolTip(
+            "Averaging window per point -- also sets the update rate (~1/window)"
+        )
+        self.daqmon_fcut = QtWidgets.QDoubleSpinBox()
+        self.daqmon_fcut.setRange(0.1, 100_000.0)
+        self.daqmon_fcut.setDecimals(1)
+        self.daqmon_fcut.setValue(30.0)
+        self.daqmon_fcut.setSuffix(" Hz")
+        self.daqmon_fcut.setToolTip(
+            "Low-pass bandwidth for the mean/std and the effective-N behind the SEM"
+        )
+        self.daqmon_history = QtWidgets.QSpinBox()
+        self.daqmon_history.setRange(10, 100_000)
+        self.daqmon_history.setValue(600)
+        self.daqmon_history.setToolTip("How many recent points to keep on the strip chart")
+        pairs = [("Channel", self.daqmon_channel), ("Sample rate", self.daqmon_sample_rate),
+                 ("Range", self.daqmon_range), ("Window", self.daqmon_duration),
+                 ("Low-pass", self.daqmon_fcut), ("History", self.daqmon_history)]
+        for i, (label, widget) in enumerate(pairs):
+            r, c = i // 3, (i % 3) * 2
+            grid.addWidget(QtWidgets.QLabel(label), r, c)
+            grid.addWidget(widget, r, c + 1)
+        grid.setColumnStretch(6, 1)   # absorb leftover width instead of stretching fields
+        page.layout().addWidget(self.daqmon_cfg)
+
+        # --- big live numeric readout ---
+        self.daqmon_readout = QtWidgets.QLabel("\N{EN DASH}")
+        self.daqmon_readout.setAlignment(QtCore.Qt.AlignCenter)
+        self.daqmon_readout.setStyleSheet(
+            "font-size: 30px; font-weight: 600; color: #88c0d0; padding: 6px;"
+        )
+        page.layout().addWidget(self._panel_with_widget("Current reading", self.daqmon_readout))
+
+        # --- controls ---
+        ctrl = QtWidgets.QHBoxLayout()
+        self.daqmon_start_button = QtWidgets.QPushButton("Start")
+        self.daqmon_start_button.clicked.connect(self._daq_monitor_start)
+        self.daqmon_stop_button = QtWidgets.QPushButton("Stop")
+        self.daqmon_stop_button.setProperty("variant", "danger")
+        self.daqmon_stop_button.setEnabled(False)
+        self.daqmon_stop_button.clicked.connect(self._daq_monitor_stop)
+        self.daqmon_clear_button = QtWidgets.QPushButton("Clear")
+        self.daqmon_clear_button.setProperty("variant", "ghost")
+        self.daqmon_clear_button.clicked.connect(self._daq_monitor_clear)
+        self.daqmon_save_button = QtWidgets.QPushButton("Save CSV…")
+        self.daqmon_save_button.setProperty("variant", "ghost")
+        self.daqmon_save_button.setEnabled(False)
+        self.daqmon_save_button.clicked.connect(self._daq_monitor_save)
+        ctrl.addWidget(self.daqmon_start_button)
+        ctrl.addWidget(self.daqmon_stop_button)
+        ctrl.addWidget(self.daqmon_clear_button)
+        ctrl.addWidget(self.daqmon_save_button)
+        ctrl.addStretch(1)
+        page.layout().addLayout(ctrl)
+
+        self.daqmon_status = QtWidgets.QLabel("Idle. Connect the DAQ, then press Start.")
+        self.daqmon_status.setWordWrap(True)
+        page.layout().addWidget(self.daqmon_status)
+
+        # --- strip chart ---
+        self.daqmon_fig = Figure(figsize=(10, 4.2), tight_layout=True)
+        self.daqmon_canvas = FigureCanvas(self.daqmon_fig)
+        self.daqmon_canvas.setMinimumHeight(280)
+        plot_panel = self._panel("Voltage vs time")
+        plot_layout = QtWidgets.QVBoxLayout(plot_panel)
+        plot_layout.addWidget(self.daqmon_canvas, 1)
+        page.layout().addWidget(plot_panel, 1)
+
+        self._daq_monitor_draw()
+        return page
+
+    def _daqmon_settings(self) -> DAQMonitorSettings:
+        min_val, max_val = self.daqmon_range.currentData()
+        return DAQMonitorSettings(
+            channel=self.daqmon_channel.text().strip() or "ai0",
+            sample_rate=self.daqmon_sample_rate.value(),
+            duration=self.daqmon_duration.value(),
+            hold=0.0,                       # live monitor: no per-read settle
+            min_val=min_val,
+            max_val=max_val,
+            f_cut=self.daqmon_fcut.value(),
+        )
+
+    def _daq_monitor_set_running(self, running: bool) -> None:
+        self.daqmon_start_button.setEnabled(not running)
+        self.daqmon_stop_button.setEnabled(running)
+        self.daqmon_clear_button.setEnabled(not running)
+        self.daqmon_cfg.setEnabled(not running)   # freeze acquisition params while live
+        self.daqmon_save_button.setEnabled(not running and bool(self._daqmon_values))
+
+    def _daq_monitor_start(self) -> None:
+        daq = self._daq_ready()
+        if daq is None:
+            self.daqmon_status.setText("Connect the DAQ on the Connections page first.")
+            return
+        settings = self._daqmon_settings()
+        daq.configure_monitor(settings)
+        stop_event = threading.Event()
+        self.daq_monitor_stop_event = stop_event
+        self._daqmon_t0 = None   # first sample stamps the time origin
+        self._daq_monitor_set_running(True)
+        self.daqmon_status.setText("Monitoring… press Stop to end.")
+        timeout = settings.duration + 15.0
+
+        def work() -> dict[str, Any]:
+            idx = 0
+            while not stop_event.is_set():
+                sample = daq.monitor_cycle(
+                    index=idx, timeout=timeout, stop_event=stop_event
+                )
+                if sample is None or stop_event.is_set():
+                    break
+                self.daq_monitor_sample.emit(sample)
+                idx += 1
+            return {"status": "stopped"}
+
+        self._run_task(
+            "DAQ monitor", work,
+            self._daq_monitor_done, self._daq_monitor_error,
+        )
+
+    def _daq_monitor_stop(self) -> None:
+        if self.daq_monitor_stop_event is not None:
+            self.daq_monitor_stop_event.set()
+            self.daqmon_status.setText("Stopping…")
+
+    def _daq_monitor_done(self, _payload: dict[str, Any]) -> None:
+        self.daq_monitor_stop_event = None
+        self._daq_monitor_set_running(False)
+        self.daqmon_status.setText(f"Stopped. {len(self._daqmon_values)} points recorded.")
+
+    def _daq_monitor_error(self, _error: str) -> None:
+        self.daq_monitor_stop_event = None
+        self._daq_monitor_set_running(False)
+        self.daqmon_status.setText("DAQ read failed (see Status log).")
+
+    def _on_daq_monitor_sample(self, sample: MonitorSample) -> None:
+        """Append one live sample and redraw (GUI thread, via signal)."""
+        if self._daqmon_t0 is None:
+            self._daqmon_t0 = sample.timestamp
+        std = sample.std if sample.std is not None else float("nan")
+        sem = sample.sem if sample.sem is not None else float("nan")
+        self._daqmon_times.append(sample.timestamp - self._daqmon_t0)
+        self._daqmon_values.append(sample.value)
+        self._daqmon_stds.append(std)
+        self._daqmon_sems.append(sem)
+        # keep only the most recent `history` points on the chart
+        keep = int(self.daqmon_history.value())
+        if len(self._daqmon_times) > keep:
+            self._daqmon_times = self._daqmon_times[-keep:]
+            self._daqmon_values = self._daqmon_values[-keep:]
+            self._daqmon_stds = self._daqmon_stds[-keep:]
+            self._daqmon_sems = self._daqmon_sems[-keep:]
+        rel = (sem / abs(sample.value) * 100.0) if sample.value else float("nan")
+        self.daqmon_readout.setText(
+            f"{sample.value*1000:+.4f} \N{PLUS-MINUS SIGN} {sem*1000:.4f} mV"
+            f"   ({rel:.2f}%)"
+        )
+        self._daq_monitor_draw()
+
+    def _daq_monitor_draw(self) -> None:
+        self.daqmon_fig.clear()
+        self.daqmon_fig.patch.set_facecolor("#101820")
+        ax = self.daqmon_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("Elapsed time (s)")
+        ax.set_ylabel("Voltage (mV)")
+        if self._daqmon_times:
+            t = np.asarray(self._daqmon_times, dtype=float)
+            v = np.asarray(self._daqmon_values, dtype=float) * 1000.0
+            sem = np.asarray(self._daqmon_sems, dtype=float) * 1000.0
+            band = np.where(np.isfinite(sem), sem, 0.0)
+            ax.fill_between(t, v - band, v + band, color="#88c0d0", alpha=0.25,
+                            linewidth=0)
+            ax.plot(t, v, color="#88c0d0", linewidth=1.2)
+            ax.plot(t[-1], v[-1], "o", color="#ebcb8b", markersize=5)
+        else:
+            ax.text(0.5, 0.5, "Press Start to stream the DAQ input",
+                    ha="center", va="center", color="#d8dee9",
+                    transform=ax.transAxes, fontsize=9)
+        self.daqmon_canvas.draw_idle()
+
+    def _daq_monitor_clear(self) -> None:
+        self._daqmon_t0 = None
+        self._daqmon_times = []
+        self._daqmon_values = []
+        self._daqmon_stds = []
+        self._daqmon_sems = []
+        self.daqmon_readout.setText("\N{EN DASH}")
+        self.daqmon_save_button.setEnabled(False)
+        self.daqmon_status.setText("Cleared.")
+        self._daq_monitor_draw()
+
+    def _daq_monitor_save(self) -> None:
+        if not self._daqmon_values:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save DAQ monitor log", "daq_monitor.csv", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            import csv
+
+            with open(path, "w", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["elapsed_s", "voltage_v", "voltage_std_v", "voltage_sem_v"])
+                for t, val, std, sem in zip(self._daqmon_times, self._daqmon_values,
+                                            self._daqmon_stds, self._daqmon_sems):
+                    writer.writerow([f"{t:.6f}", f"{val:.9g}", f"{std:.9g}", f"{sem:.9g}"])
+            self._log(f"Saved DAQ monitor log → {path}")
+        except Exception as exc:
+            self._log(f"Save failed: {exc}")
+
     # ===================== Scope Monitor page ========================
     _TRIG_SOURCES = [("CH1", "CHANnel1"), ("CH2", "CHANnel2"), ("CH3", "CHANnel3"),
                      ("CH4", "CHANnel4"), ("EXT", "EXTernanalog")]
@@ -7868,6 +8135,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scope_stop_event.set()
         if self.monitor_stop_event is not None:
             self.monitor_stop_event.set()
+        if self.daq_monitor_stop_event is not None:
+            self.daq_monitor_stop_event.set()
         if self.scope_controller is not None:
             try:
                 self.scope_controller.disconnect()

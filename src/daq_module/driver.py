@@ -77,13 +77,16 @@ class NIDAQDriver:
         """One untriggered finite acquisition; returns the raw voltage samples."""
         self._ensure_connected()
         import nidaqmx
-        from nidaqmx.constants import AcquisitionType
+        from nidaqmx.constants import AcquisitionType, TerminalConfiguration
 
         n_samples = max(1, int(round(sample_rate * duration)))
         try:
             with nidaqmx.Task() as task:
                 task.ai_channels.add_ai_voltage_chan(
-                    f"{self.device}/{channel}", min_val=min_val, max_val=max_val
+                    f"{self.device}/{channel}",
+                    terminal_config=TerminalConfiguration.RSE,  # single-ended vs AI GND
+                    min_val=min_val,
+                    max_val=max_val,
                 )
                 task.timing.cfg_samp_clk_timing(
                     sample_rate,

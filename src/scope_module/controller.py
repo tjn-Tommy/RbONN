@@ -78,6 +78,8 @@ class MonitorSample:
 
     value: float                           # volts (gated MEAN of the channel)
     std: float | None = None               # volts (gated STDDev over the window)
+    sem: float | None = None               # volts (standard error of the mean, if reported)
+    sem_ratio: float | None = None         # sem / value (fractional error, if reported)
     index: int = 0                         # sequence number in the monitor run
     timestamp: float = 0.0                 # time.time() when read
     waveform: "Waveform | None" = None     # optional captured trace
