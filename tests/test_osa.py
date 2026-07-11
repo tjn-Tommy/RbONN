@@ -215,5 +215,53 @@ class DriverTransportTests(unittest.TestCase):
             drv.connect()
 
 
+class TraceListenerTests(unittest.TestCase):
+    def test_measure_notifies_listener_with_returned_trace(self) -> None:
+        osa = OSAController(driver=FakeDriver())
+        seen: list = []
+        osa.add_trace_listener(seen.append)
+        trace = osa.measure(MeasurementSettings(), poll_interval=0.0)
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0], trace)
+
+    def test_averaged_measure_notifies_once_with_averaged_trace(self) -> None:
+        fake = FakeDriver()
+        fake.y_per_sweep = [np.array([1.0, 2.0, 3.0]), np.array([3.0, 4.0, 5.0])]
+        osa = OSAController(driver=fake)
+        osa.configure(MeasurementSettings(y_unit="LINear"))
+        seen: list = []
+        osa.add_trace_listener(seen.append)
+        trace = osa.measure(averages=2, poll_interval=0.0)
+        self.assertEqual(len(seen), 1)          # once per measure(), not per sweep
+        self.assertIs(seen[0], trace)
+        self.assertEqual(seen[0].averages, 2)
+
+    def test_raising_listener_does_not_break_measure(self) -> None:
+        osa = OSAController(driver=FakeDriver())
+        seen: list = []
+
+        def bad_listener(trace) -> None:
+            raise RuntimeError("display bug")
+
+        osa.add_trace_listener(bad_listener)
+        osa.add_trace_listener(seen.append)     # later listener still fires
+        trace = osa.measure(MeasurementSettings(), poll_interval=0.0)
+        self.assertIsInstance(trace, TraceData)
+        self.assertEqual(len(seen), 1)
+
+    def test_add_remove_semantics(self) -> None:
+        osa = OSAController(driver=FakeDriver())
+        seen: list = []
+        listener = seen.append
+        osa.add_trace_listener(listener)
+        osa.add_trace_listener(listener)        # duplicate registration ignored
+        osa.measure(MeasurementSettings(), poll_interval=0.0)
+        self.assertEqual(len(seen), 1)
+        osa.remove_trace_listener(listener)
+        osa.remove_trace_listener(listener)     # extra removal is a no-op
+        osa.measure(MeasurementSettings(), poll_interval=0.0)
+        self.assertEqual(len(seen), 1)          # unhooked -> no new traces
+
+
 if __name__ == "__main__":
     unittest.main()

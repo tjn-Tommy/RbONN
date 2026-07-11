@@ -87,6 +87,8 @@ class ChannelLayout:
     # wavelength guard bands plus the centre divider column. Kept for
     # inspection / preview; the renderer leaves them at their off level anyway.
     dark_px_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
+    # requested centre dark-pad width; None -> legacy gap_px-wide pad
+    center_gap_px: int | None = None
 
     @property
     def all_channels(self) -> list[EncodingChannel]:
@@ -145,6 +147,8 @@ class LayoutGeometry:
     pitch_px: int
     nm_per_px: float                    # |slope| of the x->wavelength fit
     dark_px_ranges: list[tuple[int, int]]  # inclusive guard px ranges, always dark
+    # requested centre dark-pad width; None -> legacy gap_px-wide pad
+    center_gap_px: int | None = None
 
     @property
     def n_channels(self) -> int:
@@ -158,6 +162,7 @@ def compute_channel_geometry(
     n_channels: int = 20,
     channel_width_px: int = 15,
     gap_px: int = 5,
+    center_gap_px: int | None = None,
     center_wl: float = 778.0,
     dark_wl_bands: tuple[tuple[float, float], ...] = (
         (779.9, 780.1),
@@ -169,11 +174,19 @@ def compute_channel_geometry(
     This is the geometry half of build_channel_layout (steps 1-5 of its
     docstring). It needs only the coordinate -> wavelength mapping, so a UI can
     preview the layout from a Step-2 result before any Step-3 sweep has run.
+
+    ``center_gap_px`` widens the central dark pad (between the innermost x/w
+    pair) to at least that many pixels, reducing crosstalk between the two
+    innermost spectral bands. ``None`` keeps the legacy behaviour where the pad
+    is exactly ``gap_px`` wide (tiling starts at half a pitch). The pitch
+    between neighbouring channels on the same side is unaffected.
     """
     coords = np.asarray(coordinates, dtype=float).reshape(-1)
     wl = np.asarray(wavelengths, dtype=float).reshape(-1)
     if coords.size < 2 or coords.size != wl.size:
         raise ValueError("need at least two matching coordinate/wavelength points")
+    if center_gap_px is not None and int(center_gap_px) < 0:
+        raise ValueError("center_gap_px must be non-negative")
 
     # 1. wl = a*x + b  (a < 0: higher x -> lower wavelength)
     a, b = np.polyfit(coords, wl, 1)
@@ -242,7 +255,13 @@ def compute_channel_geometry(
     # calibrated range, keeping the two sides equal length.
     x_geo: list[ChannelGeometry] = []
     w_geo: list[ChannelGeometry] = []
-    offset = 0.5 * pitch_px
+    if center_gap_px is None:
+        offset = 0.5 * pitch_px          # legacy: centre pad exactly gap_px wide
+    else:
+        # First offset m0 so the centre dark pad (2*m0 - width) is at least
+        # center_gap_px wide. Integer ceil avoids the truncation that
+        # ``center_gap_px // 2 + half_w`` would suffer for odd widths.
+        offset = float((int(channel_width_px) + int(center_gap_px) + 1) // 2)
     while len(x_geo) < n_channels:
         m = int(round(offset))
         cleared = _clear_offset(m)
@@ -266,6 +285,7 @@ def compute_channel_geometry(
         pitch_px=pitch_px,
         nm_per_px=abs(float(a)),
         dark_px_ranges=list(guard_ranges),
+        center_gap_px=None if center_gap_px is None else int(center_gap_px),
     )
 
 
@@ -275,6 +295,7 @@ def build_channel_layout(
     n_channels: int = 20,
     channel_width_px: int = 15,
     gap_px: int = 5,
+    center_gap_px: int | None = None,
     center_wl: float = 778.0,
     dark_wl_bands: tuple[tuple[float, float], ...] = (
         (779.9, 780.1),
@@ -328,6 +349,7 @@ def build_channel_layout(
         n_channels=n_channels,
         channel_width_px=channel_width_px,
         gap_px=gap_px,
+        center_gap_px=center_gap_px,
         center_wl=center_wl,
         dark_wl_bands=dark_wl_bands,
     )
@@ -356,6 +378,7 @@ def build_channel_layout(
         calib_coords=coords,
         calib_off_levels=off_per_coord,
         dark_px_ranges=list(geom.dark_px_ranges),
+        center_gap_px=geom.center_gap_px,
     )
 
 

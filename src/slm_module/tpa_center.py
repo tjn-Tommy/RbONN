@@ -9,11 +9,13 @@ quadratic.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -215,6 +217,7 @@ def measure_center_scan(
     n_channels: int,
     channel_width_px: int,
     gap_px: int,
+    center_gap_px: int | None = None,
     pair_index: int = 0,
     drive_level: float = 1.0,
     n_trials: int = 1,
@@ -262,6 +265,7 @@ def measure_center_scan(
                 n_channels=int(n_channels),
                 channel_width_px=int(channel_width_px),
                 gap_px=int(gap_px),
+                center_gap_px=center_gap_px,
                 center_wl=float(center_wl),
             )
             if pair_index >= layout.n_channels:
@@ -356,6 +360,105 @@ def measure_center_scan(
     return result
 
 
+_SCHEMA = "tpa_center_result_v1"
+
+
+def save_tpa_center_json(result: TPACenterResult, path: str | Path) -> str:
+    """Persist a centre scan (raw rows + fit + scan config) as JSON."""
+    fit = result.fit
+    fit_payload = None
+    if fit is not None:
+        fit_payload = {
+            "center_wl_nm": fit.center_wl_nm,
+            "center_wl_err_nm": fit.center_wl_err_nm,
+            "peak_signal_v": fit.peak_signal_v,
+            "peak_signal_err_v": fit.peak_signal_err_v,
+            "coeffs": list(fit.coeffs),
+            "coeff_errs": list(fit.coeff_errs),
+            "chi2_red": fit.chi2_red,
+            "dof": fit.dof,
+            "birge": fit.birge,
+            "best_sample_center_wl_nm": fit.best_sample_center_wl_nm,
+            "best_sample_signal_v": fit.best_sample_signal_v,
+            "valid": fit.valid,
+            "message": fit.message,
+            "center_wl": fit.center_wl.tolist(),
+            "signal_v": fit.signal_v.tolist(),
+            "sem_v": fit.sem_v.tolist(),
+            "signal_pred_v": fit.signal_pred_v.tolist(),
+            "residuals_v": fit.residuals_v.tolist(),
+        }
+    payload = {
+        "schema": _SCHEMA,
+        "pair_index": result.pair_index,
+        "drive_level": result.drive_level,
+        "n_trials": result.n_trials,
+        "repeats": result.repeats,
+        "subtract_background": result.subtract_background,
+        "center_wl_nm": result.center_wl_nm.tolist(),
+        "center_x_px": result.center_x_px.tolist(),
+        "trial": result.trial.tolist(),
+        "signal_v": result.signal_v.tolist(),
+        "signal_std_v": result.signal_std_v.tolist(),
+        "background_v": result.background_v.tolist(),
+        "background_std_v": result.background_std_v.tolist(),
+        "net_signal_v": result.net_signal_v.tolist(),
+        "fit": fit_payload,
+    }
+    out = Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(out)
+
+
+def load_tpa_center_json(path: str | Path) -> TPACenterResult:
+    """Rebuild a :class:`TPACenterResult` saved by :func:`save_tpa_center_json`."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("schema") != _SCHEMA:
+        raise ValueError(
+            f"{path}: expected schema {_SCHEMA!r}, got {payload.get('schema')!r}"
+        )
+    fit = None
+    fp = payload.get("fit")
+    if fp is not None:
+        fit = TPACenterFit(
+            center_wl_nm=float(fp["center_wl_nm"]),
+            center_wl_err_nm=float(fp["center_wl_err_nm"]),
+            peak_signal_v=float(fp["peak_signal_v"]),
+            peak_signal_err_v=float(fp["peak_signal_err_v"]),
+            coeffs=tuple(float(v) for v in fp["coeffs"]),
+            coeff_errs=tuple(float(v) for v in fp["coeff_errs"]),
+            chi2_red=float(fp["chi2_red"]),
+            dof=int(fp["dof"]),
+            birge=float(fp["birge"]),
+            best_sample_center_wl_nm=float(fp["best_sample_center_wl_nm"]),
+            best_sample_signal_v=float(fp["best_sample_signal_v"]),
+            valid=bool(fp["valid"]),
+            message=str(fp["message"]),
+            center_wl=np.asarray(fp["center_wl"], dtype=float),
+            signal_v=np.asarray(fp["signal_v"], dtype=float),
+            sem_v=np.asarray(fp["sem_v"], dtype=float),
+            signal_pred_v=np.asarray(fp["signal_pred_v"], dtype=float),
+            residuals_v=np.asarray(fp["residuals_v"], dtype=float),
+        )
+    return TPACenterResult(
+        center_wl_nm=np.asarray(payload["center_wl_nm"], dtype=float),
+        center_x_px=np.asarray(payload["center_x_px"], dtype=float),
+        trial=np.asarray(payload["trial"], dtype=int),
+        signal_v=np.asarray(payload["signal_v"], dtype=float),
+        signal_std_v=np.asarray(payload["signal_std_v"], dtype=float),
+        background_v=np.asarray(payload["background_v"], dtype=float),
+        background_std_v=np.asarray(payload["background_std_v"], dtype=float),
+        net_signal_v=np.asarray(payload["net_signal_v"], dtype=float),
+        fit=fit,
+        pair_index=int(payload["pair_index"]),
+        drive_level=float(payload["drive_level"]),
+        n_trials=int(payload["n_trials"]),
+        repeats=int(payload["repeats"]),
+        subtract_background=bool(payload["subtract_background"]),
+    )
+
+
 __all__ = [
     "TPACenterAborted",
     "TPACenterProgress",
@@ -363,5 +466,7 @@ __all__ = [
     "TPACenterResult",
     "average_trace_points",
     "fit_center_trace",
+    "load_tpa_center_json",
     "measure_center_scan",
+    "save_tpa_center_json",
 ]

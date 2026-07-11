@@ -13,6 +13,13 @@ import numpy as np
 from osa_module.controller import MeasurementSettings, OSAController, TraceData
 from slm_module.controller import SLMController
 
+from .outliers import (
+    OutlierRemeasurePolicy,
+    flag_by_residual,
+    linear_fit_residuals,
+    transfer_fit_residuals,
+)
+
 if TYPE_CHECKING:  # avoid importing daq_module at runtime
     from daq_module.controller import DAQController
 
@@ -309,6 +316,7 @@ def wavelength_calibration(
     *,
     peak_half_window_nm: float | None = None,
     region: tuple[int, int] | None = None,
+    outlier_policy: OutlierRemeasurePolicy | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> CalibrationResult:
@@ -321,6 +329,12 @@ def wavelength_calibration(
     ``region`` (x_start, x_end) limits the sweep to that inclusive band of SLM
     columns, which is useful when the source only illuminates part of the SLM
     width (e.g. a ~6 nm pulse on a ~20 nm aperture); None sweeps the full width.
+
+    ``outlier_policy`` enables post-sweep auto-remeasurement: after the sweep, a
+    linear coordinate->wavelength fit flags points whose residual exceeds
+    ``k_sigma`` robust sigmas; each flagged window is re-displayed and
+    re-measured (up to ``max_retries`` rounds) and the point becomes the median
+    of its re-measurements. ``None`` (default) disables it.
     """
 
     del levels
@@ -375,6 +389,59 @@ def wavelength_calibration(
 
     coordinate_array = np.asarray(coordinates, dtype=float)
     wavelength_array = np.asarray(wavelengths, dtype=float)
+
+    if (
+        outlier_policy is not None
+        and coordinate_array.size >= outlier_policy.min_points
+    ):
+        # Post-sweep auto-remeasure: flag points off the linear map, re-measure
+        # them, and replace each with the median of its re-measurements (the
+        # flagged original is discarded). Repeat until clean or retries exhaust.
+        readings: dict[int, list[float]] = {}
+        wl_scale = float(np.nanmax(np.abs(wavelength_array)))
+        for retry in range(1, outlier_policy.max_retries + 1):
+            residuals = linear_fit_residuals(coordinate_array, wavelength_array)
+            flagged = np.flatnonzero(
+                flag_by_residual(
+                    residuals,
+                    k_sigma=outlier_policy.k_sigma,
+                    rel_floor_scale=wl_scale,
+                )
+            )
+            if flagged.size == 0:
+                break
+            for i in flagged:
+                _check_stop(stop_event)
+                x_start = int(coordinates[i]) - window_size // 2
+                pattern = dark_pattern.copy()
+                pattern[x_start : x_start + window_size] = max_level
+                _display_1d_pattern(slm, pattern, slm_height)
+                trace = osa.measure(measure_settings)
+                trace_wavelengths, _signal, normalized = _reduce_trace(
+                    trace, _trace_power_w(trace), background_power, reference_power
+                )
+                wavelength, _, _ = local_peak_centroid(
+                    trace_wavelengths,
+                    normalized,
+                    half_window=peak_half_window,
+                    half_window_nm=peak_half_window_nm,
+                )
+                readings.setdefault(int(i), []).append(float(wavelength))
+                wavelength_array[i] = float(np.median(readings[int(i)]))
+                _report(
+                    progress_callback,
+                    "wavelength",
+                    total,
+                    total,
+                    (
+                        f"recheck x={coordinates[i]} retry "
+                        f"{retry}/{outlier_policy.max_retries} -> "
+                        f"{wavelength_array[i]:.3f} nm"
+                    ),
+                    x=float(coordinates[i]),
+                    y=float(wavelength_array[i]),
+                )
+
     fitted_wavelengths, coeffs = _fit_wavelength_mapping(
         coordinate_array, wavelength_array
     )
@@ -618,6 +685,7 @@ def build_channel_calibration_grid(
     n_channels_per_side: int = 20,
     channel_width_px: int = 15,
     gap_px: int = 5,
+    center_gap_px: int | None = None,
     slm_width: int | None = None,
     guard_bands_nm: Iterable[tuple[float, float]] | None = None,
     require_symmetric_guard_bands: bool = True,
@@ -628,6 +696,13 @@ def build_channel_calibration_grid(
     channels.  For the default 15 px channel plus 5 px gap, the first channels
     sit at center +/- 10 px, leaving the target wavelength 2.5 px from each
     inner channel edge.
+
+    ``center_gap_px`` widens the central dark pad to at least that many pixels
+    (first offset ``ceil((width + center_gap_px)/2)`` instead of half a pitch).
+    It MUST match the ``center_gap_px`` used by
+    :func:`slm_module.encoding.build_channel_layout`, otherwise the measured
+    coordinates will not coincide with the encoding layout's channel centers.
+    ``None`` keeps the legacy half-pitch placement.
 
     When ``center_coordinate`` is supplied, the linear wavelength map is shifted
     so that this refined coordinate is exactly ``target_wavelength_nm``.  That
@@ -662,6 +737,11 @@ def build_channel_calibration_grid(
     pitch = width + gap
     if pitch <= 0:
         raise ValueError("channel pitch must be positive")
+    first_offset: float | None = None
+    if center_gap_px is not None:
+        center_gap = _validate_non_negative_int(center_gap_px, "center_gap_px")
+        # same formula as encoding.compute_channel_geometry: centre pad >= gap
+        first_offset = float((width + center_gap + 1) // 2)
 
     source_coordinates, _source_wavelengths = _calibrated_mapping(
         calibration_results
@@ -709,6 +789,7 @@ def build_channel_calibration_grid(
         valid_channel,
         coord_min,
         coord_max,
+        first_offset_px=first_offset,
     )
     right = _collect_guarded_channel_side(
         center,
@@ -718,6 +799,7 @@ def build_channel_calibration_grid(
         valid_channel,
         coord_min,
         coord_max,
+        first_offset_px=first_offset,
     )
     if len(left) < n_channels or len(right) < n_channels:
         raise ValueError(
@@ -845,6 +927,7 @@ def batch_intensity_calibration(
     guard_bands_nm: Iterable[tuple[float, float]] | None = None,
     refine_wavelength: bool = False,
     refine_half_window_nm: float | None = None,
+    outlier_policy: OutlierRemeasurePolicy | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> CalibrationResult:
@@ -855,6 +938,13 @@ def batch_intensity_calibration(
     leaving two channel pitches between simultaneously active windows to reduce
     crosstalk.  Each trace is reduced at every active channel wavelength, so the
     output shape and normalization match :func:`intensity_calibration`.
+
+    ``outlier_policy`` enables post-sweep auto-remeasurement: after each group's
+    level sweep, every channel's curve is fitted to the sin^2 transfer model and
+    cells whose residual exceeds ``k_sigma`` robust sigmas are re-measured (the
+    group pattern for that level is re-displayed); each flagged cell becomes the
+    median of its re-measurements. Up to ``max_retries`` rounds per group.
+    ``None`` (default) disables it.
     """
 
     level_values = _validate_levels(levels)
@@ -903,41 +993,58 @@ def batch_intensity_calibration(
     total = int(len(groups) * level_values.size)
     step = 0
 
+    def _acquire_group(
+        group: np.ndarray, level: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Display the group's windows at ``level`` and reduce one trace."""
+        pattern = dark_pattern.copy()
+        for channel_index in group:
+            x_start = _window_start_from_coordinate(
+                coordinates[channel_index], window_size, slm_width
+            )
+            pattern[x_start : x_start + window_size] = int(level)
+        pattern[guard_mask] = min_level
+        _display_1d_pattern(slm, pattern, slm_height)
+        trace = measure()
+        return _reduce_trace(
+            trace,
+            _trace_power_w(trace),
+            background_power,
+            reference_power,
+        )
+
+    def _channel_values(
+        trace_wavelengths: np.ndarray,
+        signal: np.ndarray,
+        normalized: np.ndarray,
+        channel_index: int,
+    ) -> tuple[float, float]:
+        """(raw, normalized) intensity at one channel's calibrated wavelength."""
+        wavelength_nm = float(wavelengths[channel_index])
+        raw_value = mean_near_wavelength(
+            trace_wavelengths,
+            signal,
+            wavelength_nm,
+            half_window_points=average_half_window,
+            window_nm=wavelength_window_nm,
+        )
+        normalized_value = mean_near_wavelength(
+            trace_wavelengths,
+            normalized,
+            wavelength_nm,
+            half_window_points=average_half_window,
+            window_nm=wavelength_window_nm,
+        )
+        return raw_value, normalized_value
+
     for group_number, group in enumerate(groups, start=1):
         for level_index, level in enumerate(level_values):
             _check_stop(stop_event)
-            pattern = dark_pattern.copy()
-            for channel_index in group:
-                x_start = _window_start_from_coordinate(
-                    coordinates[channel_index], window_size, slm_width
-                )
-                pattern[x_start : x_start + window_size] = int(level)
-            pattern[guard_mask] = min_level
-            _display_1d_pattern(slm, pattern, slm_height)
-
-            trace = measure()
-            trace_wavelengths, signal, normalized = _reduce_trace(
-                trace,
-                _trace_power_w(trace),
-                background_power,
-                reference_power,
-            )
+            trace_wavelengths, signal, normalized = _acquire_group(group, int(level))
             group_values: list[float] = []
             for channel_index in group:
-                wavelength_nm = float(wavelengths[channel_index])
-                raw_value = mean_near_wavelength(
-                    trace_wavelengths,
-                    signal,
-                    wavelength_nm,
-                    half_window_points=average_half_window,
-                    window_nm=wavelength_window_nm,
-                )
-                normalized_value = mean_near_wavelength(
-                    trace_wavelengths,
-                    normalized,
-                    wavelength_nm,
-                    half_window_points=average_half_window,
-                    window_nm=wavelength_window_nm,
+                raw_value, normalized_value = _channel_values(
+                    trace_wavelengths, signal, normalized, channel_index
                 )
                 raw_intensity_levels[channel_index, level_index] = raw_value
                 intensity_levels[channel_index, level_index] = normalized_value
@@ -961,6 +1068,77 @@ def batch_intensity_calibration(
                 y=mean_value,
             )
             step += 1
+
+        if (
+            outlier_policy is not None
+            and level_values.size >= outlier_policy.min_points
+        ):
+            # Post-sweep auto-remeasure for this group: fit each channel's
+            # curve to the sin^2 transfer model, re-measure flagged cells (one
+            # re-displayed group pattern per flagged level), replace each cell
+            # with the median of its re-measurements. The refine_wavelength
+            # best-trace tracking is intentionally left to the forward pass.
+            cell_readings: dict[tuple[int, int], list[tuple[float, float]]] = {}
+            for retry in range(1, outlier_policy.max_retries + 1):
+                flagged_levels: dict[int, list[int]] = {}
+                for channel_index in group:
+                    curve = intensity_levels[channel_index]
+                    residuals = transfer_fit_residuals(
+                        level_values.astype(float), curve
+                    )
+                    finite = curve[np.isfinite(curve)]
+                    mask = flag_by_residual(
+                        residuals,
+                        k_sigma=outlier_policy.k_sigma,
+                        rel_floor_scale=(
+                            float(np.max(np.abs(finite))) if finite.size else None
+                        ),
+                    )
+                    for level_index in np.flatnonzero(mask):
+                        flagged_levels.setdefault(int(level_index), []).append(
+                            int(channel_index)
+                        )
+                if not flagged_levels:
+                    break
+                for level_index in sorted(flagged_levels):
+                    _check_stop(stop_event)
+                    level = int(level_values[level_index])
+                    trace_wavelengths, signal, normalized = _acquire_group(
+                        group, level
+                    )
+                    for channel_index in flagged_levels[level_index]:
+                        raw_value, normalized_value = _channel_values(
+                            trace_wavelengths, signal, normalized, channel_index
+                        )
+                        key = (channel_index, level_index)
+                        cell_readings.setdefault(key, []).append(
+                            (raw_value, normalized_value)
+                        )
+                        cell = np.asarray(cell_readings[key], dtype=float)
+                        raw_intensity_levels[channel_index, level_index] = float(
+                            np.median(cell[:, 0])
+                        )
+                        intensity_levels[channel_index, level_index] = float(
+                            np.median(cell[:, 1])
+                        )
+                    _report(
+                        progress_callback,
+                        "batch_intensity",
+                        step,
+                        total,
+                        (
+                            f"recheck group {group_number}/{len(groups)}, "
+                            f"level {level} retry "
+                            f"{retry}/{outlier_policy.max_retries} -> "
+                            f"{len(flagged_levels[level_index])} channels"
+                        ),
+                        x=float(level),
+                        y=float(
+                            intensity_levels[
+                                flagged_levels[level_index][0], level_index
+                            ]
+                        ),
+                    )
 
     if refine_wavelength:
         half_window = _resolve_refine_half_window_nm(
@@ -1584,11 +1762,16 @@ def _collect_guarded_channel_side(
     is_valid: Callable[[float], bool],
     coord_min: float,
     coord_max: float,
+    first_offset_px: float | None = None,
 ) -> list[float]:
     channels: list[float] = []
     index = 0
     while len(channels) < desired_count:
-        coordinate = center + int(direction) * (index + 0.5) * pitch_px
+        if first_offset_px is None:
+            offset = (index + 0.5) * pitch_px          # legacy half-pitch start
+        else:
+            offset = float(first_offset_px) + index * pitch_px
+        coordinate = center + int(direction) * offset
         if direction < 0 and coordinate < coord_min:
             break
         if direction > 0 and coordinate > coord_max:

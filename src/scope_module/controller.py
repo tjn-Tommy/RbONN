@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -176,6 +176,8 @@ class ScopeController:
         else:
             raise ValueError("either host or an explicit driver is required")
         self._settings: ScopeSettings | None = None
+        self._sample_listeners: list[Callable[[MonitorSample], None]] = []
+        self._sample_listener_lock = threading.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -299,6 +301,39 @@ class ScopeController:
         channel = settings.channel if settings is not None else None
         return self.download(channel)
 
+    def add_sample_listener(
+        self, listener: Callable[[MonitorSample], None]
+    ) -> None:
+        """Register a callback fired once per completed monitor_cycle().
+
+        The listener runs on the *calling* (worker) thread with the returned
+        MonitorSample, so it must only hand the sample off (e.g. emit a queued
+        Qt signal), never touch widgets. Listener exceptions are swallowed so
+        a display bug can never abort a measurement.
+        """
+        with self._sample_listener_lock:
+            if listener not in self._sample_listeners:
+                self._sample_listeners.append(listener)
+
+    def remove_sample_listener(
+        self, listener: Callable[[MonitorSample], None]
+    ) -> None:
+        """Unregister a sample listener (no-op if it is not registered)."""
+        with self._sample_listener_lock:
+            try:
+                self._sample_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_sample_listeners(self, sample: MonitorSample) -> None:
+        with self._sample_listener_lock:
+            listeners = tuple(self._sample_listeners)
+        for listener in listeners:
+            try:
+                listener(sample)
+            except Exception:
+                pass  # a monitor must never break the measurement
+
     # --- triggered monitor (per-event averaged readout) ------------------
     def configure_monitor(self, settings: MonitorSettings) -> None:
         """Set up the scope once for the triggered mean-readout loop.
@@ -379,9 +414,11 @@ class ScopeController:
         waveform = None
         if want_waveform and settings is not None:
             waveform = self.download(settings.channel)
-        return MonitorSample(
+        sample = MonitorSample(
             value=value, std=std, index=index, timestamp=time.time(), waveform=waveform
         )
+        self._notify_sample_listeners(sample)
+        return sample
 
     def __enter__(self):
         self.connect()

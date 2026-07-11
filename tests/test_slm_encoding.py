@@ -13,9 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from slm_module.encoding import (
     ChannelLayout,
     EncodingChannel,
+    build_channel_layout,
+    compute_channel_geometry,
     encode_to_pattern,
     optimize_from_osa,
 )
+from slm_module.calibration.calibration_new import CalibrationResult
 import slm_module.analysis as analysis
 from slm_module.analysis import (
     ChannelSpectrum,
@@ -332,6 +335,100 @@ class _FakeMonitor:
         class _Sample:
             value = 0.001
         return _Sample()
+
+
+class CenterGapGeometryTests(unittest.TestCase):
+    """center_gap_px widens only the central pad; None keeps legacy tiling."""
+
+    # linear map: wl = 783 - 0.01 * x -> center_wl 778 sits exactly at x = 500
+    COORDS = np.array([0.0, 1000.0])
+    WLS = np.array([783.0, 773.0])
+
+    def _geom(self, **kwargs):
+        kwargs.setdefault("n_channels", 3)
+        kwargs.setdefault("channel_width_px", 15)
+        kwargs.setdefault("gap_px", 5)
+        kwargs.setdefault("center_wl", 778.0)
+        kwargs.setdefault("dark_wl_bands", ())
+        return compute_channel_geometry(self.COORDS, self.WLS, **kwargs)
+
+    def test_none_keeps_legacy_half_pitch_start(self) -> None:
+        geom = self._geom()
+        self.assertEqual(geom.c0, 500)
+        self.assertIsNone(geom.center_gap_px)
+        self.assertEqual([c.x_center for c in geom.x], [490, 470, 450])
+        self.assertEqual([c.x_center for c in geom.w], [510, 530, 550])
+        # central pad between the innermost pair is exactly gap_px wide
+        self.assertEqual(geom.w[0].x_start - geom.x[0].x_end, 5)
+
+    def test_gap_equal_to_gap_px_matches_legacy(self) -> None:
+        # ceil((15 + 5)/2) == 10 == half pitch: same positions as None
+        legacy = self._geom()
+        explicit = self._geom(center_gap_px=5)
+        self.assertEqual([c.x_center for c in explicit.x],
+                         [c.x_center for c in legacy.x])
+        self.assertEqual([c.x_center for c in explicit.w],
+                         [c.x_center for c in legacy.w])
+        self.assertEqual(explicit.center_gap_px, 5)
+
+    def test_widened_center_pad(self) -> None:
+        geom = self._geom(center_gap_px=10)
+        # m0 = ceil((15 + 10)/2) = 13 -> innermost pair at c0 -/+ 13
+        self.assertEqual([c.x_center for c in geom.x], [487, 467, 447])
+        self.assertEqual([c.x_center for c in geom.w], [513, 533, 553])
+        # pad = 2*13 - 15 = 11 >= requested 10
+        self.assertEqual(geom.w[0].x_start - geom.x[0].x_end, 11)
+        # mirror symmetry about c0 and unchanged same-side pitch
+        for xc, wc in zip(geom.x, geom.w):
+            self.assertEqual(xc.x_center + wc.x_center, 2 * geom.c0)
+        self.assertEqual(geom.x[0].x_center - geom.x[1].x_center, 20)
+
+    def test_odd_request_parity(self) -> None:
+        # ceil((15 + 12)/2) = 14 -> pad 13 >= 12 (floor division would give 12)
+        geom = self._geom(center_gap_px=12)
+        self.assertEqual(geom.w[0].x_start - geom.x[0].x_end, 13)
+
+    def test_guard_band_still_pushes_symmetrically(self) -> None:
+        # guard band at px [505, 515] overlaps the w[0] window (506..520)
+        # for center_gap_px=10 -> pair pushed outward together
+        geom = self._geom(
+            n_channels=1, center_gap_px=10,
+            dark_wl_bands=((777.85, 777.95),),
+        )
+        self.assertEqual(geom.w[0].x_center, 523)   # cleared past guard hi+1
+        self.assertEqual(geom.x[0].x_center, 477)   # mirror kept
+        self.assertEqual(geom.x[0].x_center + geom.w[0].x_center, 2 * geom.c0)
+
+    def test_negative_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "center_gap_px"):
+            self._geom(center_gap_px=-1)
+
+    def test_build_channel_layout_carries_center_gap(self) -> None:
+        coords = np.arange(0.0, 1001.0, 20.0)
+        calib = CalibrationResult(
+            wavelength=783.0 - 0.01 * coords,
+            coordinates=coords,
+            max_level=900,
+            min_level=100,
+            level_range=np.asarray([100, 500, 900]),
+            intensity_levels=np.tile(
+                np.asarray([0.0, 0.5, 1.0]), (coords.size, 1)
+            ),
+        )
+        layout = build_channel_layout(
+            calib, n_channels=2, channel_width_px=15, gap_px=5,
+            center_gap_px=10, center_wl=778.0, dark_wl_bands=(),
+        )
+        self.assertEqual(layout.center_gap_px, 10)
+        self.assertEqual(layout.x_channels[0].x_center, 487)
+        self.assertEqual(layout.w_channels[0].x_center, 513)
+        # default (unset) stays None and keeps the legacy positions
+        legacy = build_channel_layout(
+            calib, n_channels=2, channel_width_px=15, gap_px=5,
+            center_wl=778.0, dark_wl_bands=(),
+        )
+        self.assertIsNone(legacy.center_gap_px)
+        self.assertEqual(legacy.x_channels[0].x_center, 490)
 
 
 class MeasurePairGridsColRatioTests(unittest.TestCase):

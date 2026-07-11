@@ -35,12 +35,34 @@ class OptimizationAborted(Exception):
 
 
 @dataclass(frozen=True)
+class EvaluationSample:
+    """One hardware evaluation's headline metrics, for live plotting.
+
+    ``eta``/``c_total`` are the main-anchor (offset 0) values of the candidate
+    just measured; ``evaluation`` is its 1-based index within ``stage``.
+    """
+
+    stage: str
+    evaluation: int
+    loss: float
+    eta: float | None
+    c_total: float | None
+    feasible: bool
+
+
+@dataclass(frozen=True)
 class OptimizationProgress:
     stage: str
     step: int
     total: int
     message: str
     best_loss: float | None = None
+    # metrics of the evaluation that triggered this report (None for
+    # book-keeping reports such as baseline / setup)
+    sample: EvaluationSample | None = None
+    # {"loss", "eta", "c_total"} of the flat (all-ones) profile, sent once
+    # early in the run so a live plot can draw the comparison reference lines
+    flat_reference: dict[str, float] | None = None
 
 
 ProgressCallback = Callable[[OptimizationProgress], None]
@@ -435,6 +457,11 @@ class OSAOptimizationConfig:
     discrete_refine: bool = True
     discrete_step: float = 0.01
     skip_stage1: bool = False
+    # measure the flat (all-ones) profile right after the initial baseline so
+    # a live plot can show current-vs-flat during the run (the end-of-run
+    # comparison_metrics re-measure stays: references drift over hours)
+    flat_reference_up_front: bool = True
+    flat_reference_repeats: int = 3
     output_root: str = "data/osa_optimization"
     run_name: str | None = None
     resume: bool = False
@@ -1227,14 +1254,22 @@ class OptimizationRunner:
         self._best_loss: dict[str, float] = {}
         self.c_floor = config.c_floor_min
         self.initial_metrics: dict[int, AnchorMetrics] = {}
+        self._last_sample: EvaluationSample | None = None
+        self._pending_flat_reference: dict[str, float] | None = None
 
     def _report(self, stage: str, step: int, total: int, message: str) -> None:
-        if self.progress_callback is not None:
-            self.progress_callback(
-                OptimizationProgress(
-                    stage, step, total, message, self._best_loss.get(stage)
-                )
+        if self.progress_callback is None:
+            self._last_sample = None
+            self._pending_flat_reference = None
+            return
+        sample, self._last_sample = self._last_sample, None
+        flat_ref, self._pending_flat_reference = self._pending_flat_reference, None
+        self.progress_callback(
+            OptimizationProgress(
+                stage, step, total, message, self._best_loss.get(stage),
+                sample=sample, flat_reference=flat_ref,
             )
+        )
 
     def _maybe_refresh_main_reference(self, stage: str) -> bool:
         interval = self.config.reference_interval_candidates
@@ -1265,6 +1300,16 @@ class OptimizationRunner:
         record = _CandidateRecord(float(loss), np.asarray(profile).copy(), metrics, hashes)
         history.append(record)
         self._best_loss[stage] = min(self._best_loss.get(stage, math.inf), float(loss))
+        # headline metrics for the live plot; the next _report attaches them
+        main = metrics[0] if metrics else None
+        self._last_sample = EvaluationSample(
+            stage=stage,
+            evaluation=len(history),
+            loss=float(loss),
+            eta=float(main.eta) if main is not None else None,
+            c_total=float(main.c_total) if main is not None else None,
+            feasible=self._is_feasible(metrics, self.config.eta_accept),
+        )
         self.store.append_candidate(
             stage,
             len(history),
@@ -1341,6 +1386,43 @@ class OptimizationRunner:
                 "anchors": {key: value.to_dict() for key, value in self.initial_metrics.items()},
             },
         )
+
+    def _measure_flat_reference(self) -> None:
+        """Measure the flat (all-ones) profile once, early in the run.
+
+        Gives live plots a fixed current-vs-flat reference line; sent to the
+        progress callback exactly once (attached to a dedicated report) and
+        persisted as flat_reference.json. When the initial profile IS flat the
+        just-measured baseline is reused instead of extra sweeps.
+        """
+        if not self.config.flat_reference_up_front:
+            return
+        flat = np.ones_like(self.initial_l)
+        if np.allclose(self.initial_l, flat):
+            aggregate = self.initial_metrics[0]
+        else:
+            repeats: list[AnchorMetrics] = []
+            for _ in range(max(1, self.config.flat_reference_repeats)):
+                metrics, _ = self.evaluator.measure_one_hot(
+                    0, flat, stage="flat_reference"
+                )
+                repeats.append(metrics)
+            aggregate = _aggregate_metrics(repeats)
+        loss = stage1_loss(
+            [aggregate.c_total], [aggregate.eta], [self.initial_metrics[0].c_total],
+            c_floor=self.c_floor,
+            beta_eta=self.config.beta_eta,
+            eta_threshold=self.config.eta_threshold,
+            eta_scale=self.config.eta_scale,
+        )
+        reference = {
+            "loss": float(loss),
+            "eta": float(aggregate.eta),
+            "c_total": float(aggregate.c_total),
+        }
+        self.store.write_json("flat_reference.json", reference)
+        self._pending_flat_reference = reference
+        self._report("flat_reference", 1, 1, "flat (all-ones) reference measured")
 
     def _minimize(
         self,
@@ -1666,6 +1748,7 @@ class OptimizationRunner:
         self._report("setup", 0, len(self.config.anchor_offsets), "calibrating fixed bins")
         self.evaluator.calibrate_all()
         self._measure_initial_baseline()
+        self._measure_flat_reference()
 
         if self.config.skip_stage1:
             stage1_l = self.initial_l.copy()
@@ -1879,6 +1962,129 @@ def run_osa_optimization(
         evaluator, initial, config, store, progress_callback=progress_callback
     )
     return runner.run()
+
+
+@dataclass(frozen=True)
+class OSABatchVariant:
+    """One OSA-settings variant of a batch run (e.g. a sampling-point count)."""
+
+    label: str                       # short tag, becomes part of the run name
+    settings: MeasurementSettings
+
+
+@dataclass
+class OSABatchOutcome:
+    """Result envelope for one variant of a batch optimisation."""
+
+    variant: OSABatchVariant
+    result: OptimizationResult | None
+    run_dir: str | None
+    error: str | None = None
+    stopped: bool = False
+
+
+def run_osa_optimization_batch(
+    osa: OSAController,
+    slm: SLMController,
+    layout: ChannelLayout,
+    initial_l: Sequence[float],
+    *,
+    base_config: OSAOptimizationConfig,
+    variants: Sequence[OSABatchVariant],
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> list[OSABatchOutcome]:
+    """Run the full optimisation once per OSA-settings variant.
+
+    Each variant gets its own run directory (``<run_name>_<label>``) and its
+    progress stages are prefixed with ``[i/n label]`` so a single live view can
+    follow the whole batch. A stop request ends the batch at the next variant
+    boundary (and aborts the in-flight run as usual); any other per-variant
+    failure is recorded and the batch continues. A summary JSON comparing the
+    variants is written next to the run directories.
+    """
+    if not variants:
+        raise ValueError("batch optimisation needs at least one variant")
+    labels = [variant.label for variant in variants]
+    if len(set(labels)) != len(labels):
+        raise ValueError("batch variant labels must be unique")
+
+    base_name = base_config.run_name or time.strftime("%Y-%m-%d_batch%H%M%S")
+    outcomes: list[OSABatchOutcome] = []
+    for index, variant in enumerate(variants, start=1):
+        if stop_event is not None and stop_event.is_set():
+            outcomes.append(
+                OSABatchOutcome(variant, None, None, stopped=True)
+            )
+            continue
+
+        config = replace(
+            base_config,
+            settings=variant.settings,
+            run_name=f"{base_name}_{variant.label}",
+        )
+
+        wrapped: ProgressCallback | None = None
+        if progress_callback is not None:
+            prefix = f"[{index}/{len(variants)} {variant.label}] "
+
+            def wrapped(
+                progress: OptimizationProgress, _prefix: str = prefix
+            ) -> None:
+                progress_callback(
+                    replace(progress, stage=f"{_prefix}{progress.stage}")
+                )
+
+        try:
+            result = run_osa_optimization(
+                osa, slm, layout, initial_l,
+                config=config, stop_event=stop_event,
+                progress_callback=wrapped,
+            )
+            outcomes.append(
+                OSABatchOutcome(variant, result, result.run_dir)
+            )
+        except OptimizationAborted:
+            outcomes.append(OSABatchOutcome(variant, None, None, stopped=True))
+            break
+        except Exception as exc:  # noqa: BLE001 - isolate per-variant failures
+            outcomes.append(
+                OSABatchOutcome(variant, None, None, error=str(exc))
+            )
+
+    summary = {
+        "base_name": base_name,
+        "variants": [
+            {
+                "label": outcome.variant.label,
+                "settings": asdict(outcome.variant.settings),
+                "run_dir": outcome.run_dir,
+                "stopped": outcome.stopped,
+                "error": outcome.error,
+                "accepted": (
+                    outcome.result.accepted if outcome.result is not None else None
+                ),
+                "final_metrics": (
+                    {
+                        key: value.to_dict()
+                        for key, value in outcome.result.final_metrics.items()
+                    }
+                    if outcome.result is not None
+                    else None
+                ),
+            }
+            for outcome in outcomes
+        ],
+    }
+    summary_path = Path(base_config.output_root) / f"{base_name}_batch_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False, default=RunStore._json_default),
+        encoding="utf-8",
+    )
+    tmp.replace(summary_path)
+    return outcomes
 
 
 def load_optimization_result(path: str | Path) -> OptimizationResult:

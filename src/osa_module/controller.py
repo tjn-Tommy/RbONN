@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,8 @@ class OSAController:
         else:
             raise ValueError("either host or an explicit driver is required")
         self._settings: MeasurementSettings | None = None
+        self._trace_listeners: list[Callable[[TraceData], None]] = []
+        self._trace_listener_lock = threading.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -109,6 +112,35 @@ class OSAController:
 
     def disconnect(self) -> None:
         self.driver.disconnect()
+
+    def add_trace_listener(self, listener: Callable[[TraceData], None]) -> None:
+        """Register a callback fired with every trace :meth:`measure` returns.
+
+        Listeners run on whatever (worker) thread called measure(), so a GUI
+        listener must only hand the trace off (e.g. emit a queued Qt signal),
+        never touch widgets. Listener exceptions are swallowed so a display bug
+        can never abort an acquisition.
+        """
+        with self._trace_listener_lock:
+            if listener not in self._trace_listeners:
+                self._trace_listeners.append(listener)
+
+    def remove_trace_listener(self, listener: Callable[[TraceData], None]) -> None:
+        """Unregister a trace listener (no-op if it is not registered)."""
+        with self._trace_listener_lock:
+            try:
+                self._trace_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_trace_listeners(self, trace: TraceData) -> None:
+        with self._trace_listener_lock:
+            listeners = tuple(self._trace_listeners)
+        for listener in listeners:
+            try:
+                listener(trace)
+            except Exception:
+                pass  # a monitor must never break the measurement
 
     def identify(self) -> str:
         return self.driver.identify()
@@ -183,6 +215,10 @@ class OSAController:
         power domain even when the display unit is dBm, so the result is a true
         power average rather than a log-domain mean; the wavelength axis comes
         from the first sweep. `timeout` applies per sweep.
+
+        Registered trace listeners (see :meth:`add_trace_listener`) are
+        notified exactly once per call with the returned trace (the averaged
+        one when averages > 1), on the calling thread.
         """
         if averages < 1:
             raise ValueError("averages must be >= 1")
@@ -200,9 +236,9 @@ class OSAController:
                 )
             traces.append(self.read_trace())
 
-        if len(traces) == 1:
-            return traces[0]
-        return self._average_traces(traces)
+        result = traces[0] if len(traces) == 1 else self._average_traces(traces)
+        self._notify_trace_listeners(result)
+        return result
 
     @staticmethod
     def _average_traces(traces: list[TraceData]) -> TraceData:

@@ -89,6 +89,53 @@ class DAQControllerTests(unittest.TestCase):
         self.assertFalse(daq.is_connected)
 
 
+class SampleListenerTests(unittest.TestCase):
+    def test_monitor_cycle_notifies_listener_with_returned_sample(self) -> None:
+        daq = DAQController(driver=FakeDriver())
+        daq.configure_monitor(DAQMonitorSettings(hold=0.0))
+        seen: list[MonitorSample] = []
+        daq.add_sample_listener(seen.append)
+        sample = daq.monitor_cycle(index=7)
+        self.assertEqual(seen, [sample])
+
+    def test_aborted_cycle_does_not_notify(self) -> None:
+        daq = DAQController(driver=FakeDriver())
+        daq.configure_monitor(DAQMonitorSettings(hold=0.0))
+        seen: list[MonitorSample] = []
+        daq.add_sample_listener(seen.append)
+        stop = threading.Event()
+        stop.set()
+        self.assertIsNone(daq.monitor_cycle(stop_event=stop))
+        self.assertEqual(seen, [])
+
+    def test_listener_exception_never_breaks_the_cycle(self) -> None:
+        daq = DAQController(driver=FakeDriver())
+        daq.configure_monitor(DAQMonitorSettings(hold=0.0))
+        seen: list[MonitorSample] = []
+
+        def bad(_sample) -> None:
+            raise RuntimeError("display bug")
+
+        daq.add_sample_listener(bad)
+        daq.add_sample_listener(seen.append)
+        sample = daq.monitor_cycle()
+        self.assertIsInstance(sample, MonitorSample)
+        self.assertEqual(seen, [sample])
+
+    def test_duplicate_add_and_remove_semantics(self) -> None:
+        daq = DAQController(driver=FakeDriver())
+        daq.configure_monitor(DAQMonitorSettings(hold=0.0))
+        seen: list[MonitorSample] = []
+        daq.add_sample_listener(seen.append)
+        daq.add_sample_listener(seen.append)      # dedupe: still one call
+        daq.monitor_cycle()
+        self.assertEqual(len(seen), 1)
+        daq.remove_sample_listener(seen.append)
+        daq.remove_sample_listener(seen.append)   # no-op when absent
+        daq.monitor_cycle()
+        self.assertEqual(len(seen), 1)
+
+
 class DriverConstructionTests(unittest.TestCase):
     def test_unconnected_read_raises(self) -> None:
         from daq_module.driver import NIDAQDriver

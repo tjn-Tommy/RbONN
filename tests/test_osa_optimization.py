@@ -15,8 +15,10 @@ from slm_module.calibration.calibration_new import CalibrationResult
 from slm_module.optimization import (
     AmplitudeLUT,
     FixedChannelBins,
+    OSABatchVariant,
     OSAEvaluator,
     OSAOptimizationConfig,
+    OptimizationProgress,
     RunStore,
     StageAmplitudeReference,
     amplitudes_to_intensity_commands,
@@ -25,6 +27,7 @@ from slm_module.optimization import (
     load_optimization_result,
     mirror_intensity_profile,
     run_osa_optimization,
+    run_osa_optimization_batch,
     stage1_loss,
     stage3_loss,
     validate_independent_profile,
@@ -394,6 +397,145 @@ class EvaluatorIntegrationTests(unittest.TestCase):
             )
             self.assertTrue(stage1_payload["skipped"])
             np.testing.assert_allclose(stage1_payload["l"], initial)
+
+
+def _tiny_config(tmp: str, run_name: str, **overrides) -> OSAOptimizationConfig:
+    """The smallest complete-run budget used by the integration tests."""
+    kwargs = dict(
+        settings=MeasurementSettings(
+            center_wl="778nm", span="0.8nm", sampling_points="1001",
+            y_unit="LINear"
+        ),
+        anchor_offsets=(0,),
+        averages=1,
+        rerank_averages=1,
+        baseline_repeats=2,
+        stage2_repeats=1,
+        stage1_maxfev=1,
+        stage3_maxfev=1,
+        stage1_top_k=1,
+        stage3_top_k=1,
+        max_alternations=1,
+        final_lut_points=5,
+        lut_self_consistency=False,
+        discrete_refine=False,
+        reference_interval_candidates=0,
+        output_root=tmp,
+        run_name=run_name,
+    )
+    kwargs.update(overrides)
+    return OSAOptimizationConfig(**kwargs)
+
+
+class LiveProgressTests(unittest.TestCase):
+    def test_progress_carries_samples_and_flat_reference_once(self) -> None:
+        layout = _hardware_layout()
+        slm = _HardwareSLM()
+        osa = _HardwareOSA(slm, layout)
+        seen: list[OptimizationProgress] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _tiny_config(tmp, "live")
+            result = run_osa_optimization(
+                osa, slm, layout, np.ones(8), config=config,
+                progress_callback=seen.append,
+            )
+
+            # the flat reference is attached to exactly one progress report
+            flat_reports = [p for p in seen if p.flat_reference is not None]
+            self.assertEqual(len(flat_reports), 1)
+            ref = flat_reports[0].flat_reference
+            self.assertEqual(set(ref), {"loss", "eta", "c_total"})
+            self.assertTrue(Path(result.run_dir, "flat_reference.json").is_file())
+
+            # evaluation samples stream with 1-based increasing indices
+            stage1_samples = [
+                p.sample for p in seen
+                if p.sample is not None and p.sample.stage == "stage1"
+            ]
+            self.assertTrue(stage1_samples)
+            evaluations = [s.evaluation for s in stage1_samples]
+            self.assertEqual(evaluations, sorted(evaluations))
+            self.assertEqual(evaluations[0], 1)
+            for sample in stage1_samples:
+                self.assertTrue(np.isfinite(sample.loss))
+                self.assertIsNotNone(sample.eta)
+                self.assertIsNotNone(sample.c_total)
+
+
+class BatchOptimizationTests(unittest.TestCase):
+    def test_batch_runs_each_variant_and_writes_summary(self) -> None:
+        layout = _hardware_layout()
+        slm = _HardwareSLM()
+        osa = _HardwareOSA(slm, layout)
+        seen: list[OptimizationProgress] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _tiny_config(tmp, "batch")
+            variants = [
+                OSABatchVariant("sp501", MeasurementSettings(
+                    center_wl="778nm", span="0.8nm", sampling_points="501",
+                    y_unit="LINear")),
+                OSABatchVariant("sp1001", MeasurementSettings(
+                    center_wl="778nm", span="0.8nm", sampling_points="1001",
+                    y_unit="LINear")),
+            ]
+            outcomes = run_osa_optimization_batch(
+                osa, slm, layout, np.ones(8),
+                base_config=base, variants=variants,
+                progress_callback=seen.append,
+            )
+
+            self.assertEqual(len(outcomes), 2)
+            for outcome, label in zip(outcomes, ("sp501", "sp1001")):
+                self.assertIsNone(outcome.error)
+                self.assertFalse(outcome.stopped)
+                self.assertIsNotNone(outcome.result)
+                self.assertTrue(
+                    Path(outcome.run_dir, "final_result.json").is_file()
+                )
+                self.assertIn(f"batch_{label}", str(outcome.run_dir))
+            # distinct run dirs per variant
+            self.assertNotEqual(outcomes[0].run_dir, outcomes[1].run_dir)
+
+            # progress stages carry the [i/n label] prefix
+            self.assertTrue(any(p.stage.startswith("[1/2 sp501] ") for p in seen))
+            self.assertTrue(any(p.stage.startswith("[2/2 sp1001] ") for p in seen))
+
+            summary_path = Path(tmp) / "batch_batch_summary.json"
+            self.assertTrue(summary_path.is_file())
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [v["label"] for v in summary["variants"]], ["sp501", "sp1001"]
+            )
+            self.assertTrue(all(v["accepted"] is not None for v in summary["variants"]))
+
+    def test_stop_during_first_variant_ends_the_batch(self) -> None:
+        import threading
+
+        layout = _hardware_layout()
+        slm = _HardwareSLM()
+        osa = _HardwareOSA(slm, layout)
+        stop = threading.Event()
+        calls = {"n": 0}
+
+        def stop_soon(progress: OptimizationProgress) -> None:
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                stop.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _tiny_config(tmp, "stopbatch")
+            variants = [
+                OSABatchVariant("a", base.settings),
+                OSABatchVariant("b", base.settings),
+            ]
+            outcomes = run_osa_optimization_batch(
+                osa, slm, layout, np.ones(8),
+                base_config=base, variants=variants,
+                stop_event=stop, progress_callback=stop_soon,
+            )
+            self.assertEqual(len(outcomes), 1)      # batch ended at the abort
+            self.assertTrue(outcomes[0].stopped)
+            self.assertIsNone(outcomes[0].result)
 
 
 if __name__ == "__main__":
