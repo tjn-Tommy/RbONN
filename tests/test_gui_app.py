@@ -40,7 +40,7 @@ class FormatDurationTests(unittest.TestCase):
 
 class FormatVoltsTests(unittest.TestCase):
     def test_scales_to_readable_units(self) -> None:
-        from slm_module.gui.daq_monitor import _format_volts
+        from slm_module.gui.live_readout import _format_volts
 
         self.assertEqual(_format_volts(1.5), "1.5 V")
         self.assertEqual(_format_volts(0.0123), "12.3 mV")
@@ -190,28 +190,54 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_daq_monitor_dock_receives_bridged_samples(self) -> None:
+    def test_live_readout_dock_receives_bridged_samples(self) -> None:
         from scope_module.controller import MonitorSample
         from slm_module.gui.app import MainWindow
 
         window = MainWindow()
         try:
-            view = window.daq_monitor_view
+            dock = window.live_readout_dock
+            view = dock.view
             self.assertEqual(view.sample_count, 0)
             # same-thread emit is delivered synchronously by Qt
-            window._monitor_bridge.on_sample(
-                MonitorSample(value=0.0123, std=0.0004, index=0, timestamp=1.0)
+            dock.bridge.on_sample(
+                MonitorSample(
+                    value=0.0123, std=0.0004, sem=0.0001, index=0, timestamp=1.0
+                )
             )
-            window._monitor_bridge.on_sample(
+            dock.bridge.on_sample(
                 MonitorSample(value=0.0125, std=None, index=1, timestamp=2.0)
             )
             self.assertEqual(view.sample_count, 2)
-            view._draw_samples()   # render path handles a None std
+            view._draw_samples()   # render path handles a None std/sem
             self.assertIn("reading 2", view.status_label.text())
             view.clear()
             self.assertEqual(view.sample_count, 0)
             self.assertTrue(window.mon_dock_button.isCheckable())
-            self.assertFalse(window.daq_monitor_dock.isVisible())
+            self.assertFalse(dock.isVisible())
+        finally:
+            window.close()
+
+    def test_live_readout_dock_watch_unwatch(self) -> None:
+        from slm_module.gui.app import MainWindow
+
+        class _FakeMonitorController:
+            def __init__(self) -> None:
+                self.listeners: list = []
+
+            def add_sample_listener(self, listener) -> None:
+                self.listeners.append(listener)
+
+            def remove_sample_listener(self, listener) -> None:
+                self.listeners.remove(listener)
+
+        window = MainWindow()
+        try:
+            monitor = _FakeMonitorController()
+            window.live_readout_dock.watch(monitor)
+            self.assertEqual(len(monitor.listeners), 1)
+            window.live_readout_dock.unwatch(monitor)
+            self.assertEqual(monitor.listeners, [])
         finally:
             window.close()
 

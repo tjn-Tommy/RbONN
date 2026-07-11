@@ -719,6 +719,71 @@ class CalibrationNewTests(unittest.TestCase):
         self.assertLessEqual(result.coordinates.max(), 10)
         self.assertEqual(osa.measure_calls, 7)  # background + reference + 5 positions
 
+    def test_wavelength_calibration_stride_fills_skipped_columns(self) -> None:
+        # linear optical mapping: window start s peaks at (700 + s + 1) nm,
+        # i.e. wavelength = 700 + coordinate for window_size 2
+        axis = np.arange(700.0, 740.0)
+        n_samples = axis.size
+
+        def peak_trace(start: int) -> TraceData:
+            powers = np.full(n_samples, 0.1)
+            powers[start + 1] = 1.0
+            return make_trace(axis, list(powers))
+
+        # width 20, window 2 -> starts 0..18; stride 5 measures 0,5,10,15
+        # plus the appended far-edge anchor 18
+        measured_starts = [0, 5, 10, 15, 18]
+        traces = [
+            make_trace(axis, [0.0] * n_samples),
+            make_trace(axis, [1.0] * n_samples),
+        ] + [peak_trace(start) for start in measured_starts]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(20, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        result = wavelength_calibration(
+            osa,
+            slm,
+            [],
+            MeasurementSettings(),
+            seed,
+            window_size=2,
+            peak_half_window_nm=1.0,
+            coordinate_stride=5,
+        )
+
+        self.assertEqual(osa.measure_calls, 2 + len(measured_starts))
+        # the fit fills every skipped column: same dense grid as stride 1
+        np.testing.assert_allclose(result.coordinates, np.arange(19) + 1.0)
+        np.testing.assert_allclose(
+            result.wavelength, 700.0 + result.coordinates, atol=1e-6
+        )
+
+    def test_wavelength_calibration_rejects_bad_stride(self) -> None:
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+        with self.assertRaisesRegex(ValueError, "coordinate_stride"):
+            wavelength_calibration(
+                FakeOSA([]),
+                FakeSLM(size=(20, 2)),
+                [],
+                MeasurementSettings(),
+                seed,
+                window_size=2,
+                coordinate_stride=0,
+            )
+
     def test_intensity_calibration_region_filters_loaded_mapping(self) -> None:
         wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])
         # mapping spans the SLM; only coordinates 6 and 8 are inside region (5, 10)

@@ -115,8 +115,8 @@ from .common import (
     WorkerSignals,
     _format_duration,
 )
-from .daq_monitor import LiveSampleView, MonitorSampleBridge
 from .live_plots import BatchResultsTable, LiveLossCanvas
+from .live_readout import LiveReadoutDock
 from .osa_monitor import LiveSpectrumView, OSATraceBridge
 from .pipeline_page import PipelinePage
 from .style import DARK_STYLESHEET
@@ -489,12 +489,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._osa_bridge.trace_ready.connect(self._osa_view_on_trace)
         self._osa_bridge.trace_ready.connect(self.osa_monitor_view.set_trace)
 
-        # Live DAQ/scope monitor: every monitor_cycle() (TPA centre scan,
-        # step 6/7, pipeline stages, encoder-page reads) notifies the bridge
-        # from the worker thread; the queued signal appends the sample to the
-        # dock's rolling strip chart.
-        self._monitor_bridge = MonitorSampleBridge(self)
-        self._monitor_bridge.sample_ready.connect(self.daq_monitor_view.add_sample)
 
     def _build_ui(self) -> None:
         # Dockable live OSA monitor (hidden until toggled from the OSA Viewer
@@ -506,14 +500,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.osa_monitor_dock)
         self.osa_monitor_dock.hide()
 
-        # Dockable live DAQ/scope monitor (hidden until toggled from the TPA
-        # encoder page): a rolling strip chart of every monitor_cycle() sample.
-        self.daq_monitor_view = LiveSampleView(self)
-        self.daq_monitor_dock = QtWidgets.QDockWidget("DAQ/Scope Monitor", self)
-        self.daq_monitor_dock.setObjectName("DAQMonitorDock")
-        self.daq_monitor_dock.setWidget(self.daq_monitor_view)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.daq_monitor_dock)
-        self.daq_monitor_dock.hide()
+        # Dockable live readout (hidden until toggled from the TPA encoder
+        # page): passively mirrors every monitor_cycle() sample from any
+        # module. Not to be confused with the DAQ Monitor page, which drives
+        # its own continuous acquisition loop.
+        self.live_readout_dock = LiveReadoutDock(self)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.live_readout_dock)
+        self.live_readout_dock.hide()
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
@@ -5425,7 +5418,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_daq()
             self._log("DAQ disconnected automatically (scope connected)")
         self.scope_controller = scope
-        scope.add_sample_listener(self._monitor_bridge.on_sample)
+        self.live_readout_dock.watch(scope)
         self._set_status(self.scope_status_label, "Scope: open", "ok")
         self.scope_connect_button.setEnabled(False)
         self.scope_disconnect_button.setEnabled(True)
@@ -5443,7 +5436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_connect_button.setEnabled(True)
         self.scope_disconnect_button.setEnabled(False)
         if scope is not None:
-            scope.remove_sample_listener(self._monitor_bridge.on_sample)
+            self.live_readout_dock.unwatch(scope)
             self._run_task("Disconnect scope", scope.disconnect)
         self._sync_monitor_source()
 
@@ -5468,7 +5461,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_scope()
             self._log("Scope disconnected automatically (DAQ connected)")
         self.daq_controller = daq
-        daq.add_sample_listener(self._monitor_bridge.on_sample)
+        self.live_readout_dock.watch(daq)
         self._set_status(self.daq_status_label, "DAQ: open", "ok")
         self.daq_connect_button.setEnabled(False)
         self.daq_disconnect_button.setEnabled(True)
@@ -5487,7 +5480,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daq_connect_button.setEnabled(True)
         self.daq_disconnect_button.setEnabled(False)
         if daq is not None:
-            daq.remove_sample_listener(self._monitor_bridge.on_sample)
+            self.live_readout_dock.unwatch(daq)
             self._run_task("Disconnect DAQ", daq.disconnect)
         self._sync_monitor_source()
 
@@ -5818,12 +5811,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mon_dock_button.setProperty("variant", "ghost")
         self.mon_dock_button.setCheckable(True)
         self.mon_dock_button.setToolTip(
-            "Show the dockable live monitor: every scope/DAQ reading from any "
-            "module (TPA scans, step 6/7, pipeline, this page) streams into "
-            "its rolling chart, visible from every page."
+            "Show the dockable Live Readout: every scope/DAQ reading from any "
+            "module (TPA scans, step 6/7, pipeline, the DAQ Monitor page, this "
+            "page) streams into its rolling chart, visible from every page."
         )
-        self.mon_dock_button.toggled.connect(self.daq_monitor_dock.setVisible)
-        self.daq_monitor_dock.visibilityChanged.connect(
+        self.mon_dock_button.toggled.connect(self.live_readout_dock.setVisible)
+        self.live_readout_dock.visibilityChanged.connect(
             self.mon_dock_button.setChecked
         )
         row = QtWidgets.QHBoxLayout()

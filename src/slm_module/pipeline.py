@@ -63,12 +63,14 @@ from .tpa_pair import (
 from .tpa_phase import (
     PairModel,
     PhaseResult,
-    TPAPhaseAborted,
-    build_phase_sweep,
     load_pair_models,
-    measure_phase_sweep,
     save_phase_json,
     write_phase_csv,
+)
+from .tpa_phase_measure import (
+    TPAPhaseAborted,
+    build_phase_sweep,
+    measure_phase_sweep,
 )
 
 _STAGE_ABORTS = (
@@ -210,6 +212,7 @@ class OSAStageSettings:
 class WlMapConfig:
     levels: list[int] = field(default_factory=lambda: list(range(0, 1024, 64)))
     window_size: int = 8
+    coordinate_stride: int = 1        # measure every Nth column, fit fills the rest
     peak_half_window_nm: float | None = None
     region: tuple[int, int] | None = None
     osa: OSAStageSettings = field(default_factory=OSAStageSettings)
@@ -543,6 +546,7 @@ def _run_wl_map(ctx: _Context, plan: StagePlan) -> Any:
         window_size=cfg.window_size,
         peak_half_window_nm=cfg.peak_half_window_nm,
         region=cfg.region,
+        coordinate_stride=cfg.coordinate_stride,
         outlier_policy=cfg.outlier_policy,
         stop_event=ctx.stop_event, progress_callback=report,
     )

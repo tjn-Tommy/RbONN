@@ -36,7 +36,7 @@ from slm_module.pipeline import (
 )
 from slm_module.tpa_center import TPACenterProgress
 from slm_module.tpa_pair import TPAPairAborted, TPAPairProgress
-from slm_module.tpa_phase import TPAPhaseProgress
+from slm_module.tpa_phase_measure import TPAPhaseProgress
 
 
 def _plan(stage_id, config, inputs, out_dir: Path, name: str) -> StagePlan:

@@ -211,14 +211,9 @@ class DAQController:
         n_eff = max(2.0 * duration * settings.f_cut, 1.0)
         sem = std / float(np.sqrt(n_eff))
         sem_ratio = sem / mean if mean else float("nan")
-        return MonitorSample(
+        sample = MonitorSample(
             value=mean, std=std, sem=sem, sem_ratio=sem_ratio,
             index=index, timestamp=time.time(),
-        sample = MonitorSample(
-            value=float(values.mean()),
-            std=float(values.std()),
-            index=index,
-            timestamp=time.time(),
         )
         self._notify_sample_listeners(sample)
         return sample

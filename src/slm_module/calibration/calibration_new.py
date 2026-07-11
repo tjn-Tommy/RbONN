@@ -316,6 +316,7 @@ def wavelength_calibration(
     *,
     peak_half_window_nm: float | None = None,
     region: tuple[int, int] | None = None,
+    coordinate_stride: int = 1,
     outlier_policy: OutlierRemeasurePolicy | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -330,6 +331,13 @@ def wavelength_calibration(
     columns, which is useful when the source only illuminates part of the SLM
     width (e.g. a ~6 nm pulse on a ~20 nm aperture); None sweeps the full width.
 
+    ``coordinate_stride`` speeds up acquisition: only every Nth window position
+    is measured (the last position is always kept so the fit spans the whole
+    region). The coordinate->wavelength mapping is nearly linear, so the
+    polynomial fit over the strided points fills in the skipped coordinates:
+    the returned result still carries the dense per-column grid a stride-1
+    sweep would produce. 1 (default) measures every position.
+
     ``outlier_policy`` enables post-sweep auto-remeasurement: after the sweep, a
     linear coordinate->wavelength fit flags points whose residual exceeds
     ``k_sigma`` robust sigmas; each flagged window is re-displayed and
@@ -340,6 +348,9 @@ def wavelength_calibration(
     del levels
     slm_width, slm_height = slm.get_slm_info()
     window_size = _validate_window_size(window_size, slm_width)
+    coordinate_stride = int(coordinate_stride)
+    if coordinate_stride < 1:
+        raise ValueError("coordinate_stride must be >= 1")
     min_level = _level_value(calibration_results.min_level, "min_level")
     max_level = _level_value(calibration_results.max_level, "max_level")
     region_lo, region_hi = _resolve_scan_region(region, slm_width, window_size)
@@ -357,8 +368,12 @@ def wavelength_calibration(
     coordinates: list[int] = []
     wavelengths: list[float] = []
 
-    total = max(0, region_hi - region_lo)
-    for index, x_start in enumerate(range(region_lo, region_hi)):
+    x_starts = list(range(region_lo, region_hi, coordinate_stride))
+    if x_starts[-1] != region_hi - 1:
+        x_starts.append(region_hi - 1)   # anchor the fit at the far edge
+
+    total = len(x_starts)
+    for index, x_start in enumerate(x_starts):
         _check_stop(stop_event)
         pattern = dark_pattern.copy()
         pattern[x_start : x_start + window_size] = max_level
@@ -445,6 +460,14 @@ def wavelength_calibration(
     fitted_wavelengths, coeffs = _fit_wavelength_mapping(
         coordinate_array, wavelength_array
     )
+
+    if coordinate_stride > 1:
+        # Fill the skipped columns from the fitted curve so downstream
+        # consumers see the same dense grid a stride-1 sweep would produce.
+        coordinate_array = (
+            np.arange(region_lo, region_hi, dtype=float) + window_size // 2
+        )
+        fitted_wavelengths = np.polyval(coeffs, coordinate_array)
 
     return CalibrationResult(
         wavelength=fitted_wavelengths,

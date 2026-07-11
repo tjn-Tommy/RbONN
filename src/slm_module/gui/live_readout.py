@@ -1,4 +1,4 @@
-"""Live DAQ/scope monitor: sample-listener bridge + rolling strip chart.
+"""Live readout panel: sample-listener bridge + rolling strip chart, docked.
 
 Every TPA readout in the codebase funnels through ``monitor_cycle()`` on
 whichever monitor instrument is connected (``ScopeController`` or
@@ -9,12 +9,15 @@ thread where a :class:`LiveSampleView` appends it to a rolling mean ± std
 strip chart -- TPA centre scans, step 6/7, pipeline stages and encoder-page
 reads all stream here, no matter which module triggered them.
 
-Wiring (done by the main window)::
+This panel is a *passive mirror* of readings other modules trigger. It is
+deliberately separate from the DAQ Monitor page (``_build_daq_monitor_page``
+in app.py), which is an *active* live voltmeter driving its own continuous
+acquisition loop; when that loop runs, its samples stream here too, since
+they go through the same ``monitor_cycle()`` funnel.
 
-    bridge = MonitorSampleBridge(parent)
-    monitor.add_sample_listener(bridge.on_sample)     # on connect
-    bridge.sample_ready.connect(view.add_sample)      # GUI-thread slot
-    monitor.remove_sample_listener(bridge.on_sample)  # on disconnect
+:class:`LiveReadoutDock` bundles the bridge and the view into one
+self-contained dock widget, so the main window only creates it and calls
+``watch(controller)`` / ``unwatch(controller)`` on connect/disconnect.
 """
 from __future__ import annotations
 
@@ -68,7 +71,9 @@ class LiveSampleView(QtWidgets.QWidget):
         max_points: int = 500,
     ) -> None:
         super().__init__(parent)
-        self._samples: deque[tuple[int, float, float]] = deque(maxlen=int(max_points))
+        self._samples: deque[tuple[int, float, float, float]] = deque(
+            maxlen=int(max_points)
+        )
         self._dirty = False
         self.sample_count = 0
 
@@ -105,8 +110,10 @@ class LiveSampleView(QtWidgets.QWidget):
         """Append one MonitorSample; the timer repaints on its own cadence."""
         value = float(sample.value)
         std = float(sample.std) if sample.std is not None else float("nan")
+        sem = getattr(sample, "sem", None)
+        sem = float(sem) if sem is not None else float("nan")
         self.sample_count += 1
-        self._samples.append((self.sample_count, value, std))
+        self._samples.append((self.sample_count, value, std, sem))
         self._dirty = True
 
     def clear(self) -> None:
@@ -140,6 +147,7 @@ class LiveSampleView(QtWidgets.QWidget):
         n = np.array([s[0] for s in self._samples], dtype=float)
         value = np.array([s[1] for s in self._samples], dtype=float)
         std = np.array([s[2] for s in self._samples], dtype=float)
+        sem = np.array([s[3] for s in self._samples], dtype=float)
 
         self.figure.clear()
         ax = self.figure.add_subplot(111)
@@ -158,6 +166,8 @@ class LiveSampleView(QtWidgets.QWidget):
         last = f"last {_format_volts(value[-1])}"
         if np.isfinite(std[-1]):
             last += f" \N{PLUS-MINUS SIGN} {_format_volts(std[-1])}"
+        if np.isfinite(sem[-1]):
+            last += f"  ·  SEM {_format_volts(sem[-1])}"
         self.status_label.setText(f"reading {self.sample_count}  ·  {last}")
 
     @staticmethod
@@ -169,4 +179,29 @@ class LiveSampleView(QtWidgets.QWidget):
         ax.figure.set_facecolor("#0b1118")
 
 
-__all__ = ["MonitorSampleBridge", "LiveSampleView"]
+class LiveReadoutDock(QtWidgets.QDockWidget):
+    """Self-contained dockable live-readout panel (bridge + strip chart).
+
+    Owns its worker→GUI bridge and knows how to hook itself onto a monitor
+    controller, so the main window only creates and docks it, then calls
+    ``watch()`` / ``unwatch()`` when the scope or DAQ connects/disconnects.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__("Live Readout (scope/DAQ)", parent)
+        self.setObjectName("LiveReadoutDock")
+        self.view = LiveSampleView(self)
+        self.setWidget(self.view)
+        self.bridge = MonitorSampleBridge(self)
+        self.bridge.sample_ready.connect(self.view.add_sample)
+
+    def watch(self, controller) -> None:
+        """Start mirroring a controller's monitor_cycle() samples."""
+        controller.add_sample_listener(self.bridge.on_sample)
+
+    def unwatch(self, controller) -> None:
+        """Stop mirroring (safe to call even if watch() never ran)."""
+        controller.remove_sample_listener(self.bridge.on_sample)
+
+
+__all__ = ["MonitorSampleBridge", "LiveSampleView", "LiveReadoutDock"]

@@ -317,20 +317,8 @@ def make_plot(fit: PhaseFit, tgt: int, path) -> None:
     )
     ax1.text(0.05, 0.95, txt, transform=ax1.transAxes, va="top",
              bbox=dict(boxstyle="round", fc="white", alpha=0.85), fontsize=8)
-    """Measured Y(theta2) with the fitted a/b/dPhi_comb model curve + pulls, PNG.
 
-    Rendering lives in :mod:`slm_module.tpa_phase_report` (shared with the
-    GUI); this wrapper only owns the headless figure + save-to-file part.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")  # headless: write a PNG rather than open a window
-    from matplotlib.figure import Figure
-
-    from slm_module.tpa_phase_report import plot_fringe
-
-    fig = Figure(figsize=(12, 5))
-    plot_fringe(fig, fit, tgt)
+    fig.tight_layout()
     fig.savefig(path, dpi=150)
 
 
@@ -429,19 +417,6 @@ def build_w2_sweep() -> list[tuple[float, float, float, float]]:
     """
     return [(1.0, float(w2), 1.0, 1.0) for w2 in MEAS_W2_VALUES]
 
-    Rendering lives in :mod:`slm_module.tpa_phase_report` (shared with the
-    GUI); this wrapper only owns the headless figure + save-to-file part.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")  # headless: write a PNG rather than open a window
-    from matplotlib.figure import Figure
-
-    from slm_module.tpa_phase_report import plot_report
-
-    fig = Figure(figsize=(12, 5))
-    plot_report(fig, result, tgt, ref, subtitle=subtitle)
-    fig.savefig(path, dpi=150)
 
 _MEAS_CSV_HEADER = [
     "trial", "tgt_index", "ref_index",

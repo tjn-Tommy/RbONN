@@ -364,6 +364,13 @@ class PipelinePage(QtWidgets.QWidget):
         self.wl_window = QtWidgets.QSpinBox()
         self.wl_window.setRange(1, 200)
         self.wl_window.setValue(8)
+        self.wl_stride = QtWidgets.QSpinBox()
+        self.wl_stride.setRange(1, 256)
+        self.wl_stride.setValue(1)
+        self.wl_stride.setToolTip(
+            "Measure every Nth column; the near-linear wavelength fit fills "
+            "in the skipped columns (1 = measure every column)"
+        )
         self.wl_peak_nm = QtWidgets.QDoubleSpinBox()
         self.wl_peak_nm.setRange(0.01, 20.0)
         self.wl_peak_nm.setValue(1.0)
@@ -379,6 +386,8 @@ class PipelinePage(QtWidgets.QWidget):
         grid.addWidget(self.wl_window, 1, 1)
         grid.addWidget(self.wl_peak_check, 1, 2)
         grid.addWidget(self.wl_peak_nm, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Stride (px)"), 1, 4)
+        grid.addWidget(self.wl_stride, 1, 5)
         grid.addWidget(self.wl_region_check, 2, 0)
         grid.addWidget(self.wl_region_start, 2, 1)
         grid.addWidget(self.wl_region_end, 2, 3)
@@ -680,6 +689,7 @@ class PipelinePage(QtWidgets.QWidget):
             return WlMapConfig(
                 levels=_levels_from(*self.wl_levels),
                 window_size=self.wl_window.value(),
+                coordinate_stride=self.wl_stride.value(),
                 peak_half_window_nm=(
                     self.wl_peak_nm.value()
                     if self.wl_peak_check.isChecked() else None
@@ -1008,7 +1018,7 @@ class PipelinePage(QtWidgets.QWidget):
     # ------------------------------------------------------------- persistence
     _PERSIST_SPINS = (
         "lay_channels", "lay_width", "lay_gap", "lay_center_gap",
-        "wl_window", "int_skip", "ctr_points", "ctr_pair", "ctr_trials",
+        "wl_window", "wl_stride", "int_skip", "ctr_points", "ctr_pair", "ctr_trials",
         "ctr_repeats", "eta_points", "eta_trials", "eta_repeats",
         "ph_ref", "ph_points", "ph_trials", "ph_repeats",
     )
