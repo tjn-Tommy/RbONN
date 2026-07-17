@@ -20,11 +20,11 @@ class PhasePattern:
 
 
 @dataclass(frozen=True)
-class XSegment:
-    """A vertical band [x_start, x_end) filled with a constant phase level."""
+class Segment:
+    """A band [start, end) along the partition axis, filled with a constant level."""
 
-    x_start: int
-    x_end: int
+    start: int
+    end: int
     level: int
 
 
@@ -51,85 +51,103 @@ def make_vertical_window(
     return data
 
 
-def make_x_segments(
+def make_segments(
     width: int,
     height: int,
-    segments: Sequence[XSegment | tuple[int, int, int]],
+    segments: Sequence[Segment | tuple[int, int, int]],
     *,
+    axis: str = "x",
     background_level: int = 0,
 ) -> np.ndarray:
-    """Build a pattern from explicit vertical bands along the x axis.
+    """Build a pattern from explicit bands along the chosen axis.
 
-    Each segment fills columns [x_start, x_end) with its level for the full
-    height. Segments must not overlap; uncovered columns get background_level.
+    With ``axis="x"`` each segment fills columns [start, end) with its level
+    for the full height (vertical bands); with ``axis="y"`` it fills rows
+    [start, end) for the full width (horizontal bands). Segments must not
+    overlap; uncovered lines get background_level.
     """
     width = _positive_int(width, "width")
     height = _positive_int(height, "height")
+    size = _axis_size(axis, width, height)
     background_level = _bounded_int(background_level, "background_level", MIN_LEVEL, MAX_LEVEL)
     if not segments:
         raise ValueError("segments must not be empty")
 
-    normalized: list[XSegment] = []
+    normalized: list[Segment] = []
     for index, segment in enumerate(segments):
-        if isinstance(segment, XSegment):
-            x_start, x_end, level = segment.x_start, segment.x_end, segment.level
+        if isinstance(segment, Segment):
+            start, end, level = segment.start, segment.end, segment.level
         else:
-            x_start, x_end, level = segment
+            start, end, level = segment
         name = f"segments[{index}]"
-        x_start = _bounded_int(x_start, f"{name}.x_start", 0, width - 1)
-        x_end = _bounded_int(x_end, f"{name}.x_end", 1, width)
+        start = _bounded_int(start, f"{name}.start", 0, size - 1)
+        end = _bounded_int(end, f"{name}.end", 1, size)
         level = _bounded_int(level, f"{name}.level", MIN_LEVEL, MAX_LEVEL)
-        if x_end <= x_start:
-            raise ValueError(f"{name}: x_end must be greater than x_start")
-        normalized.append(XSegment(x_start=x_start, x_end=x_end, level=level))
+        if end <= start:
+            raise ValueError(f"{name}: end must be greater than start")
+        normalized.append(Segment(start=start, end=end, level=level))
 
-    ordered = sorted(normalized, key=lambda segment: segment.x_start)
+    ordered = sorted(normalized, key=lambda segment: segment.start)
     for previous, current in zip(ordered, ordered[1:]):
-        if current.x_start < previous.x_end:
+        if current.start < previous.end:
             raise ValueError(
-                f"segments overlap: [{previous.x_start}, {previous.x_end}) and "
-                f"[{current.x_start}, {current.x_end})"
+                f"segments overlap: [{previous.start}, {previous.end}) and "
+                f"[{current.start}, {current.end})"
             )
 
     data = np.full((height, width), background_level, dtype=np.uint16)
     for segment in ordered:
-        data[:, segment.x_start:segment.x_end] = segment.level
+        if axis == "x":
+            data[:, segment.start:segment.end] = segment.level
+        else:
+            data[segment.start:segment.end, :] = segment.level
     return data
 
 
-def make_equal_x_segments(
+def make_equal_segments(
     width: int,
     height: int,
     levels: Sequence[int],
+    *,
+    axis: str = "x",
 ) -> np.ndarray:
-    """Divide the x axis into len(levels) equal parts with one level each.
+    """Divide the chosen axis into len(levels) equal parts with one level each.
 
-    Boundaries are rounded so the parts cover the full width exactly even
-    when width is not divisible by the number of parts.
+    Boundaries are rounded so the parts cover the full axis exactly even
+    when its size is not divisible by the number of parts.
     """
     width = _positive_int(width, "width")
     height = _positive_int(height, "height")
+    size = _axis_size(axis, width, height)
     if not levels:
         raise ValueError("levels must not be empty")
     count = len(levels)
-    if count > width:
-        raise ValueError("number of parts cannot exceed width")
+    if count > size:
+        raise ValueError("number of parts cannot exceed the axis size")
 
-    edges = equal_x_segment_edges(width, count)
+    edges = equal_segment_edges(size, count)
     segments = [
-        XSegment(x_start=edges[index], x_end=edges[index + 1], level=int(level))
+        Segment(start=edges[index], end=edges[index + 1], level=int(level))
         for index, level in enumerate(levels)
     ]
-    return make_x_segments(width, height, segments)
+    return make_segments(width, height, segments, axis=axis)
 
 
-def equal_x_segment_edges(width: int, count: int) -> list[int]:
-    """Return count+1 boundary positions dividing [0, width) into equal parts."""
-    width = _positive_int(width, "width")
+def equal_segment_edges(size: int, count: int) -> list[int]:
+    """Return count+1 boundary positions dividing [0, size) into equal parts."""
+    size = _positive_int(size, "size")
     count = _positive_int(count, "count")
-    if count > width:
-        raise ValueError("number of parts cannot exceed width")
-    return [round(index * width / count) for index in range(count + 1)]
+    if count > size:
+        raise ValueError("number of parts cannot exceed the axis size")
+    return [round(index * size / count) for index in range(count + 1)]
+
+
+def _axis_size(axis: str, width: int, height: int) -> int:
+    if axis == "x":
+        return width
+    if axis == "y":
+        return height
+    raise ValueError('axis must be "x" or "y"')
 
 
 def iter_center_scan_positions(

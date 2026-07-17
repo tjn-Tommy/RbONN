@@ -56,18 +56,24 @@ class EncodingChannel:
     def level_for(self, val: float) -> int:
         """Map a normalised output power val in [0, 1] to an SLM level.
 
-        Nearest-neighbour lookup on the *measured* transfer curve. The target
-        output is  val * (max - min)  above the channel's minimum, and we pick
-        the swept level whose measured output is closest to that target. The
-        curve is taken over the off->on segment with a monotonic envelope, so
-        the mapping is non-decreasing: val = 0 -> off_level, val = 1 -> on_level.
+        Linear interpolation on the *measured* transfer curve. The target
+        output is  val * (max - min)  above the channel's minimum; the two
+        swept points bracketing that target define the level by linear
+        interpolation, rounded to the nearest integer grayscale — so the
+        result is not limited to the levels actually swept. The curve is
+        taken over the off->on segment with a monotonic envelope, so the
+        mapping is non-decreasing: val = 0 -> off_level, val = 1 -> on_level.
         """
         val = float(np.clip(val, 0.0, 1.0))
         off_p = float(self._seg_curve[0])
         on_p = float(self._seg_curve[-1])
         target = off_p + val * (on_p - off_p)
-        idx = int(np.argmin(np.abs(self._seg_curve - target)))
-        return int(self._seg_levels[idx])
+        # drop the repeated points of each flat run the envelope created,
+        # keeping the lowest level that reaches each measured output, so the
+        # interpolation abscissa is strictly increasing
+        keep = np.r_[True, np.diff(self._seg_curve) > 0.0]
+        level = np.interp(target, self._seg_curve[keep], self._seg_levels[keep])
+        return int(round(float(level)))
 
 
 @dataclass
@@ -304,6 +310,14 @@ def build_channel_layout(
 ) -> ChannelLayout:
     """Build an encoding layout centred at center_wl with dark guard bands.
 
+    .. deprecated::
+        Do NOT use this to consume a Step-3b/3c channel calibration -- those
+        rows already ARE the channels; load them verbatim with
+        :func:`channel_layout_from_calibration` (what the GUI, the pipeline
+        stages and the draft scripts do).  Re-tiling here only remains for
+        cases where no measured channel grid exists yet: the coarse Step-1+2
+        preview and the tpa_center scan, which must move the layout centre.
+
     Geometry (see the numbered plan this implements):
       1. Fit wl = a*x + b over the Step-2 mapping (a < 0: higher x -> lower wl).
       2. Anchor the centre pixel c0 = round((center_wl - b) / a). The centre sits
@@ -379,6 +393,136 @@ def build_channel_layout(
         calib_off_levels=off_per_coord,
         dark_px_ranges=list(geom.dark_px_ranges),
         center_gap_px=geom.center_gap_px,
+    )
+
+
+def channel_layout_from_calibration(
+    calib: CalibrationResult,
+    *,
+    channel_width_px: int | None = None,
+    assumed_gap_px: int = 5,
+) -> ChannelLayout:
+    """Rebuild a ChannelLayout verbatim from a channels-only calibration.
+
+    A Step-3b/3c result already *is* the channel structure: each row was
+    measured at one encoding-channel centre of a mirror-symmetric grid, so the
+    target centre, pitch and guard skips are all baked into ``coordinates``.
+    This loader takes those rows as the channels directly -- no re-tiling, no
+    guard-band rebuild, no nearest-coordinate snapping -- so the encoder always
+    agrees with what was actually measured.
+
+    The file does not record how the scan's pitch split into window + gap, so
+    the window width defaults to ``pitch - assumed_gap_px`` (the Step-3c
+    default gap); pass ``channel_width_px`` to override.
+    """
+    if calib.intensity_levels is None:
+        raise ValueError("CalibrationResult has no intensity data (Step 3c not run)")
+
+    coords = np.asarray(calib.coordinates, dtype=float)
+    wls = np.asarray(calib.wavelength, dtype=float)
+    intens = np.asarray(calib.intensity_levels, dtype=float)
+    levels = np.asarray(calib.level_range, dtype=int)
+    n = coords.size
+    if n < 4 or n % 2:
+        raise ValueError(
+            f"channel calibration needs an even number of coordinates (>= 4), got {n}"
+        )
+    if wls.size != n or intens.ndim != 2 or intens.shape[0] != n:
+        raise ValueError("wavelength/intensity rows do not match the coordinates")
+
+    order = np.argsort(coords)
+    coords, wls, intens = coords[order], wls[order], intens[order]
+
+    # mirror pairs (outermost-in) share one midpoint; a spread means the file
+    # is not a symmetric channel grid
+    midpoints = 0.5 * (coords + coords[::-1])
+    center_x = float(np.mean(midpoints))
+    if float(np.max(np.abs(midpoints - center_x))) > 1.0:
+        raise ValueError(
+            "coordinates are not mirror-symmetric channel pairs (midpoint "
+            f"spread {float(np.ptp(midpoints)):.2f} px) -- is this a Step 3b/3c "
+            "channel result?"
+        )
+
+    diffs = np.diff(coords)
+    pitch = int(round(float(np.min(diffs))))
+    if pitch < 1:
+        raise ValueError("duplicate channel coordinates in the calibration")
+
+    if channel_width_px is None:
+        width = pitch - int(assumed_gap_px)
+        if width < 1:
+            raise ValueError(
+                f"grid pitch {pitch} px is too fine to infer a window width -- "
+                "this looks like a dense Step-3 scan, not a channel grid"
+            )
+    else:
+        width = int(channel_width_px)
+        if width < 1:
+            raise ValueError("channel_width_px must be positive")
+    if width > pitch:
+        raise ValueError(
+            f"channel width {width} px exceeds the {pitch} px grid pitch"
+        )
+
+    a, b = np.polyfit(coords, wls, 1)
+    if a == 0.0 or not np.isfinite(a) or not np.isfinite(b):
+        raise ValueError("degenerate wavelength fit (need a sloped x->wl map)")
+    center_wl = float(a * center_x + b)
+
+    # x side = the half with wavelengths above the centre; both sides ordered
+    # innermost-first so x[i]/w[i] stay mirror pairs (the encoder contract)
+    half = n // 2
+    if a < 0:
+        x_rows = range(half - 1, -1, -1)
+        w_rows = range(half, n)
+    else:
+        x_rows = range(half, n)
+        w_rows = range(half - 1, -1, -1)
+
+    half_w = width // 2
+
+    def _make(index: int, side: str, row: int) -> EncodingChannel:
+        x_c = int(round(coords[row]))
+        x_start = x_c - half_w
+        return EncodingChannel(
+            index=index,
+            side=side,
+            x_center=x_c,
+            x_start=x_start,
+            x_end=x_start + width,
+            wavelength_nm=float(wls[row]),
+            levels=levels.copy(),
+            intensity_curve=intens[row].copy(),
+        )
+
+    x_channels = [_make(i, "x", row) for i, row in enumerate(x_rows)]
+    w_channels = [_make(i, "w", row) for i, row in enumerate(w_rows)]
+
+    # guard skips show up as larger-than-pitch jumps in the grid; keep the
+    # pixels between the flanking windows as dark ranges for inspection (the
+    # renderer leaves unlit columns at their off level anyway)
+    dark_ranges: list[tuple[int, int]] = []
+    centers = np.round(coords).astype(int)
+    for left, right, diff in zip(centers[:-1], centers[1:], diffs):
+        if int(round(float(diff))) > pitch:
+            lo = int(left - half_w + width)
+            hi = int(right - half_w - 1)
+            if lo <= hi:
+                dark_ranges.append((lo, hi))
+
+    return ChannelLayout(
+        x_channels=x_channels,
+        w_channels=w_channels,
+        center_wl=center_wl,
+        center_x=center_x,
+        channel_width_px=width,
+        pitch_px=pitch,
+        nm_per_px=abs(float(a)),
+        calib_coords=coords,
+        calib_off_levels=levels[np.argmin(intens, axis=1)],
+        dark_px_ranges=dark_ranges,
+        center_gap_px=None,
     )
 
 

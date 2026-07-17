@@ -30,10 +30,8 @@ with ``phi_half(x) = asin(sqrt(x)) = phi/2`` (:func:`phi_half`,
 where ``a`` := reference amplitude and ``b`` := target amplitude.  ``(g, dPhi_SLM)``
 are computed per row straight from the commanded intensities, so the fit is
 GEOMETRY-GENERAL: it does not care how the sweep was built.  The usual drive holds
-the reference AND the target's x channel fully on and sweeps only ``w_t`` (so
-``g = sqrt(w_t)``, ``dPhi_SLM = phi_half(w_t) - pi/2``); a re-fit of an older CSV
-that swept both target channels together (``x_t = w_t``, so ``g = sin(theta/2)^2``,
-``dPhi_SLM = theta - pi``) fits identically.  Because the target is calibrated
+the reference fully on and sweeps both target channels together (``x_t = w_t``, so
+``g = sin(theta/2)^2``, ``dPhi_SLM = theta - pi``).  Because the target is calibrated
 *against* the reference and the reference defines ``Phi = 0``, the fitted
 ``dPhi_comb`` IS the target pair's phase in the spectrum ``{Phi_k}``.
 
@@ -50,14 +48,21 @@ fully-on reference contributes a constant, the swept target the ramp, so the fri
 never absorbs the single-beam ramp (which would bias dPhi_comb).  The three free
 parameters ``s, dPhi_comb, d`` are solved by bounded nonlinear least squares
 (:func:`fit_phase_ratio`); ``d`` should sit near 0 after per-row dark removal.
+``frac = 0`` collapses the box: ``s`` is PINNED at exactly 1 (``a``/``b`` are the
+step-6 etas verbatim) and only ``dPhi_comb, d`` float.
 ``a_at_bound``/``b_at_bound`` (both track the shared ``s``) warn when the scale box
 actually bound.  An unconstrained closed-form variant is kept as :func:`fit_phase`
 for diagnostics.
 
-The measurement is instrument-agnostic exactly like step 6.  Raw rows (one per
+This module is fitting + IO only and geometry-general.  The instrument-facing
+half (drive builders + the SLM/monitor sweep) lives in
+:mod:`slm_module.tpa_phase_measure` for the pipeline, and in
+``src/drafts/calib_step7_test.py`` for the offline driver.  Raw rows (one per
 trial x point) are persisted as a CSV (:func:`write_phase_csv`) so a run can be
-reloaded and re-fit offline (:func:`load_phase_csv`); the driver in
-``src/drafts/calib_step7_test.py`` does the SLM/DAQ wiring.
+reloaded and re-fit offline (:func:`load_phase_csv`); the fitted spectrum is
+persisted as a combined ``{step3, step6, step7}`` JSON
+(:func:`save_comb_phase_json` / :func:`load_comb_phase_json`) that downstream
+consumers read as their single input.
 """
 from __future__ import annotations
 
@@ -68,7 +73,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-
 
 # ======================================================================
 # per-pair step-6 model  (background + eta, used to isolate the fringe)
@@ -236,7 +240,7 @@ class PhaseFit:
     r2: float
     eta_ref: float             # step-6 bound centre for a
     eta_tgt: float             # step-6 bound centre for b
-    bound_frac: float          # box half-width as a fraction of eta (inf == free)
+    bound_frac: float          # box half-width as a fraction of eta (inf == free, 0 == s pinned at 1)
     a_at_bound: bool
     b_at_bound: bool
     bg0: float                 # step-6 single-beam background, constant
@@ -251,9 +255,7 @@ class PhaseFit:
     y_pred: np.ndarray = field(repr=False)       # full model prediction
     residuals: np.ndarray = field(repr=False)
     # commanded intensities per fitted point (same order as g/dphi_slm), so the
-    # plot/report can tell how the sweep was driven: w-only (x_t != w_t; ref +
-    # target-x held on, only w_t swept, g = sqrt(w_t)) vs both target channels
-    # together (x_t == w_t, g = sin^2(theta/2)).  Optional -> None: old fits load.
+    # plot can rebuild the swept geometry.  Optional -> None: old fits load.
     x_t: np.ndarray | None = field(default=None, repr=False)
     w_t: np.ndarray | None = field(default=None, repr=False)
     x_r: np.ndarray | None = field(default=None, repr=False)
@@ -484,7 +486,14 @@ def fit_phase_ratio(
     background (dark already removed) that the amplitudes do NOT scale.  Solved as
     a bounded nonlinear least squares (:func:`scipy.optimize.least_squares`);
     errors are covariance-propagated from the Jacobian and Birge-scaled.
-    ``bg0/bg1/bg2`` re-express that background as a polynomial in ``g`` for the
+
+    ``frac = 0`` collapses the box: ``s`` is PINNED at exactly 1, so
+    ``a = eta_ref`` and ``b = eta_tgt`` verbatim and only ``dPhi_comb`` and ``d``
+    float (two free parameters) -- use when the step-6 amplitudes are trusted
+    outright.  ``a_err``/``b_err`` are then 0 by construction, and the step-6 eta
+    uncertainties are NOT propagated into ``dphi_comb_err``.
+
+    ``bg0/bg1/bg2`` re-express the background as a polynomial in ``g`` for the
     special case ``x_t = w_t`` and are only stashed for reference.  ``eta_ref_err``/
     ``eta_tgt_err`` are accepted for API symmetry (reserved for a soft ratio
     prior) but do not enter this hard-ratio fit.
@@ -498,18 +507,12 @@ def fit_phase_ratio(
     sem = np.asarray(sem, dtype=float)
 
     A, B = float(eta_ref), float(eta_tgt)
+    fix_scale = frac == 0.0                                   # box collapsed -> s pinned at 1
 
-    def predict(p):
-        s, dphi, d = p
+    def predict(s, dphi, d):
         s2 = s * s
         return (s2 * (A * A + B * B * g * g)
                 + 2.0 * s2 * A * B * g * np.cos(dphi_slm + dphi) + fixed_bg + d)
-
-    def resid(p):
-        return (predict(p) - y) / sem
-
-    lo = [max(0.0, 1.0 - frac), -np.inf, -np.inf]
-    hi = [1.0 + frac, np.inf, np.inf]
 
     # phase seed: linear projection of the (background + self) subtracted signal
     w = 1.0 / sem**2
@@ -517,16 +520,28 @@ def fit_phase_ratio(
     P = float(np.sum(w * r0 * g * np.cos(dphi_slm)))
     Q = float(np.sum(w * r0 * g * np.sin(dphi_slm)))
     dphi0 = float(np.arctan2(-Q, P))
-    p0 = [1.0, dphi0, 0.0]
 
-    sol = least_squares(resid, p0, bounds=(lo, hi), max_nfev=20000)
-    s, dphi, d = (float(v) for v in sol.x)
+    if fix_scale:                  # 2 free params (dPhi_comb, d); a = A, b = B verbatim
+        def resid(p):
+            return (predict(1.0, p[0], p[1]) - y) / sem
+
+        sol = least_squares(resid, [dphi0, 0.0], max_nfev=20000)
+        s, dphi, d = 1.0, float(sol.x[0]), float(sol.x[1])
+    else:                          # 3 free params; s boxed to [max(0, 1-frac), 1+frac]
+        def resid(p):
+            return (predict(p[0], p[1], p[2]) - y) / sem
+
+        lo = [max(0.0, 1.0 - frac), -np.inf, -np.inf]
+        hi = [1.0 + frac, np.inf, np.inf]
+        sol = least_squares(resid, [1.0, dphi0, 0.0], bounds=(lo, hi), max_nfev=20000)
+        s, dphi, d = (float(v) for v in sol.x)
     dphi = float(np.arctan2(np.sin(dphi), np.cos(dphi)))      # wrap to (-pi, pi]
     a, b = s * A, s * B                                       # ratio locked to A:B
 
-    y_pred = predict(sol.x)
+    y_pred = predict(s, dphi, d)
     residuals = y - y_pred
-    dof = max(len(y) - 3, 1)
+    n_free = 2 if fix_scale else 3
+    dof = max(len(y) - n_free, 1)
     chi2_red = float(np.sum((residuals / sem) ** 2) / dof)
     birge = max(1.0, np.sqrt(chi2_red))
 
@@ -534,21 +549,26 @@ def fit_phase_ratio(
     try:
         cov = np.linalg.inv(sol.jac.T @ sol.jac) * birge**2
     except np.linalg.LinAlgError:
-        cov = np.full((3, 3), np.nan)
-    s_err = float(np.sqrt(max(cov[0, 0], 0.0)))
-    dphi_err = float(np.sqrt(max(cov[1, 1], 0.0)))
-    offset_err = float(np.sqrt(max(cov[2, 2], 0.0)))
+        cov = np.full((n_free, n_free), np.nan)
+    if fix_scale:
+        s_err = 0.0                                           # s is a constant, not fitted
+        dphi_err = float(np.sqrt(max(cov[0, 0], 0.0)))
+        offset_err = float(np.sqrt(max(cov[1, 1], 0.0)))
+        a_at_bound = b_at_bound = False
+    else:
+        s_err = float(np.sqrt(max(cov[0, 0], 0.0)))
+        dphi_err = float(np.sqrt(max(cov[1, 1], 0.0)))
+        offset_err = float(np.sqrt(max(cov[2, 2], 0.0)))
+
+        def _hit(val, lower, upper) -> bool:
+            span = max(abs(upper - lower), 1e-30)
+            return bool(val - lower <= 1e-6 * span or upper - val <= 1e-6 * span)
+
+        # a and b move together, so both share the single scale's bound state
+        a_at_bound = b_at_bound = _hit(s, lo[0], hi[0])
     a_err, b_err = A * s_err, B * s_err                       # fully correlated via s
     amp = 2.0 * a * b                                         # = 2 s^2 A B
     amp_err = float(abs(4.0 * s * A * B) * s_err)             # d(amp)/ds = 4 s A B
-
-    def _hit(val, lower, upper) -> bool:
-        span = max(abs(upper - lower), 1e-30)
-        return bool(val - lower <= 1e-6 * span or upper - val <= 1e-6 * span)
-
-    # a and b move together, so both share the single scale's bound state
-    s_at_bound = _hit(s, lo[0], hi[0])
-    a_at_bound = b_at_bound = s_at_bound
 
     known = a * a + b * b * g * g + fixed_bg
     ss_res = float(np.sum(residuals**2))
@@ -590,11 +610,13 @@ def fit_result(
       This is the numerically clean, well-conditioned fit for ``dPhi_comb``.
     * a number -- lock the ratio ``a:b`` to the step-6 ``eta_ref:eta_tgt`` and
       float only a shared scale ``s`` boxed to ``+/- frac`` about 1, via the
-      ratio-locked nonlinear fit (:func:`fit_phase_ratio`).  ``single_beam_bg``
-      then also folds in both pairs' step-6 single-beam response as a FIXED
-      additive background: the reference (held fully on) contributes a constant,
-      the swept target contributes the ``~g`` ramp, so ``s``/``dPhi_comb`` are not
-      forced to absorb it.
+      ratio-locked nonlinear fit (:func:`fit_phase_ratio`).  ``frac=0`` pins the
+      scale exactly (``s = 1``: ``a``/``b`` ARE the step-6 etas; only
+      ``dPhi_comb`` and ``d`` float).  ``single_beam_bg`` then also folds in both
+      pairs' step-6 single-beam response as a FIXED additive background: the
+      reference (held fully on) contributes a constant, the swept target
+      contributes the ``~g`` ramp, so ``s``/``dPhi_comb`` are not forced to
+      absorb it.
 
     ``dark`` (scalar) overrides the per-row dark uniformly.
     """
@@ -628,11 +650,49 @@ def fit_result(
             bg0=bg0, bg1=bg1, bg2=bg2, frac=frac,
         )
 
-    # stash the per-point commanded intensities so plot/report can tell how the
-    # sweep was driven (w-only: x_t != w_t; both target channels together: x_t == w_t)
+    # stash the per-point commanded intensities so the plot can rebuild the sweep
     fit.x_t, fit.w_t, fit.x_r, fit.w_r = x_t, w_t, x_r, w_r
     result.fit = fit
     return fit
+
+
+def swap_invariance(result: PhaseResult):
+    """Table-2 diagnostic: |Z(x=a,w=b) - Z(x=b,w=a)| for each swap pair.
+
+    The test runs on the CLEAN interference term, not raw Y, so the fitted self
+    terms AND the step-6 single-beam background are removed first::
+
+        Z(x,w) = Y(x,w) - [a^2 + b^2 (x w) + sb_ref + sb_tgt] - d
+               = 2 a b sqrt(x w) cos(dPhi_SLM + dPhi_comb)
+
+    Under the bilinear model the target amplitude ``sqrt(x w)`` and ``dPhi_SLM``
+    (a channel *sum*) are swap-symmetric, so ``Z`` must be too; a residual well
+    above the combined SEM flags a genuine channel asymmetry (unequal per-channel
+    phase/amplitude law or crosstalk).  Returns ``(x_t, w_t, z, z_swapped,
+    abs_diff, sem)`` for the off-diagonal cells.  Falls back to raw Y only if the
+    fit is not attached.  ``fit.known`` already carries ``a^2 + b^2 g^2 + sb``.
+    """
+    x_t, w_t, x_r, w_r, y, sem = _average_points(result)   # y already dark-subtracted
+    fit = result.fit
+    if fit is not None and fit.known is not None and np.isfinite(fit.a):
+        # clean interference: strip fitted self terms + step-6 single-beam + d
+        sig = y - fit.known - fit.offset
+    else:
+        sig = y
+
+    lut = {(round(a, 9), round(b, 9)): (zz, ss)
+           for a, b, zz, ss in zip(x_t, w_t, sig, sem)}
+    out = []
+    for a, b, zz, ss in zip(x_t, w_t, sig, sem):
+        if round(a, 9) == round(b, 9):
+            continue
+        swapped = lut.get((round(b, 9), round(a, 9)))
+        if swapped is None:
+            continue
+        z_sw, s_sw = swapped
+        out.append((float(a), float(b), float(zz), float(z_sw),
+                    abs(float(zz) - float(z_sw)), float(np.hypot(ss, s_sw))))
+    return out
 
 
 # ======================================================================
@@ -691,8 +751,8 @@ def load_phase_csv(
     """Load a raw phase-sweep CSV and re-fit dPhi_comb with the given step-6 models.
 
     The per-row ``dark_v`` column is used when present; otherwise the scalar
-    ``# dark_mean_v`` (or legacy ``# dark_v``) comment, then the step-6 mean, is
-    filled for every row.  ``dark`` (scalar) overrides all of them uniformly.
+    ``# dark_mean_v`` comment, then the step-6 mean, is filled for every row.
+    ``dark`` (scalar) overrides all of them uniformly.
 
     ``only_tgt`` keeps only rows whose ``tgt_index`` matches it; a collected file
     records every target pair vs the shared reference in one CSV, so pass the pair
@@ -701,15 +761,16 @@ def load_phase_csv(
     ``frac``/``single_beam_bg`` are forwarded to :func:`fit_result`: ``frac=None``
     (default) keeps the unconstrained closed-form fit; a number locks ``a:b`` to
     the step-6 ``eta_ref:eta_tgt`` ratio and floats a shared scale boxed to
-    ``+/- frac``.  ``single_beam_bg`` additionally folds in both pairs' step-6
-    single-beam response as a fixed background.
+    ``+/- frac`` (``frac=0`` pins ``a``/``b`` to the step-6 etas exactly).
+    ``single_beam_bg`` additionally folds in both pairs' step-6 single-beam
+    response as a fixed background.
     """
     file_dark: float | None = None
     with open(Path(path), newline="", encoding="utf-8") as f:
         for raw in f:
             if raw.startswith("#"):
                 parts = raw.lstrip("#").strip().split(",")
-                if len(parts) == 2 and parts[0].strip() in ("dark_mean_v", "dark_v"):
+                if len(parts) == 2 and parts[0].strip() == "dark_mean_v":
                     file_dark = float(parts[1])
 
     rows: list[tuple[int, float, float, float, float, float, float, float, float | None]] = []
@@ -721,10 +782,7 @@ def load_phase_csv(
                 continue  # skip the other targets in a multi-pair CSV
             dv = row.get("dark_v")
             std_v = float(row.get("voltage_std_v", "nan") or "nan")
-            # New CSVs carry voltage_sem_v (the fit weight); older single-column
-            # CSVs stored the SEM in voltage_std_v, so fall back to it when absent.
-            sem_raw = row.get("voltage_sem_v")
-            sem_v = float(sem_raw) if sem_raw not in (None, "") else std_v
+            sem_v = float(row["voltage_sem_v"])  # the fit weight; every CSV records it
             rows.append((
                 int(float(row.get("trial", 0))),
                 float(row["x_t"]), float(row["w_t"]),
@@ -767,6 +825,33 @@ def load_phase_csv(
     return result
 
 
+def phase_fit_payload(fit: PhaseFit) -> dict:
+    """JSON-ready summary of one dPhi_comb fit (shared by every phase saver)."""
+    return {
+        "dphi_comb_rad": fit.dphi_comb,
+        "dphi_comb_deg": fit.dphi_comb_deg,
+        "dphi_comb_err_rad": fit.dphi_comb_err,
+        "dphi_comb_err_deg": float(np.degrees(fit.dphi_comb_err)),
+        "a": fit.a,                 # reference amplitude R_1 (~ eta_ref)
+        "a_err": fit.a_err,
+        "a_at_bound": fit.a_at_bound,
+        "b": fit.b,                 # target amplitude scale (~ eta_tgt)
+        "b_err": fit.b_err,
+        "b_at_bound": fit.b_at_bound,
+        "eta_ref": fit.eta_ref,     # step-6 box centre for a
+        "eta_tgt": fit.eta_tgt,     # step-6 box centre for b
+        "bound_frac": fit.bound_frac,
+        "amp_2ab": fit.amp,         # interference amplitude 2ab
+        "amp_2ab_err": fit.amp_err,
+        "dark_resid_v": fit.offset,  # residual DC after per-row dark subtraction
+        "dark_resid_err_v": fit.offset_err,
+        "chi2_red": fit.chi2_red,
+        "dof": fit.dof,
+        "birge": fit.birge,
+        "r2": fit.r2,
+    }
+
+
 def save_phase_json(result: PhaseResult, path: str | Path) -> str:
     """Human-readable dPhi_comb summary (radians + degrees) and fit quality."""
     out = Path(path).resolve()
@@ -781,32 +866,91 @@ def save_phase_json(result: PhaseResult, path: str | Path) -> str:
         "n_trials": result.n_trials,
         "tgt_eta": result.tgt_model.eta if result.tgt_model else None,
         "ref_eta": result.ref_model.eta if result.ref_model else None,
-        "fit": None if fit is None else {
-            "dphi_comb_rad": fit.dphi_comb,
-            "dphi_comb_deg": fit.dphi_comb_deg,
-            "dphi_comb_err_rad": fit.dphi_comb_err,
-            "dphi_comb_err_deg": float(np.degrees(fit.dphi_comb_err)),
-            "a": fit.a,                 # reference amplitude R_1 (~ eta_ref)
-            "a_err": fit.a_err,
-            "a_at_bound": fit.a_at_bound,
-            "b": fit.b,                 # target amplitude scale (~ eta_tgt)
-            "b_err": fit.b_err,
-            "b_at_bound": fit.b_at_bound,
-            "eta_ref": fit.eta_ref,     # step-6 box centre for a
-            "eta_tgt": fit.eta_tgt,     # step-6 box centre for b
-            "bound_frac": fit.bound_frac,
-            "amp_2ab": fit.amp,         # interference amplitude 2ab
-            "amp_2ab_err": fit.amp_err,
-            "dark_resid_v": fit.offset,  # residual DC after per-row dark subtraction
-            "dark_resid_err_v": fit.offset_err,
-            "chi2_red": fit.chi2_red,
-            "dof": fit.dof,
-            "birge": fit.birge,
-            "r2": fit.r2,
+        "fit": None if fit is None else phase_fit_payload(fit),
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(out)
+
+
+def save_comb_phase_json(
+    fits: dict[tuple[int, str], PhaseFit],
+    step6_path: str | Path,
+    path: str | Path,
+    *,
+    ref_index: int,
+    csv_path: str | None = None,
+    single_beam_bg: bool | None = None,
+) -> str:
+    """Combined step-7 result JSON: ``{"step3": ..., "step6": ..., "step7": ...}``.
+
+    ``fits`` maps ``(tgt_index, method)`` to a fitted :class:`PhaseFit` --
+    ``method`` is the free-form amplitude-handling label the driver used
+    (e.g. ``"bounded"`` / ``"fix"``); a target may carry one entry per method.
+    The ``step3`` and ``step6`` payloads are carried over VERBATIM from the
+    combined step-6 JSON at ``step6_path``, so this one file is a superset:
+    channel layout (step3) + per-pair eta / single-beam / dark models (step6)
+    + the comb-phase spectrum ``{Phi_k}`` vs ``ref_index`` (step7).  Downstream
+    consumers (e.g. a multi-pair forward-model check) need nothing else.
+    """
+    payload6 = json.loads(Path(step6_path).read_text(encoding="utf-8"))
+    if "step6" not in payload6:                        # bare save_tpa_pair_json summary
+        payload6 = {"step3": payload6.get("step3"), "step6": payload6}
+    out = Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step3": payload6.get("step3"),
+        "step6": payload6.get("step6"),
+        "step7": {
+            "ref_index": int(ref_index),
+            "csv": csv_path,
+            "single_beam_bg": single_beam_bg,
+            "step6_json": str(Path(step6_path).resolve()),
+            "channels": [
+                {"tgt_index": int(k), "method": str(m), "fit": phase_fit_payload(f)}
+                for (k, m), f in sorted(fits.items())
+            ],
         },
     }
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return str(out)
+
+
+def load_comb_phase_json(
+    path: str | Path, *, method: str | None = None
+) -> tuple[int, dict[int, dict]]:
+    """Load a combined step-7 JSON -> ``(ref_index, {tgt_index: channel entry})``.
+
+    Each returned entry is the stored ``{"tgt_index", "method", "fit": {...}}``
+    dict (``fit["dphi_comb_rad"]`` is the comb phase vs the reference, which
+    defines ``Phi = 0``).  ``method`` picks among multiple stored fits per
+    target (e.g. ``"bounded"`` / ``"fix"``); with ``None`` a target must have
+    exactly one stored fit, otherwise the choice is ambiguous and raises.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    step7 = payload.get("step7")
+    if not isinstance(step7, dict):
+        raise ValueError(f"{path} has no 'step7' section (not a combined step-7 result)")
+    phases: dict[int, dict] = {}
+    seen: dict[int, list[str]] = defaultdict(list)
+    for ch in step7.get("channels", []):
+        if not ch.get("fit"):
+            continue
+        k = int(ch["tgt_index"])
+        m = str(ch.get("method", ""))
+        seen[k].append(m)
+        if method is None or m == method:
+            if method is None and k in phases:
+                raise ValueError(
+                    f"pair {k} has several stored fits ({seen[k]}); pass method="
+                )
+            phases[k] = ch
+    if method is not None:
+        missing = [k for k, ms in seen.items() if k not in phases]
+        if missing:
+            raise ValueError(
+                f"no '{method}' fit stored for pair(s) {sorted(missing)} in {path}"
+            )
+    return int(step7["ref_index"]), phases
 
 
 __all__ = [
@@ -820,7 +964,11 @@ __all__ = [
     "fit_phase",
     "fit_phase_ratio",
     "fit_result",
+    "swap_invariance",
     "write_phase_csv",
     "load_phase_csv",
+    "phase_fit_payload",
     "save_phase_json",
+    "save_comb_phase_json",
+    "load_comb_phase_json",
 ]

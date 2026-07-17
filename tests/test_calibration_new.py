@@ -765,6 +765,192 @@ class CalibrationNewTests(unittest.TestCase):
             result.wavelength, 700.0 + result.coordinates, atol=1e-6
         )
 
+    def test_wavelength_calibration_max_peak_excludes_artifact(self) -> None:
+        wavelengths = np.asarray([769.0, 770.0, 771.0, 772.0, 773.0])
+        # real peak at 771 nm; a stronger fixed artifact sits at 773 nm
+        peak = [0.1, 0.5, 1.0, 0.5, 5.0]
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+        ] + [make_trace(wavelengths, peak) for _ in range(4)]
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        # control: without the cap the artifact wins the peak search
+        result = wavelength_calibration(
+            FakeOSA([make_trace(wavelengths, t.powers.tolist()) for t in traces]),
+            FakeSLM(size=(5, 2)),
+            [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+        )
+        self.assertGreater(float(result.wavelength[0]), 772.5)
+
+        result = wavelength_calibration(
+            FakeOSA(traces),
+            FakeSLM(size=(5, 2)),
+            [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+            max_peak_wavelength_nm=772.5,
+        )
+        np.testing.assert_allclose(result.wavelength, 771.0, atol=1e-6)
+
+    def test_wavelength_calibration_min_peak_excludes_artifact(self) -> None:
+        wavelengths = np.asarray([769.0, 770.0, 771.0, 772.0, 773.0])
+        # real peak at 772 nm; a stronger fixed artifact sits at 769 nm
+        peak = [5.0, 0.1, 0.5, 1.0, 0.5]
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+        ] + [make_trace(wavelengths, peak) for _ in range(4)]
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        # control: without the floor the artifact wins the peak search
+        result = wavelength_calibration(
+            FakeOSA([make_trace(wavelengths, t.powers.tolist()) for t in traces]),
+            FakeSLM(size=(5, 2)),
+            [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+        )
+        self.assertLess(float(result.wavelength[0]), 769.5)
+
+        result = wavelength_calibration(
+            FakeOSA(traces),
+            FakeSLM(size=(5, 2)),
+            [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+            min_peak_wavelength_nm=769.5,
+        )
+        np.testing.assert_allclose(result.wavelength, 772.0, atol=1e-6)
+
+    def test_wavelength_calibration_rejects_inverted_peak_bounds(self) -> None:
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+        with self.assertRaises(ValueError):
+            wavelength_calibration(
+                FakeOSA([]), FakeSLM(size=(5, 2)),
+                [], MeasurementSettings(), seed,
+                window_size=2,
+                min_peak_wavelength_nm=780.0, max_peak_wavelength_nm=775.0,
+            )
+
+    def test_wavelength_calibration_floors_weak_reference(self) -> None:
+        wavelengths = np.asarray([769.0, 770.0, 771.0, 772.0, 773.0])
+        # the bright reference carries no light at 773 nm; the signal noise
+        # there must not be inflated by the near-zero denominator
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1e-9]),
+        ] + [make_trace(wavelengths, [0.1, 0.5, 1.0, 0.5, 0.4]) for _ in range(4)]
+        osa = FakeOSA(traces)
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        result = wavelength_calibration(
+            osa, FakeSLM(size=(5, 2)), [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+        )
+
+        np.testing.assert_allclose(result.wavelength, 771.0, atol=1e-6)
+
+    def test_wavelength_calibration_narrow_span_recenters_on_prediction(self) -> None:
+        # linear mapping wl = 700 + coordinate (window 2 -> coordinate = start+1)
+        wide_axis = np.arange(699.0, 722.0)
+
+        def wide_peak_trace(start: int) -> TraceData:
+            powers = np.zeros(wide_axis.size)
+            powers[int(np.flatnonzero(wide_axis == 700.0 + start + 1.0)[0])] = 1.0
+            return make_trace(wide_axis, powers.tolist())
+
+        def narrow_trace(center: float) -> TraceData:
+            axis = np.linspace(center - 0.5, center + 0.5, 11)
+            powers = 1.0 - np.abs(np.linspace(-1.0, 1.0, 11))  # symmetric peak
+            return make_trace(axis, powers.tolist())
+
+        # width 20, window 2, stride 5 -> starts [0, 5, 10, 15] + far edge 18;
+        # 0 and 18 are the wide anchors, 5/10/15 use the narrow span
+        traces = [
+            make_trace(wide_axis, [0.0] * wide_axis.size),
+            make_trace(wide_axis, [1.0] * wide_axis.size),
+            wide_peak_trace(0),
+            wide_peak_trace(18),
+            narrow_trace(706.0),
+            narrow_trace(711.0),
+            narrow_trace(716.0),
+        ]
+        osa = FakeNarrowOSA(traces)
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        result = wavelength_calibration(
+            osa, FakeSLM(size=(20, 2)), [], MeasurementSettings(), seed,
+            window_size=2, peak_half_window_nm=1.0,
+            coordinate_stride=5, sweep_span_nm=1.0,
+        )
+
+        self.assertEqual(osa.measure_calls, 7)
+        wide_default = MeasurementSettings()
+        for settings in osa.measure_settings_seen[:4]:
+            self.assertEqual(settings.span, wide_default.span)
+        narrow_seen = osa.measure_settings_seen[4:]
+        self.assertEqual(
+            [s.center_wl for s in narrow_seen],
+            ["706.0000nm", "711.0000nm", "716.0000nm"],
+        )
+        self.assertTrue(all(s.span == "1.0nm" for s in narrow_seen))
+        np.testing.assert_allclose(result.coordinates, np.arange(19) + 1.0)
+        np.testing.assert_allclose(
+            result.wavelength, 700.0 + result.coordinates, atol=1e-6
+        )
+
+    def test_wavelength_calibration_narrow_rejects_dead_anchor(self) -> None:
+        wide_axis = np.arange(699.0, 722.0)
+        traces = [
+            make_trace(wide_axis, [0.0] * wide_axis.size),
+            make_trace(wide_axis, [1.0] * wide_axis.size),
+            make_trace(wide_axis, [0.0] * wide_axis.size),  # anchor: no peak
+        ]
+        seed = CalibrationResult(
+            wavelength=np.asarray([]),
+            coordinates=np.asarray([]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([], dtype=int),
+        )
+
+        with self.assertRaisesRegex(ValueError, "anchor"):
+            wavelength_calibration(
+                FakeNarrowOSA(traces), FakeSLM(size=(20, 2)), [],
+                MeasurementSettings(), seed,
+                window_size=2, peak_half_window_nm=1.0,
+                coordinate_stride=5, sweep_span_nm=1.0,
+            )
+
     def test_wavelength_calibration_rejects_bad_stride(self) -> None:
         seed = CalibrationResult(
             wavelength=np.asarray([]),

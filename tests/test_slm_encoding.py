@@ -14,6 +14,7 @@ from slm_module.encoding import (
     ChannelLayout,
     EncodingChannel,
     build_channel_layout,
+    channel_layout_from_calibration,
     compute_channel_geometry,
     encode_to_pattern,
     optimize_from_osa,
@@ -62,6 +63,55 @@ def _make_layout(width: int = 10) -> ChannelLayout:
         calib_coords=np.array([0, 50, 150, 200], dtype=float),
         calib_off_levels=np.zeros(4, dtype=int),
     )
+
+
+class LevelForInterpolationTests(unittest.TestCase):
+    """level_for interpolates between the two swept points bracketing the target."""
+
+    @staticmethod
+    def _channel(levels, curve) -> EncodingChannel:
+        return EncodingChannel(
+            index=0, side="x", x_center=50, x_start=45, x_end=55,
+            wavelength_nm=780.0,
+            levels=np.asarray(levels, dtype=int),
+            intensity_curve=np.asarray(curve, dtype=float),
+        )
+
+    def test_returns_levels_between_swept_points(self) -> None:
+        # coarse 10-point sweep, linear curve: val = 0.1166 lands between the
+        # swept points at 100 and 200 -> interpolated grayscale 105
+        ch = self._channel(np.linspace(0, 900, 10), np.linspace(0.0, 1.0, 10))
+        level = ch.level_for(0.1166)
+        self.assertEqual(level, 105)
+        self.assertNotIn(level, ch.levels)
+
+    def test_bracketing_pair_on_nonlinear_curve(self) -> None:
+        ch = self._channel([0, 100, 200], [0.0, 0.2, 1.0])
+        self.assertEqual(ch.level_for(0.1), 50)    # within [0.0, 0.2] segment
+        self.assertEqual(ch.level_for(0.6), 150)   # within [0.2, 1.0] segment
+
+    def test_endpoints_hit_off_and_on_levels(self) -> None:
+        ch = self._channel([10, 300, 700, 1000], [0.05, 0.3, 0.8, 0.97])
+        self.assertEqual(ch.level_for(0.0), ch.off_level)
+        self.assertEqual(ch.level_for(1.0), ch.on_level)
+        self.assertEqual(ch.level_for(-0.5), ch.off_level)   # clipped
+        self.assertEqual(ch.level_for(1.5), ch.on_level)
+
+    def test_flat_run_from_envelope_uses_lowest_level(self) -> None:
+        # noise dip at level 200 is clamped by the cumulative-max envelope to a
+        # flat run; a target on the flat takes the lowest level reaching it and
+        # targets above interpolate from the end of the run
+        ch = self._channel([0, 100, 200, 300], [0.0, 0.5, 0.4, 1.0])
+        self.assertEqual(ch.level_for(0.5), 100)
+        self.assertEqual(ch.level_for(0.75), 200)  # between 0.5@100 and 1.0@300
+
+    def test_mapping_is_non_decreasing(self) -> None:
+        rng = np.random.default_rng(7)
+        curve = np.clip(np.sin(np.linspace(0, np.pi / 2, 12)) ** 2
+                        + rng.normal(0, 0.01, 12), 0.0, None)
+        ch = self._channel(np.linspace(0, 1023, 12), curve)
+        out = [ch.level_for(v) for v in np.linspace(0.0, 1.0, 101)]
+        self.assertTrue(all(b >= a for a, b in zip(out, out[1:])))
 
 
 class EncodeToPatternTests(unittest.TestCase):
@@ -429,6 +479,124 @@ class CenterGapGeometryTests(unittest.TestCase):
         )
         self.assertIsNone(legacy.center_gap_px)
         self.assertEqual(legacy.x_channels[0].x_center, 490)
+
+
+class ChannelLayoutFromCalibrationTests(unittest.TestCase):
+    """Verbatim rebuild of a ChannelLayout from a Step-3b/3c channel result."""
+
+    def _calib(
+        self,
+        coords: np.ndarray,
+        *,
+        slope: float = -0.005,
+        intercept: float = 781.0,
+    ) -> CalibrationResult:
+        coords = np.asarray(coords, dtype=float)
+        # give every row a distinct curve so channel<->row pairing is checkable
+        intensity = np.stack(
+            [np.array([0.0, 0.5, 1.0]) + 0.001 * i for i in range(coords.size)]
+        )
+        return CalibrationResult(
+            wavelength=slope * coords + intercept,
+            coordinates=coords,
+            max_level=1023,
+            min_level=0,
+            level_range=np.array([0, 512, 1023]),
+            intensity_levels=intensity,
+        )
+
+    # centre 510 px, pitch 20, guard skips between 440/480 and 540/580
+    GRID = np.array([420.0, 440.0, 480.0, 500.0, 520.0, 540.0, 580.0, 600.0])
+
+    def test_channels_taken_verbatim_with_mirror_pairing(self) -> None:
+        calib = self._calib(self.GRID)
+        layout = channel_layout_from_calibration(calib)
+
+        self.assertEqual(layout.n_channels, 4)
+        # negative slope: lower px = higher wavelength = x side, innermost first
+        self.assertEqual([c.x_center for c in layout.x_channels],
+                         [500, 480, 440, 420])
+        self.assertEqual([c.x_center for c in layout.w_channels],
+                         [520, 540, 580, 600])
+        for xch, wch in zip(layout.x_channels, layout.w_channels):
+            self.assertAlmostEqual(0.5 * (xch.x_center + wch.x_center), 510.0)
+        self.assertAlmostEqual(layout.center_x, 510.0)
+        self.assertAlmostEqual(layout.center_wl, -0.005 * 510.0 + 781.0)
+        self.assertEqual(layout.pitch_px, 20)
+        self.assertAlmostEqual(layout.nm_per_px, 0.005)
+
+        # wavelengths and transfer curves come from the matching rows
+        sorted_coords = list(self.GRID)
+        for ch in layout.x_channels + layout.w_channels:
+            row = sorted_coords.index(float(ch.x_center))
+            self.assertAlmostEqual(ch.wavelength_nm, -0.005 * ch.x_center + 781.0)
+            np.testing.assert_allclose(
+                ch.intensity_curve, np.array([0.0, 0.5, 1.0]) + 0.001 * row
+            )
+
+    def test_width_defaults_to_pitch_minus_gap(self) -> None:
+        layout = channel_layout_from_calibration(self._calib(self.GRID))
+        self.assertEqual(layout.channel_width_px, 15)
+        self.assertEqual(layout.x_channels[0].x_start, 500 - 7)
+        self.assertEqual(layout.x_channels[0].x_end, 500 - 7 + 15)
+
+        explicit = channel_layout_from_calibration(
+            self._calib(self.GRID), channel_width_px=11
+        )
+        self.assertEqual(explicit.channel_width_px, 11)
+        self.assertEqual(explicit.x_channels[0].x_start, 500 - 5)
+        self.assertEqual(explicit.x_channels[0].x_end, 500 - 5 + 11)
+
+    def test_guard_skips_become_dark_ranges(self) -> None:
+        layout = channel_layout_from_calibration(self._calib(self.GRID))
+        # windows are 15 px around 440/480 and 540/580; the 40 px jumps leave
+        # the pixels between the flanking windows dark
+        self.assertEqual(layout.dark_px_ranges, [(448, 472), (548, 572)])
+
+    def test_positive_slope_swaps_sides(self) -> None:
+        layout = channel_layout_from_calibration(
+            self._calib(self.GRID, slope=0.005, intercept=775.0)
+        )
+        self.assertEqual([c.x_center for c in layout.x_channels],
+                         [520, 540, 580, 600])
+        self.assertEqual([c.x_center for c in layout.w_channels],
+                         [500, 480, 440, 420])
+
+    def test_encode_to_pattern_accepts_loaded_layout(self) -> None:
+        layout = channel_layout_from_calibration(self._calib(self.GRID))
+        pattern = encode_to_pattern(
+            np.ones(4), np.zeros(4), layout, slm_width=700, slm_height=2
+        )
+        self.assertEqual(pattern.shape, (2, 700))
+        # x[0] at 500 px lit at its on level, w[0] at 520 px at its off level
+        self.assertTrue(np.all(pattern[:, 493:508] == 1023))
+        self.assertTrue(np.all(pattern[:, 513:528] == 0))
+
+    def test_rejects_odd_or_asymmetric_grids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "even number"):
+            channel_layout_from_calibration(self._calib(self.GRID[:-1]))
+        skewed = self.GRID.copy()
+        skewed[0] += 6.0                      # breaks the mirror midpoint
+        with self.assertRaisesRegex(ValueError, "mirror-symmetric"):
+            channel_layout_from_calibration(self._calib(skewed))
+
+    def test_rejects_width_wider_than_pitch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            channel_layout_from_calibration(
+                self._calib(self.GRID), channel_width_px=21
+            )
+
+    def test_requires_intensity_data(self) -> None:
+        calib = self._calib(self.GRID)
+        bare = CalibrationResult(
+            wavelength=calib.wavelength,
+            coordinates=calib.coordinates,
+            max_level=1023,
+            min_level=0,
+            level_range=calib.level_range,
+        )
+        with self.assertRaisesRegex(ValueError, "no intensity data"):
+            channel_layout_from_calibration(bare)
 
 
 class MeasurePairGridsColRatioTests(unittest.TestCase):

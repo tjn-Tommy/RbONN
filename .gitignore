@@ -7,3 +7,4 @@ refractor_claude.md
 refractor_codex.md
 .gitignore
 AGENT.md
+.src/calib_data/*.png

@@ -21,11 +21,13 @@ The measurement is instrument-agnostic: it drives an SLM (``get_slm_info`` +
 ``display_array``) and reads whatever *monitor* object exposes the
 ``ScopeController`` / ``DAQController`` shape (``monitor_cycle`` returning a
 ``MonitorSample`` and caching the raw waveform on ``last_values``).  Each grid
-point is repeated over ``n_trials`` passes so every (x, w) cell gets an
-empirical standard error, and the per-parameter errors are Birge-scaled when
-chi2/dof > 1 so the reported eta uncertainty is honest.
+point is read ONCE over a long fixed window -- T_single (``x == 0 or w == 0``,
+the weak single-beam and dark points) or T_both (both beams on) on the DAQ --
+and weighted by the instrument-reported SEM; the per-parameter errors are
+Birge-scaled when chi2/dof > 1 so the reported eta uncertainty is honest.
 
-Raw rows are persisted as a CSV (one row per trial x grid point) matching the
+Raw rows are persisted as a CSV (one row per grid point; the ``trial`` column
+is kept so multi-trial CSVs from older runs still load) matching the
 ``tests/tpa_pair_calibration_test.py`` layout, so a run can be reloaded and
 re-fit offline.
 """
@@ -243,41 +245,37 @@ def recompute_fits(result: TPAPairResult) -> TPAPairResult:
 # measurement  (instrument-agnostic grid sweep)
 # ======================================================================
 
-def _read_mean_std(monitor, repeats: int, timeout: float = 30.0) -> tuple[float, float, float]:
-    """Averaged reading, its raw trace std, and the per-point SEM of the mean.
+def _read_mean_std(
+    monitor, timeout: float = 30.0, single: bool = False
+) -> tuple[float, float, float]:
+    """One averaged reading, its raw trace std, and the per-point SEM of the mean.
 
     Returns ``(mean, std, sem)``.  ``std`` is the raw (low-passed) trace spread,
     kept for diagnostics; ``sem`` is the standard error of the mean and is what
     the fit weights by.  The DAQ path reports ``sample.sem`` directly (spread
     divided by the effective independent-sample count ``2 * duration * f_cut``);
     monitors that don't report one (e.g. the scope) fall back to the raw-waveform
-    std on ``last_values`` for both.  With repeats>1 the per-read values are
-    pooled in quadrature.
+    std on ``last_values`` for both.  ``single`` marks a weak point -- at most
+    one beam on (``x == 0 or w == 0``, including the all-off dark): the DAQ
+    reads it over its longer T_single window (``single_duration``); the scope
+    ignores the flag.
     """
-    means: list[float] = []
-    std_variances: list[float] = []
-    sem_variances: list[float] = []
-    for _ in range(max(1, repeats)):
-        sample = monitor.monitor_cycle(timeout=timeout)
-        if sample is None:
-            raise TPAPairAborted("monitor read aborted")
-        means.append(float(sample.value))
-        std = getattr(sample, "std", None)
-        waveform = getattr(monitor, "last_values", None)
-        raw_std = (
-            float(std) if std is not None and np.isfinite(std)
-            else (float(np.std(waveform)) if waveform is not None and np.size(waveform) > 1
-                  else 0.0)
-        )
-        std_variances.append(raw_std ** 2)
-        sem = getattr(sample, "sem", None)
-        if sem is not None and np.isfinite(sem):
-            sem_variances.append(float(sem) ** 2)              # SEM of the mean (DAQ)
-        else:
-            sem_variances.append(raw_std ** 2)                 # scope: no effective-N -> raw std
-    mean_v = float(np.mean(means))
-    std_v = float(np.sqrt(np.mean(std_variances))) if std_variances else 0.0
-    sem_v = float(np.sqrt(np.mean(sem_variances))) if sem_variances else 0.0
+    sample = monitor.monitor_cycle(timeout=timeout, single=single)
+    if sample is None:
+        raise TPAPairAborted("monitor read aborted")
+    mean_v = float(sample.value)
+    std = getattr(sample, "std", None)
+    waveform = getattr(monitor, "last_values", None)
+    std_v = (
+        float(std) if std is not None and np.isfinite(std)
+        else (float(np.std(waveform)) if waveform is not None and np.size(waveform) > 1
+              else 0.0)
+    )
+    sem = getattr(sample, "sem", None)
+    if sem is not None and np.isfinite(sem):
+        sem_v = float(sem)                                     # SEM of the mean (DAQ)
+    else:
+        sem_v = std_v                                          # scope: no effective-N -> raw std
     return mean_v, std_v, sem_v
 
 
@@ -335,20 +333,21 @@ def measure_pair_grids(
     pair_indices: Sequence[int],
     sweep: Sequence[float],
     points: Sequence[tuple[float, float]] | None = None,
-    n_trials: int = 1,
-    repeats: int = 1,
     settle: float = 0.15,
     read_timeout: float = 30.0,
     col_ratio: np.ndarray | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> TPAPairResult:
-    """Sweep each requested pair's (x, w) points and fit eta for each.
+    """Sweep each requested pair's (x, w) points once and fit eta for each.
 
     ``monitor`` must already be configured (the caller runs
-    ``configure_monitor``); this only calls ``monitor_cycle``.  For each pair the
-    ``(x, w)`` points are measured ``n_trials`` times (all other channels held
-    off), then the pair's data is fit to the TPA model.  By default the points
+    ``configure_monitor``); this only calls ``monitor_cycle``.  Each ``(x, w)``
+    point is measured once (all other channels held off) -- the DAQ's long
+    fixed windows already average enough per point -- then the pair's data is
+    fit to the TPA model.  Points with at most one beam on (``x == 0 or
+    w == 0``, including the all-off dark) are read over the DAQ's longer
+    T_single window; both-beams points use T_both.  By default the points
     are the full outer-product grid of ``sweep`` x ``sweep``; pass ``points`` to
     measure an explicit list instead (e.g. the reduced 1-D curves from
     :func:`build_pair_points`), in which case ``sweep`` is only recorded as the
@@ -380,40 +379,42 @@ def measure_pair_grids(
         i: [] for i in indices
     }
 
-    total = max(n_trials * len(indices) * len(grid_pts), 1)
+    total = max(len(indices) * len(grid_pts), 1)
     step = 0
-    for trial in range(n_trials):
-        for i in indices:
+    for i in indices:
+        _check_stop()
+        x_ch = layout.x_channels[i]
+        w_ch = layout.w_channels[i]
+        wl_pair = 0.5 * (x_ch.wavelength_nm + w_ch.wavelength_nm)
+        for x_val, w_val in grid_pts:
             _check_stop()
-            x_ch = layout.x_channels[i]
-            w_ch = layout.w_channels[i]
-            wl_pair = 0.5 * (x_ch.wavelength_nm + w_ch.wavelength_nm)
-            for x_val, w_val in grid_pts:
-                _check_stop()
-                x_vals = zeros.copy()
-                w_vals = zeros.copy()
-                x_vals[i] = x_val
-                w_vals[i] = w_val
-                pattern = encode_to_pattern(x_vals, w_vals, layout, slm_width,
-                                            slm_height, col_ratio=col_ratio)
-                slm.display_array(pattern)
-                if settle:
-                    time.sleep(settle)
-                mean_v, std_v, sem_v = _read_mean_std(monitor, repeats, read_timeout)
-                rows[i].append((trial, x_val, w_val, mean_v, std_v, sem_v))
-                step += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        TPAPairProgress(
-                            step=step, total=total,
-                            message=(
-                                f"trial {trial} pair[{i}] @ {wl_pair:.2f} nm "
-                                f"x={x_val:.2f} w={w_val:.2f} "
-                                f"-> {mean_v*1000:.4f} mV"
-                            ),
-                            pair_index=i,
-                        )
+            x_vals = zeros.copy()
+            w_vals = zeros.copy()
+            x_vals[i] = x_val
+            w_vals[i] = w_val
+            pattern = encode_to_pattern(x_vals, w_vals, layout, slm_width,
+                                        slm_height, col_ratio=col_ratio)
+            slm.display_array(pattern)
+            if settle:
+                time.sleep(settle)
+            single = x_val == 0.0 or w_val == 0.0       # at most one beam on
+            mean_v, std_v, sem_v = _read_mean_std(
+                monitor, read_timeout, single=single
+            )
+            rows[i].append((0, x_val, w_val, mean_v, std_v, sem_v))
+            step += 1
+            if progress_callback is not None:
+                progress_callback(
+                    TPAPairProgress(
+                        step=step, total=total,
+                        message=(
+                            f"pair[{i}] @ {wl_pair:.2f} nm "
+                            f"x={x_val:.2f} w={w_val:.2f} "
+                            f"-> {mean_v*1000:.4f} mV"
+                        ),
+                        pair_index=i,
                     )
+                )
 
     channels: list[ChannelPairGrid] = []
     for i in indices:
@@ -446,7 +447,7 @@ def measure_pair_grids(
             )
 
     return TPAPairResult(
-        sweep=sweep_arr, n_trials=n_trials, channels=channels,
+        sweep=sweep_arr, n_trials=1, channels=channels,
         center_wl=float(getattr(layout, "center_wl", 0.0)),
     )
 
@@ -457,7 +458,7 @@ def measure_pair_grids(
 
 _CSV_HEADER = [
     "trial", "pair_index", "x", "w", "product",
-    "voltage_mean_v", "voltage_std_v", "voltage_sem_v",
+    "voltage_mean_v", "voltage_std_v", "voltage_sem_v", "sem_ratio",
 ]
 
 
@@ -465,8 +466,10 @@ def write_tpa_pair_csv(result: TPAPairResult, path: str | Path) -> str:
     """Raw rows: one line per (trial, pair, grid point).  Round-trips via load.
 
     ``voltage_std_v`` is the raw low-passed trace spread (diagnostic);
-    ``voltage_sem_v`` is the standard error of the mean the fit weights by.  With
-    adaptive per-point durations the two are not related by a single fixed
+    ``voltage_sem_v`` is the standard error of the mean the fit weights by; and
+    ``sem_ratio`` = sem/|mean| is derived per row for at-a-glance measurement
+    quality (recomputed on load, so :func:`load_tpa_pair_csv` ignores it).  With
+    per-point durations the std and sem are not related by a single fixed
     ``n_eff``, so both are recorded explicitly.
     """
     out = Path(path).resolve()
@@ -479,9 +482,10 @@ def write_tpa_pair_csv(result: TPAPairResult, path: str | Path) -> str:
                 grid.trial, grid.x, grid.w, grid.voltage_mean_v,
                 grid.voltage_std_v, grid.voltage_sem_v,
             ):
+                ratio = abs(sem_v / mean_v) if mean_v else float("inf")
                 writer.writerow(
                     [int(t), grid.index, f"{x:.6g}", f"{w:.6g}", f"{x*w:.6g}",
-                     f"{mean_v:.9g}", f"{std_v:.9g}", f"{sem_v:.9g}"]
+                     f"{mean_v:.9g}", f"{std_v:.9g}", f"{sem_v:.9g}", f"{ratio:.6g}"]
                 )
     result.csv_path = str(out)
     return str(out)
@@ -496,19 +500,13 @@ def load_tpa_pair_csv(
 
     Wavelengths are recovered from ``layout`` when supplied (the CSV carries only
     x/w/voltage), otherwise left as NaN.
-
-    New CSVs carry an explicit ``voltage_sem_v`` column (the fit weight).  Older
-    single-column CSVs stored the SEM in ``voltage_std_v`` (the live DAQ path
-    wrote ``sample.sem`` there), so ``voltage_sem_v`` falls back to it when
-    absent.
     """
     grouped: dict[int, list[tuple[int, float, float, float, float, float]]] = defaultdict(list)
     with open(Path(path), newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             idx = int(float(row["pair_index"]))
             std_v = float(row.get("voltage_std_v", "nan") or "nan")
-            sem_raw = row.get("voltage_sem_v")
-            sem_v = float(sem_raw) if sem_raw not in (None, "") else std_v
+            sem_v = float(row["voltage_sem_v"])  # the fit weight; every CSV records it
             grouped[idx].append(
                 (
                     int(float(row.get("trial", 0))),

@@ -5,6 +5,13 @@ Not a pytest test (no mocks, needs real hardware) -- run it directly::
     python drafts/calib_step6_test.py             # sweep hardware, fit, plot
     python drafts/calib_step6_test.py --meas       # raw meas CSV only: sweep + record, no fit
     python drafts/calib_step6_test.py some.csv     # re-fit an existing CSV offline
+    python drafts/calib_step6_test.py some.csv --flip  # re-fit sign-flipped (inverted read)
+
+``--flip`` applies to a REFIT only (the measure path always records the raw
+signal): when the photodiode/DAQ reads inverted (more light -> more negative
+volts) it negates the loaded ``voltage_mean_v`` in memory (every row incl. the
+(0,0) dark) and re-fits, so the fitted Y = eta^2*(x*w) + ... + d is the positive
+light signal.  Nothing is written back -- the raw CSV on disk is untouched.
 
 For channel pair ``PAIR_INDEX`` (x[PAIR_INDEX], w[PAIR_INDEX]) this walks the
 reduced 1-D calibration curves built by ``tpa_pair.build_pair_points`` -- one
@@ -15,16 +22,20 @@ line per fit term rather than the full 2-D grid, ``N_SWEEP_POINTS`` points each:
   * cross   (x=1, w=r)  -- x pinned at 1, w swept -> pins eta
   * one shared dark (0, 0) point anchors the offset d
 
-with every other channel held off, repeated ``N_TRIALS`` times, recording the
-DAQ reading at each point.
+with every other channel held off, recording the DAQ reading at each point.
 
-The sweep, the weighted-least-squares fit of
+Each point is one fixed-duration ``daq_module`` acquisition (the same
+``DAQController.monitor_cycle`` read the GUI pipeline uses): acquisition time
+= ``T_SINGLE_S`` (5 s) if ``x == 0 or w == 0`` (the weak single-beam lines and
+the shared dark point need the averaging), else ``T_BOTH_S`` (3 s) for the
+bright both-beams cross points -- low-passed at the ``DAQMonitorSettings``
+bandwidth.  The weighted-least-squares fit of
 
     Y = eta^2*(x*w) + a_x*x + q_x*x^2 + a_w*w + q_w*w^2 + d
 
-and the CSV persistence all live in :mod:`slm_module.tpa_pair` (the same code the
-GUI's Step 6 TPA tab uses).  This file only wires up the hardware and prints /
-plots the result, so there is a single source of truth for the processing.
+and the CSV persistence live in :mod:`slm_module.tpa_pair` (the same code the
+GUI's Step 6 TPA tab uses); every CSV row records the mean, its SEM and the
+SEM ratio (sem/|mean|).
 
 The result is written to a single ``calib_step6_result_MMDD_HHMM.json`` that
 embeds the input Step-3 calibration JSON alongside every fitted pair result.
@@ -41,11 +52,11 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "drafts"))  # for draft_hw
 
-from daq_module.controller import DAQController, DAQMonitorSettings  # noqa: E402
+from draft_hw import connect_daq, connect_slm, read_point  # noqa: E402
 from slm_module.calibration.calibration_new import load_calibration_result  # noqa: E402
-from slm_module.controller import SLMController  # noqa: E402
-from slm_module.encoding import build_channel_layout  # noqa: E402
+from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 from slm_module.tpa_pair import (  # noqa: E402
     ChannelPairGrid,
     PairFit,
@@ -54,7 +65,6 @@ from slm_module.tpa_pair import (  # noqa: E402
     build_sweep,
     fit_grid,
     load_tpa_pair_csv,
-    measure_pair_grids,
     save_tpa_pair_json,
     write_tpa_pair_csv,
 )
@@ -66,89 +76,23 @@ PAIR_INDICES = [1,3,4,5]                           # near (cols 660/680) + far (
 SWEEP_MIN = 0.1                                # min per-side intensity in the ramp (0..1)
 SWEEP_MAX = 1.0                                 # max per-side intensity in the ramp (0..1)
 N_SWEEP_POINTS = 10                              # points per 1-D curve (x-only / w-only / cross)
-IN_STEP3 = CALIB_PATH / "calib_step3_0710.json"    # Step 3 calib (near pair 0 + far pair 3)
+IN_STEP3 = CALIB_PATH / "calib_step3b_0714_1534.json"    # Step 3 calib (near pair 0 + far pair 3)
 
 SLM_DISPLAY_NO = None           # None -> auto-detect the LCOS-SLM display (like the GUI's Detect)
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch (USB link)
 
 DAQ_DEVICE = "Dev1"
 DAQ_CHANNEL = "ai0"
-DAQ_F_CUT_HZ = 3.5             # DAQ low-pass 3 dB bandwidth (matches DAQMonitorSettings.f_cut)
 
-# ---- Adaptive per-point averaging (DAQController) ----
-# Each reading picks its own duration so its SEM meets
-# max(TARGET_REL*|mean|, SEM_FLOOR), capped at T_MAX.  Bright cross points finish
-# fast; near-zero single-beam points stop at the absolute SEM_FLOOR instead of
-# chasing an unreachable 1% relative target.  Recorded per-point in voltage_sem_v.
-TARGET_REL = 0.01               # target relative SEM (SEM/|mean|)
-SEM_FLOOR = 60e-6               # absolute SEM floor (V) for near-zero-signal points
-T_PROBE = 1.0                   # probe / minimum window per point (s)
-T_MAX = 10.0                    # cap per point (s)
-
-# Refitting OLD single-column CSVs (voltage_std_v held the RAW std, no
-# voltage_sem_v column): the SEM is reconstructed as std/sqrt(n_eff),
-# n_eff = 2*DAQ_DURATION_S*DAQ_F_CUT_HZ.  Auto-detected from the CSV header --
-# new two-column CSVs carry voltage_sem_v and skip this entirely.
-DAQ_DURATION_S = 5.0            # fixed window those legacy CSVs were recorded at
+# ---- Fixed per-point acquisition (daq_module) ----
+# Sample rate / range / low-pass bandwidth are the DAQMonitorSettings defaults
+# (1 kS/s, +/-0.1 V DIFF, 20 Hz).  Acquisition time = T_SINGLE_S if x==0 or
+# w==0 (weak single-beam / dark points), else T_BOTH_S.  Every CSV row records
+# the per-point SEM (voltage_sem_v) and sem_ratio -- the per-point sigma.
+T_SINGLE_S = 5.0                # at most one beam on (x==0 or w==0, incl. dark) (s)
+T_BOTH_S = 3.0                  # both beams on (the bright cross points) (s)
 
 SETTLE_S = 0.25                  # wait after each SLM pattern change, before reading
-REPEATS = 1                      # repeated monitor readings averaged per grid point
-N_TRIALS = 1                    # times the whole grid is repeated (single-trial sigma comes from voltage_sem_v)
-
-
-def detect_slm_display() -> int:
-    """Find the LCOS-SLM display number (the GUI's Detect step).
-
-    Probing needs the DLL, so use a throwaway controller on display 1 just to
-    run detect_displays(); the real controller is then built on the found no.
-    Hardcoding display 1 is what dumped the pattern onto the main monitor.
-    """
-    probe = SLMController(display_no=1)
-    for display_no, width, height, name in probe.detect_displays():
-        print(f"  display {display_no}: {width}x{height} ({name})")
-        if name.startswith("LCOS-SLM"):
-            return display_no
-    raise RuntimeError(
-        "No LCOS-SLM display found. Check the SLM is connected as an extended "
-        "display, or set SLM_DISPLAY_NO manually."
-    )
-
-
-def connect_slm() -> SLMController:
-    display_no = SLM_DISPLAY_NO if SLM_DISPLAY_NO is not None else detect_slm_display()
-    slm = SLMController(display_no=display_no)
-    slm.open_slm()
-    width, height = slm.get_slm_info()
-    print(f"SLM: connected on display {display_no} ({width}x{height})")
-    # display_array() only writes the DVI-mode frame buffer; if the panel's
-    # video interface is still set to Memory mode over USB, that write is
-    # silently ignored by the hardware. Force DVI mode so what we send is
-    # actually what the panel shows (mirrors the GUI's "Switch to DVI mode").
-    slm.set_dvi_mode(USB_SLM_NO)
-    print(f"SLM: DVI mode set (USB device {USB_SLM_NO})")
-    return slm
-
-
-def connect_daq() -> DAQController:
-    """DAQ is the Y-measurement instrument for this sweep.
-
-    ``hold=0`` because ``measure_pair_grids`` owns the settle (``SETTLE_S``)
-    after each pattern change -- leaving the DAQ's own hold non-zero would
-    double the wait.
-    """
-    daq = DAQController(device=DAQ_DEVICE)
-    daq.connect()
-    daq.configure_monitor(
-        DAQMonitorSettings(
-            channel=DAQ_CHANNEL, hold=0.0,
-            adaptive=True, target_rel=TARGET_REL, sem_floor=SEM_FLOOR,
-            t_probe=T_PROBE, t_max=T_MAX,
-        )
-    )
-    print(f"Monitor: DAQ ({DAQ_DEVICE}/{DAQ_CHANNEL}) adaptive: "
-          f"rel<={TARGET_REL:.1%} or SEM<={SEM_FLOOR*1e6:.0f} uV, "
-          f"{T_PROBE:.1f}-{T_MAX:.1f} s/point")
-    return daq
 
 
 def _sigma(value: float, err: float) -> float:
@@ -273,14 +217,17 @@ def _load_layout():
     """Load the Step-3 calibration -> channel layout, validating PAIR_INDICES.
 
     Shared by the fit run and the meas-only run: both need the same layout and the
-    same in-range check on the configured pair indices.
+    same in-range check on the configured pair indices.  The Step-3b/3c rows ARE
+    the channels, so the layout is loaded verbatim (the same
+    ``channel_layout_from_calibration`` the GUI encoding page uses) -- no
+    re-tiling, so pair indices here mean the same thing as in the UI.
     """
     if not IN_STEP3.is_file():
         raise FileNotFoundError(
             f"Step-3 calibration not found: {IN_STEP3}\n"
             f"(CALIB_PATH is the calib_data directory; IN_STEP3 is the JSON in it.)"
         )
-    layout = build_channel_layout(load_calibration_result(IN_STEP3))
+    layout = channel_layout_from_calibration(load_calibration_result(IN_STEP3))
     for pi in PAIR_INDICES:
         if not (0 <= pi < layout.n_channels):
             raise ValueError(
@@ -315,27 +262,31 @@ def sweep_and_fit() -> None:
     points = build_pair_points(SWEEP_MIN, SWEEP_MAX, N_SWEEP_POINTS)
     print(f"Reduced sweep: {len(points)} points/pair "
           f"(x-only + w-only + cross @ {N_SWEEP_POINTS} each + dark)")
-    slm = connect_slm()
-    daq = connect_daq()
+    slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
+    daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
+                      t_both=T_BOTH_S, t_single=T_SINGLE_S)
+    channels: list[ChannelPairGrid] = []
     try:
-        result = measure_pair_grids(
-            daq, slm, layout,
-            pair_indices=list(PAIR_INDICES), sweep=sweep, points=points,
-            n_trials=N_TRIALS, repeats=REPEATS, settle=SETTLE_S,
-            read_timeout=max(30.0, T_MAX * 3.0 + 10.0),
-            progress_callback=lambda p: print(f"[{p.step}/{p.total}] {p.message}"),
-        )
+        for i in PAIR_INDICES:
+            print(f"\n=== Sweep: pair {i} ===")
+            channels.append(_measure_pair(slm, daq, layout, i, points))
     finally:
-        daq.disconnect()
         slm.close_slm()
+        daq.disconnect()
 
+    result = TPAPairResult(
+        sweep=sweep, n_trials=1, channels=channels,
+        center_wl=float(getattr(layout, "center_wl", 0.0)),
+    )
     stamp = time.strftime("%m%d_%H%M")
     csv_path = CALIB_PATH / f"calib_step6_meas_{stamp}.csv"
     json_path = CALIB_PATH / f"calib_step6_result_{stamp}.json"
-    write_tpa_pair_csv(result, csv_path)
-    save_combined_json(result, json_path)
+    write_tpa_pair_csv(result, csv_path)  # raw rows on disk BEFORE fitting
     total_rows = sum(int(c.trial.size) for c in result.channels)
     print(f"\nSaved {total_rows} rows to {csv_path}")
+    for grid in result.channels:  # a singular fit can't lose the measured data now
+        fit_grid(grid)
+    save_combined_json(result, json_path)
     print(f"Saved Step-3 calib + Step-6 fits -> {json_path}")
     for grid in result.channels:
         print(f"\n=== pair {grid.index} ===")
@@ -345,21 +296,7 @@ def sweep_and_fit() -> None:
         print(f"Plot saved to {plot_path}")
 
 
-def _csv_has_sem(path: str | Path) -> bool:
-    """True if the CSV header carries an explicit ``voltage_sem_v`` column.
-
-    New two-column CSVs record the SEM directly; old single-column CSVs stored
-    only the raw std, so their SEM must be reconstructed at refit time.
-    """
-    with open(Path(path), newline="", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("#") or not line.strip():
-                continue
-            return "voltage_sem_v" in [c.strip() for c in line.split(",")]
-    return False
-
-
-def fit_csv(path: str | Path) -> None:
+def fit_csv(path: str | Path, *, flip: bool = False) -> None:
     """Re-fit an already-recorded pair-grid CSV offline (no hardware).
 
     Writes the same combined ``calib_step6_result_MMDD_HHMM.json`` (input Step-3
@@ -367,18 +304,18 @@ def fit_csv(path: str | Path) -> None:
     from clobbering earlier results.  No PNGs are written -- instead one random
     fitted pair's model plot is shown interactively to eyeball the refit.
 
-    Old single-column CSVs (``voltage_std_v`` held the RAW waveform std, no
-    ``voltage_sem_v`` column) are auto-detected and their SEM is reconstructed as
-    std/sqrt(n_eff), n_eff = 2*duration*f_cut, before re-fitting.  New two-column
-    CSVs already carry the per-point SEM, so nothing is converted.
+    ``flip`` handles an inverted photodiode/DAQ read (more light -> more negative
+    volts): the loaded ``voltage_mean_v`` is negated in memory on every row (incl.
+    the (0,0) dark) and each pair is re-fit, so Y = eta^2*(x*w) + ... + d comes out
+    as the positive light signal.  Nothing is written back -- the raw CSV on disk
+    is untouched, and the spreads (std/SEM) are magnitudes so they stay as read.
     """
     result = load_tpa_pair_csv(path)
-    if not _csv_has_sem(path):
-        n_eff = max(2.0 * DAQ_DURATION_S * DAQ_F_CUT_HZ, 1.0)
-        for c in result.channels:
-            c.voltage_sem_v = np.asarray(c.voltage_std_v, dtype=float) / np.sqrt(n_eff)
-            fit_grid(c)  # re-fit with SEM weights: eta unchanged, chi2/dof now meaningful
-        print(f"Legacy single-column CSV: SEM = std/sqrt(n_eff={n_eff:.0f})")
+    if flip:
+        for grid in result.channels:
+            grid.voltage_mean_v = -grid.voltage_mean_v   # inverted read (same channel)
+            fit_grid(grid)                               # re-fit the negated data
+        print("Flip: negated voltage_mean_v in memory and re-fit (inverted read).")
     n_axis = int(sum(
         int(((c.fit.x == 0) | (c.fit.w == 0)).sum()) for c in result.channels if c.fit
     ))
@@ -399,74 +336,56 @@ def fit_csv(path: str | Path) -> None:
         make_plot(c.fit)
 
 
-def _read_daq(daq, timeout: float) -> tuple[float, float, float]:
-    """One averaged reading, its raw trace std, and the per-point SEM of the mean.
+def _read_point(daq, x_val: float, w_val: float) -> tuple[float, float, float, float]:
+    """One fixed-duration DAQ read for a grid point; return ``(mean, std, sem, duration)``.
 
-    Mirrors :func:`tpa_pair._read_mean_std` (the calibration sweep's read), so a
-    meas row is the same measurement as a real step-6 row -- it is just never fit.
-    ``std`` is the raw (low-passed) trace spread kept for diagnostics; ``sem`` is
-    the DAQ's reported standard error of the mean (low-passed, effective-N) and is
-    what the fit weights by.  With adaptive duration each point averages for a
-    different time, so ``sem`` is recorded per point rather than reconstructed.
+    Acquisition time = ``T_SINGLE_S`` if ``x == 0 or w == 0`` (at most one beam
+    on, incl. the dark point), else ``T_BOTH_S``.  Filtering and
+    the SEM (over ``n_eff = 2 * duration * f_cut``) happen inside
+    ``DAQController.monitor_cycle`` -- the same read the GUI pipeline uses.
+    ``std`` is the low-passed trace spread, so ``sem = std / sqrt(n_eff)``
+    round-trips from the CSV.
     """
-    means: list[float] = []
-    std_vars: list[float] = []
-    sem_vars: list[float] = []
-    for _ in range(max(1, REPEATS)):
-        sample = daq.monitor_cycle(timeout=timeout)
-        means.append(float(sample.value))
-        std = getattr(sample, "std", None)
-        waveform = getattr(daq, "last_values", None)
-        raw_std = (
-            float(std) if std is not None and np.isfinite(std)
-            else (float(np.std(waveform)) if waveform is not None and np.size(waveform) > 1
-                  else 0.0)
-        )
-        std_vars.append(raw_std ** 2)
-        sem = getattr(sample, "sem", None)
-        sem_vars.append(float(sem) ** 2 if sem is not None and np.isfinite(sem) else raw_std ** 2)
-    mean_v = float(np.mean(means))
-    std_v = float(np.sqrt(np.mean(std_vars))) if std_vars else 0.0
-    sem_v = float(np.sqrt(np.mean(sem_vars))) if sem_vars else 0.0
-    return mean_v, std_v, sem_v
+    single = x_val == 0.0 or w_val == 0.0
+    mean_v, std_v, sem_v = read_point(daq, single=single)
+    return mean_v, std_v, sem_v, (T_SINGLE_S if single else T_BOTH_S)
 
 
-def _measure_pair(daq, slm, layout, i: int, points) -> ChannelPairGrid:
+def _measure_pair(slm, daq, layout, i: int, points) -> ChannelPairGrid:
     """Sweep pair ``i`` over ``points`` and read Y; raw ChannelPairGrid, no fit.
 
-    Same drive as :func:`tpa_pair.measure_pair_grids` (only pair ``i`` on, every
-    other channel off, ``SETTLE_S`` after each pattern change), but records raw
-    rows only -- it never runs the least-squares fit, so a singular grid can't
-    throw away the just-measured hardware data.  Repeated ``N_TRIALS`` times.
+    Only pair ``i`` on, every other channel off, ``SETTLE_S`` after each pattern
+    change, then one fixed-duration read per point (see :func:`_read_point`).
+    Records raw rows only -- the caller decides whether to fit, so a singular
+    grid can't throw away the just-measured hardware data.
     """
     from slm_module.encoding import encode_to_pattern
 
     zeros = np.zeros(layout.n_channels)
     slm_width, slm_height = slm.get_slm_info()
-    read_timeout = max(30.0, T_MAX * 3.0 + 10.0)
     x_ch = layout.x_channels[i]
     w_ch = layout.w_channels[i]
 
-    total = N_TRIALS * len(points)
+    total = len(points)
     step = 0
     rows: list[tuple[int, float, float, float, float, float]] = []
-    for trial in range(N_TRIALS):
-        for x_val, w_val in points:
-            x_vals = zeros.copy()
-            w_vals = zeros.copy()
-            x_vals[i] = x_val
-            w_vals[i] = w_val
-            slm.display_array(
-                encode_to_pattern(x_vals, w_vals, layout, slm_width, slm_height)
-            )
-            if SETTLE_S:
-                time.sleep(SETTLE_S)
-            mean_v, std_v, sem_v = _read_daq(daq, read_timeout)
-            rows.append((trial, float(x_val), float(w_val), mean_v, std_v, sem_v))
-            step += 1
-            print(f"[{step}/{total}] pair {i} trial {trial} "
-                  f"x={x_val:.3f} w={w_val:.3f} -> {mean_v*1000:.4f} mV "
-                  f"(SEM {sem_v*1e6:.1f} uV)")
+    for x_val, w_val in points:
+        x_vals = zeros.copy()
+        w_vals = zeros.copy()
+        x_vals[i] = x_val
+        w_vals[i] = w_val
+        slm.display_array(
+            encode_to_pattern(x_vals, w_vals, layout, slm_width, slm_height)
+        )
+        if SETTLE_S:
+            time.sleep(SETTLE_S)
+        mean_v, std_v, sem_v, dur = _read_point(daq, x_val, w_val)
+        rows.append((0, float(x_val), float(w_val), mean_v, std_v, sem_v))
+        step += 1
+        ratio = abs(sem_v / mean_v) if mean_v else float("inf")
+        print(f"[{step}/{total}] pair {i} "
+              f"x={x_val:.3f} w={w_val:.3f} ({dur:.0f}s) -> {mean_v*1000:.4f} mV "
+              f"sem ratio {ratio*100:.2f}%")
 
     return ChannelPairGrid(
         index=i,
@@ -500,19 +419,20 @@ def measure_only() -> None:
     points = build_pair_points(SWEEP_MIN, SWEEP_MAX, N_SWEEP_POINTS)
     print(f"Meas (no fit): {len(points)} points/pair "
           f"(x-only + w-only + cross @ {N_SWEEP_POINTS} each + dark), pairs {list(PAIR_INDICES)}")
-    slm = connect_slm()
-    daq = connect_daq()
+    slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
+    daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
+                      t_both=T_BOTH_S, t_single=T_SINGLE_S)
     channels: list[ChannelPairGrid] = []
     try:
         for i in PAIR_INDICES:
             print(f"\n=== Meas: pair {i} ===")
-            channels.append(_measure_pair(daq, slm, layout, i, points))
+            channels.append(_measure_pair(slm, daq, layout, i, points))
     finally:
-        daq.disconnect()
         slm.close_slm()
+        daq.disconnect()
 
     result = TPAPairResult(
-        sweep=sweep, n_trials=N_TRIALS, channels=channels,
+        sweep=sweep, n_trials=1, channels=channels,
         center_wl=float(getattr(layout, "center_wl", 0.0)),
     )
     csv_path = CALIB_PATH / f"calib_step6_meas_{time.strftime('%m%d_%H%M')}.csv"
@@ -523,10 +443,11 @@ def measure_only() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    flags = {"--meas", "-m"}
+    flags = {"--meas", "-m", "--flip"}
+    flip = "--flip" in argv               # refit only: negate voltage_mean_v (inverted read)
     positional = [a for a in argv if a not in flags]
     if positional:                       # a CSV path -> offline re-fit, no hardware
-        fit_csv(positional[0])
+        fit_csv(positional[0], flip=flip)
         return 0
     if any(a in ("--meas", "-m") for a in argv):   # raw meas CSV only: sweep + record, no fit
         measure_only()
