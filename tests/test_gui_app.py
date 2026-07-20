@@ -178,15 +178,43 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_encoding_page_center_gap_control(self) -> None:
+    def test_encoding_page_loads_layout_verbatim_from_calibration(self) -> None:
+        from slm_module.calibration.calibration_new import CalibrationResult
         from slm_module.gui.app import MainWindow
+
+        # mirror-symmetric channel grid: centre 510 px, pitch 20, one guard skip
+        coords = np.array([420.0, 440.0, 480.0, 500.0, 520.0, 540.0, 580.0, 600.0])
+        wavelengths = -0.005 * coords + 781.0
+        levels = np.array([0, 512, 1023], dtype=int)
+        intensity = np.tile([0.0, 0.5, 1.0], (coords.size, 1))
+        calib = CalibrationResult(
+            wavelength=wavelengths,
+            coordinates=coords,
+            max_level=1023,
+            min_level=0,
+            level_range=levels,
+            intensity_levels=intensity,
+        )
 
         window = MainWindow()
         try:
-            self.assertIsNone(window._enc_center_gap())    # legacy default
-            window.enc_center_gap_check.setChecked(True)
-            window.enc_center_gap_spin.setValue(12)
-            self.assertEqual(window._enc_center_gap(), 12)
+            window._enc_calib_override = calib
+            window._enc_build_layout()
+            layout = window.encoding_layout
+            self.assertIsNotNone(layout)
+            self.assertEqual(layout.n_channels, 4)
+            # channels sit exactly on the calibrated coordinates, no re-tiling
+            self.assertEqual(
+                [ch.x_center for ch in layout.x_channels], [500, 480, 440, 420]
+            )
+            self.assertEqual(
+                [ch.x_center for ch in layout.w_channels], [520, 540, 580, 600]
+            )
+            self.assertAlmostEqual(layout.center_x, 510.0)
+            self.assertEqual(layout.pitch_px, 20)
+            self.assertEqual(layout.channel_width_px, 15)   # pitch - default gap
+            self.assertEqual(window.enc_val_table.rowCount(), 4)
+            self.assertTrue(window.enc_generate_button.isEnabled())
         finally:
             window.close()
 

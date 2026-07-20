@@ -17,11 +17,9 @@ from slm_module.calibration.calibration_new import (
     save_calibration_result,
 )
 from slm_module.pipeline import (
-    CombPhaseConfig,
     InputSpec,
     IntensityConfig,
     LayoutConfig,
-    PairEtaConfig,
     PipelineAborted,
     PipelineInstruments,
     PipelineRequest,
@@ -288,61 +286,44 @@ class RunPipelineOrchestrationTests(unittest.TestCase):
         self.assertEqual(progress.inner.message, "level 5")
 
 
-class CenterWavelengthResolutionTests(unittest.TestCase):
-    """use_center_fit feeds a VALID tpa_center fit into downstream layouts."""
+class LayoutConfigBuildLayoutTests(unittest.TestCase):
+    """build_layout loads a Step-3 channel calibration verbatim (no re-tiling)."""
 
-    class _Fit:
-        def __init__(self, valid: bool, wl: float):
-            self.valid = valid
-            self.center_wl_nm = wl
-
-    class _CenterResult:
-        def __init__(self, valid: bool, wl: float):
-            self.fit = CenterWavelengthResolutionTests._Fit(valid, wl)
-
-    def _ctx(self, *, use_fit: bool, artifact) -> tuple:
-        request = PipelineRequest(
-            stages=[], layout=LayoutConfig(center_wl=778.0),
-            use_center_fit=use_fit,
+    def _channel_calib(self) -> CalibrationResult:
+        # mirror-symmetric channel grid: pitch 20 px around centre 640
+        coords = np.asarray([590.0, 610.0, 630.0, 650.0, 670.0, 690.0])
+        wls = 778.0 - 0.01 * (coords - 640.0)   # a < 0: higher px -> lower wl
+        levels = np.arange(100, 105)
+        intens = np.tile(
+            np.linspace(0.0, 1.0, levels.size), (coords.size, 1)
+        ) + np.arange(coords.size)[:, None]     # distinct curve per row
+        return CalibrationResult(
+            wavelength=wls, coordinates=coords,
+            max_level=int(levels.max()), min_level=int(levels.min()),
+            level_range=levels, intensity_levels=intens,
         )
-        ctx = pipeline._Context(
-            request=request,
-            instruments=_instruments(),
-            stop_event=None,
-            progress_callback=None,
-        )
-        if artifact is not None:
-            ctx.artifacts["center_fit"] = artifact
-        plan = StagePlan(
-            stage_id="pair_eta", config=PairEtaConfig(),
-            inputs=(
-                {"center_fit": InputSpec("memory")} if artifact is not None else {}
-            ),
-            output_path=Path("unused.json"),
-        )
-        return ctx, plan
 
-    def test_valid_fit_wins(self) -> None:
-        ctx, plan = self._ctx(
-            use_fit=True, artifact=self._CenterResult(True, 777.987)
-        )
-        self.assertAlmostEqual(ctx.center_wl(plan), 777.987)
+    def test_channels_are_calibration_rows(self) -> None:
+        layout = LayoutConfig(gap_px=5).build_layout(self._channel_calib())
+        self.assertEqual(layout.n_channels, 3)
+        self.assertEqual(layout.pitch_px, 20)
+        self.assertEqual(layout.channel_width_px, 15)  # pitch - gap_px
+        # innermost-first x/w mirror pairs at exactly the measured centres
+        self.assertEqual([ch.x_center for ch in layout.x_channels],
+                         [630, 610, 590])
+        self.assertEqual([ch.x_center for ch in layout.w_channels],
+                         [650, 670, 690])
 
-    def test_invalid_fit_falls_back_to_layout(self) -> None:
-        ctx, plan = self._ctx(
-            use_fit=True, artifact=self._CenterResult(False, 999.0)
-        )
-        self.assertAlmostEqual(ctx.center_wl(plan), 778.0)
+    def test_configured_gap_recovers_width(self) -> None:
+        layout = LayoutConfig(gap_px=8).build_layout(self._channel_calib())
+        self.assertEqual(layout.channel_width_px, 12)  # pitch 20 - gap 8
 
-    def test_use_center_fit_false_ignores_fit(self) -> None:
-        ctx, plan = self._ctx(
-            use_fit=False, artifact=self._CenterResult(True, 777.9)
-        )
-        self.assertAlmostEqual(ctx.center_wl(plan), 778.0)
-
-    def test_no_center_input_falls_back(self) -> None:
-        ctx, plan = self._ctx(use_fit=True, artifact=None)
-        self.assertAlmostEqual(ctx.center_wl(plan), 778.0)
+    def test_geometry_fields_do_not_retile(self) -> None:
+        # n_channels / center_wl are grid-DESIGN inputs; a measured grid wins
+        config = LayoutConfig(n_channels=1, center_wl=760.0)
+        layout = config.build_layout(self._channel_calib())
+        self.assertEqual(layout.n_channels, 3)
+        self.assertAlmostEqual(layout.center_x, 640.0)
 
 
 class PlotPointTests(unittest.TestCase):
@@ -404,6 +385,74 @@ class PhaseReportRenderTests(unittest.TestCase):
         fig = Figure(figsize=(8, 4))
         plot_fringe(fig, fit, tgt=3)      # must render without raising
         self.assertEqual(len(fig.axes), 2)
+
+
+class CombPhaseJsonTests(unittest.TestCase):
+    """save_comb_phase_json / load_comb_phase_json round trip (no hardware)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    @staticmethod
+    def _fit(dphi: float, frac: float):
+        from slm_module.tpa_phase import PhaseFit
+
+        n = 5
+        arr = np.zeros(n)
+        return PhaseFit(
+            dphi_comb=dphi, dphi_comb_err=0.02,
+            a=0.05, a_err=1e-3, b=0.048, b_err=1e-3,
+            amp=2 * 0.05 * 0.048, amp_err=1e-4,
+            offset=0.0, offset_err=1e-5,
+            chi2_red=1.0, dof=n - 3, birge=1.0, r2=0.99,
+            eta_ref=0.05, eta_tgt=0.048, bound_frac=frac,
+            a_at_bound=False, b_at_bound=False,
+            bg0=0.0, bg1=0.0, bg2=0.0,
+            dphi_slm=arr, g=arr, y=arr, sem=np.ones(n),
+            known=arr, y_pred=arr, residuals=arr,
+        )
+
+    def test_round_trip_and_method_selection(self) -> None:
+        import json
+
+        from slm_module.tpa_phase import load_comb_phase_json, save_comb_phase_json
+
+        step6 = self.out / "step6.json"
+        step6.write_text(
+            json.dumps({"step3": {"probe": 1}, "step6": {"channels": []}}),
+            encoding="utf-8",
+        )
+        fits = {
+            (3, "bounded"): self._fit(0.30, 1.0),
+            (3, "fix"): self._fit(0.29, 0.0),
+            (5, "bounded"): self._fit(-0.23, 1.0),
+            (5, "fix"): self._fit(-0.51, 0.0),
+        }
+        out = self.out / "step7.json"
+        save_comb_phase_json(fits, step6, out, ref_index=1,
+                             csv_path="meas.csv", single_beam_bg=True)
+
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(payload["step3"], {"probe": 1})   # carried over verbatim
+        self.assertEqual(payload["step6"], {"channels": []})
+        self.assertEqual(payload["step7"]["ref_index"], 1)
+
+        ref, entries = load_comb_phase_json(out, method="bounded")
+        self.assertEqual(ref, 1)
+        self.assertEqual(sorted(entries), [3, 5])
+        self.assertAlmostEqual(entries[3]["fit"]["dphi_comb_rad"], 0.30)
+        self.assertAlmostEqual(entries[5]["fit"]["dphi_comb_rad"], -0.23)
+
+        _, fixed = load_comb_phase_json(out, method="fix")
+        self.assertAlmostEqual(fixed[5]["fit"]["dphi_comb_rad"], -0.51)
+        self.assertEqual(fixed[3]["fit"]["bound_frac"], 0.0)
+
+        with self.assertRaisesRegex(ValueError, "several stored fits"):
+            load_comb_phase_json(out)                      # ambiguous without method
+        with self.assertRaisesRegex(ValueError, "no 'other' fit"):
+            load_comb_phase_json(out, method="other")
 
 
 if __name__ == "__main__":

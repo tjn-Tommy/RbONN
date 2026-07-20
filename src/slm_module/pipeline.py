@@ -43,11 +43,10 @@ from .calibration.calibration_new import (
     write_intensity_calibration_csv,
 )
 from .calibration.outliers import OutlierRemeasurePolicy
-from .encoding import ChannelLayout, build_channel_layout
+from .encoding import ChannelLayout, channel_layout_from_calibration
 from .tpa_center import (
     TPACenterAborted,
     TPACenterResult,
-    load_tpa_center_json,
     measure_center_scan,
     save_tpa_center_json,
 )
@@ -132,12 +131,12 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         "pair_eta", "Step 6 · TPA pair efficiency (eta)",
-        requires=("intensity_calib",), optional=("center_fit",),
+        requires=("intensity_calib",), optional=(),
         produces="pair_etas", instruments=frozenset({"monitor", "slm"}),
     ),
     StageSpec(
         "comb_phase", "Step 7 · Comb phase (dPhi_comb)",
-        requires=("intensity_calib", "pair_etas"), optional=("center_fit",),
+        requires=("intensity_calib", "pair_etas"), optional=(),
         produces="comb_phase", instruments=frozenset({"monitor", "slm"}),
     ),
 )
@@ -152,13 +151,15 @@ _STAGE_ORDER: dict[str, int] = {spec.stage_id: i for i, spec in enumerate(STAGES
 
 @dataclass
 class LayoutConfig:
-    """Channel-layout geometry shared by every layout-consuming stage.
+    """Channel-grid geometry for the measurement stages.
 
-    ``guard_bands`` are ``(center_nm, half_width_nm)`` pairs (the Rb lines);
-    they feed :func:`build_channel_calibration_grid` directly and are converted
-    to ``(lo, hi)`` ranges for :func:`build_channel_layout`, so measurement and
-    encoding always agree.  ``center_gap_px`` (None = legacy) likewise reaches
-    both sides.
+    The geometry fields (``n_channels``, widths, gaps, ``center_wl``,
+    ``guard_bands``) feed grid *design* only: the Step-3 stage's
+    :func:`build_channel_calibration_grid` and the tpa_center scan.  Stages
+    that *consume* a measured Step-3 channel calibration no longer re-tile
+    this geometry: :meth:`build_layout` loads the calibration rows verbatim
+    (:func:`channel_layout_from_calibration`), so the encoder always drives
+    exactly the channels that were measured.
     """
 
     n_channels: int = 20
@@ -173,17 +174,15 @@ class LayoutConfig:
             (center - half, center + half) for center, half in self.guard_bands
         )
 
-    def build_layout(
-        self, calib: CalibrationResult, *, center_wl: float | None = None
-    ) -> ChannelLayout:
-        return build_channel_layout(
-            calib,
-            n_channels=self.n_channels,
-            channel_width_px=self.channel_width_px,
-            gap_px=self.gap_px,
-            center_gap_px=self.center_gap_px,
-            center_wl=self.center_wl if center_wl is None else float(center_wl),
-            dark_wl_bands=self.dark_wl_bands(),
+    def build_layout(self, calib: CalibrationResult) -> ChannelLayout:
+        """Load the channel layout verbatim from a Step-3 channel calibration.
+
+        The calibration rows ARE the channels (one per measured centre); the
+        file does not record the window/gap split, so the configured
+        ``gap_px`` recovers the window width as ``pitch - gap_px``.
+        """
+        return channel_layout_from_calibration(
+            calib, assumed_gap_px=self.gap_px
         )
 
 
@@ -213,6 +212,9 @@ class WlMapConfig:
     levels: list[int] = field(default_factory=lambda: list(range(0, 1024, 64)))
     window_size: int = 8
     coordinate_stride: int = 1        # measure every Nth column, fit fills the rest
+    sweep_span_nm: float | None = None       # narrow re-centered span; None = wide
+    min_peak_wavelength_nm: float | None = None  # ignore peaks below
+    max_peak_wavelength_nm: float | None = None  # ignore peaks above (leak mask)
     peak_half_window_nm: float | None = None
     region: tuple[int, int] | None = None
     osa: OSAStageSettings = field(default_factory=OSAStageSettings)
@@ -251,8 +253,6 @@ class PairEtaConfig:
     sweep_max: float = 1.0
     n_points: int = 5
     reduced_points: bool = True       # 1-D curves (x-only/w-only/cross) vs full grid
-    n_trials: int = 5
-    repeats: int = 1
     settle: float = 0.15
 
 
@@ -264,13 +264,10 @@ class CombPhaseConfig:
     phi_start_deg: float = 0.0
     phi_stop_deg: float = 180.0
     ref_phase_deg: float = 180.0
-    n_trials: int = 10
-    repeats: int = 1
     settle: float = 0.15
-    bound_frac: float | None = 1.0    # None -> unconstrained closed-form fit
+    bound_frac: float | None = 1.0    # None -> unconstrained closed-form fit; 0 -> a,b pinned to the step-6 etas (s=1)
     single_beam_bg: bool = True
     measure_dark: bool = True
-    dark_per_trial: bool = True
 
 
 _CONFIG_TYPES: dict[str, type] = {
@@ -306,7 +303,6 @@ class PipelineRequest:
     stages: list[StagePlan]
     layout: LayoutConfig = field(default_factory=LayoutConfig)
     col_ratio: np.ndarray | None = None   # per-column encoding shape (TPA stages)
-    use_center_fit: bool = True           # feed a valid centre fit downstream
 
 
 @dataclass
@@ -463,7 +459,6 @@ def validate_request(request: PipelineRequest) -> None:
 _FILE_LOADERS: dict[str, Callable[[Path], Any]] = {
     "wl_map": load_calibration_result,
     "intensity_calib": load_calibration_result,
-    "center_fit": load_tpa_center_json,
     # pair_etas from file stays a Path: CSV re-fits need the layout, which
     # only exists inside the consuming stage (see _as_pair_models)
     "pair_etas": lambda path: Path(path),
@@ -509,19 +504,6 @@ class _Context:
         self.saved_files.append(resolved)
         return resolved
 
-    def center_wl(self, plan: StagePlan) -> float:
-        """The centre wavelength downstream stages should build layouts at."""
-        layout = self.request.layout
-        if not self.request.use_center_fit:
-            return layout.center_wl
-        center_fit = self.resolve(plan, "center_fit")
-        if center_fit is None:
-            return layout.center_wl
-        fit = getattr(center_fit, "fit", None)
-        if fit is not None and fit.valid:
-            return float(fit.center_wl_nm)
-        return layout.center_wl
-
 
 def _run_wl_map(ctx: _Context, plan: StagePlan) -> Any:
     cfg: WlMapConfig = plan.config
@@ -547,6 +529,9 @@ def _run_wl_map(ctx: _Context, plan: StagePlan) -> Any:
         peak_half_window_nm=cfg.peak_half_window_nm,
         region=cfg.region,
         coordinate_stride=cfg.coordinate_stride,
+        sweep_span_nm=cfg.sweep_span_nm,
+        min_peak_wavelength_nm=cfg.min_peak_wavelength_nm,
+        max_peak_wavelength_nm=cfg.max_peak_wavelength_nm,
         outlier_policy=cfg.outlier_policy,
         stop_event=ctx.stop_event, progress_callback=report,
     )
@@ -658,9 +643,7 @@ def _run_pair_eta(ctx: _Context, plan: StagePlan) -> Any:
     cfg: PairEtaConfig = plan.config
     report = ctx.forward(STAGE_BY_ID["pair_eta"])
     calib: CalibrationResult = ctx.resolve(plan, "intensity_calib")
-    layout_obj = ctx.request.layout.build_layout(
-        calib, center_wl=ctx.center_wl(plan)
-    )
+    layout_obj = ctx.request.layout.build_layout(calib)
 
     indices = list(cfg.pair_indices) or list(range(layout_obj.n_channels))
     for index in indices:
@@ -677,7 +660,7 @@ def _run_pair_eta(ctx: _Context, plan: StagePlan) -> Any:
     result = measure_pair_grids(
         ctx.instruments.monitor, ctx.instruments.slm, layout_obj,
         pair_indices=indices, sweep=sweep, points=points,
-        n_trials=cfg.n_trials, repeats=cfg.repeats, settle=cfg.settle,
+        settle=cfg.settle,
         read_timeout=ctx.instruments.monitor_read_timeout,
         col_ratio=ctx.request.col_ratio,
         stop_event=ctx.stop_event, progress_callback=report,
@@ -716,9 +699,7 @@ def _run_comb_phase(ctx: _Context, plan: StagePlan) -> Any:
     cfg: CombPhaseConfig = plan.config
     report = ctx.forward(STAGE_BY_ID["comb_phase"])
     calib: CalibrationResult = ctx.resolve(plan, "intensity_calib")
-    layout_obj = ctx.request.layout.build_layout(
-        calib, center_wl=ctx.center_wl(plan)
-    )
+    layout_obj = ctx.request.layout.build_layout(calib)
     models = _as_pair_models(ctx.resolve(plan, "pair_etas"), layout_obj)
 
     needed = [("reference", cfg.ref_index)] + [
@@ -744,9 +725,9 @@ def _run_comb_phase(ctx: _Context, plan: StagePlan) -> Any:
             ctx.instruments.monitor, ctx.instruments.slm, layout_obj,
             tgt_index=k, ref_index=cfg.ref_index,
             drive=drive, tgt_model=models[k], ref_model=models[cfg.ref_index],
-            n_trials=cfg.n_trials, repeats=cfg.repeats, settle=cfg.settle,
+            settle=cfg.settle,
             read_timeout=ctx.instruments.monitor_read_timeout,
-            measure_dark=cfg.measure_dark, dark_per_trial=cfg.dark_per_trial,
+            measure_dark=cfg.measure_dark,
             col_ratio=ctx.request.col_ratio,
             frac=cfg.bound_frac, single_beam_bg=cfg.single_beam_bg,
             stop_event=ctx.stop_event, progress_callback=report,

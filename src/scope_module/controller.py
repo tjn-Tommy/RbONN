@@ -394,6 +394,7 @@ class ScopeController:
         poll_interval: float = 0.05,
         stop_event: threading.Event | None = None,
         want_waveform: bool = False,
+        single: bool = False,
     ) -> MonitorSample | None:
         """Wait for one trigger, then return the gated MEAN (and STDDev).
 
@@ -401,7 +402,10 @@ class ScopeController:
         configure_monitor() has already run. ``timeout`` must exceed the worst
         case wait for a trigger plus the acquisition window. Both the mean
         (group 1) and its within-window standard deviation (group 2) come from
-        the one completed acquisition.
+        the one completed acquisition.  ``single`` is accepted for interface
+        parity with DAQController (which reads single-beam/dark points over a
+        longer T_single window); the scope's window is fixed by
+        configure_monitor, so it is ignored here.
         """
         settings = getattr(self, "_monitor_settings", None)
         completed = self.run_single_acquisition(

@@ -20,10 +20,10 @@ from scope_module.controller import MonitorSample
 from .driver import DAQConnectionError, DAQError, NIDAQDriver
 
 
-def _lowpass(v: np.ndarray, fs: float, f_cut: float, order: int = 4) -> np.ndarray:
-    """Zero-phase Butterworth low-pass at ``f_cut`` Hz (ported from the
-    ``daq_read_waveform`` smoke test).
+def lowpass(v: np.ndarray, fs: float, f_cut: float, order: int = 4) -> np.ndarray:
+    """Zero-phase Butterworth low-pass at ``f_cut`` Hz.
 
+    The one low-pass every DAQ consumer shares (controller, drafts, GUI).
     Returns ``v`` unchanged when the cutoff is at/above Nyquist, when the trace
     is too short to filter, or when SciPy is unavailable -- so the caller always
     gets a usable trace back.
@@ -48,31 +48,30 @@ def _lowpass(v: np.ndarray, fs: float, f_cut: float, order: int = 4) -> np.ndarr
 class DAQMonitorSettings:
     """Parameters for one untriggered averaged DAQ readout.
 
-    No trigger: the PC arms the acquisition directly and stops it after
-    ``duration`` seconds (see NIDAQDriver.read_waveform), mirroring the
-    scope's software/AUTO free-run read path used for the same page.
+    No trigger: the PC arms the acquisition directly and stops it after a fixed
+    window (see NIDAQDriver.read_waveform), mirroring the scope's software/AUTO
+    free-run read path used for the same page.  Two fixed windows: ``duration``
+    (T_both -- both beams of a pair on, bright signal) and the longer
+    ``single_duration`` (T_single -- at most one beam on, i.e. ``x == 0 or
+    w == 0`` including the all-off dark point) -- a weak signal needs the extra
+    averaging while bright points do not (``monitor_cycle(single=True)``
+    selects it).
+
+    Defaults are the values validated on hardware by the step-6/7 calibration
+    runs (``src/drafts/calib_step6_test.py`` / ``calib_step7_test.py``).
     """
 
     channel: str = "ai0"
-    sample_rate: float = 100.0   # Sa/s
-    duration: float = 0.05           # fixed averaging window, seconds (adaptive=False)
+    sample_rate: float = 1_000.0     # Sa/s
+    duration: float = 3.0            # T_both: window per read, seconds
+    single_duration: float = 5.0     # T_single: window for single-beam / dark reads, seconds
     hold: float = 0.1                # settle time after the SLM pattern change, seconds
-    min_val: float = -0.010          # V
-    max_val: float = 0.050           # V
-    f_cut: float = 3.5               # Hz, hardware 3 dB bandwidth (low-pass + effective-N)
+    # Input range is quantized: the board only offers +/-0.1, 0.2, 0.5, 1, 2,
+    # 5, 10 V and rounds any request UP -- +/-0.1 V is the most sensitive.
+    min_val: float = -0.1            # V
+    max_val: float = 0.1             # V
+    f_cut: float = 20.0              # Hz, hardware 3 dB bandwidth (low-pass + effective-N)
     filter_order: int = 4            # digital Butterworth low-pass order
-
-    # ---- Adaptive per-point averaging (see DAQController._adaptive_read) ----
-    # When ``adaptive`` is set, ``duration`` is ignored: each reading probes for
-    # ``t_probe`` seconds, then extends until its SEM meets
-    # ``max(target_rel*|mean|, sem_floor)``, capped at ``t_max``.  Bright points
-    # finish fast; near-zero-signal points stop at the absolute ``sem_floor``
-    # instead of chasing an unreachable relative target.
-    adaptive: bool = False           # per-point dynamic duration to hit a SEM target
-    target_rel: float = 0.01         # target relative SEM (SEM/|mean|)
-    sem_floor: float = 60e-6         # absolute SEM floor (V) for near-zero signals
-    t_probe: float = 1.0             # probe / minimum window per point, seconds
-    t_max: float = 10.0              # cap per point, seconds
 
 
 class DAQController:
@@ -146,6 +145,7 @@ class DAQController:
         index: int = 0,
         timeout: float = 30.0,
         stop_event: threading.Event | None = None,
+        single: bool = False,
     ) -> MonitorSample | None:
         """One settle-then-read averaged sample, shaped like ScopeController's.
 
@@ -162,18 +162,19 @@ class DAQController:
         ``f_cut``-bandwidth signal), not the raw sample count -- oversampling
         past ``2 * f_cut`` adds no new information about the mean.
 
-        With ``settings.adaptive`` set, the fixed ``duration`` window is replaced
-        by a per-point dynamic one (see :meth:`_adaptive_read`).
+        ``single=True`` marks a weak point -- at most one beam on (``x == 0 or
+        w == 0``, including the all-off dark): it reads the longer
+        ``settings.single_duration`` window (T_single), since a weak signal
+        needs the extra averaging.  Every other read uses the fixed
+        ``settings.duration`` window (T_both).
         """
         if stop_event is not None and stop_event.is_set():
             return None
         settings = self._settings or DAQMonitorSettings()
         if settings.hold:
             time.sleep(settings.hold)
-        if settings.adaptive:
-            return self._adaptive_read(settings, index=index, timeout=timeout,
-                                       stop_event=stop_event)
-        values = self._read_raw(settings, settings.duration, timeout)
+        duration = settings.single_duration if single else settings.duration
+        values = self._read_raw(settings, duration, timeout)
         return self._sample_from(settings, values, index)
 
     def _read_raw(self, settings: DAQMonitorSettings, duration: float,
@@ -204,7 +205,7 @@ class DAQController:
             np.arange(values.size, dtype=float) / settings.sample_rate
             if settings.sample_rate else np.zeros_like(values)
         )
-        filtered = _lowpass(values, settings.sample_rate, settings.f_cut, settings.filter_order)
+        filtered = lowpass(values, settings.sample_rate, settings.f_cut, settings.filter_order)
         mean = float(filtered.mean())
         std = float(filtered.std())
         duration = values.size / settings.sample_rate if settings.sample_rate else 0.0
@@ -217,53 +218,6 @@ class DAQController:
         )
         self._notify_sample_listeners(sample)
         return sample
-
-    def _adaptive_read(
-        self,
-        settings: DAQMonitorSettings,
-        *,
-        index: int,
-        timeout: float,
-        stop_event: threading.Event | None,
-    ) -> MonitorSample | None:
-        """Per-point dynamic duration: probe once, then extend to hit a SEM target.
-
-        The low-passed waveform std is (to first order) independent of the window
-        length, so a short probe of ``t_probe`` seconds predicts the SEM at any
-        duration via ``SEM(T) = std / sqrt(2*T*f_cut)``.  Inverting that for the
-        SEM target ``max(target_rel*|mean|, sem_floor)`` gives the duration needed;
-        it is clamped to ``[t_probe, t_max]``.
-
-        The probe samples are kept and pooled with the extension read, so no
-        acquisition time is wasted -- and the returned mean/std/sem are recomputed
-        on the *full pooled trace*, so the recorded uncertainty is the true
-        achieved SEM even if the probe's duration estimate was slightly off.  Near-
-        zero-signal points hit the absolute ``sem_floor`` (and its bounded
-        duration) instead of an unreachable relative target.
-        """
-        f_cut = settings.f_cut
-        t_probe = settings.t_probe if settings.t_probe > 0 else settings.duration
-        values = self._read_raw(settings, t_probe, timeout)
-
-        filtered = _lowpass(values, settings.sample_rate, f_cut, settings.filter_order)
-        mean = float(filtered.mean())
-        std = float(filtered.std())
-        sem_target = max(settings.target_rel * abs(mean), settings.sem_floor)
-        if f_cut > 0.0 and sem_target > 0.0:
-            t_need = std * std / (2.0 * f_cut * sem_target * sem_target)
-        else:
-            t_need = settings.t_max
-        t_total = min(max(t_need, t_probe), settings.t_max)
-
-        if t_total > t_probe * 1.001:
-            if stop_event is not None and stop_event.is_set():
-                return None
-            # Back-to-back finite reads with a ~ms re-arm gap; for an f_cut-limited
-            # signal the seam is negligible, so treat the concatenation as one trace.
-            extra = self._read_raw(settings, t_total - t_probe, timeout)
-            values = np.concatenate([values, extra])
-
-        return self._sample_from(settings, values, index)
 
     def __enter__(self):
         self.connect()
@@ -279,4 +233,5 @@ __all__ = [
     "MonitorSample",
     "DAQError",
     "DAQConnectionError",
+    "lowpass",
 ]

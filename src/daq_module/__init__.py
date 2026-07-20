@@ -1,6 +1,6 @@
 """NI-DAQmx analog-input control package."""
 
-from .controller import DAQController, DAQMonitorSettings, MonitorSample
+from .controller import DAQController, DAQMonitorSettings, MonitorSample, lowpass
 from .driver import DAQConnectionError, DAQError, NIDAQDriver
 
 __all__ = [
@@ -10,4 +10,5 @@ __all__ = [
     "NIDAQDriver",
     "DAQError",
     "DAQConnectionError",
+    "lowpass",
 ]

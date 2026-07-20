@@ -36,6 +36,16 @@ averaged around that coordinate's calibrated wavelength.
 """
 
 
+# Normalized traces are only trusted where the bright reference rises above
+# this fraction of its own peak; below it the divide inflates noise/drift into
+# spurious peaks (see _reduce_arrays).
+_MIN_REFERENCE_FRACTION = 0.05
+
+# Minimum normalized peak strength for a step-2 anchor measurement to count as
+# a real peak (a genuine window peak normalizes to ~1).
+_MIN_ANCHOR_PEAK_STRENGTH = 0.1
+
+
 class CalibrationAborted(Exception):
     """Raised when a stop_event interrupts a calibration sweep."""
 
@@ -317,6 +327,9 @@ def wavelength_calibration(
     peak_half_window_nm: float | None = None,
     region: tuple[int, int] | None = None,
     coordinate_stride: int = 1,
+    sweep_span_nm: float | None = None,
+    min_peak_wavelength_nm: float | None = None,
+    max_peak_wavelength_nm: float | None = None,
     outlier_policy: OutlierRemeasurePolicy | None = None,
     stop_event: threading.Event | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -338,6 +351,21 @@ def wavelength_calibration(
     the returned result still carries the dense per-column grid a stride-1
     sweep would produce. 1 (default) measures every position.
 
+    ``sweep_span_nm`` speeds up acquisition further: when set, the two
+    region-edge positions are measured first with the wide ``measure_settings``
+    span (anchors -- their wavelengths are unknown until measured), a straight
+    line through the two anchor peaks predicts every other position's
+    wavelength, and each remaining position is measured with a narrow OSA span
+    (``sweep_span_nm`` wide) re-centered on its prediction -- far fewer samples
+    per sweep with AUTO sampling. The dark/bright references keep the wide span
+    and are interpolated onto each narrow grid. None (default) uses the wide
+    span everywhere.
+
+    ``min_peak_wavelength_nm`` / ``max_peak_wavelength_nm`` exclude trace
+    samples below / above that wavelength from the peak search, e.g. to mask a
+    fixed leakage artifact the SLM never modulates (light falling outside the
+    active area). None (default) leaves that end of the trace unclipped.
+
     ``outlier_policy`` enables post-sweep auto-remeasurement: after the sweep, a
     linear coordinate->wavelength fit flags points whose residual exceeds
     ``k_sigma`` robust sigmas; each flagged window is re-displayed and
@@ -351,6 +379,26 @@ def wavelength_calibration(
     coordinate_stride = int(coordinate_stride)
     if coordinate_stride < 1:
         raise ValueError("coordinate_stride must be >= 1")
+    use_narrow = sweep_span_nm is not None
+    sweep_value = 0.0
+    if use_narrow:
+        sweep_value = float(sweep_span_nm)
+        if not sweep_value > 0:
+            raise ValueError("sweep_span_nm must be positive when provided")
+    min_peak = None
+    if min_peak_wavelength_nm is not None:
+        min_peak = float(min_peak_wavelength_nm)
+        if not np.isfinite(min_peak):
+            raise ValueError("min_peak_wavelength_nm must be finite")
+    max_peak = None
+    if max_peak_wavelength_nm is not None:
+        max_peak = float(max_peak_wavelength_nm)
+        if not np.isfinite(max_peak):
+            raise ValueError("max_peak_wavelength_nm must be finite")
+    if min_peak is not None and max_peak is not None and min_peak >= max_peak:
+        raise ValueError(
+            "min_peak_wavelength_nm must be below max_peak_wavelength_nm"
+        )
     min_level = _level_value(calibration_results.min_level, "min_level")
     max_level = _level_value(calibration_results.max_level, "max_level")
     region_lo, region_hi = _resolve_scan_region(region, slm_width, window_size)
@@ -365,31 +413,111 @@ def wavelength_calibration(
     reference_trace = osa.measure(measure_settings)
     reference_power = _trace_power_w(reference_trace)
 
+    reference_axis = np.asarray(reference_trace.wavelengths_nm, dtype=float)
+    n_ref = min(reference_axis.size, background_power.size, reference_power.size)
+    denominator_scale = (
+        float(np.max(reference_power[:n_ref] - background_power[:n_ref]))
+        if n_ref else 0.0
+    )
+
+    def _acquire_peak(x_start: int, center_nm: float | None) -> tuple[float, float]:
+        """Display the bright window at x_start, measure, return (wl, strength).
+
+        center_nm re-centers a sweep_span_nm-wide sweep on that wavelength;
+        None measures with the wide measure_settings span."""
+        pattern = dark_pattern.copy()
+        pattern[x_start : x_start + window_size] = max_level
+        _display_1d_pattern(slm, pattern, slm_height)
+        if center_nm is None:
+            trace = osa.measure(measure_settings)
+            trace_wavelengths, _signal, normalized = _reduce_trace(
+                trace, _trace_power_w(trace), background_power, reference_power
+            )
+        else:
+            narrow_settings = replace(
+                measure_settings,
+                center_wl=f"{center_nm:.4f}nm",
+                span=f"{sweep_value}nm",
+            )
+            trace = osa.measure(narrow_settings)
+            trace_wavelengths, _signal, normalized = _reduce_trace_resampled(
+                trace,
+                _trace_power_w(trace),
+                reference_axis,
+                background_power,
+                reference_power,
+                denominator_scale=denominator_scale,
+            )
+        if min_peak is not None:
+            normalized[trace_wavelengths < min_peak] = 0.0
+        if max_peak is not None:
+            normalized[trace_wavelengths > max_peak] = 0.0
+        wavelength, _, strength = local_peak_centroid(
+            trace_wavelengths,
+            normalized,
+            half_window=peak_half_window,
+            half_window_nm=peak_half_window_nm,
+        )
+        return float(wavelength), float(strength)
+
     coordinates: list[int] = []
     wavelengths: list[float] = []
 
     x_starts = list(range(region_lo, region_hi, coordinate_stride))
     if x_starts[-1] != region_hi - 1:
         x_starts.append(region_hi - 1)   # anchor the fit at the far edge
-
     total = len(x_starts)
+
+    predict = None
+    anchor_wavelengths: dict[int, float] = {}
+    if use_narrow:
+        if len(x_starts) < 2:
+            raise ValueError(
+                "sweep_span_nm needs a region with at least two window positions"
+            )
+        # Measure the two region-edge positions with the wide span first: their
+        # wavelengths bootstrap the linear prediction the narrow sweeps center on.
+        for anchor_index, a_start in ((0, x_starts[0]), (total - 1, x_starts[-1])):
+            _check_stop(stop_event)
+            anchor_wl, anchor_strength = _acquire_peak(a_start, None)
+            if anchor_strength < _MIN_ANCHOR_PEAK_STRENGTH:
+                raise ValueError(
+                    f"anchor window at x={a_start} shows no clear peak "
+                    f"(normalized strength {anchor_strength:.3g}); check the "
+                    "scan region, OSA settings, and min/max_peak_wavelength_nm"
+                )
+            anchor_wavelengths[a_start] = anchor_wl
+            _report(
+                progress_callback,
+                "wavelength",
+                anchor_index,
+                total,
+                f"anchor x={a_start + window_size // 2} -> {anchor_wl:.3f} nm",
+                x=float(a_start + window_size // 2),
+                y=float(anchor_wl),
+            )
+        c_lo = float(x_starts[0] + window_size // 2)
+        c_hi = float(x_starts[-1] + window_size // 2)
+        w_lo = anchor_wavelengths[x_starts[0]]
+        w_hi = anchor_wavelengths[x_starts[-1]]
+        if abs(w_hi - w_lo) < 1e-9:
+            raise ValueError(
+                f"anchor peaks coincide (both read {w_lo:.4f} nm); cannot "
+                "predict sweep centers"
+            )
+        slope = (w_hi - w_lo) / (c_hi - c_lo)
+
+        def predict(coordinate: float) -> float:
+            return w_lo + slope * (coordinate - c_lo)
+
     for index, x_start in enumerate(x_starts):
         _check_stop(stop_event)
-        pattern = dark_pattern.copy()
-        pattern[x_start : x_start + window_size] = max_level
-        _display_1d_pattern(slm, pattern, slm_height)
-
-        trace = osa.measure(measure_settings)
-        trace_wavelengths, _signal, normalized = _reduce_trace(
-            trace, _trace_power_w(trace), background_power, reference_power
-        )
-        wavelength, _, _ = local_peak_centroid(
-            trace_wavelengths,
-            normalized,
-            half_window=peak_half_window,
-            half_window_nm=peak_half_window_nm,
-        )
         coordinate = x_start + window_size // 2
+        if x_start in anchor_wavelengths:
+            wavelength = anchor_wavelengths[x_start]
+        else:
+            center = predict(float(coordinate)) if predict is not None else None
+            wavelength, _strength = _acquire_peak(x_start, center)
         coordinates.append(coordinate)
         wavelengths.append(wavelength)
         _report(
@@ -428,19 +556,10 @@ def wavelength_calibration(
             for i in flagged:
                 _check_stop(stop_event)
                 x_start = int(coordinates[i]) - window_size // 2
-                pattern = dark_pattern.copy()
-                pattern[x_start : x_start + window_size] = max_level
-                _display_1d_pattern(slm, pattern, slm_height)
-                trace = osa.measure(measure_settings)
-                trace_wavelengths, _signal, normalized = _reduce_trace(
-                    trace, _trace_power_w(trace), background_power, reference_power
+                center = (
+                    predict(float(coordinates[i])) if predict is not None else None
                 )
-                wavelength, _, _ = local_peak_centroid(
-                    trace_wavelengths,
-                    normalized,
-                    half_window=peak_half_window,
-                    half_window_nm=peak_half_window_nm,
-                )
+                wavelength, _strength = _acquire_peak(x_start, center)
                 readings.setdefault(int(i), []).append(float(wavelength))
                 wavelength_array[i] = float(np.median(readings[int(i)]))
                 _report(
@@ -722,9 +841,10 @@ def build_channel_calibration_grid(
 
     ``center_gap_px`` widens the central dark pad to at least that many pixels
     (first offset ``ceil((width + center_gap_px)/2)`` instead of half a pitch).
-    It MUST match the ``center_gap_px`` used by
-    :func:`slm_module.encoding.build_channel_layout`, otherwise the measured
-    coordinates will not coincide with the encoding layout's channel centers.
+    The measured coordinates ARE the encoding layout's channel centers: the
+    encoder loads the result verbatim via
+    :func:`slm_module.encoding.channel_layout_from_calibration`, so the grid
+    designed here is the single source of the channel geometry.
     ``None`` keeps the legacy half-pitch placement.
 
     When ``center_coordinate`` is supplied, the linear wavelength map is shifted
@@ -1492,14 +1612,13 @@ def save_calibration_result(
     return out
 
 
-def load_calibration_result(path: str | Path) -> CalibrationResult:
-    """Rebuild a CalibrationResult written by save_calibration_result."""
+def calibration_result_from_dict(payload: dict) -> CalibrationResult:
+    """Rebuild a CalibrationResult from a save_calibration_result payload dict.
 
-    src = Path(path).resolve()
-    if not src.is_file():
-        raise FileNotFoundError(f"Calibration result not found: {src}")
-    with open(src, "r", encoding="utf-8") as file:
-        payload = json.load(file)
+    Accepts the parsed JSON either straight from a calibration file or embedded
+    in another output (e.g. the step-6 combined result stores the raw step-3
+    payload under its ``"step3"`` key).
+    """
 
     return CalibrationResult(
         wavelength=_array_or_empty(payload.get("wavelength")),
@@ -1513,6 +1632,18 @@ def load_calibration_result(path: str | Path) -> CalibrationResult:
             payload.get("wavelength_fit_coefficients")
         ),
     )
+
+
+def load_calibration_result(path: str | Path) -> CalibrationResult:
+    """Rebuild a CalibrationResult written by save_calibration_result."""
+
+    src = Path(path).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Calibration result not found: {src}")
+    with open(src, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    return calibration_result_from_dict(payload)
 
 
 def load_wavelength_map_csv(
@@ -1614,6 +1745,34 @@ def _check_stop(stop_event: threading.Event | None) -> None:
         raise CalibrationAborted("calibration stopped by request")
 
 
+def _reduce_arrays(
+    wavelengths: np.ndarray,
+    power_w: np.ndarray,
+    background_power_w: np.ndarray,
+    reference_power_w: np.ndarray,
+    *,
+    denominator_scale: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    signal = np.asarray(power_w, dtype=float) - background_power_w
+    signal = np.clip(np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+
+    denominator = reference_power_w - background_power_w
+    # Only normalize where the bright reference actually carries light. Where
+    # it does not (outside the source spectrum, or light the SLM never
+    # modulates), the ratio is drift-residue over nothing and inflates into
+    # spurious peaks that can beat the real one.
+    scale = denominator_scale
+    if scale is None:
+        scale = float(np.max(denominator)) if denominator.size else 0.0
+    floor = max(_MIN_REFERENCE_FRACTION * scale, float(np.finfo(float).eps))
+    normalized = np.zeros(signal.size, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        np.divide(signal, denominator, out=normalized, where=denominator > floor)
+
+    normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+    return wavelengths, signal, np.clip(normalized, 0.0, None)
+
+
 def _reduce_trace(
     trace: TraceData,
     power_w: np.ndarray,
@@ -1624,7 +1783,9 @@ def _reduce_trace(
 
     signal_W is the background-subtracted power in watts (clipped at 0);
     normalized divides that by the bright reference (reference - background),
-    also clipped at 0. Both share the returned wavelength axis.
+    also clipped at 0, and only where the reference rises above
+    _MIN_REFERENCE_FRACTION of its own peak. Both share the returned
+    wavelength axis.
     """
     count = min(
         trace.wavelengths_nm.size,
@@ -1635,22 +1796,52 @@ def _reduce_trace(
     if count <= 0:
         raise ValueError("Trace, background, and reference must not be empty")
 
-    wavelengths = trace.wavelengths_nm[:count]
-    signal = np.asarray(power_w[:count], dtype=float) - background_power_w[:count]
-    signal = np.clip(np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    return _reduce_arrays(
+        trace.wavelengths_nm[:count],
+        power_w[:count],
+        background_power_w[:count],
+        reference_power_w[:count],
+    )
 
-    denominator = reference_power_w[:count] - background_power_w[:count]
-    normalized = np.zeros(count, dtype=float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        np.divide(
-            signal,
-            denominator,
-            out=normalized,
-            where=np.abs(denominator) > np.finfo(float).eps,
-        )
 
-    normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
-    return wavelengths, signal, np.clip(normalized, 0.0, None)
+def _reduce_trace_resampled(
+    trace: TraceData,
+    power_w: np.ndarray,
+    reference_axis_nm: np.ndarray,
+    background_power_w: np.ndarray,
+    reference_power_w: np.ndarray,
+    *,
+    denominator_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reduce a trace whose wavelength grid differs from the reference grid.
+
+    The wide-span background/reference are interpolated onto the (narrow)
+    trace axis. ``denominator_scale`` carries the wide-grid peak reference so
+    the validity floor stays relative to the source maximum rather than to
+    whatever slice of it the narrow span happens to cover.
+    """
+    count = min(trace.wavelengths_nm.size, power_w.size)
+    if count <= 0:
+        raise ValueError("Trace must not be empty")
+    n_ref = min(
+        np.asarray(reference_axis_nm).size,
+        background_power_w.size,
+        reference_power_w.size,
+    )
+    if n_ref <= 0:
+        raise ValueError("Background and reference must not be empty")
+
+    wavelengths = np.asarray(trace.wavelengths_nm[:count], dtype=float)
+    axis = np.asarray(reference_axis_nm, dtype=float)[:n_ref]
+    background = np.interp(wavelengths, axis, background_power_w[:n_ref])
+    reference = np.interp(wavelengths, axis, reference_power_w[:n_ref])
+    return _reduce_arrays(
+        wavelengths,
+        power_w[:count],
+        background,
+        reference,
+        denominator_scale=denominator_scale,
+    )
 
 
 def _display_1d_pattern(

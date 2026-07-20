@@ -84,7 +84,7 @@ class NIDAQDriver:
             with nidaqmx.Task() as task:
                 task.ai_channels.add_ai_voltage_chan(
                     f"{self.device}/{channel}",
-                    terminal_config=TerminalConfiguration.RSE,  # single-ended vs AI GND
+                    terminal_config=TerminalConfiguration.DIFF,  # AI+ minus AI- (not vs AI GND)
                     min_val=min_val,
                     max_val=max_val,
                 )
