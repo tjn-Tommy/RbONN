@@ -1,4 +1,4 @@
-"""Shared bench wiring for the calibration steps (SLM + DAQ).
+"""Shared bench wiring for the calibration steps (SLM + DAQ + OSA).
 
 The step scripts drive the same instruments the GUI does, but from plain
 scripts.  This module holds the wiring that used to be copy-pasted into each
@@ -12,6 +12,8 @@ one, and is the single chokepoint every step-6/7/8 read passes through:
   :class:`~daq_module.DAQMonitorSettings` defaults -- the values these steps
   validated on hardware, now owned by ``daq_module``.
 * :func:`read_point` -- one fixed-window averaged read -> ``(mean, std)``.
+* :func:`connect_osa` -- the AQ637X over LAN, for the step 1-3 OSA sweeps.
+* :func:`print_progress` -- a ``progress_callback`` that prints each update.
 
 It was ``steps/draft_hw.py`` until the fit/measure split; nothing about it was
 ever a draft, and it sits here now because it is the acquisition layer itself,
@@ -26,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from daq_module import DAQController, DAQMonitorSettings  # noqa: E402
+from osa_module.controller import OSAController  # noqa: E402
 from slm_module.controller import SLMController  # noqa: E402
 
 # Our transimpedance amplifier outputs a NEGATIVE voltage for positive light, so
@@ -137,9 +140,28 @@ def read_point(
     return mean, float(sample.std)
 
 
+def connect_osa(host: str = "192.168.1.11", port: int = 10001) -> OSAController:
+    """Open the OSA over LAN (the GUI's Connections-page defaults)."""
+    osa = OSAController(host=host, port=port)
+    osa.connect()
+    print(f"OSA: {osa.identify()} at {host}:{port}")
+    return osa
+
+
+def print_progress(progress) -> None:
+    """A ``progress_callback`` for the step 1-3 sweeps: one line per update.
+
+    ``progress`` is a ``measure.slm_response.CalibrationProgress``.
+    """
+    print(f"  [{progress.phase} {progress.step + 1}/{progress.total}] "
+          f"{progress.message}")
+
+
 __all__ = [
     "detect_slm_display",
     "connect_slm",
     "connect_daq",
+    "connect_osa",
     "read_point",
+    "print_progress",
 ]

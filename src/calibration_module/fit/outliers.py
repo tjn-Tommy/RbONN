@@ -9,7 +9,7 @@ the median of its re-measurements.  The flag -> re-measure round repeats up to
 ``max_retries`` times per sweep.
 
 Only the pure numerics live here (Qt-free, hardware-free); the calibration
-functions in :mod:`slm_module.calibration.calibration_new` own the actual
+sweeps in :mod:`calibration_module.measure.slm_response` own the actual
 re-display + re-measure loops.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .calibration import intensity_model
+from .legacy_intensity import intensity_model
 
 _SIGMA_FLOOR = 1e-15
 
@@ -129,7 +129,7 @@ def transfer_fit_residuals(levels: np.ndarray, values: np.ndarray) -> np.ndarray
     """Residuals of the sin^2 SLM transfer model (Step-3 curve shape).
 
     Fits ``I = i0 * sin((a*level + b)/2)^2`` (the
-    :func:`slm_module.calibration.calibration.intensity_model`) by nonlinear
+    :func:`calibration_module.fit.legacy_intensity.intensity_model`) by nonlinear
     least squares.  If the fit cannot converge it falls back to a cubic
     polynomial -- the point is a smooth reference to flag spikes against, not a
     physics-grade fit -- so this never raises for finite input arrays.

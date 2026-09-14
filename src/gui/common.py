@@ -14,7 +14,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from slm_module.calibration.calibration_new import CalibrationProgress
+from calibration_module.measure.slm_response import CalibrationProgress
 
 
 def _format_duration(seconds: float) -> str:

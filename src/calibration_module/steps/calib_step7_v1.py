@@ -95,7 +95,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from calibration_module.measure.bench import connect_daq, connect_slm, read_point  # noqa: E402
-from slm_module.calibration.calibration_new import calibration_result_from_dict  # noqa: E402
+from calibration_module.fit.slm_response import calibration_result_from_dict  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 from calibration_module.fit.phase import (  # noqa: E402
     PhaseFit,

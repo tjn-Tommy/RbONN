@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from calibration_module.measure.phase_v2 import PhaseV2Config  # noqa: E402
 
-RUN = REPO / "src/calib_data/run_0908_1444"
+RUN = REPO / "src/calib_data/archive/2026-09/run_0908_1444"
 STEP3 = RUN / "calib_step3c_0907_1358_pad10.json"
 STEP6_CSV = RUN / "calib_step6v2_meas_0908_1517.csv"
 STEP6 = RUN / "calib_step6v2_result_0908_1517.json"

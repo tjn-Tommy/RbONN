@@ -3,7 +3,7 @@
 Needs real hardware for the sweep; the refit path is offline.  Either way
 ``--step6``, ``--targets`` and ``--ref`` are required and have no default::
 
-    S="--step6 src/calib_data/run_0907_1724/calib_step6v2_result_0907_1757.json --targets 2,3,4,5,6 --ref 2"
+    S="--step6 src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_result_0907_1757.json --targets 2,3,4,5,6 --ref 2"
     python src/calibration_module/steps/calib_step7_v2.py $S
     python src/calibration_module/steps/calib_step7_v2.py $S --out DIR   # CSV, JSON, PNGs into DIR
     python src/calibration_module/steps/calib_step7_v2.py $S --meas
@@ -110,7 +110,7 @@ from calibration_module.measure.phase_v2 import (  # noqa: E402
     measure_target,
     run_seconds,
 )
-from slm_module.calibration.calibration_new import (  # noqa: E402
+from calibration_module.fit.slm_response import (  # noqa: E402
     calibration_result_from_dict,
 )
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402

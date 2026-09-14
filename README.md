@@ -11,6 +11,9 @@ running. Nothing marked **legacy** or **dead** should be imported from new code.
 |------|------|
 | `src/calibration_module/fit/` | calibration physics — models, fits, file formats. Imports no driver, so it can be run against saved CSVs with the bench powered down. |
 | `src/calibration_module/measure/` | acquisition — drives the SLM, DAQ and OSA and returns rows. Does no fitting. |
+| `src/calibration_module/fit/slm_response.py` | steps 1–3 data — `CalibrationResult` and its JSON/CSV (the file every later step and the encoder read), the step-3 channel grid, peak centroids, the usable-band clip. Driver-free. Beside it, `fit/transfer.py` is the per-channel sin² curve the encoder inverts and `fit/outliers.py` the post-sweep re-measure flags. |
+| `src/calibration_module/measure/slm_response.py` | steps 1–3 acquisition — the OSA/DAQ sweeps, plus one `run_step1/2/3b/3c` per step. The GUI's Step 1/2/3b/3c tabs and the step scripts both call the runner, so a step's sequence (e.g. 3b: refine centre → tile grid → grouped sweep) is written once. |
+| `src/calibration_module/steps/calib_step{1,2,3b,3c}.py` | the step 1–3 runners — constants (the GUI tabs' defaults), then `measure.slm_response.run_step*` → JSON (+ CSV for 3b/3c). `calib_step2.py` needs `--step1` or `--min-max`; 3b/3c need `--step2`, and take `--width`/`--gap`. |
 | `src/calibration_module/fit/pair_v2.py` | **current** step 6 estimator — the difference fit (`D(w) = Y(1,w) − Ŷ(0,w) = η²w + a_x + q_x`) over 31 acquisitions on 10 repeated levels, plus 6 verification levels. Driver-free: `tests/test_pair_v2.py` runs the whole estimator off a committed CSV with no fake instrument. `PairV2Config` carries what a fit was specified with, so two configurations can coexist in one process. |
 | `src/calibration_module/measure/pair_v2.py` | step 6 acquisition — one pair's interleaved schedule, the near-rail ±0.1 → ±0.2 V escalation and the TIA sign convention. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
 | `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner (287 lines) — constants, then load layout → `measure.pair_v2` → `fit.pair_v2` → CSV/JSON/PNG. Holds no physics. |
@@ -36,7 +39,7 @@ once its GUI page is rebuilt.
 | Path | Kept alive by |
 |------|---------------|
 | `src/calibration_module/measure/center.py` | TPA centre scan — [app.py:6471](src/gui/app.py#L6471) only |
-| `src/slm_module/calibration/calibration.py` | the old sin² transfer-curve fit. Step 3 is `calibration_new.py`; only `intensity_model` (used by `outliers.py`) and one GUI "load a calibration CSV" path at [app.py:8062](src/gui/app.py#L8062) still reach it. `phase_for_level` and `predict_intensity` are exported and called nowhere at all — not in `src/`, not in the tests. |
+| `src/calibration_module/fit/legacy_intensity.py` | the old sin² transfer-curve fit (was `slm_module/calibration/calibration.py`). Step 3 is `fit/slm_response.py` + `measure/slm_response.py`; only `intensity_model` (used by `fit/outliers.py`) and one GUI "load a calibration CSV" path at [app.py:8119](src/gui/app.py#L8119) still reach it. `phase_for_level` and `predict_intensity` are exported and called nowhere at all — not in `src/`, not in the tests. |
 
 ### Dead — nothing imports these
 
@@ -46,14 +49,14 @@ once its GUI page is rebuilt.
 | `src/slm_module/scope_background.py` (465 lines) | its only consumer is `scope_tpa.py`. Zero other importers. |
 | `src/bg_scatter.csv`, `src/bg_scatter.json` | `scope_background` output, committed to the `src/` root rather than `src/calib_data/` |
 | `tests/test_bit_depth.py` | loads `tests/fixtures/bit_depth_golden.npz` at import. `.gitignore` excludes `*.npz`, so the fixture can never be committed and `tests/fixtures/` does not exist — the file errors on every run. |
-| `src/slm_module/calibration/calibration_new.py` → `intensity_calibration` (~225 lines) | the OSA per-coordinate Step-3a sweep. Its only caller was the GUI's Step 3a page / Run All, both deleted; `tests/test_calibration_new.py` is all that reaches it now. The live Step 3 is `intensity_calibration_daq` (3c) and `batch_intensity_calibration` (3b). Same for `restrict_to_measured_intensity_range`. |
+| `src/calibration_module/measure/slm_response.py` → `intensity_calibration` (~225 lines) | the OSA per-coordinate Step-3a sweep. Its only caller was the GUI's Step 3a page / Run All, both deleted; `tests/test_calibration_new.py` is all that reaches it now. The live Step 3 is `intensity_calibration_daq` (3c) and `batch_intensity_calibration` (3b). Same for `restrict_to_measured_intensity_range` (in `fit/slm_response.py`). |
 
 The whole scope readout path is dead: the measurement moved to the DAQ bucket
 detector, and no `scope_*` module in `slm_module` has an importer left.
 
 ### Deliberately not maintained
 
-`src/calib_data/refit_0904/{compare_runs,diagnose_45,refit_as_driven}.py` are
+`src/calib_data/archive/2026-09/refit_0904/{compare_runs,diagnose_45,refit_as_driven}.py` are
 analysis scripts stored beside the run they analysed. Their imports still point
 at the pre-split `calibration_module.phase` / `.sigma` and will not run as-is;
 they are kept as a record of what was executed on 0904, not as working code. If
@@ -89,7 +92,6 @@ Kept for provenance; they answered their question and are not maintained.
 
 | Path | Status |
 |------|--------|
-| `src/calibration_module/steps/calib_step3_todaq_test.py` | one-off DAQ smoke test; Step 3 on the DAQ is now `calibration_new.intensity_calibration_daq`. Its docstring still gives the pre-move path `tests/slm_sin2_level_sweep_test.py`. |
 | `src/drafts/hold_pid.py`, `src/drafts/pid_sweep.py` | PID tuning is finished (25 °C → 0.5/20/5, 79.5 °C → 0.5/20/2, with a DC base heater). The staircase controller now lives in `heater_module/`. |
 | `src/drafts/daq_hold_time_test.py`, `src/drafts/daq_repeat_measure.py` | one-shot characterisations of settle time and repeatability |
 
@@ -198,7 +200,7 @@ swept points.
 
 - **`"fit"`** — the default from `channel_layout_from_calibration`, i.e. what the
   calibration chain and the GUI actually use. Inverts the fitted model in
-  [`calibration/transfer.py`](src/slm_module/calibration/transfer.py):
+  [`fit/transfer.py`](src/calibration_module/fit/transfer.py):
 
   $$I(L) = \mathrm{floor} + \mathrm{contrast}\cdot\sin^2\!\big(\Delta(L)/2\big),
   \qquad \Delta(L) = c_2 L^2 + c_1 L + c_0$$

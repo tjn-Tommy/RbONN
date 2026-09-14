@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
-from slm_module.calibration.calibration_new import CalibrationResult
+from calibration_module.fit.slm_response import CalibrationResult
 from slm_module.optimization import (
     AmplitudeLUT,
     FixedChannelBins,

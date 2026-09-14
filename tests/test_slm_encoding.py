@@ -19,7 +19,7 @@ from slm_module.encoding import (
     encode_to_pattern,
     optimize_from_osa,
 )
-from slm_module.calibration.calibration_new import CalibrationResult
+from calibration_module.fit.slm_response import CalibrationResult
 import slm_module.analysis as analysis
 from slm_module.analysis import (
     ChannelSpectrum,

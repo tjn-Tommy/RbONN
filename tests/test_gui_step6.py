@@ -34,8 +34,8 @@ sys.path.insert(0, str(REPO / "src"))
 from calibration_module.fit.pair_v2 import load_meas_csv  # noqa: E402
 from calibration_module.fit.phase import PairModel, load_pair_models  # noqa: E402
 
-MEAS_CSV = REPO / "src/calib_data/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
-STEP3 = REPO / "src/calib_data/run_0908_1444/calib_step3c_0907_1358_pad10.json"
+MEAS_CSV = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
+STEP3 = REPO / "src/calib_data/archive/2026-09/run_0908_1444/calib_step3c_0907_1358_pad10.json"
 
 #: What the 0907 run published, in the order the table lists them.
 RECORDED_ETA = [0.17760529803227112, 0.17954179839571333, 0.1920940148157429,
@@ -220,7 +220,7 @@ class StepThreeInputTests(_WindowCase):
 
     def test_layout_matches_the_offline_loader(self) -> None:
         """Same file, same loader, same method -> the same pixels get driven."""
-        from slm_module.calibration.calibration_new import load_calibration_result
+        from calibration_module.fit.slm_response import load_calibration_result
         from slm_module.encoding import channel_layout_from_calibration
 
         w = self.win

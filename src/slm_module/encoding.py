@@ -5,8 +5,8 @@ from typing import Callable
 
 import numpy as np
 
-from .calibration.calibration_new import CalibrationResult
-from .calibration.transfer import TransferFit, TransferFitError, fit_transfer_curve
+from calibration_module.fit.slm_response import CalibrationResult
+from calibration_module.fit.transfer import TransferFit, TransferFitError, fit_transfer_curve
 
 
 @dataclass
@@ -22,7 +22,7 @@ class EncodingChannel:
     intensity_curve: np.ndarray = field(repr=False)  # measured normalised power
 
     # How level_for() inverts the transfer curve:
-    #   "fit"    -- invert the fitted sin^2 model (slm_module.calibration.transfer).
+    #   "fit"    -- invert the fitted sin^2 model (calibration_module.fit.transfer).
     #               Full scale is the fitted Delta = pi rather than the curve's
     #               argmax, every level is informed by all the swept points rather
     #               than the two bracketing it, and `v` means sin^2(Delta/2)
@@ -90,7 +90,7 @@ class EncodingChannel:
         return self.level_for_interp(val)
 
     def level_for_fit(self, val: float) -> int:
-        """Invert the fitted sin^2 transfer model -- see :mod:`.calibration.transfer`.
+        """Invert the fitted sin^2 transfer model -- see :mod:`calibration_module.fit.transfer`.
 
         ``sin^2(Delta/2) = val`` gives ``Delta = 2 asin(sqrt(val))``, exactly
         the retardance ``calibration_module.fit.phase.phi_half`` assumes for a
@@ -494,7 +494,7 @@ def channel_layout_from_calibration(
     guessed aperture is not the calibrated one.
 
     ``method`` picks how ``level_for`` inverts the transfer curve, and defaults
-    to ``"fit"`` -- the sin^2 model of :mod:`.calibration.transfer`.  This is the
+    to ``"fit"`` -- the sin^2 model of :mod:`calibration_module.fit.transfer`.  This is the
     one loader every offline calibration step goes through (steps 6, 7 and 8 all
     call it), so it is where the pipeline's encoding convention is set.  Pass
     ``method="interp"`` for the original measured-curve interpolation.

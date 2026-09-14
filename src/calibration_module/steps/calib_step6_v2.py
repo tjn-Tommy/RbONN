@@ -3,7 +3,7 @@
 Needs real hardware for the sweep; the refit path is offline.  Either way
 ``--step3`` and ``--pairs`` are required and have no default::
 
-    S="--step3 src/calib_data/run_0908_1444/calib_step3c_0907_1358_pad10.json --pairs 2,3,4,5,6"
+    S="--step3 src/calib_data/archive/2026-09/run_0908_1444/calib_step3c_0907_1358_pad10.json --pairs 2,3,4,5,6"
     python src/calibration_module/steps/calib_step6_v2.py $S
     python src/calibration_module/steps/calib_step6_v2.py $S --out DIR   # CSV, JSON, PNGs into DIR
     python src/calibration_module/steps/calib_step6_v2.py $S --meas
@@ -88,7 +88,7 @@ from calibration_module.measure.pair_v2 import (  # noqa: E402
     measure_pair,
     run_seconds,
 )
-from slm_module.calibration.calibration_new import load_calibration_result  # noqa: E402
+from calibration_module.fit.slm_response import load_calibration_result  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 
 # ---- Edit these to match your setup ----

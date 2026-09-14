@@ -42,7 +42,7 @@ from calibration_module.measure.phase_v2 import (  # noqa: E402
     run_seconds,
 )
 
-RUN = REPO / "src/calib_data/run_0907_1724"
+RUN = REPO / "src/calib_data/archive/2026-09/run_0907_1724"
 STEP6 = RUN / "calib_step6v2_result_0907_1757.json"
 MEAS_CSV = RUN / "calib_step7_meas_0907_1808.csv"
 RESULT_JSON = RUN / "calib_step7_result_0907_1808.json"

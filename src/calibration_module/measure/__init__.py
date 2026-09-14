@@ -5,6 +5,8 @@ hands back arrays -- it does not fit them; ``calibration_module.fit`` does that,
 and keeping the two apart is what lets the fits be tested without hardware.
 
     bench     connect/read primitives shared by the step scripts
+    slm_response  steps 1-3 -- the OSA/DAQ sweeps, and one ``run_step*`` per
+              step that the GUI and ``steps/calib_step{1,2,3b,3c}.py`` share
     pair_v2   step 6 -- one pair's interleaved schedule, with the near-rail
               range escalation and the TIA sign convention
 

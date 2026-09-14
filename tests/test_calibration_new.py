@@ -13,28 +13,30 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
-from slm_module.calibration.calibration import intensity_model, load_calibration_csv
-from slm_module.calibration.outliers import OutlierRemeasurePolicy
-from slm_module.calibration.calibration_new import (
-    CalibrationAborted,
+from calibration_module.fit.legacy_intensity import intensity_model, load_calibration_csv
+from calibration_module.fit.outliers import OutlierRemeasurePolicy
+from calibration_module.fit.slm_response import (
     CalibrationResult,
     _driven_geometry,
-    batch_intensity_calibration,
     build_channel_calibration_grid,
     calibration_result_from_dict,
     clip_to_wavelength_range,
-    intensity_calibration,
-    intensity_calibration_daq,
     load_calibration_result,
     load_wavelength_map_csv,
     local_peak_centroid,
     local_peak_centroid_near,
     mean_near_wavelength,
-    refine_center_coordinate_with_osa,
     restrict_to_measured_intensity_range,
     save_calibration_result,
-    wavelength_calibration,
     write_intensity_calibration_csv,
+)
+from calibration_module.measure.slm_response import (
+    CalibrationAborted,
+    batch_intensity_calibration,
+    intensity_calibration,
+    intensity_calibration_daq,
+    refine_center_coordinate_with_osa,
+    wavelength_calibration,
 )
 
 

@@ -14,6 +14,12 @@ quietly stops testing the physics.
     fit/      arrays of commanded levels and measured volts in, fitted
               parameters out.  Imports no driver, and should not start.
 
+        slm_response  steps 1-3 -- CalibrationResult and its JSON/CSV, the
+                  step-3 channel grid, peak centroids, the usable-band clip
+        transfer  the per-channel sin^2 transfer curve the encoder inverts
+        outliers  post-sweep outlier flags for the step 2/3 re-measure loops
+        legacy_intensity  the old sin^2 fit; only outliers and one GUI CSV
+                  loader still reach it
         pair_v2   step 6 -- per-pair TPA efficiency eta from the difference
                   estimator; carries the PairV2Config it was fitted under
         pair      step 6 v1 -- the joint grid fit pair_v2 replaced; only the
@@ -25,13 +31,15 @@ quietly stops testing the physics.
         report    fringe / residual plots over the fits above
 
     measure/  drives the SLM, the DAQ and the OSA and returns rows; does no
-              fitting.  ``bench`` holds the connect/read primitives.  Its
-              ``center``, ``pair`` and ``phase`` are legacy GUI sweep drivers,
-              scheduled to die with the GUI v2 rebuild.
+              fitting.  ``bench`` holds the connect/read primitives;
+              ``slm_response`` the step 1-3 sweeps and their ``run_step*``
+              runners.  Its ``center``, ``pair`` and ``phase`` are legacy GUI
+              sweep drivers, scheduled to die with the GUI v2 rebuild.
 
-    steps/    the runnable scripts (6, 7, 8 and their v1 predecessors): ask
-              ``measure`` for rows, hand them to ``fit``, write the JSON/CSV,
-              render the report.
+    steps/    the runnable scripts (1, 2, 3b, 3c, 6, 7, 8 and the v1
+              predecessors): ask ``measure`` for rows, hand them to ``fit``,
+              write the JSON/CSV, render the report.  The GUI calls ``measure``
+              and ``fit`` directly and never these scripts.
 
 The JSON and CSV readers live beside the fit that defines each format
 (``fit.phase.save_comb_phase_json``, ``fit.center.save_tpa_center_json``,

@@ -85,7 +85,7 @@ from calibration_module.measure.pair_v2 import (  # noqa: E402
     read_point_autorange,
     set_range,
 )
-from slm_module.calibration.calibration_new import calibration_result_from_dict  # noqa: E402
+from calibration_module.fit.slm_response import calibration_result_from_dict  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 
 # ---- Edit these to match your setup ----

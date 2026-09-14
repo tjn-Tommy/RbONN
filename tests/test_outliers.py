@@ -8,8 +8,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from slm_module.calibration.calibration import intensity_model
-from slm_module.calibration.outliers import (
+from calibration_module.fit.legacy_intensity import intensity_model
+from calibration_module.fit.outliers import (
     OutlierRemeasurePolicy,
     flag_by_residual,
     linear_fit_residuals,

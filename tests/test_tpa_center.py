@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 def _make_calibration():
-    from slm_module.calibration.calibration_new import CalibrationResult
+    from calibration_module.fit.slm_response import CalibrationResult
 
     coords = np.array([0.0, 50.0, 100.0, 150.0, 200.0], dtype=float)
     wavelengths = np.array([779.0, 778.5, 778.0, 777.5, 777.0], dtype=float)

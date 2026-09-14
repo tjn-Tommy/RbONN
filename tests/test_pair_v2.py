@@ -33,7 +33,7 @@ from calibration_module.fit.pair_v2 import (  # noqa: E402
 )
 from calibration_module.fit.sigma import STD_FLOOR_V  # noqa: E402
 
-MEAS_CSV = REPO / "src/calib_data/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
+MEAS_CSV = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
 
 #: What the 0907 run published, pair label -> eta.
 RECORDED_ETA = {

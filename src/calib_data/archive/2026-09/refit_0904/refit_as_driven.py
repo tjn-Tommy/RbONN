@@ -78,10 +78,10 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[2]
+REPO_ROOT = HERE.parents[4]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from slm_module.calibration.calibration_new import load_calibration_result  # noqa: E402
+from calibration_module.fit.slm_response import load_calibration_result  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration            # noqa: E402
 from calibration_module.steps import calib_step6_v2 as s6                  # noqa: E402
 from calibration_module.steps import calib_step7_v2 as s7                  # noqa: E402
@@ -89,8 +89,8 @@ from calibration_module.steps import calib_step8_v2 as s8                  # noq
 from calibration_module.phase import phi_half                              # noqa: E402
 
 # ---- inputs: the 0904 run and the step-3b sweep it encoded against ----------
-SRC_RUN = REPO_ROOT / "src/calib_data/run_0904_0117"
-IN_STEP3 = REPO_ROOT / "src/calib_data/run_0903/calib_step3b_0903_1517.json"
+SRC_RUN = REPO_ROOT / "src/calib_data/archive/2026-09/run_0904_0117"
+IN_STEP3 = REPO_ROOT / "src/calib_data/archive/2026-09/run_0903/calib_step3b_0903_1517.json"
 
 CSV6 = HERE / "calib_step6v2_meas_0904_0140.csv"
 CSV7 = HERE / "calib_step7_meas_0904_0146.csv"

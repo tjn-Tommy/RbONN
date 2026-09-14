@@ -7,6 +7,12 @@ powered down.  Anything that needs to ask an instrument for a number belongs in
 ``calibration_module.measure``; call in here afterwards with the rows it
 collected.
 
+    slm_response  steps 1-3 -- CalibrationResult and its JSON/CSV, the
+              step-3 channel grid, peak centroids, the usable-band clip
+    transfer  the per-channel sin^2 transfer curve the encoder inverts
+    outliers  post-sweep outlier flags for the step 2/3 re-measure loops
+    legacy_intensity  the old sin^2 fit; only outliers and one GUI CSV
+              loader still reach it
     pair_v2   step 6 -- per-pair eta from the difference estimator, and the
               PairV2Config that says what grid it was specified with
     pair      step 6 v1 -- the joint 6-parameter grid fit pair_v2 replaced.

@@ -22,7 +22,7 @@ from calibration_module.fit import verify as V  # noqa: E402
 from calibration_module.fit.phase import PairModel  # noqa: E402
 from calibration_module.steps import calib_npair_verify as S8  # noqa: E402
 
-RUN = REPO / "src/calib_data/run_0908_1300"
+RUN = REPO / "src/calib_data/archive/2026-09/run_0908_1300"
 STEP7 = RUN / "calib_step7_result_0908_1344.json"
 OLD_CSV = RUN / "calib_step8_simple_0908_1351.csv"
 PAIRS = [2, 3, 4, 5, 6]

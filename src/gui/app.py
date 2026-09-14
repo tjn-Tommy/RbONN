@@ -35,23 +35,22 @@ from scope_module.controller import (
     Waveform,
 )
 
-from slm_module.calibration import CalibrationFit, fit_calibration, load_calibration_csv
-from slm_module.calibration.calibration_new import (
-    CalibrationAborted,
-    CalibrationProgress,
+from calibration_module.fit.legacy_intensity import CalibrationFit, fit_calibration, load_calibration_csv
+from calibration_module.fit.slm_response import (
     CalibrationResult,
-    batch_intensity_calibration,
-    build_channel_calibration_grid,
     calibration_result_from_dict,
-    clip_to_wavelength_range,
-    find_min_max_intensity_levels,
-    intensity_calibration_daq,
     load_calibration_result,
     load_wavelength_map_csv,
-    refine_center_coordinate_with_osa,
     save_calibration_result,
-    wavelength_calibration,
     write_intensity_calibration_csv,
+)
+from calibration_module.measure.slm_response import (
+    CalibrationAborted,
+    CalibrationProgress,
+    run_step1,
+    run_step2,
+    run_step3b,
+    run_step3c,
 )
 from slm_module.controller import ScanParams, ScanResult, SLMController
 from slm_module.detector import Detector, SimulatedDetector
@@ -904,7 +903,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # bench has to be re-plumbed by hand partway down the chain: an
         # unattended 1->7 run is not physically possible.  Real runs drive
         # steps 6-8 from drafts/calib_step6-8_v2.py with step 3 loaded from an
-        # earlier run's JSON -- see calib_data/run_0907_1724/sequence.json.
+        # earlier run's JSON -- see calib_data/archive/2026-09/run_0907_1724/sequence.json.
         self.calibration_tabs = tabs
         lay.addWidget(tabs)
 
@@ -8535,21 +8534,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"Step 1 started: {len(levels)} levels")
 
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
-            _mn, _mx, min_level, max_level, _rec = find_min_max_intensity_levels(
+            result = run_step1(
                 osa, controller, levels, settings,
                 stop_event=stop_event, progress_callback=report,
-            )
-            result = CalibrationResult(
-                wavelength=np.asarray([]),
-                coordinates=np.asarray([]),
-                max_level=max_level,
-                min_level=min_level,
-                level_range=np.asarray(levels, dtype=int),
             )
             save_calibration_result(result, out_path)
             return {
                 "status": "ok", "step": 1, "result": result, "saved": out_path,
-                "summary": f"min level {min_level}, max level {max_level}",
+                "summary": f"min level {result.min_level}, max level {result.max_level}",
             }
 
         self._launch_calibration("Run step 1", work)
@@ -8584,17 +8576,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
-            # Sweep the whole region unmasked: this step only has to land one
-            # straight coordinate -> wavelength line, and a window whose peak
-            # sits outside the usable band still measures a real peak that
-            # belongs in the fit.  Masking the peak search instead used to fail
-            # the run outright ("shows no clear peak") whenever a region edge
-            # dispersed past the band.
-            result = wavelength_calibration(
-                osa, controller, [], settings, seed,
+            # The band clips the finished map, never the peak search -- see
+            # run_step2.
+            clipped, result = run_step2(
+                osa, controller, settings, seed,
                 window_size=window, peak_half_window_nm=peak_nm, region=region,
                 coordinate_stride=stride,
                 sweep_span_nm=sweep_nm,
+                min_wavelength_nm=min_wl, max_wavelength_nm=max_wl,
                 stop_event=stop_event, progress_callback=report,
             )
             swept = result.coordinates.size
@@ -8602,10 +8591,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{result.wavelength.min():.3f}-{result.wavelength.max():.3f} nm"
                 if swept else "no coordinates"
             )
-            # Clip only now, on the way out: the JSON and the in-memory result
-            # downstream steps read carry the usable band, the fit coefficients
-            # still describe the whole swept region.
-            clipped = clip_to_wavelength_range(result, min_wl, max_wl)
             kept = clipped.coordinates.size
             note = "" if kept == swept else f" of {swept} swept ({span})"
             save_calibration_result(clipped, out_path)
@@ -8652,40 +8637,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"Step 3c guard bands: {guard_text} -> skipped")
 
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
-            slm_width, _slm_height = controller.get_slm_info()
-            grid_seed, center_coordinate = build_channel_calibration_grid(
-                mapping,
+            sweep = run_step3c(
+                daq, controller, levels, mapping,
                 target_wavelength_nm=target,
                 n_channels_per_side=n_channels,
                 channel_width_px=window,
                 gap_px=pad,
-                slm_width=slm_width,
                 guard_bands_nm=guard_bands,
-            )
-            report(
-                CalibrationProgress(
-                    phase="fast_center",
-                    step=0,
-                    total=1,
-                    message=(
-                        f"Step 2 predicts {target:.4f} nm at "
-                        f"x={center_coordinate:.3f} px"
-                    ),
-                    x=center_coordinate,
-                    y=target,
-                )
-            )
-            result = intensity_calibration_daq(
-                daq, controller, levels, grid_seed,
-                window_size=window, read_timeout=read_timeout,
+                read_timeout=read_timeout,
                 stop_event=stop_event, progress_callback=report,
             )
+            result = sweep.result
             save_calibration_result(result, out_json)
             csv_path = write_intensity_calibration_csv(result, out_csv)
             return {
                 "status": "ok", "step": "3c", "result": result, "saved": out_json,
                 "csv": csv_path,
-                "center_coordinate": center_coordinate,
+                "center_coordinate": sweep.center_coordinate,
                 "summary": (
                     f"{result.coordinates.size} channels, "
                     f"pitch {window + pad} px"
@@ -8735,65 +8703,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"Fast channel guard bands: {guard_text} -> min level")
 
         def work(report: ProgressEmit, stop_event: threading.Event) -> dict[str, Any]:
-            slm_width, _slm_height = controller.get_slm_info()
-            measured_peak = None
-            coarse_center = None
-            refined_center = None
-            if fine_tune_center:
-                refined_center, measured_peak, coarse_center = (
-                    refine_center_coordinate_with_osa(
-                        osa,
-                        controller,
-                        settings,
-                        step2_mapping,
-                        target_wavelength_nm=target_wavelength,
-                        window_size=channel_width,
-                        peak_half_window_nm=peak_half_window_nm,
-                        stop_event=stop_event,
-                        progress_callback=report,
-                    )
-                )
-
-            grid_seed, center_coordinate = build_channel_calibration_grid(
-                step2_mapping,
-                target_wavelength_nm=target_wavelength,
-                center_coordinate=refined_center,
-                n_channels_per_side=n_channels,
-                channel_width_px=channel_width,
-                gap_px=gap_px,
-                slm_width=slm_width,
-                guard_bands_nm=guard_bands,
-            )
-            if not fine_tune_center:
-                report(
-                    CalibrationProgress(
-                        phase="fast_center",
-                        step=0,
-                        total=1,
-                        message=(
-                            f"Step 2 predicts {target_wavelength:.4f} nm at "
-                            f"x={center_coordinate:.3f} px"
-                        ),
-                        x=center_coordinate,
-                        y=target_wavelength,
-                    )
-                )
-
-            final = batch_intensity_calibration(
+            sweep = run_step3b(
                 osa,
                 controller,
                 levels,
                 settings,
-                grid_seed,
-                window_size=channel_width,
-                wavelength_window_nm=avg_nm,
+                step2_mapping,
+                target_wavelength_nm=target_wavelength,
+                n_channels_per_side=n_channels,
+                channel_width_px=channel_width,
+                gap_px=gap_px,
                 group_skip_channels=group_skip,
-                guard_bands_nm=guard_bands,
+                fine_tune_center=fine_tune_center,
+                peak_half_window_nm=peak_half_window_nm,
+                wavelength_window_nm=avg_nm,
                 refine_wavelength=refine,
                 refine_half_window_nm=refine_half_window_nm,
+                guard_bands_nm=guard_bands,
                 stop_event=stop_event,
                 progress_callback=report,
             )
+            final = sweep.result
             save_calibration_result(final, out_json)
             csv_path = write_intensity_calibration_csv(final, out_csv)
             group_count = min(group_skip + 1, int(final.coordinates.size))
@@ -8803,9 +8733,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "result": final,
                 "saved": out_json,
                 "csv": csv_path,
-                "center_coordinate": center_coordinate,
-                "coarse_center": coarse_center,
-                "measured_peak": measured_peak,
+                "center_coordinate": sweep.center_coordinate,
+                "coarse_center": sweep.coarse_center,
+                "measured_peak": sweep.measured_peak_nm,
                 "pitch_px": pitch_px,
                 "group_count": group_count,
                 "summary": (

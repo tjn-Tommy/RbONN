@@ -56,7 +56,7 @@ class CalibrationDialogEtaTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def test_eta_estimates_remaining_from_pace(self) -> None:
-        from slm_module.calibration.calibration_new import CalibrationProgress
+        from calibration_module.measure.slm_response import CalibrationProgress
         from gui.app import CalibrationProgressDialog
 
         dialog = CalibrationProgressDialog()
@@ -125,7 +125,7 @@ class MainWindowStartupTests(unittest.TestCase):
             window.close()
 
     def test_encoding_page_loads_layout_verbatim_from_calibration(self) -> None:
-        from slm_module.calibration.calibration_new import CalibrationResult
+        from calibration_module.fit.slm_response import CalibrationResult
         from gui.app import MainWindow
 
         # mirror-symmetric channel grid: centre 510 px, pitch 20, one guard skip

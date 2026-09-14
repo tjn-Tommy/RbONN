@@ -3,7 +3,7 @@
 Reads a ``calib_step3{a,b,c}_<stamp>.csv`` (the long
 ``coordinate_px,wavelength_nm,level,intensity,raw_intensity_w`` format written
 by ``write_intensity_calibration_csv``) and fits each channel's level sweep
-twice with :func:`slm_module.calibration.transfer.fit_transfer_curve` -- once
+twice with :func:`calibration_module.fit.transfer.fit_transfer_curve` -- once
 with ``curvature=False`` (the original 4-parameter linear-``Delta`` model) and
 once with it on (the 5-parameter model, now the default everywhere)::
 
@@ -62,7 +62,7 @@ REPO_SRC = Path(__file__).resolve().parents[1]
 if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
-from slm_module.calibration.transfer import (  # noqa: E402
+from calibration_module.fit.transfer import (  # noqa: E402
     TransferFit,
     TransferFitError,
     fit_transfer_curve,

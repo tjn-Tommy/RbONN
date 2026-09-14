@@ -24,14 +24,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[2]
+REPO_ROOT = HERE.parents[4]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from calibration_module.steps import calib_step8_v2 as s8   # noqa: E402
 from calibration_module.sigma import floor_std              # noqa: E402
 import refit_as_driven as rad                               # noqa: E402
 
-OLD_DIR = REPO_ROOT / "src/calib_data/run_0904_0117"
+OLD_DIR = REPO_ROOT / "src/calib_data/archive/2026-09/run_0904_0117"
 OLD_CSV = OLD_DIR / "calib_step8_simple_0904_0150.csv"
 OLD_JSON = OLD_DIR / "calib_step7_result_0904_0147.json"
 NEW_CSV = rad.OUT8

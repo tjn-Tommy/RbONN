@@ -1,6 +1,6 @@
 """The fitted sin^2 transfer curve and the encoding built on it.
 
-Covers :mod:`slm_module.calibration.transfer` and the ``method="fit"`` path
+Covers :mod:`calibration_module.fit.transfer` and the ``method="fit"`` path
 through :class:`slm_module.encoding.EncodingChannel`.
 """
 from __future__ import annotations
@@ -17,12 +17,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from slm_module.calibration.calibration_new import (  # noqa: E402
+from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
     load_calibration_result,
     save_calibration_result,
 )
-from slm_module.calibration.transfer import (  # noqa: E402
+from calibration_module.fit.transfer import (  # noqa: E402
     MAX_LEVEL,
     TransferFit,
     TransferFitError,
