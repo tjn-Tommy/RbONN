@@ -179,7 +179,7 @@ class AcquisitionSettingsTests(_WindowCase):
                            self.win._tpa_acq().range_v)
 
     def test_windows_are_not_shared_with_step_6(self) -> None:
-        """Step 6's T_both is bound to the DAQ Monitor page; step 7's is its own."""
+        """Step 7 runs its own acquisition windows, not step 6's."""
         w = self.win
         before = w.tpa_tboth.value()
         w.tpa_phase_tboth.setValue(3.5)

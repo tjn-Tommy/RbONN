@@ -28,8 +28,6 @@ from heater_module.controller import (
 from osa_module.controller import MeasurementSettings, OSAController
 from osa_module.driver import OSAError
 from scope_module.controller import (
-    MonitorSample,
-    MonitorSettings,
     ScopeController,
     ScopeSettings,
     Waveform,
@@ -149,7 +147,6 @@ from .common import (
     _format_duration,
 )
 from .live_plots import BatchResultsTable, LiveLossCanvas
-from .live_readout import LiveReadoutDock
 from .osa_monitor import LiveSpectrumView, OSATraceBridge
 from .style import DARK_STYLESHEET
 
@@ -448,7 +445,6 @@ class MainWindow(QtWidgets.QMainWindow):
     edge_gain_progress = QtCore.pyqtSignal(int, int, str)
     edge_optimization_progress = QtCore.pyqtSignal(object)
     qt_test_progress = QtCore.pyqtSignal(int, int, str)
-    monitor_sample = QtCore.pyqtSignal(object)
     hold_progress = QtCore.pyqtSignal(int, int)
     heater_sample = QtCore.pyqtSignal(object)
 
@@ -470,6 +466,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_stop_event: threading.Event | None = None
         self.calibration_dialog: CalibrationProgressDialog | None = None
         self._calibration_is_running = False
+        # Step 6 / 6b / 7 run outside _launch_calibration; each names itself here
+        # while it runs, so manual OSA/DAQ reads stay locked for every calibration
+        self._running_tpa_calibrations: set[str] = set()
+        self._daqmon_reading = False
         self._active_calibration_label: str | None = None
         self.scan_stop_event: threading.Event | None = None
         self.scan_pause_event: threading.Event | None = None
@@ -507,9 +507,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_controller: ScopeController | None = None
         self.scope_stop_event: threading.Event | None = None
         self.daq_controller: DAQController | None = None
-        self.monitor_stop_event: threading.Event | None = None
-        self._monitor_values: list[float] = []
-        self._monitor_stds: list[float] = []
         self.hold_stop_event: threading.Event | None = None
         # Heater (Thorlabs TC300B): one serial link, so at most one background
         # loop (ramp or read-only monitor) owns it at a time.
@@ -536,7 +533,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.edge_gain_progress.connect(self._edge_gain_progress)
         self.edge_optimization_progress.connect(self._edge_optimization_progress)
         self.qt_test_progress.connect(self._qt_test_progress)
-        self.monitor_sample.connect(self._on_monitor_sample)
         self.hold_progress.connect(self._on_hold_progress)
         self.heater_sample.connect(self._on_heater_sample)
 
@@ -557,14 +553,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.osa_monitor_dock.setWidget(self.osa_monitor_view)
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.osa_monitor_dock)
         self.osa_monitor_dock.hide()
-
-        # Dockable live readout (hidden until toggled from the TPA encoder
-        # page): passively mirrors every monitor_cycle() sample from any
-        # module. Not to be confused with the DAQ Monitor page, which runs
-        # its own one-shot waveform reads.
-        self.live_readout_dock = LiveReadoutDock(self)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.live_readout_dock)
-        self.live_readout_dock.hide()
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
@@ -603,7 +591,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("\N{CHART WITH UPWARDS TREND}  Calibration", "Min/max, wavelength, intensity, TPA"),
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
-            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding + scope/DAQ readout"),
+            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding"),
             ("\N{DOWNWARDS ARROW WITH TIP RIGHTWARDS}  Shape",
              "Global per-column encoding shape (applied to all encoding "
              "+ calibration) + OSA optimisation hook"),
@@ -2294,21 +2282,15 @@ class MainWindow(QtWidgets.QMainWindow):
         left_split.setStretchFactor(1, 1)
         left_split.setSizes([460, 230])
 
-        left = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(left_split, 1)
-        left_layout.addLayout(ctrl_row)
+        # Encoding info only: the page used to carry a scope/DAQ readout, now
+        # deprecated -- acquisitions run on the Step 6 / Step 7 tabs.
+        main = QtWidgets.QWidget()
+        main_layout = QtWidgets.QVBoxLayout(main)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(left_split, 1)
+        main_layout.addLayout(ctrl_row)
 
-        # SLM pane and the instrument monitor (scope or DAQ) split evenly
-        main_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        main_split.addWidget(left)
-        main_split.addWidget(self._build_monitor_widget())
-        main_split.setStretchFactor(0, 1)
-        main_split.setStretchFactor(1, 1)
-        main_split.setSizes([630, 630])
-
-        # --- single Feedback log for both SLM and the instrument monitor, spanning full width ---
+        # --- Feedback log, spanning full width ---
         self.enc_log = QtWidgets.QPlainTextEdit()
         self.enc_log.setReadOnly(True)
         self.enc_log.setObjectName("LogBox")
@@ -2316,7 +2298,7 @@ class MainWindow(QtWidgets.QMainWindow):
         log_panel = self._panel_with_widget("Feedback", self.enc_log)
 
         page.layout().addWidget(cfg_panel)
-        page.layout().addWidget(main_split, 1)
+        page.layout().addWidget(main, 1)
         page.layout().addWidget(log_panel)
 
         # auto-load the local calibration and build a default layout so the
@@ -2343,10 +2325,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Append a timestamped hint/action line to the encoding feedback box."""
         stamp = time.strftime("%H:%M:%S")
         self.enc_log.appendPlainText(f"[{stamp}] {message}")
-
-    def _mon_status(self, message: str) -> None:
-        """Instrument-monitor feedback shares the encoder's merged Feedback log."""
-        self._enc_log(f"[monitor] {message}")
 
     # calibration results are named calib_step*.json (calib_step3.json,
     # calib_step33.json, ...); the encoder needs a step-3 intensity result.
@@ -2616,10 +2594,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # pattern is now live on the SLM: clear the dim preview veil
             self.enc_monitor_view.set_preview(False)
             _cleanup()
-            if self._enc_should_read_monitor():
-                self._enc_read_monitor_after_send()   # keeps Send disabled until read done
-            else:
-                self.enc_send_button.setEnabled(True)
+            self.enc_send_button.setEnabled(True)
 
         def failed(_error: str) -> None:
             self._enc_log("\N{CROSS MARK} Send failed (see the Status log on the Connections page).")
@@ -2631,107 +2606,6 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: controller.display_csv(tmp.name),
             done, failed,
         )
-
-    def _enc_active_monitor(self) -> tuple[str, ScopeController | DAQController] | None:
-        """Return ('scope', ctrl) or ('daq', ctrl) for whichever is connected.
-
-        Scope takes priority if somehow both are connected, but
-        _on_scope_connected / _on_daq_connected keep that from happening.
-        """
-        if self.scope_controller is not None and self.scope_controller.is_connected:
-            return "scope", self.scope_controller
-        if self.daq_controller is not None and self.daq_controller.is_connected:
-            return "daq", self.daq_controller
-        return None
-
-    def _enc_should_read_monitor(self) -> bool:
-        """Take a reading after a send only if it's safe/enabled."""
-        return (
-            self._enc_active_monitor() is not None
-            and self.mon_read_on_send.isChecked()
-            and self.monitor_stop_event is None   # not already running the trigger loop
-        )
-
-    def _enc_acquire_sample(self, *, label: str, on_finish=None) -> None:
-        """Read one averaged (mean+std) sample from the connected instrument and
-        append it to the record.
-
-        Shared by the manual Acquire button and the auto-read-after-send path.
-        ``on_finish`` runs on the GUI thread once the read settles (ok or err) --
-        e.g. to re-enable whichever button kicked it off.
-        """
-        def done() -> None:
-            if on_finish is not None:
-                on_finish()
-
-        active = self._enc_active_monitor()
-        if active is None:
-            self._mon_status("No instrument connected (connect Scope or DAQ).")
-            done()
-            return
-        kind, ctrl = active
-        self._mon_status(f"Reading {kind} ({label})…")
-
-        if kind == "scope":
-            # AUTO free-run with no armed edge: the SINGle self-triggers and
-            # completes right away (the earlier timeout was a stale
-            # ACQuire:COUNt, now forced to 1 in configure_monitor).
-            settings = self._monitor_settings(trigger_mode="AUTO")
-            read_timeout = max(30.0, settings.duration * 3.0 + 10.0)
-
-            def work() -> MonitorSample | None:
-                ctrl.configure_monitor(settings)
-                time.sleep(settings.hold)          # settle before the read
-                return ctrl.monitor_cycle(
-                    index=len(self._monitor_values), timeout=read_timeout
-                )
-        else:
-            settings = self._daq_monitor_settings()
-            read_timeout = max(30.0, settings.duration * 3.0 + 10.0)
-
-            def work() -> MonitorSample | None:
-                # DAQController.monitor_cycle() sleeps settings.hold itself.
-                ctrl.configure_monitor(settings)
-                return ctrl.monitor_cycle(
-                    index=len(self._monitor_values), timeout=read_timeout
-                )
-
-        def ok(sample: MonitorSample | None) -> None:
-            if sample is not None:
-                self._on_monitor_sample(sample)
-            else:
-                self._mon_status(f"{kind.capitalize()} read returned nothing.")
-            done()
-
-        def err(_error: str) -> None:
-            self._mon_status(f"{kind.capitalize()} read failed (see Status log).")
-            done()
-
-        self._run_task(f"{kind.capitalize()} read ({label})", work, ok, err)
-
-    def _enc_read_monitor_after_send(self) -> None:
-        """After the pattern is displayed, read one sample and keep Send disabled
-        until the read finishes."""
-        active = self._enc_active_monitor()
-        if active is None:
-            self.enc_send_button.setEnabled(True)
-            return
-        self._enc_acquire_sample(
-            label="on send",
-            on_finish=lambda: self.enc_send_button.setEnabled(True),
-        )
-
-    def _enc_acquire_clicked(self) -> None:
-        """Manual Acquire: read one sample now, without needing an SLM send."""
-        if self._enc_active_monitor() is None:
-            self._mon_status("No instrument connected (connect Scope or DAQ).")
-            return
-        if self.monitor_stop_event is not None:
-            self._mon_status("A monitor loop is already running.")
-            return
-        self.mon_acquire_button.setEnabled(False)
-        # _sync_monitor_source re-enables it only if an instrument is still connected
-        self._enc_acquire_sample(label="manual", on_finish=self._sync_monitor_source)
 
     # ==================================================================
     # Shape page: global per-column encoding shape + OSA optimisation hook
@@ -4219,13 +4093,18 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _osa_view_set_running(self, running: bool, *, continuous: bool = False) -> None:
-        self.osv_single_button.setEnabled(not running)
+        busy = self._calibration_busy()
+        self.osv_single_button.setEnabled(not running and not busy)
         self.osv_cont_button.setChecked(running and continuous)
-        self.osv_cont_button.setEnabled(not running or continuous)
+        self.osv_cont_button.setEnabled((not running and not busy) or (running and continuous))
         self.osv_stop_button.setEnabled(running)
         self.osv_save_button.setEnabled(not running and self.osa_view_trace is not None)
 
     def _osa_view_single(self) -> None:
+        if self._calibration_busy():
+            self.osv_cont_button.setChecked(False)
+            self.osv_status.setText("A calibration is running; OSA reads are locked.")
+            return
         osa = self._osa_ready()
         if osa is None:
             self.osv_status.setText("Connect the OSA on the Connections page first.")
@@ -4266,6 +4145,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.osv_cont_button.isChecked():
             # toggled off by the user's click -> treat as stop
             self._osa_view_stop()
+            return
+        if self._calibration_busy():
+            self.osv_cont_button.setChecked(False)
+            self.osv_status.setText("A calibration is running; OSA reads are locked.")
             return
         osa = self._osa_ready()
         if osa is None:
@@ -4770,18 +4653,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_settle.setToolTip(
             "Wait after each SLM pattern change, before reading."
         )
-        # T_both / T_single keep their names: the DAQ Monitor page two-way binds
-        # to these two spinboxes, so both views stay one setting (_bind_spins).
         self.tpa_tboth = self._double_spin(0.001, 30.0, 8.0, " s", 3)
         self.tpa_tboth.setToolTip(
-            "T_both: averaging window when both beams of the pair are on. "
-            "Mirrors the DAQ Monitor panel."
+            "T_both: averaging window when both beams of the pair are on."
         )
         self.tpa_tsingle = self._double_spin(0.001, 60.0, 10.0, " s", 3)
         self.tpa_tsingle.setToolTip(
             "T_single: averaging window when at most one beam is on (x=0 or "
             "w=0, incl. the all-off dark) — a weak signal needs the longer "
-            "window. Mirrors the DAQ Monitor panel."
+            "window."
         )
         self.tpa_invert = QtWidgets.QCheckBox("Invert sign (TIA)")
         self.tpa_invert.setChecked(True)
@@ -5067,6 +4947,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _tpa_set_running(self, running: bool) -> None:
+        self._mark_tpa_calibration("step6", running)
         self.tpa_run_button.setEnabled(not running)
         self.tpa_stop_button.setEnabled(running)
         self.tpa_load_button.setEnabled(not running)
@@ -5571,10 +5452,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_phase_settle.setToolTip(
             "Wait after each SLM pattern change, before reading."
         )
-        # Not bound to the DAQ Monitor page's spinboxes the way step 6's are:
-        # step 7 reads a different signal (both pairs on, every point) and runs
-        # its own windows -- tying them together would drag step 6's 8 s onto a
-        # step that validated at 10.
+        # Its own windows, not step 6's: step 7 reads a different signal (both
+        # pairs on, every point) and validated at 10 s where step 6 runs 8.
         self.tpa_phase_tboth = self._double_spin(0.001, 30.0, 10.0, " s", 3)
         self.tpa_phase_tboth.setToolTip(
             "T_both: averaging window for every sweep point. The reference is "
@@ -5923,6 +5802,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _tpa_phase_set_running(self, running: bool) -> None:
+        self._mark_tpa_calibration("step7", running)
         self.tpa_phase_run_button.setEnabled(not running)
         self.tpa_phase_stop_button.setEnabled(running)
         self.tpa_phase_load_button.setEnabled(not running)
@@ -6363,7 +6243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         page = self._page_shell("TPA Centre-Wavelength Calibration")
         subtitle = QtWidgets.QLabel(
             "Scan the symmetric layout centre wavelength, read the TPA fluorescence "
-            "brightness from the connected scope or DAQ, and fit the peak with a "
+            "brightness from the DAQ (Step 6 acquisition settings), and fit the peak with a "
             "weighted quadratic. Build the channel grid on the TPA Encoding page "
             "first; this scan reuses its width, spacing and channel count."
         )
@@ -6446,6 +6326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return page
 
     def _tpa_center_set_running(self, running: bool) -> None:
+        self._mark_tpa_calibration("step6b", running)
         self.tpa_center_run_button.setEnabled(not running)
         self.tpa_center_stop_button.setEnabled(running)
         can_apply = (
@@ -6483,9 +6364,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tpa_center_status.setText("Stop λ must be greater than start λ.")
             return
 
-        active = self._enc_active_monitor()
-        if active is None:
-            self.tpa_center_status.setText("Connect the scope or DAQ first (Scope / DAQ page).")
+        monitor = self.daq_controller
+        if monitor is None or not monitor.is_connected:
+            self.tpa_center_status.setText("Connect the DAQ first (Connections page).")
             return
         controller = self._controller()
         if not getattr(controller, "is_open", False):
@@ -6499,11 +6380,17 @@ class MainWindow(QtWidgets.QMainWindow):
         total = max(n_trials * centers.size * (2 if subtract_bg else 1), 1)
         gap_px = layout.pitch_px - layout.channel_width_px
 
-        kind, monitor = active
-        if kind == "scope":
-            settings = self._monitor_settings(trigger_mode="AUTO")
-        else:
-            settings = self._daq_monitor_settings()
+        # the Encoding page's readout is gone; the scan reads the DAQ with the
+        # Step 6 tab's acquisition settings
+        lo, hi = self.tpa_daq_range.currentData()
+        settings = DAQMonitorSettings(
+            channel=self.tpa_daq_channel.text().strip() or "ai0",
+            sample_rate=self.tpa_daq_rate.value(),
+            duration=self.tpa_tboth.value(),
+            hold=self.tpa_settle.value(),
+            min_val=lo, max_val=hi,
+            f_cut=self.tpa_daq_fcut.value(),
+        )
         settle = float(settings.hold)
         read_timeout = max(30.0, settings.duration * 3.0 + 10.0)
         settings0 = replace(settings, hold=0.0)
@@ -6512,7 +6399,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_center_bar.setValue(0)
         self.tpa_center_status.setText(
             f"Starting… pair[{pair_index}] · {start:.4f}–{stop:.4f} nm · "
-            f"{centers.size} points via {kind}"
+            f"{centers.size} points via DAQ"
         )
         self._tpa_center_set_running(True)
 
@@ -6748,12 +6635,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_daq()
             self._log("DAQ disconnected automatically (scope connected)")
         self.scope_controller = scope
-        self.live_readout_dock.watch(scope)
         self._set_status(self.scope_status_label, "Scope: open", "ok")
         self.scope_connect_button.setEnabled(False)
         self.scope_disconnect_button.setEnabled(True)
         self._log(f"Scope connected: {identity.strip()}")
-        self._sync_monitor_source()
 
     def _on_scope_error(self, _error: str) -> None:
         self._set_status(self.scope_status_label, "Scope: error", "error")
@@ -6766,9 +6651,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_connect_button.setEnabled(True)
         self.scope_disconnect_button.setEnabled(False)
         if scope is not None:
-            self.live_readout_dock.unwatch(scope)
             self._run_task("Disconnect scope", scope.disconnect)
-        self._sync_monitor_source()
 
     # ===================== DAQ (NI-DAQmx) page ========================
     def _connect_daq(self) -> None:
@@ -6791,12 +6674,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disconnect_scope()
             self._log("Scope disconnected automatically (DAQ connected)")
         self.daq_controller = daq
-        self.live_readout_dock.watch(daq)
         self._set_status(self.daq_status_label, "DAQ: open", "ok")
         self.daq_connect_button.setEnabled(False)
         self.daq_disconnect_button.setEnabled(True)
         self._log(f"DAQ connected: {identity.strip()}")
-        self._sync_monitor_source()
         self._refresh_step3_run_button()
 
     def _on_daq_error(self, _error: str) -> None:
@@ -6810,9 +6691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daq_connect_button.setEnabled(True)
         self.daq_disconnect_button.setEnabled(False)
         if daq is not None:
-            self.live_readout_dock.unwatch(daq)
             self._run_task("Disconnect DAQ", daq.disconnect)
-        self._sync_monitor_source()
 
     # ===================== Heater (Thorlabs TC300B) =====================
     def _connect_heater(self) -> None:
@@ -7331,6 +7210,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return freqs[1:], spec[1:]  # drop DC bin
 
     def _daq_waveform_read(self) -> None:
+        if self._calibration_busy():
+            self.daqmon_status.setText("A calibration is running; DAQ reads are locked.")
+            return
         daq = self._daq_ready()
         if daq is None:
             self.daqmon_status.setText("Connect the DAQ on the Connections page first.")
@@ -7344,6 +7226,7 @@ class MainWindow(QtWidgets.QMainWindow):
         invert = self.daqmon_invert.isChecked()
         order = DAQMonitorSettings().filter_order
         settle_cycles = self._DAQMON_SETTLE_CYCLES
+        self._daqmon_reading = True
         self.daqmon_read_button.setEnabled(False)
         self.daqmon_cfg.setEnabled(False)
         self.daqmon_status.setText(
@@ -7372,7 +7255,8 @@ class MainWindow(QtWidgets.QMainWindow):
                        self._daq_waveform_done, self._daq_waveform_error)
 
     def _daq_waveform_done(self, payload: dict[str, Any]) -> None:
-        self.daqmon_read_button.setEnabled(True)
+        self._daqmon_reading = False
+        self._refresh_manual_reads()
         self.daqmon_cfg.setEnabled(True)
         n0 = int(payload["n_settle"])
         fs = payload["fs"]
@@ -7396,7 +7280,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._daq_waveform_draw(payload)
 
     def _daq_waveform_error(self, _error: str) -> None:
-        self.daqmon_read_button.setEnabled(True)
+        self._daqmon_reading = False
+        self._refresh_manual_reads()
         self.daqmon_cfg.setEnabled(True)
         self.daqmon_status.setText("DAQ read failed (see Status log).")
 
@@ -7453,316 +7338,10 @@ class MainWindow(QtWidgets.QMainWindow):
                       labelcolor="#d8dee9")
         self.daqmon_canvas.draw_idle()
 
-    # ===================== Scope Monitor page ========================
-    _TRIG_SOURCES = [("CH1", "CHANnel1"), ("CH2", "CHANnel2"), ("CH3", "CHANnel3"),
-                     ("CH4", "CHANnel4"), ("EXT", "EXTernanalog")]
     # NI-DAQmx programmable-gain input ranges (device-independent common set;
     # the driver silently snaps to the closest one the connected card supports).
     _DAQ_RANGES = [(-0.1, 0.1), (-0.2, 0.2), (-0.5, 0.5), (-1.0, 1.0),
                    (-2.0, 2.0), (-5.0, 5.0), (-10.0, 10.0)]
-
-    def _build_monitor_widget(self) -> QtWidgets.QWidget:
-        """Embeddable single-reading monitor (lives inside the TPA encoder page).
-
-        Shows either the scope's trigger/averaging config or the DAQ's
-        acquisition config, whichever instrument is connected on the
-        Connections page (see _sync_monitor_source); the recorded-readings
-        plot and controls below are shared between both sources. The two
-        config panels are toggled with setVisible() rather than a
-        QStackedWidget -- a QStackedWidget's sizeHint is the union of every
-        page it has ever held, so it would keep the smaller DAQ panel
-        stretched to the taller scope panel's height.
-        """
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(0, 0, 0, 0)
-
-        self.mon_source_label = QtWidgets.QLabel("Source: (none connected)")
-        self.mon_source_label.setObjectName("PageSubtitle")
-        v.addWidget(self.mon_source_label)
-
-        # config : average-per-pattern share leftover height 1:2 (only the
-        # visible one of the two config panels counts, the hidden one takes no
-        # space -- see _sync_monitor_source)
-        self.scope_monitor_cfg = self._build_scope_monitor_config()
-        self.daq_monitor_cfg = self._build_daq_monitor_config()
-        v.addWidget(self.scope_monitor_cfg, 1)
-        v.addWidget(self.daq_monitor_cfg, 1)
-
-        self.mon_count_label = QtWidgets.QLabel("0 patterns")
-        self.mon_count_label.setObjectName("PageSubtitle")
-        self.mon_count_label.setAlignment(QtCore.Qt.AlignCenter)
-        v.addWidget(self.mon_count_label)
-
-        self.mon_fig = Figure(figsize=(4, 1.8), tight_layout=True)
-        self.mon_canvas = FigureCanvas(self.mon_fig)
-        v.addWidget(self._panel_with_widget("Mean \N{PLUS-MINUS SIGN} std per pattern", self.mon_canvas), 2)
-
-        # This readout is a behaviour recorder, not a live monitor: each reading
-        # appends one (pattern #, mean, std) point -- either automatically after
-        # an SLM send, or on demand via the Acquire button.
-        self.mon_acquire_button = QtWidgets.QPushButton("Acquire")
-        self.mon_acquire_button.setToolTip(
-            "Read one averaged (mean \N{PLUS-MINUS SIGN} std) sample now from the connected "
-            "instrument (scope or DAQ) and append it to the record -- no SLM send needed."
-        )
-        self.mon_acquire_button.clicked.connect(self._enc_acquire_clicked)
-        self.mon_clear_button = QtWidgets.QPushButton("Clear")
-        self.mon_clear_button.setProperty("variant", "ghost")
-        self.mon_clear_button.clicked.connect(self._monitor_clear)
-        self.mon_save_button = QtWidgets.QPushButton("Save CSV…")
-        self.mon_save_button.setProperty("variant", "ghost")
-        self.mon_save_button.clicked.connect(self._monitor_save)
-        self.mon_read_on_send = QtWidgets.QCheckBox("Auto-read on SLM send")
-        self.mon_read_on_send.setChecked(True)
-        self.mon_read_on_send.setToolTip(
-            "After a pattern is sent from this page, take one averaged reading "
-            "from whichever instrument (scope or DAQ) is connected, and append "
-            "it to the record."
-        )
-        v.addWidget(self.mon_read_on_send)
-        self.mon_dock_button = QtWidgets.QPushButton("Live dock")
-        self.mon_dock_button.setProperty("variant", "ghost")
-        self.mon_dock_button.setCheckable(True)
-        self.mon_dock_button.setToolTip(
-            "Show the dockable Live Readout: every scope/DAQ reading from any "
-            "module (TPA scans, step 6/7, pipeline, the DAQ Monitor page, this "
-            "page) streams into its rolling chart, visible from every page."
-        )
-        self.mon_dock_button.toggled.connect(self.live_readout_dock.setVisible)
-        self.live_readout_dock.visibilityChanged.connect(
-            self.mon_dock_button.setChecked
-        )
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.mon_dock_button)
-        row.addStretch(1)   # push the action buttons to the right at their natural width
-        row.addWidget(self.mon_acquire_button)
-        row.addWidget(self.mon_clear_button)
-        row.addWidget(self.mon_save_button)
-        v.addLayout(row)
-        self._sync_monitor_source()
-        return w
-
-    def _build_scope_monitor_config(self) -> QtWidgets.QWidget:
-        cfg = self._panel("Scope Monitor · trigger & averaging")
-        grid = QtWidgets.QGridLayout(cfg)
-        self.mon_channel = QtWidgets.QComboBox(); self.mon_channel.addItems(["1", "2", "3", "4"])
-        self.mon_trig_source = QtWidgets.QComboBox()
-        for label, _tok in self._TRIG_SOURCES:
-            self.mon_trig_source.addItem(label)
-        self.mon_trig_source.setCurrentIndex(2)
-        self.mon_trig_level = QtWidgets.QDoubleSpinBox()
-        self.mon_trig_level.setRange(-5.0, 5.0); self.mon_trig_level.setSingleStep(0.1)
-        self.mon_trig_level.setValue(1.5); self.mon_trig_level.setSuffix(" V")
-        self.mon_hold = QtWidgets.QDoubleSpinBox()
-        self.mon_hold.setRange(0.0, 10000.0); self.mon_hold.setValue(100.0); self.mon_hold.setSuffix(" ms")
-        self.mon_duration = QtWidgets.QDoubleSpinBox()
-        self.mon_duration.setRange(0.001, 10.0); self.mon_duration.setDecimals(3)
-        self.mon_duration.setValue(1.0); self.mon_duration.setSuffix(" s")
-        self.mon_decimation = QtWidgets.QComboBox(); self.mon_decimation.addItems(["HRESolution", "SAMPle"])
-        self.mon_bandwidth = QtWidgets.QComboBox(); self.mon_bandwidth.addItems(["(keep)", "FULL", "B800", "B200", "B20"])
-        self.mon_digfilter = QtWidgets.QLineEdit(""); self.mon_digfilter.setPlaceholderText("off")
-        pairs = [("Channel", self.mon_channel), ("Trigger src", self.mon_trig_source),
-                 ("Level", self.mon_trig_level), ("Hold", self.mon_hold),
-                 ("Average for", self.mon_duration), ("Decimation", self.mon_decimation),
-                 ("BW limit", self.mon_bandwidth), ("Digital LP", self.mon_digfilter)]
-        # 4 fields per row: the panel spans half the page width, so 2-per-row
-        # left most of it empty and made the panel needlessly tall
-        for i, (label, widget) in enumerate(pairs):
-            r, c = i // 4, (i % 4) * 2
-            grid.addWidget(QtWidgets.QLabel(label), r, c)
-            grid.addWidget(widget, r, c + 1)
-        grid.setColumnStretch(8, 1)   # absorb leftover width instead of stretching fields
-        return cfg
-
-    @staticmethod
-    def _bind_spins(
-        a: QtWidgets.QDoubleSpinBox, b: QtWidgets.QDoubleSpinBox
-    ) -> None:
-        """Two-way sync: the two spinboxes are views of the same setting.
-
-        ``setValue`` only emits ``valueChanged`` on an actual change, so the
-        cross-connection cannot loop.  ``b`` is set to ``a``'s current value.
-        """
-        a.valueChanged.connect(b.setValue)
-        b.valueChanged.connect(a.setValue)
-        b.setValue(a.value())
-
-    def _build_daq_monitor_config(self) -> QtWidgets.QWidget:
-        cfg = self._panel("DAQ Monitor · acquisition")
-        grid = QtWidgets.QGridLayout(cfg)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
-        self.daq_mon_channel = QtWidgets.QLineEdit("ai0")
-        self.daq_mon_channel.setMaximumWidth(90)
-        self.daq_mon_sample_rate = QtWidgets.QDoubleSpinBox()
-        self.daq_mon_sample_rate.setRange(1.0, 2_000_000.0); self.daq_mon_sample_rate.setDecimals(0)
-        self.daq_mon_sample_rate.setValue(1000.0); self.daq_mon_sample_rate.setSuffix(" S/s")
-        self.daq_mon_sample_rate.setMaximumWidth(120)
-        self.daq_mon_hold = QtWidgets.QDoubleSpinBox()
-        self.daq_mon_hold.setRange(0.0, 10000.0); self.daq_mon_hold.setValue(250.0); self.daq_mon_hold.setSuffix(" ms")
-        self.daq_mon_hold.setMaximumWidth(100)
-        self.daq_mon_duration = QtWidgets.QDoubleSpinBox()
-        self.daq_mon_duration.setRange(0.001, 10.0); self.daq_mon_duration.setDecimals(3)
-        self.daq_mon_duration.setValue(8.0); self.daq_mon_duration.setSuffix(" s")
-        self.daq_mon_duration.setMaximumWidth(100)
-        self.daq_mon_duration.setToolTip(
-            "T_both: averaging window when both beams of a pair are on "
-            "(bright points); also the plain window for non-sweep reads"
-        )
-        self.daq_mon_single = QtWidgets.QDoubleSpinBox()
-        self.daq_mon_single.setRange(0.001, 30.0); self.daq_mon_single.setDecimals(3)
-        self.daq_mon_single.setValue(10.0); self.daq_mon_single.setSuffix(" s")
-        self.daq_mon_single.setMaximumWidth(100)
-        self.daq_mon_single.setToolTip(
-            "T_single: averaging window when at most one beam is on "
-            "(x=0 or w=0, incl. the all-off dark) -- weak signal needs a "
-            "longer window than the bright points"
-        )
-        # The Step 6 tab shows the same two windows -- one setting, two views.
-        # Defaults are step 6 v2's validated 8 s / 10 s rather than v1's 3/5,
-        # since the binding would otherwise hand v1's timings to the v2 sweep.
-        self._bind_spins(self.daq_mon_duration, self.tpa_tboth)
-        self._bind_spins(self.daq_mon_single, self.tpa_tsingle)
-        self.daq_mon_fcut = QtWidgets.QDoubleSpinBox()
-        self.daq_mon_fcut.setRange(0.1, 100_000.0); self.daq_mon_fcut.setDecimals(1)
-        self.daq_mon_fcut.setValue(20.0); self.daq_mon_fcut.setSuffix(" Hz")
-        self.daq_mon_fcut.setMaximumWidth(100)
-        self.daq_mon_fcut.setToolTip(
-            "Detector 3 dB bandwidth: low-pass cutoff for the trace behind "
-            "the reported mean and std"
-        )
-        self.daq_mon_range = QtWidgets.QComboBox()
-        self.daq_mon_range.setMaximumWidth(100)
-        for lo, hi in self._DAQ_RANGES:
-            self.daq_mon_range.addItem(f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
-        self.daq_mon_range.setCurrentIndex(0)   # smallest / most sensitive range by default
-        pairs = [("Channel", self.daq_mon_channel), ("Sample rate", self.daq_mon_sample_rate),
-                 ("Hold", self.daq_mon_hold), ("T_both", self.daq_mon_duration),
-                 ("T_single", self.daq_mon_single), ("Low-pass", self.daq_mon_fcut),
-                 ("Range", self.daq_mon_range)]
-        # 4 fields per row: the panel spans half the page width, so 2-per-row
-        # left most of it empty and made the panel needlessly tall
-        for i, (label, widget) in enumerate(pairs):
-            r, c = i // 4, (i % 4) * 2
-            grid.addWidget(QtWidgets.QLabel(label), r, c)
-            grid.addWidget(widget, r, c + 1)
-        grid.setColumnStretch(8, 1)   # absorb leftover width instead of stretching fields
-        return cfg
-
-    def _sync_monitor_source(self) -> None:
-        """Show the config panel for whichever instrument is connected."""
-        if not hasattr(self, "scope_monitor_cfg"):
-            return
-        connected = self._enc_active_monitor() is not None
-        # manual Acquire only makes sense when an instrument is connected
-        self.mon_acquire_button.setEnabled(connected)
-        if self.scope_controller is not None and self.scope_controller.is_connected:
-            self.scope_monitor_cfg.setVisible(True)
-            self.daq_monitor_cfg.setVisible(False)
-            self.mon_source_label.setText("Source: Scope (R&S RTO6)")
-        elif self.daq_controller is not None and self.daq_controller.is_connected:
-            self.scope_monitor_cfg.setVisible(False)
-            self.daq_monitor_cfg.setVisible(True)
-            self.mon_source_label.setText("Source: DAQ (NI-DAQmx)")
-        else:
-            self.scope_monitor_cfg.setVisible(True)
-            self.daq_monitor_cfg.setVisible(False)
-            self.mon_source_label.setText("Source: (none connected — connect Scope or DAQ)")
-
-    def _monitor_settings(self, trigger_mode: str = "NORMal") -> MonitorSettings:
-        cutoff_text = self.mon_digfilter.text().strip()
-        try:
-            cutoff = float(cutoff_text) if cutoff_text else None
-        except ValueError:
-            cutoff = None
-        bw = self.mon_bandwidth.currentText()
-        return MonitorSettings(
-            channel=int(self.mon_channel.currentText()),
-            trigger_mode=trigger_mode,
-            trigger_source=self._TRIG_SOURCES[self.mon_trig_source.currentIndex()][1],
-            trigger_level=self.mon_trig_level.value(),
-            trigger_slope="POSitive",
-            hold=self.mon_hold.value() / 1000.0,      # ms -> s
-            duration=self.mon_duration.value(),
-            decimation=self.mon_decimation.currentText(),
-            bandwidth_limit=None if bw == "(keep)" else bw,
-            digital_filter_cutoff=cutoff,
-        )
-
-    def _daq_monitor_settings(self) -> DAQMonitorSettings:
-        min_val, max_val = self.daq_mon_range.currentData()
-        return DAQMonitorSettings(
-            channel=self.daq_mon_channel.text().strip() or "ai0",
-            sample_rate=self.daq_mon_sample_rate.value(),
-            duration=self.daq_mon_duration.value(),
-            single_duration=self.daq_mon_single.value(),
-            hold=self.daq_mon_hold.value() / 1000.0,  # ms -> s
-            min_val=min_val,
-            max_val=max_val,
-            f_cut=self.daq_mon_fcut.value(),
-        )
-
-    def _on_monitor_sample(self, sample: MonitorSample) -> None:
-        self._monitor_values.append(sample.value)
-        # std is per-window noise (None if the source doesn't report it); NaN
-        # keeps the record aligned 1:1 with the mean list for plotting/saving
-        self._monitor_stds.append(sample.std if sample.std is not None else float("nan"))
-        self.mon_count_label.setText(f"{len(self._monitor_values)} patterns")
-        n = len(self._monitor_values)
-        if sample.std is not None:
-            self._mon_status(
-                f"pattern #{n}: {sample.value*1000:.4f} \N{PLUS-MINUS SIGN} "
-                f"{sample.std*1000:.4f} mV"
-            )
-        else:
-            self._mon_status(f"pattern #{n}: {sample.value*1000:.4f} mV")
-        self._monitor_draw()
-
-    def _monitor_draw(self) -> None:
-        self.mon_fig.clear()
-        self.mon_fig.patch.set_facecolor("#101820")
-        ax = self.mon_fig.add_subplot(111)
-        self._style_dark_axes(ax)
-        ax.set_xlabel("Pattern # (send order)")
-        ax.set_ylabel("Mean \N{PLUS-MINUS SIGN} std (mV)")
-        if self._monitor_values:
-            n = len(self._monitor_values)
-            xs = list(range(1, n + 1))
-            ys = [v * 1000 for v in self._monitor_values]
-            # per-point std as error bars (mV); NaN entries render bar-less
-            yerr = [s * 1000 for s in self._monitor_stds]
-            ax.errorbar(xs, ys, yerr=yerr, marker="o", ms=3, color="#47b8e0",
-                        linewidth=0.8, ecolor="#6f8ea0", elinewidth=0.8, capsize=2)
-            # integer-only ticks on the pattern axis (1, 2, 3, …)
-            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-            ax.set_xlim(0.5, n + 0.5)
-        self.mon_canvas.draw_idle()
-
-    def _monitor_clear(self) -> None:
-        self._monitor_values = []
-        self._monitor_stds = []
-        self.mon_count_label.setText("0 patterns")
-        self._monitor_draw()
-
-    def _monitor_save(self) -> None:
-        if not self._monitor_values:
-            self._mon_status("No readings to save.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save pattern readings", "scope_readings.csv", "CSV (*.csv)")
-        if not path:
-            return
-        import csv as _csv
-
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = _csv.writer(f)
-            writer.writerow(["pattern", "mean_V", "std_V"])
-            for i, (v, s) in enumerate(
-                zip(self._monitor_values, self._monitor_stds), start=1
-            ):
-                writer.writerow([i, v, "" if s != s else s])  # blank for NaN std
-        self._log(f"Pattern readings saved: {path}")
 
     def _page_shell(self, title: str) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -8254,8 +7833,38 @@ class MainWindow(QtWidgets.QMainWindow):
             osa.remove_trace_listener(self._osa_bridge.on_trace)
             self._run_task("Disconnect OSA", osa.disconnect)
 
+    def _calibration_busy(self) -> bool:
+        """True while any GUI calibration (steps 1-3c, 4b, 6, 6b, 7) is running."""
+        return self._calibration_is_running or bool(self._running_tpa_calibrations)
+
+    def _mark_tpa_calibration(self, name: str, running: bool) -> None:
+        if running:
+            self._running_tpa_calibrations.add(name)
+        else:
+            self._running_tpa_calibrations.discard(name)
+        self._refresh_manual_reads()
+
+    def _refresh_manual_reads(self) -> None:
+        """Lock the OSA Viewer sweeps and the DAQ Monitor read during a calibration.
+
+        A manual read would share the instrument with the calibration's own
+        acquisitions, so a continuous OSA sweep already running is stopped too.
+        """
+        busy = self._calibration_busy()
+        if busy and self.osa_view_stop_event is not None:
+            self.osa_view_stop_event.set()
+            self._log("OSA Viewer sweep stopped: a calibration started")
+        if hasattr(self, "osv_single_button"):
+            self._osa_view_set_running(
+                self.osa_view_stop_event is not None,
+                continuous=self.osv_cont_button.isChecked(),
+            )
+        if hasattr(self, "daqmon_read_button"):
+            self.daqmon_read_button.setEnabled(not busy and not self._daqmon_reading)
+
     def _set_calibration_running(self, running: bool) -> None:
         self._calibration_is_running = running
+        self._refresh_manual_reads()
         connected = self.osa_controller is not None
         for button in getattr(self, "calibration_run_buttons", []):
             button.setEnabled(connected and not running)
@@ -9693,8 +9302,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.osa_controller = None
         if self.scope_stop_event is not None:
             self.scope_stop_event.set()
-        if self.monitor_stop_event is not None:
-            self.monitor_stop_event.set()
         if self.heater_stop_event is not None:
             self.heater_stop_event.set()
         if self.scope_controller is not None:

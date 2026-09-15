@@ -163,16 +163,6 @@ class AcquisitionSettingsTests(_WindowCase):
         w.tpa_invert.setChecked(True)
         w.tpa_autorange.setChecked(True)
 
-    def test_windows_are_shared_with_the_daq_monitor_page(self) -> None:
-        """One setting, two views -- _bind_spins ties them both ways."""
-        w = self.win
-        w.tpa_tboth.setValue(6.5)
-        self.assertAlmostEqual(w.daq_mon_duration.value(), 6.5)
-        w.daq_mon_single.setValue(12.0)
-        self.assertAlmostEqual(w.tpa_tsingle.value(), 12.0)
-        w.tpa_tboth.setValue(8.0)
-        w.tpa_tsingle.setValue(10.0)
-
     def test_default_windows_are_the_v2_validated_ones(self) -> None:
         self.assertAlmostEqual(self.win.tpa_tboth.value(), 8.0)
         self.assertAlmostEqual(self.win.tpa_tsingle.value(), 10.0)
