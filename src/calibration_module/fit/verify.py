@@ -24,7 +24,7 @@ from __future__ import annotations
 import csv
 import itertools
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,7 @@ from .phase import PairModel, load_comb_phase_json, load_pair_models, phi_half
 __all__ = [
     "load_forward_model",
     "predict",
+    "saturate",
     "FullScale",
     "full_scale",
     "support_h",
@@ -91,12 +92,37 @@ def load_forward_model(
     return {k: models[k] for k in pairs}, {k: phases[k] for k in pairs}, int(ref)
 
 
+def saturate(y, y_sat: float | None):
+    """Two-photon saturation of the readout, ``Y / (1 + Y / Y_sat)``.
+
+    The atoms respond to the coherent ``|E|^2``, and the excited population stops
+    growing linearly with it: ``Y_sat`` is the ``|E|^2`` (in detector volts) at
+    which the response has fallen to half the linear one.  ``None`` or ``0`` is
+    the linear model.  Steps 6 and 7 read at most ~66 mV, where the correction is
+    ~1 %, so their fits are left as linear.
+    """
+    if not y_sat:
+        return y
+    return y / (1.0 + y / float(y_sat))
+
+
 def predict(models: Mapping[int, PairModel], phases: Mapping[int, float],
-            driven: Sequence[int], x, w) -> np.ndarray:
+            driven: Sequence[int], x, w, *, coherent: bool = False,
+            y_sat: float | None = None) -> np.ndarray:
     """Dark-free ``Y`` for drives ``x``, ``w`` of shape ``(..., len(driven))``.
 
     Column ``i`` drives pair ``driven[i]``.  The single-beam response is detector
     background rather than TPA field, so it adds OUTSIDE the coherent sum.
+
+    ``coherent=True`` returns ``|E|^2`` alone, dropping that background.  That is
+    the quantity ``FS = Y_max`` is defined on (see :class:`FullScale`), so it is
+    what a level target means; the full ``Y`` is what the ADC sees, so it is what
+    a read's input range is chosen from.  Keeping the two apart matters: on the
+    0911 runs the background ramps 0.64 -> 1.14 mV across the scale, a tilt of
+    the level axis that would otherwise be read as model bias.
+
+    ``y_sat`` applies :func:`saturate` to ``|E|^2``; the background is detector
+    offset, not atoms, so it stays linear.
     """
     x = np.asarray(x, dtype=float)
     w = np.asarray(w, dtype=float)
@@ -111,7 +137,8 @@ def predict(models: Mapping[int, PairModel], phases: Mapping[int, float],
         field = field + m.amplitude(xi, wi) * np.exp(
             1j * (phi_half(xi) + phi_half(wi) + phases[k]))
         bg = bg + m.single_beam(xi, wi)
-    return np.abs(field) ** 2 + bg
+    coh = saturate(np.abs(field) ** 2, y_sat)
+    return coh if coherent else coh + bg
 
 
 # ======================================================================
@@ -310,6 +337,11 @@ class VerifyBlock:
     std_v: np.ndarray
     range_v: np.ndarray
     pred_v: np.ndarray
+    #: Any column this module has no meaning for, carried through verbatim --
+    #: the system-accuracy run writes ``kind``, ``seq``, ``target_alpha`` and
+    #: friends, and its report reads them back without verify.py having to know
+    #: what they are.  Numeric columns arrive as float arrays, the rest as str.
+    extra: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def n(self) -> int:
@@ -377,13 +409,20 @@ def pairs_tag(driven: Sequence[int]) -> str:
 
 
 def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapping],
-                     *, meta: Mapping[str, object]) -> str:
+                     *, meta: Mapping[str, object],
+                     extra: Sequence[str] = ()) -> str:
     """One row per pattern; ``x_k, w_k`` for every pair, 0 for the undriven ones.
 
     Each row mapping carries ``block, driven, x, w`` (``x``/``w`` in ``driven``
     order) and ``dark_v, mean_v, std_v, range_v, pred_v``.  ``meta`` is written
     as trailing ``# key,value`` lines.  The layout is step 8's with ``v``
     dropped and ``range_v`` added, so :func:`load_verify_csv` reads both.
+
+    ``extra`` names further per-row columns to append after ``pred_v``, taken
+    from the same row mappings and blank where a row omits one.  They are how the
+    system-accuracy run records which family a read belongs to without needing a
+    second file format -- and because the leading columns are unchanged, such a
+    CSV still loads and compares as an ordinary n-pair block.
     """
     pairs = sorted(int(k) for k in pairs)
     out = Path(path).resolve()
@@ -391,7 +430,8 @@ def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapp
     with open(out, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["block", "pairs"]
-                        + [c for k in pairs for c in (f"x_{k}", f"w_{k}")] + _TAIL)
+                        + [c for k in pairs for c in (f"x_{k}", f"w_{k}")]
+                        + _TAIL + list(extra))
         for r in rows:
             drive = dict(zip(r["driven"], zip(r["x"], r["w"])))
             line = [r["block"], pairs_tag(r["driven"])]
@@ -400,6 +440,7 @@ def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapp
                 line += [f"{float(xk):.6f}", f"{float(wk):.6f}"]
             line += [f"{r['dark_v']:.9g}", f"{r['mean_v']:.9g}", f"{r['std_v']:.9g}",
                      f"{r['range_v']:g}", f"{r['pred_v']:.9g}"]
+            line += [r.get(c, "") for c in extra]
             writer.writerow(line)
         for key, value in meta.items():
             f.write(f"# {key},{value}\n")
@@ -439,6 +480,23 @@ def load_verify_csv(path: str | Path) -> tuple[list[int], list[VerifyBlock], dic
         return np.array([float(r[name]) if r.get(name) not in (None, "") else np.nan
                          for r in group])
 
+    # Anything this module has no meaning for rides along untouched.  "v" is an
+    # old step-8 column that x_k/w_k already carry, so it is not passed on.
+    named = ({"block", "pairs", "v", None}
+             | {c for k in pairs for c in (f"x_{k}", f"w_{k}")} | set(_TAIL))
+    spare = [c for c in rows[0] if c not in named]
+
+    def spare_cols(group) -> dict[str, np.ndarray]:
+        out = {}
+        for name in spare:
+            raw = [r.get(name, "") for r in group]
+            try:
+                out[name] = np.array([float(v) if v not in (None, "") else np.nan
+                                      for v in raw])
+            except (TypeError, ValueError):
+                out[name] = np.array([("" if v is None else str(v)) for v in raw])
+        return out
+
     blocks = []
     for (_, tag), g in grouped.items():
         driven = tuple(int(t) for t in tag.split("+"))
@@ -448,7 +506,7 @@ def load_verify_csv(path: str | Path) -> tuple[list[int], list[VerifyBlock], dic
             w=np.array([[float(r[f"w_{k}"]) for k in driven] for r in g]),
             dark_v=col(g, "dark_v"), mean_v=col(g, "voltage_mean_v"),
             std_v=col(g, "voltage_std_v"), range_v=col(g, "range_v"),
-            pred_v=col(g, "pred_v"),
+            pred_v=col(g, "pred_v"), extra=spare_cols(g),
         ))
     check_sign(path, blocks)
     return pairs, blocks, meta

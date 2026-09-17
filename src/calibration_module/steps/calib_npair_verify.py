@@ -190,12 +190,23 @@ def range_for(pred_v: float) -> tuple[float, float]:
 
 
 def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
-                 acq: PairV2Acq = ACQ, encode=None, log=print) -> None:
+                 acq: PairV2Acq = ACQ, encode=None, log=print,
+                 extra=None, y_sat: float | None = None, t_both_of=None) -> None:
     """Drive every block's patterns; append one row per read to ``rows``.
 
     ``x`` and ``w`` are ``(len(blocks), patterns, n)``.  ``rows`` is the caller's
     list, filled as the run goes, so an interrupted run keeps what it read.
     ``encode`` defaults to ``encode_to_pattern``.
+
+    ``extra``, if given, is ``(len(blocks), patterns)`` of mappings merged into
+    each row, so a caller can label its reads without this function knowing what
+    the labels mean.  It defaults to ``None``, which is exactly the behaviour
+    every existing caller gets.
+
+    ``y_sat`` is passed to :func:`predict`, so a pattern's range, logged diff and
+    ``pred_v`` all use the saturated model.  ``t_both_of(pred_v)``, if given,
+    sets each pattern read's window in seconds; the dark keeps ``acq.t_single_s``.
+    Both default to ``None``: linear model, fixed ``acq.t_both_s``.
     """
     if encode is None:
         from slm_module.encoding import encode_to_pattern as encode
@@ -215,6 +226,9 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
         rng, wide = range_for(pred)
         if can_autorange(daq):
             set_range(daq, rng)
+            if t_both_of is not None and not single:
+                daq.configure_monitor(replace(daq._settings,  # noqa: SLF001
+                                              duration=float(t_both_of(pred))))
         return read_point_autorange(daq, single=single,
                                     acq=replace(acq, range_v=rng, range_wide_v=wide),
                                     log=log)
@@ -234,7 +248,7 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
             if time.monotonic() - dark_t > DARK_EVERY_S:
                 dark, dark_t = read_dark()
             xs, ws = x[b, j], w[b, j]
-            pred = float(predict(models, phases, driven, xs, ws))
+            pred = float(predict(models, phases, driven, xs, ws, y_sat=y_sat))
             display(driven, xs, ws)
             mean, std, used = read(False, pred)
             i += 1
@@ -250,9 +264,12 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
                         f"arriving negative.  The read already inverts the TIA "
                         f"(ACQ.invert) -- check the amplifier polarity and that the "
                         f"beam is on; do not negate it a second time.")
-            rows.append({"block": b, "driven": driven, "x": xs, "w": ws,
-                         "dark_v": dark, "mean_v": mean, "std_v": std,
-                         "range_v": used, "pred_v": pred})
+            row = {"block": b, "driven": driven, "x": xs, "w": ws,
+                   "dark_v": dark, "mean_v": mean, "std_v": std,
+                   "range_v": used, "pred_v": pred}
+            if extra is not None:
+                row.update(extra[b][j])
+            rows.append(row)
             log(f"[{i}/{total}] {pairs_tag(driven)} #{j + 1}: "
                 f"{(mean - dark) * 1e3:9.4f} mV  pred {pred * 1e3:9.4f}  "
                 f"diff {(mean - dark - pred) * 1e3:+.4f}  [+/-{used:g} V]")
