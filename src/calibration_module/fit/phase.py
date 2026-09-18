@@ -82,7 +82,7 @@ from __future__ import annotations
 import csv
 import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1149,6 +1149,35 @@ def reference_in_csv(path: str | Path) -> int | None:
     return seen.pop()
 
 
+def references_in_csv(path: str | Path) -> dict[int, int]:
+    """``{tgt_index: ref_index}`` -- which reference EACH target was swept against.
+
+    The cascaded form of :func:`reference_in_csv`.  A cascaded run is one
+    measurement written to one CSV, so its rows carry two (or more) references:
+    the root for the pairs it could reach directly, a hub for the neighbours it
+    could not.  :func:`reference_in_csv` rightly refuses such a file -- no single
+    number describes it -- so a caller that understands cascades asks this
+    instead and feeds :func:`load_phase_csv` the right ``ref_model`` per target.
+
+    Raises if one target appears against two different references: that is two
+    runs concatenated, not a cascade, and silently fitting the first would
+    report a phase against a reference nobody chose.
+    """
+    out: dict[int, int] = {}
+    with open(Path(path), newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(line for line in f if not line.startswith("#")):
+            t, r = row.get("tgt_index"), row.get("ref_index")
+            if t in (None, "") or r in (None, ""):
+                continue
+            k, ref = int(float(t)), int(float(r))
+            if out.setdefault(k, ref) != ref:
+                raise ValueError(
+                    f"{Path(path).name}: pair {k} appears against references "
+                    f"{out[k]} and {ref}; a step-7 CSV records each target once"
+                )
+    return out
+
+
 def load_phase_csv(
     path: str | Path,
     tgt_model: PairModel,
@@ -1272,6 +1301,43 @@ def phase_fit_payload(fit: PhaseFit) -> dict:
     }
 
 
+def _chained_fit_payload(fit: PhaseFit, chain, root: int) -> dict:
+    """:func:`phase_fit_payload`, with the phase referred to ``root`` if it hopped.
+
+    The fit itself always describes the hop that was MEASURED -- its amplitudes,
+    its residual, its R^2 -- and those are left alone: they are what says whether
+    that fringe was any good, and rewriting them would hide a bad hop behind
+    good arithmetic.  Only the phase and its error bars move, because the file's
+    contract is that ``dphi_comb_rad`` is the phase against ``ref_index``.
+
+    ``dphi_deta_ref`` becomes the sensitivity to the ROOT's eta, and
+    ``dphi_deta_tgt`` the target's own; the hub's -- which is the coherent sum of
+    its two roles, and the reason a chained error is not two bars in quadrature
+    -- has no slot in the flat schema, so it lives in the ``chained`` block with
+    the rest of the path.  ``chain=None`` (a directly measured pair, or an
+    uncascaded run) returns the payload unchanged.
+    """
+    payload = phase_fit_payload(fit)
+    if chain is None or not chain.chained:
+        return payload
+    from .cascade import chained_payload      # local: cascade imports nothing here
+    payload.update({
+        "dphi_comb_rad": chain.dphi,
+        "dphi_comb_deg": chain.dphi_deg,
+        "dphi_comb_err_rad": chain.err_fringe,
+        "dphi_comb_err_deg": float(np.degrees(chain.err_fringe)),
+        "dphi_comb_err_eta_rad": chain.err_eta,
+        "dphi_comb_err_eta_deg": float(np.degrees(chain.err_eta)),
+        "dphi_comb_err_total_rad": chain.err_total,
+        "dphi_comb_err_total_deg": float(np.degrees(chain.err_total)),
+        "dphi_deta_ref": chain.deta.get(int(root), 0.0),
+        "dphi_deta_tgt": chain.deta.get(int(chain.tgt), 0.0),
+        "eta_ref_err": chain.eta_err.get(int(root), 0.0),
+        "chained": chained_payload(chain, fit),
+    })
+    return payload
+
+
 def save_phase_json(result: PhaseResult, path: str | Path) -> str:
     """Human-readable dPhi_comb summary (radians + degrees) and fit quality."""
     out = Path(path).resolve()
@@ -1300,6 +1366,7 @@ def save_comb_phase_json(
     ref_index: int,
     csv_path: str | None = None,
     single_beam_bg: bool | None = None,
+    chains: Mapping[int, object] | None = None,
     extra: dict | None = None,
 ) -> str:
     """Combined step-7 result JSON: ``{"step3": ..., "step6": ..., "step7": ...}``.
@@ -1316,6 +1383,17 @@ def save_comb_phase_json(
 
     ``extra`` keys are merged into the ``step7`` section (step-7 v2 stores its
     ``beta2`` dispersion check there under ``"verification"``).
+
+    ``chains`` (``{tgt: ChainedPhase}`` from
+    :func:`~calibration_module.fit.cascade.chain_fits`) makes this the saver for
+    a CASCADED run, where some pairs were measured against a hub rather than
+    against ``ref_index`` itself.  Every stored ``dphi_comb_*`` is then the phase
+    referred to ``ref_index`` -- the root -- whichever hub produced it, because
+    that is the one thing every downstream consumer assumes about this file.
+    A hopped pair additionally carries a ``"chained"`` block holding the hop as
+    measured and the hub's own phase, so a merged spectrum can still be taken
+    apart.  Without ``chains`` the fits are stored exactly as fitted, which is
+    the single-reference case and byte-identical to what it always wrote.
     """
     payload6 = json.loads(Path(step6_path).read_text(encoding="utf-8"))
     if "step6" not in payload6:                        # bare save_tpa_pair_json summary
@@ -1334,7 +1412,9 @@ def save_comb_phase_json(
             "single_beam_bg": single_beam_bg,
             "step6_json": str(Path(step6_path).resolve()),
             "channels": [
-                {"tgt_index": int(k), "method": str(m), "fit": phase_fit_payload(f)}
+                {"tgt_index": int(k), "method": str(m),
+                 "fit": _chained_fit_payload(f, (chains or {}).get(k),
+                                             int(ref_index))}
                 for (k, m), f in sorted(fits.items())
             ],
         },
@@ -1513,6 +1593,19 @@ def phase_covariance(fits, pairs) -> np.ndarray:
     pairs = list(pairs)
     if not pairs:
         raise ValueError("no target pairs to build a covariance over")
+    # The rank-1 term below IS the assumption that one reference is common to
+    # every fit.  A cascaded run breaks it -- its hub pairs were fitted against
+    # a different reference -- and the failure is silent: the matrix comes out
+    # the right shape and the wrong weights.  Only the eta_ref VALUES can say,
+    # since the fits themselves do not record which pair they came from.
+    refs = {round(float(fits[k].eta_ref), 12) for k in pairs}
+    if len(refs) > 1:
+        raise ValueError(
+            f"these fits do not share one reference (eta_ref takes "
+            f"{len(refs)} values), so the common-eta_ref term here would be "
+            f"wrong; use calibration_module.fit.cascade.cascade_covariance, "
+            f"which tracks each path's hops and pairs"
+        )
     diag = np.array(
         [fits[k].dphi_comb_err**2 + (fits[k].dphi_deta_tgt * fits[k].eta_tgt_err) ** 2
          for k in pairs], dtype=float)
@@ -1774,6 +1867,7 @@ __all__ = [
     "write_meas_csv",
     "targets_in_csv",
     "reference_in_csv",
+    "references_in_csv",
     "load_phase_csv",
     "phase_fit_payload",
     "save_phase_json",

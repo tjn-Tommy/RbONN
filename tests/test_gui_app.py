@@ -172,5 +172,135 @@ class MainWindowStartupTests(unittest.TestCase):
             window.close()
 
 
+class StepDefaultsTests(unittest.TestCase):
+    """The values the calibration pages come up with.
+
+    These are what actually gets run when nobody retypes anything, so they are
+    worth pinning: a default that drifts is not a visible bug, it is a run
+    measured under settings nobody chose. Change the page and change these in
+    the same commit -- that is the point of the test, not that any particular
+    number is sacred.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from gui.app import MainWindow
+        cls.win = MainWindow()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.win.close()
+
+    def test_step_2_sweep_defaults(self) -> None:
+        w = self.win.step_widgets[2]
+        self.assertEqual(w["window"].value(), 20)
+        self.assertEqual(w["stride"].value(), 30)
+        self.assertAlmostEqual(w["peak_nm"].value(), 0.2)
+        self.assertAlmostEqual(w["sweep_nm"].value(), 1.0)
+        self.assertAlmostEqual(w["min_wl"].value(), 775.0)
+        self.assertAlmostEqual(w["max_wl"].value(), 781.0)
+
+    def test_step_3c_channel_grid_defaults(self) -> None:
+        w = self.win.step_widgets["3c"]
+        self.assertAlmostEqual(w["target"].value(), 778.04)
+        # 15 px window + 35 px gap: the geometry the 0916 ten-pair run used
+        self.assertEqual(w["window"].value(), 15)
+        self.assertEqual(w["pad"].value(), 35)
+        self.assertEqual(w["count"].value(), 10)
+        self.assertTrue(w["guard_check"].isChecked())
+        self.assertAlmostEqual(w["guard_nm"].value(), 0.06)
+
+    def test_step_3c_sweeps_the_usable_middle_of_the_level_range(self) -> None:
+        """Not 0-1023: 3c starts well above the floor and stops below the top."""
+        w = self.win.step_widgets["3c"]
+        self.assertEqual(
+            (w["level_start"].value(), w["level_stop"].value(),
+             w["level_step"].value()),
+            (350, 950, 25),
+        )
+
+    def test_step_1_still_sweeps_the_whole_range(self) -> None:
+        """Step 1 finds the min and max, so it cannot start inside them."""
+        w = self.win.step_widgets[1]
+        self.assertEqual(
+            (w["level_start"].value(), w["level_stop"].value(),
+             w["level_step"].value()),
+            (0, 1023, 64),
+        )
+
+    def test_the_daq_sweep_defaults(self) -> None:
+        w = self.win.step_widgets["3c"]
+        self.assertEqual(w["daq_channel"].text(), "ai1")
+        self.assertAlmostEqual(w["daq_sample_rate"].value(), 1_000.0)
+        self.assertAlmostEqual(w["daq_hold"].value(), 250.0)
+        self.assertAlmostEqual(w["daq_duration"].value(), 1.0)
+
+    def test_the_region_limit_is_off_but_pre_filled(self) -> None:
+        """Unchecked, so the default span only applies once it is switched on."""
+        w = self.win.step_widgets[2]
+        self.assertFalse(w["region_check"].isChecked())
+        self.assertFalse(w["region_start"].isEnabled())
+        self.assertEqual(w["region_start"].value(), 600)
+        self.assertEqual(w["region_end"].value(), 1700)
+        self.assertIsNone(self.win._step_region(2))
+
+    def test_the_region_reaches_the_sweep_once_it_is_switched_on(self) -> None:
+        w = self.win.step_widgets[2]
+        w["region_check"].setChecked(True)
+        try:
+            self.assertTrue(w["region_start"].isEnabled())
+            self.assertEqual(self.win._step_region(2), (600, 1700))
+        finally:
+            w["region_check"].setChecked(False)
+
+    def test_connecting_an_slm_leaves_the_step_2_region_alone(self) -> None:
+        """The page's region is a choice; the panel width must not replace it.
+
+        ``_on_info_read`` used to widen ``region_end`` to the full width
+        whenever the limit was off, which reset the default to 1919 while
+        leaving the start at 600.
+        """
+        from gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            w = window.step_widgets[2]
+            window._on_info_read((1920, 1200))
+            self.assertEqual((w["region_start"].value(), w["region_end"].value()),
+                             (600, 1700))
+            w["region_check"].setChecked(True)
+            self.assertEqual(window._step_region(2), (600, 1700))
+        finally:
+            window.close()
+
+    def test_a_region_wider_than_the_panel_is_pulled_in(self) -> None:
+        """Bounding it to the real width is the part that has to stay."""
+        from gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            w = window.step_widgets[2]
+            w["region_check"].setChecked(True)
+            w["region_end"].setValue(8000)
+            window._on_info_read((1920, 1200))
+            self.assertEqual(w["region_end"].value(), 1919)
+            self.assertEqual(w["region_end"].maximum(), 1919)
+        finally:
+            window.close()
+
+    def test_the_slm_control_page_still_scans_the_whole_panel(self) -> None:
+        """Step 2's region default must not narrow the SLM Control scan."""
+        from gui.app import MainWindow
+
+        window = MainWindow()
+        try:
+            self.assertEqual(window.start_x_spin.value(), 0)
+            window._on_info_read((1920, 1200))
+            self.assertEqual(window.start_x_spin.value(), 0)
+            self.assertEqual(window.end_x_spin.value(), 1919)
+        finally:
+            window.close()
+
+
 if __name__ == "__main__":
     unittest.main()

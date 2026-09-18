@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -180,6 +180,19 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
             self._xs.append(float(progress.x))
             self._ys.append(float(progress.y))
             self._dirty = True
+
+    def note(self, lines: str | Iterable[str]) -> None:
+        """Write something into the log that is not tied to a measured step.
+
+        For what the caller knows BEFORE the first reading — a step-7 cascade's
+        stage breakdown, say. This window is the one thing open for the whole
+        run, so a plan written here is still on screen when a chained pair shows
+        up in the results and you want to know what it was measured against.
+        """
+        if isinstance(lines, str):
+            lines = [lines]
+        for line in lines:
+            self.log.appendPlainText(str(line))
 
     def _enter_phase(self, phase: str) -> None:
         self._phase = phase

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -126,9 +127,16 @@ from calibration_module.fit.phase import (
     load_pair_models,
     load_phase_csv,
     save_comb_phase_json,
-    reference_in_csv,
+    references_in_csv,
     targets_in_csv,
     write_meas_csv as write_phase_meas_csv,
+)
+from calibration_module.fit.cascade import (
+    MIN_PAIR_SEP,
+    Stage,
+    chain_fits,
+    plan_cascade,
+    plan_lines,
 )
 from calibration_module.measure.phase_v2 import (
     PhaseV2Acq,
@@ -137,6 +145,7 @@ from calibration_module.measure.phase_v2 import (
     PhaseV2Progress,
     build_xw_sweep,
     measure_target,
+    run_seconds as phase_run_seconds,   # NOT pair_v2's: a step-7 Drive is a 4-tuple
 )
 from calibration_module.fit.report import plot_fringe
 from slm_module.keepalive import SLMKeepAlive
@@ -501,6 +510,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_rows: dict[int, list] = {}
         self.tpa_stop_event: threading.Event | None = None
         self.tpa_phase_results: dict[int, PhaseResult] = {}
+        # Every fitted pair referred back to the ROOT reference, hops and all;
+        # the results dict beside it still speaks in the hop each pair was
+        # actually measured over.  Keyed the same, so a row reads both.
+        self.tpa_phase_chains: dict[int, Any] = {}
+        self.tpa_phase_stages: list[Stage] = []
+        self.tpa_phase_root: int | None = None
         self.tpa_phase_stop_event: threading.Event | None = None
         self.tpa_center_result: TPACenterResult | None = None
         self.tpa_center_stop_event: threading.Event | None = None
@@ -1333,13 +1348,19 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(widgets["sampling_points"], 2, 1)
         return box
 
-    def _level_sweep_row(self, step: int | str, *, stop: int = 1023, stepv: int = 64) -> QtWidgets.QWidget:
-        """A 'Levels start / stop / step' row stored on self.step_widgets[step]."""
+    def _level_sweep_row(self, step: int | str, *, start: int = 0,
+                         stop: int = 1023, stepv: int = 64) -> QtWidgets.QWidget:
+        """A 'Levels start / stop / step' row stored on self.step_widgets[step].
+
+        All three ends are per-step: step 1 wants the full 0-1023 to find the
+        min and max at all, while 3c sweeps the usable middle of that range and
+        starts well above 0.
+        """
         row = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         widgets = self.step_widgets[step]
-        widgets["level_start"] = self._spin(0, 1023, 0)
+        widgets["level_start"] = self._spin(0, 1023, start)
         widgets["level_stop"] = self._spin(0, 1023, stop)
         widgets["level_step"] = self._spin(1, 1023, stepv)
         layout.addWidget(QtWidgets.QLabel("Levels"))
@@ -1434,8 +1455,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Only sweep/calibrate this band of SLM columns (x). Off = full width "
             "(or, for a loaded map, its whole range)."
         )
-        start = self._spin(0, 8191, 0)
-        end = self._spin(0, 8191, 1919)
+        start = self._spin(0, 8191, 600)
+        end = self._spin(0, 8191, 1700)
         start.setEnabled(False)
         end.setEnabled(False)
         check.toggled.connect(start.setEnabled)
@@ -1483,10 +1504,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cfg = QtWidgets.QHBoxLayout()
         widgets = self.step_widgets[2]
-        widgets["window"] = self._spin(1, 8191, 30)
+        widgets["window"] = self._spin(1, 8191, 20)
         widgets["peak_nm"] = self._double_spin(0.0, 50.0, 0.2, " nm", 3)
         widgets["peak_nm"].setToolTip("Centroid half-window around the peak, in nm")
-        widgets["stride"] = self._spin(1, 8191, 15)
+        widgets["stride"] = self._spin(1, 8191, 30)
         widgets["stride"].setToolTip(
             "Measure every Nth column; the near-linear wavelength fit fills "
             "in the skipped columns (1 = measure every column)."
@@ -1570,11 +1591,11 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets["daq_sample_rate"] = QtWidgets.QDoubleSpinBox()
         widgets["daq_sample_rate"].setRange(1.0, 2_000_000.0)
         widgets["daq_sample_rate"].setDecimals(0)
-        widgets["daq_sample_rate"].setValue(100_000.0)
+        widgets["daq_sample_rate"].setValue(1_000.0)
         widgets["daq_sample_rate"].setSuffix(" S/s")
         widgets["daq_hold"] = QtWidgets.QDoubleSpinBox()
-        widgets["daq_hold"].setRange(0.0, 10_000.0)
-        widgets["daq_hold"].setValue(150.0)
+        widgets["daq_hold"].setRange(0.0, 5_000.0)
+        widgets["daq_hold"].setValue(250.0)
         widgets["daq_hold"].setSuffix(" ms")
         widgets["daq_hold"].setToolTip("Settle after each SLM frame before the DAQ reads.")
         widgets["daq_duration"] = QtWidgets.QDoubleSpinBox()
@@ -1619,8 +1640,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout(grid_panel)
         widgets["target"] = self._double_spin(700.0, 900.0, 778.04, " nm", 3)
         widgets["window"] = self._spin(1, 256, 15)
-        widgets["pad"] = self._spin(0, 256, 5)
-        widgets["count"] = self._spin(1, 200, 20)
+        widgets["pad"] = self._spin(0, 256, 35)
+        widgets["count"] = self._spin(1, 200, 10)
         widgets["guard_check"] = QtWidgets.QCheckBox("Min-level guard bands")
         widgets["guard_check"].setChecked(True)
         widgets["guard_wl"] = QtWidgets.QLineEdit("780.14, 775.94")
@@ -1647,7 +1668,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(widgets["guard_nm"], 2, 5)
         layout.addWidget(grid_panel)
 
-        layout.addWidget(self._level_sweep_row("3c", stop=1023, stepv=10))
+        layout.addWidget(
+            self._level_sweep_row("3c", start=350, stop=950, stepv=25))
 
         # wavelength source (same choices as Step 3)
         src_row = QtWidgets.QHBoxLayout()
@@ -5542,8 +5564,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.tpa_phase_targets = QtWidgets.QLineEdit("2-6")
         self.tpa_phase_targets.setToolTip(
-            "Target pair labels, 1-based: \"2-6\", \"1,3,5\" or a mix.\n"
-            "The reference is skipped if it appears here."
+            "Pair labels to measure, 1-based: \"2-6\", \"1,3,5\" or a mix.\n"
+            "The reference is skipped if it appears here.\n\n"
+            "A pair CANNOT be swept against its neighbour — the two sit side by "
+            "side on the panel and the leakage is not in the model — so any pair "
+            "within ±1 of the reference is measured against a hub further out "
+            "instead, and its phase is chained back to the reference. The plan "
+            "is worked out for you and printed in the progress window; the run "
+            "is refused up front if some pair cannot be reached at all."
         )
         sgrid.addWidget(QtWidgets.QLabel("Reference"), 2, 0)
         sgrid.addWidget(self.tpa_phase_ref, 2, 1, 1, 2)
@@ -5813,11 +5841,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- run ---------------------------------------------------------------
     def _tpa_phase_plan(self):
-        """``(cfg, layout, models, targets)`` for the run, or raise ``ValueError``.
+        """``(cfg, layout, models, stages)`` for the run, or raise ``ValueError``.
 
         Every check that does NOT need an instrument, in one place: it is what
         the page can say about a run before anything is connected, and it is
         what the tests can drive without a bench.
+
+        The target list is what you want phases FOR, not what one sweep can
+        reach: a pair next to the reference is unmeasurable against it, so
+        :func:`~calibration_module.fit.cascade.plan_cascade` splits the run into
+        stages and the neighbours are measured against a hub and chained back.
+        The cheap, local complaints are raised FIRST — a label outside the
+        layout, or one step 6 has no η for, is a typo worth naming as a typo
+        rather than reporting as an unreachable pair.
         """
         layout, models = self._tpa_phase_load_step6()
         cfg = self._tpa_phase_config()
@@ -5843,13 +5879,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"No step-6 η for pair(s) {missing}; the file covers "
                 f"{self._compact_indices(sorted(models))}."
             )
-        return cfg, layout, models, targets
+        # CascadeError is a ValueError, so an unreachable pair reaches the
+        # status label by the same path as every other refusal here.
+        stages = plan_cascade(targets, cfg.ref_index, n_pairs=layout.n_channels)
+        return cfg, layout, models, stages
+
+    def _tpa_phase_plan_lines(self, stages: "Sequence[Stage]") -> list[str]:
+        """The stage breakdown, costed with THIS page's drive and acquisition."""
+        secs = phase_run_seconds(build_xw_sweep(self._tpa_phase_config()),
+                                 self._tpa_phase_acq())
+        return plan_lines(stages, self._tpa_phase_config().ref_index,
+                          seconds_per_target=secs)
 
     def _tpa_phase_run(self) -> None:
         # The plan first: a typo in the target list is worth saying before
         # "connect the DAQ", because fixing that one does not need the bench.
         try:
-            cfg, layout, models, targets = self._tpa_phase_plan()
+            cfg, layout, models, stages = self._tpa_phase_plan()
         except (ValueError, FileNotFoundError) as exc:
             self.tpa_phase_status.setText(str(exc))
             return
@@ -5870,7 +5916,8 @@ class MainWindow(QtWidgets.QMainWindow):
         acq = self._tpa_phase_acq()
         drive = build_xw_sweep(cfg)
         per_target = len(drive) + 1               # + the all-off dark
-        total = per_target * len(targets)
+        n_targets = sum(len(s) for s in stages)
+        total = per_target * n_targets
         lo, hi = self.tpa_phase_daq_range.currentData()
         settings = DAQMonitorSettings(
             channel=self.tpa_phase_daq_channel.text().strip() or "ai0",
@@ -5883,12 +5930,28 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         read_timeout = max(30.0, acq.t_single_s * 3.0 + 10.0)
 
+        plan_text = self._tpa_phase_plan_lines(stages)
+        hops = [s for s in stages if s.depth]
         self.tpa_phase_status.setText(
-            f"Running\N{HORIZONTAL ELLIPSIS} {len(targets)} target(s) vs ref "
+            f"Running\N{HORIZONTAL ELLIPSIS} {n_targets} target(s) vs ref "
             f"{cfg.ref_index}, {len(drive)} points each"
+            + (f" \N{MIDDLE DOT} {len(stages)} stages, "
+               f"{sum(len(s) for s in hops)} chained" if hops else "")
         )
         self._tpa_phase_set_running(True)
         self._open_calibration_dialog(on_stop=self._tpa_phase_stop)
+        # The plan goes in the dialog, not on the page: it is the one window
+        # that is open for the whole run, and a cascade is worth seeing BEFORE
+        # the hour is spent rather than inferred afterwards from which pair was
+        # measured against what.
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.note(
+                [f"Reference {cfg.ref_index} \N{MIDDLE DOT} "
+                 f"{self._compact_indices(sorted(models))} have step-6 \N{GREEK SMALL LETTER ETA}"]
+                + plan_text
+            )
+        for line in plan_text:
+            self._log(f"[step 7] {line}")
 
         stop_event = threading.Event()
         self.tpa_phase_stop_event = stop_event
@@ -5900,20 +5963,26 @@ class MainWindow(QtWidgets.QMainWindow):
         def work() -> dict[str, Any]:
             daq.configure_monitor(settings)
             results: dict[int, PhaseResult] = {}
+            done = 0
             try:
-                for n, k in enumerate(targets):
-                    results[k] = measure_target(
-                        daq, controller, layout, k, drive,
-                        cfg=cfg, acq=acq, col_ratio=col_ratio,
-                        read_timeout=read_timeout,
-                        step0=n * per_target, total=total,
-                        progress_callback=report, stop_event=stop_event,
-                    )
+                for stage in stages:
+                    # Each stage drives its OWN reference; everything else about
+                    # the sweep is shared, so only ref_index moves.
+                    stage_cfg = replace(cfg, ref_index=stage.ref)
+                    for k in stage.targets:
+                        results[k] = measure_target(
+                            daq, controller, layout, k, drive,
+                            cfg=stage_cfg, acq=acq, col_ratio=col_ratio,
+                            read_timeout=read_timeout,
+                            step0=done * per_target, total=total,
+                            progress_callback=report, stop_event=stop_event,
+                        )
+                        done += 1
             except PhaseV2Aborted:
                 return {"status": "aborted", "results": results, "cfg": cfg,
-                        "models": models}
+                        "models": models, "stages": stages}
             return {"status": "ok", "results": results, "cfg": cfg,
-                    "models": models}
+                    "models": models, "stages": stages}
 
         self._run_slm_task(
             "TPA comb-phase sweep (v2)", work,
@@ -5958,24 +6027,81 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tpa_phase_fit_results(self, results: dict[int, PhaseResult],
                                models: dict[int, PairModel],
-                               ref_index: int) -> list[str]:
-        """Fit every target into ``self.tpa_phase_results``; return the failures."""
+                               ref_index: int,
+                               stages: "Sequence[Stage] | None" = None) -> list[str]:
+        """Fit every target into ``self.tpa_phase_results``; return the failures.
+
+        Each target is fit against the reference it was actually SWEPT against
+        -- its own stage's, which for a one-stage run is ``ref_index`` for
+        everything -- and then :func:`~calibration_module.fit.cascade.chain_fits`
+        refers the lot back to ``ref_index``.  The fits keep the hop they
+        measured; only ``self.tpa_phase_chains`` speaks in root coordinates.
+        """
         single_beam_bg = self.tpa_phase_single_beam.isChecked()
         self.tpa_phase_results = {}
+        self.tpa_phase_chains = {}
+        self.tpa_phase_root = int(ref_index)
+        if stages is None:                      # a loaded CSV: one stage per ref
+            stages = self._tpa_phase_stages_for(results, ref_index)
+        self.tpa_phase_stages = list(stages)
+        ref_of = {k: s.ref for s in stages for k in s.targets}
         failed: list[str] = []
         for k in sorted(results):
             result = results[k]
-            if k not in models or ref_index not in models:
+            ref = ref_of.get(k, ref_index)
+            if k not in models or ref not in models:
                 failed.append(f"pair {k}: no step-6 η")
                 self.tpa_phase_results[k] = result
                 continue
             try:
-                fit_result(result, models[k], models[ref_index],
+                fit_result(result, models[k], models[ref],
                            comb_only=True, single_beam_bg=single_beam_bg)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {k}: {exc}")
             self.tpa_phase_results[k] = result
+        self.tpa_phase_chains = chain_fits(
+            {k: r.fit for k, r in self.tpa_phase_results.items()
+             if r.fit is not None},
+            self.tpa_phase_stages, ref_index,
+        )
+        # A pair whose HUB failed to fit has no route back to the root, so it
+        # has no phase to report even though its own fringe was fine.  Say so
+        # here rather than letting it show up as a silently missing row.
+        for k, r in sorted(self.tpa_phase_results.items()):
+            if r.fit is not None and k not in self.tpa_phase_chains:
+                failed.append(
+                    f"pair {k}: fit ok but its reference {ref_of.get(k, ref_index)} "
+                    f"did not, so it cannot be chained to {ref_index}"
+                )
         return failed
+
+    @staticmethod
+    def _tpa_phase_stages_for(results: "dict[int, PhaseResult]",
+                              root: int) -> "list[Stage]":
+        """Rebuild the stage list from results that already know their reference.
+
+        Loading a CSV skips the planner entirely -- the file records what was
+        driven, and that is the truth about it, plan or no plan.  Stages come
+        out ordered by how far their reference is from the root so
+        :func:`chain_fits` always resolves a hub before what hangs off it.
+        """
+        by_ref: dict[int, list[int]] = {}
+        for k, r in sorted(results.items()):
+            by_ref.setdefault(int(r.ref_index), []).append(int(k))
+        depth = {int(root): 0}
+        stages: list[Stage] = []
+        pending = dict(by_ref)
+        while pending:
+            ready = [ref for ref in sorted(pending) if ref in depth]
+            if not ready:                       # orphaned refs: keep them last
+                ready = sorted(pending)
+            for ref in ready:
+                targets = pending.pop(ref)
+                stages.append(Stage(ref=ref, targets=tuple(targets),
+                                    depth=depth.get(ref, 0)))
+                for k in targets:
+                    depth.setdefault(k, depth.get(ref, 0) + 1)
+        return stages
 
     def _tpa_phase_finished(self, payload: dict[str, Any]) -> None:
         self.tpa_phase_stop_event = None
@@ -5991,20 +6117,28 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         cfg = payload["cfg"]
+        # A run stopped part-way may have finished stage 1 but not the stage
+        # hanging off it, so plan only over what actually came back -- otherwise
+        # chain_fits waits on a hub target that was never measured.
+        stages = [replace(s, targets=tuple(k for k in s.targets if k in results))
+                  for s in payload.get("stages") or []]
         failed = self._tpa_phase_fit_results(
-            results, payload["models"], cfg.ref_index
+            results, payload["models"], cfg.ref_index,
+            [s for s in stages if s.targets] or None,
         )
         self._tpa_phase_set_running(False)
         self._tpa_phase_fill_table()
         self._tpa_phase_redraw()
 
         parts = [
-            f"ΔΦ[{k}]={r.fit.dphi_comb_deg:+.2f}°"
-            for k, r in sorted(self.tpa_phase_results.items())
-            if r.fit is not None
+            f"ΔΦ[{k}]={np.degrees(c.dphi):+.2f}°"
+            for k, c in sorted(self.tpa_phase_chains.items())
         ]
         head = "Stopped" if aborted else "Done"
+        n_chained = sum(1 for c in self.tpa_phase_chains.values() if c.chained)
         note = f"  · {len(failed)} fit(s) failed" if failed else ""
+        if n_chained:
+            note += f"  · {n_chained} chained to ref {cfg.ref_index}"
         self.tpa_phase_status.setText(
             f"{head} · " + ("; ".join(parts) or "no fit") + note
         )
@@ -6029,27 +6163,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- results table -----------------------------------------------------
     def _tpa_phase_fill_table(self) -> None:
-        """One row per target: every column a scalar, so ten targets stay readable."""
+        """One row per target: every column a scalar, so ten targets stay readable.
+
+        The PHASE columns are the chained ones -- referred to the root reference,
+        whichever hub actually measured the pair -- because a table that mixed
+        two reference frames would need reading pair by pair to be believed.
+        Everything after them (a, b, R², pull, residual) describes the hop that
+        was measured, unchained: that is what says whether the fringe was any
+        good, and it is not the root's business.  A hopped row says so in its
+        tooltip.
+        """
         self.tpa_phase_table.blockSignals(True)
         items = sorted(self.tpa_phase_results.items())
         self.tpa_phase_table.setRowCount(len(items))
         for row, (k, result) in enumerate(items):
             fit = result.fit
-            if fit is None:
+            chain = self.tpa_phase_chains.get(k)
+            if fit is None or chain is None:
                 cells = [str(k)] + ["\N{EN DASH}"] * (
                     len(self._TPA_PHASE_COLUMNS) - 1
                 )
             else:
                 cells = [
                     str(k),
-                    f"{fit.dphi_comb_deg:+.2f}",
+                    f"{chain.dphi_deg:+.2f}",
                     # The quoted error is the TOTAL: fringe noise and the pinned
                     # step-6 eta in quadrature.  a and b do not float, so the
                     # fitter's own error cannot see the eta term -- it is
                     # invisible there, not absent, hence all three columns.
-                    f"{np.degrees(fit.dphi_comb_err_total):.2f}",
-                    f"{np.degrees(fit.dphi_comb_err):.2f}",
-                    f"{np.degrees(fit.dphi_comb_err_eta):.2f}",
+                    # Chained, these gain the hub's hop: its fringe noise adds
+                    # in quadrature, but its eta enters BOTH hops and so is
+                    # summed coherently first (see cascade.ChainedPhase).
+                    f"{np.degrees(chain.err_total):.2f}",
+                    f"{np.degrees(chain.err_fringe):.2f}",
+                    f"{np.degrees(chain.err_eta):.2f}",
                     f"{fit.a*1e3:.3f}",
                     f"{fit.b*1e3:.3f}",
                     f"{fit.r2:.5f}",
@@ -6058,17 +6205,41 @@ class MainWindow(QtWidgets.QMainWindow):
                     # mean residual means the pinned amplitudes are off.
                     f"{float(np.mean(fit.residuals))*1e3:+.4f}",
                 ]
+            tip = self._tpa_phase_row_tip(k, result, chain)
             for col, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(text)
                 if col:
                     item.setTextAlignment(
                         QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
                     )
+                item.setToolTip(tip)
                 self.tpa_phase_table.setItem(row, col, item)
         self.tpa_phase_table.resizeColumnsToContents()
         self.tpa_phase_table.blockSignals(False)
         if items:
             self.tpa_phase_table.selectRow(0)
+
+    def _tpa_phase_row_tip(self, k: int, result: "PhaseResult", chain) -> str:
+        """Where this row's phase came from — the only place the hub is named.
+
+        A chained pair looks exactly like a measured one in the table, which is
+        the point (one reference frame, one column), so the provenance has to
+        live somewhere: here, at no cost in layout.
+        """
+        if chain is None or result.fit is None:
+            return f"Pair {k}: no fit."
+        if not chain.chained:
+            return f"Pair {k} measured directly against reference {chain.via}."
+        return (
+            f"Pair {k} could not be swept against reference {chain.root} "
+            f"(neighbours leak), so it was measured against hub {chain.via} "
+            f"and chained:\n"
+            f"  ΔΦ[{k}|{chain.via}] = {np.degrees(result.fit.dphi_comb):+.2f}°\n"
+            f"  ΔΦ[{chain.via}|{chain.root}] = "
+            f"{np.degrees(chain.dphi_raw - result.fit.dphi_comb):+.2f}°\n"
+            f"  ΔΦ[{k}|{chain.root}] = {chain.dphi_deg:+.2f}°\n"
+            f"The a/b/R²/pull columns describe the measured hop, not the chain."
+        )
 
     def _tpa_phase_selected(self) -> "tuple[int, PhaseResult] | None":
         items = sorted(self.tpa_phase_results.items())
@@ -6095,8 +6266,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_phase_canvas.draw_idle()
 
     # ---- files -------------------------------------------------------------
+    @staticmethod
+    def _tpa_phase_root_of(refs: "dict[int, int]") -> "int | None":
+        """Which reference in a recorded run is the ROOT: the one nothing measured.
+
+        A cascade's hub is itself a target of an earlier stage, so it appears in
+        both columns; the root only ever appears as a reference.  Exactly one
+        such pair means one run rooted there.  None means the file is not one
+        run -- no root at all is a cycle, two roots is two runs concatenated --
+        and the caller says so rather than picking one.
+
+        A row whose target IS its reference does not count as measuring it: a
+        recorded run carries the reference's own self-rows (0907 on), and
+        counting those would leave every file looking like a cycle.
+        """
+        measured = {k for k, r in refs.items() if k != r}
+        roots = sorted(set(refs.values()) - measured)
+        return roots[0] if len(roots) == 1 else None
+
     def _tpa_phase_load(self) -> None:
-        """Re-fit a recorded step-7 CSV: every target it carries, in one go."""
+        """Re-fit a recorded step-7 CSV: every target it carries, in one go.
+
+        Cascades included.  The file records a reference PER ROW, so a run that
+        needed a hub carries two of them, and each target is re-fit against the
+        one it was actually swept against before the lot is chained back to the
+        root.  Nothing here consults the planner: what was driven is what the
+        file says was driven.
+        """
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Load Step-7 measurement CSV", "", "CSV (*.csv)"
         )
@@ -6112,71 +6308,115 @@ class MainWindow(QtWidgets.QMainWindow):
         name = Path(path).name
         try:
             targets = targets_in_csv(path)
-            recorded_ref = reference_in_csv(path)
+            recorded = references_in_csv(path)
         except Exception as exc:
             self.tpa_phase_status.setText(f"Load failed: {exc}")
             return
 
-        # The CSV knows its own reference -- every row records it -- so it wins
-        # over the spinbox, which is a setting for the NEXT sweep and has no
-        # business deciding how an existing one is read.  The spinbox is moved
-        # to match, so the page never shows a reference the results are not
-        # against.
-        ref = self._tpa_phase_config().ref_index if recorded_ref is None else recorded_ref
-        if recorded_ref is not None and recorded_ref != self.tpa_phase_ref.value():
-            self.tpa_phase_ref.setValue(recorded_ref)
+        # The CSV knows its own reference(s) -- every row records one -- so it
+        # wins over the spinbox, which is a setting for the NEXT sweep and has
+        # no business deciding how an existing one is read.  The spinbox is
+        # moved to match, so the page never shows a reference the results are
+        # not against.
+        root = self._tpa_phase_root_of(recorded) if recorded else None
+        if recorded and root is None:
+            self.tpa_phase_status.setText(
+                f"{name} is not one run: its references "
+                f"{self._compact_indices(sorted(set(recorded.values())))} are all "
+                f"themselves measured in it, so no pair defines ΔΦ = 0. It looks "
+                f"like two runs concatenated — load them separately."
+            )
+            return
+        if root is None:                       # old CSV with no ref_index column
+            root = self._tpa_phase_config().ref_index
+        elif root != self.tpa_phase_ref.value():
+            self.tpa_phase_ref.setValue(root)
             self._log(f"[step 7] {name} was swept against reference "
-                      f"{recorded_ref}; using that, not the {ref} on the page")
-        if ref not in models:
+                      f"{root}; using that, not the {root} on the page")
+        ref_of = {k: recorded.get(k, root) for k in targets}
+        if root not in models:
             # One run-level failure, not one per target: with no eta for the
             # reference there is no `a` to pin, so nothing in this file is
             # fittable and saying it five times explains it no better.
             self.tpa_phase_status.setText(
-                f"{name} was swept against reference {ref}, but the Step-6 file "
+                f"{name} was swept against reference {root}, but the Step-6 file "
                 f"has no η for it — it covers "
                 f"{self._compact_indices(sorted(models))}. Point Step 6 at the "
                 f"result this sweep was measured against."
             )
             return
-        fittable = [k for k in targets if k in models and k != ref]
+        fittable = [k for k in targets
+                    if k in models and k != root and ref_of[k] in models]
         if not fittable:
-            missing = [k for k in targets if k not in models and k != ref]
+            missing = [k for k in targets if k not in models and k != root]
             why = (f"step 6 has no η for {self._compact_indices(missing)}"
                    if missing else "it carries only the reference")
             self.tpa_phase_status.setText(
                 f"No fittable target in {name}: it carries "
-                f"{self._compact_indices(targets)} against reference {ref}, and "
+                f"{self._compact_indices(targets)} against reference {root}, and "
                 f"{why}."
             )
             return
 
         single_beam_bg = self.tpa_phase_single_beam.isChecked()
-        self.tpa_phase_results = {}
+        loaded: dict[int, PhaseResult] = {}
         failed: list[str] = []
         for k in fittable:
             try:
-                self.tpa_phase_results[k] = load_phase_csv(
-                    path, models[k], models[ref],
+                loaded[k] = load_phase_csv(
+                    path, models[k], models[ref_of[k]],
                     comb_only=True, single_beam_bg=single_beam_bg, only_tgt=k,
                 )
             except (ValueError, KeyError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {k}: {exc}")
+        # Already fitted by load_phase_csv; this only re-refers them to the root,
+        # over stages rebuilt from what the file recorded rather than planned.
+        self.tpa_phase_results = loaded
+        self.tpa_phase_root = root
+        self.tpa_phase_stages = self._tpa_phase_stages_for(loaded, root)
+        self.tpa_phase_chains = chain_fits(
+            {k: r.fit for k, r in loaded.items() if r.fit is not None},
+            self.tpa_phase_stages, root,
+        )
         self._tpa_phase_fill_table()
         self._tpa_phase_redraw()
         self.tpa_phase_save_button.setEnabled(bool(self.tpa_phase_results))
-        skipped = [k for k in targets if k not in fittable and k != ref]
+        skipped = [k for k in targets if k not in fittable and k != root]
         note = ""
         if failed:
             note += "  · " + "; ".join(failed)
         if skipped:
             note += (f"  · skipped {self._compact_indices(skipped)} "
                      f"(no step-6 η)")
+        chained = sorted(k for k, c in self.tpa_phase_chains.items() if c.chained)
+        if chained:
+            note += (f"  · {self._compact_indices(chained)} chained to {root} "
+                     f"via {self._compact_indices(sorted({self.tpa_phase_chains[k].via for k in chained}))}")
         self.tpa_phase_status.setText(
             f"Loaded {name} · {len(self.tpa_phase_results)} "
-            f"target(s) re-fit vs ref {ref}{note}"
+            f"target(s) re-fit vs ref {root}{note}"
         )
         for line in failed:
             self._log(f"[step 7] fit failed — {line}")
+
+    def _tpa_phase_plan_payload(self) -> dict:
+        """The stage breakdown, stored in the JSON's step-7 section.
+
+        One CSV holds a whole cascaded run, and the chained pairs' own blocks
+        say which hub each took, but nothing there records the SHAPE of the run.
+        This does, in one place, so a file can be read back as the run it was
+        rather than reconstructed from nine per-pair footnotes.  Omitted
+        entirely for a plain single-reference run, which has no shape to record.
+        """
+        if not any(s.depth for s in self.tpa_phase_stages):
+            return {}
+        return {"cascade": {
+            "min_sep": MIN_PAIR_SEP,
+            "stages": [
+                {"ref": s.ref, "targets": list(s.targets), "depth": s.depth}
+                for s in self.tpa_phase_stages
+            ],
+        }}
 
     def _tpa_phase_save(self) -> None:
         """Raw CSV, the combined JSON step 8 reads, and one PNG per target.
@@ -6218,12 +6458,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Saved {written[0]} — no fitted target, so no JSON was written."
             )
             return
+        # The ROOT, not the spinbox: a loaded file may have moved it, and after
+        # a cascade the spinbox is the root anyway.  Every phase in the JSON is
+        # referred here, which is the contract step 8 reads it under.
+        root = (self.tpa_phase_root if self.tpa_phase_root is not None
+                else self._tpa_phase_config().ref_index)
         try:
             js = save_comb_phase_json(
                 fits, step6, json_path,
-                ref_index=self._tpa_phase_config().ref_index,
+                ref_index=root,
                 csv_path=str(csv_path.resolve()),
                 single_beam_bg=self.tpa_phase_single_beam.isChecked(),
+                chains=self.tpa_phase_chains,
+                extra=self._tpa_phase_plan_payload(),
             )
             written.append(Path(js).name)
             for (k, _method), fit in fits.items():
@@ -7641,17 +7888,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slm_size = (int(width), int(height))
         self.info_label.setText(f"Size: {width} x {height}")
         self.scan_size_label.setText(f"Using SLM size {width} x {height}")
+        # The SLM Control page scans the WHOLE panel by default, so its end
+        # follows the real width.
         self.start_x_spin.setMaximum(width - 1)
         self.end_x_spin.setMaximum(width - 1)
         self.end_x_spin.setValue(width - 1)
-        # keep the calibration region spinners bounded to the real SLM width
+        # The calibration region is a different thing: a deliberate band of
+        # columns Step 2 sweeps, defaulted on the page.  Bound it to the real
+        # width -- setMaximum pulls an over-wide value down on its own -- but do
+        # NOT widen it.  This used to reset the end to the full width whenever
+        # the limit was off, which silently replaced that default with the panel
+        # width and left the start where it was, so the two ends disagreed about
+        # what the region was.
         for step in (2, 3):
             widgets = getattr(self, "step_widgets", {}).get(step, {})
             if "region_end" in widgets:
                 widgets["region_start"].setMaximum(width - 1)
                 widgets["region_end"].setMaximum(width - 1)
-                if not widgets["region_check"].isChecked():
-                    widgets["region_end"].setValue(width - 1)
         self._update_scan_preview()
         if self._segment_mode_is_equal():
             self._rebuild_equal_segment_rows()

@@ -518,5 +518,246 @@ class RunPlanTests(_WindowCase):
         self.assertAlmostEqual(secs, 10.0 + 10 * 10.0 + 11 * 0.25, places=6)
 
 
+class CascadeTests(_WindowCase):
+    """A run whose target list includes the reference's neighbours.
+
+    The 0916 ten-pair run is the case: pairs 1 and 3 cannot be swept against
+    reference 2, so the page has to plan two stages, drive each against its own
+    reference, and report everything against 2.  It was done by hand at the
+    time, and ``calib_step7_result_0916_merged_ref2.json`` is what that produced
+    -- the numbers here are checked against it.
+    """
+
+    RUN10 = REPO / "src/calib_data/run_0916_10pairs_w15g35"
+    STEP6_10 = RUN10 / "calib_step6v2_result_0916_1958.json"
+    MERGED = RUN10 / "calib_step7_result_0916_merged_ref2.json"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._tmp = tempfile.TemporaryDirectory()
+        # The two committed stage CSVs are one cascaded run; the GUI writes
+        # them as a single file now, so stitch them into one to load it back.
+        head = (cls.RUN10 / "calib_step7_meas_0916_2015.csv").read_text(
+            encoding="utf-8").splitlines()
+        tail = (cls.RUN10 / "calib_step7_meas_0916_2028.csv").read_text(
+            encoding="utf-8").splitlines()
+        cls.CASCADE_CSV = Path(cls._tmp.name) / "calib_step7_meas_cascade.csv"
+        cls.CASCADE_CSV.write_text("\n".join(head + tail[1:]) + "\n",
+                                   encoding="utf-8")
+        cls.MERGED_DPHI = {
+            c["tgt_index"]: c["fit"]["dphi_comb_rad"]
+            for c in json.loads(cls.MERGED.read_text(encoding="utf-8"))
+            ["step7"]["channels"]
+        }
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+        super().tearDownClass()
+
+    def _page(self, targets: str, ref: int = 2):
+        w = self.win
+        w.tpa_phase_step6_edit.setText(str(self.STEP6_10))
+        w.tpa_phase_ref.setValue(ref)
+        w.tpa_phase_targets.setText(targets)
+        return w
+
+    def tearDown(self) -> None:
+        self.win.tpa_phase_targets.setText("2-6")
+        self.win.tpa_phase_ref.setValue(2)
+        self.win.tpa_phase_step6_edit.setText(str(STEP6))
+
+    # ---- planning ------------------------------------------------------
+    def test_the_page_plans_the_two_stages_the_run_actually_used(self) -> None:
+        w = self._page("1-10")
+        _cfg, _layout, _models, stages = w._tpa_phase_plan()
+        self.assertEqual([(s.ref, s.targets) for s in stages],
+                         [(2, (4, 5, 6, 7, 8, 9, 10)), (5, (1, 3))])
+
+    def test_a_list_with_no_neighbours_still_plans_one_stage(self) -> None:
+        _cfg, _layout, _models, stages = self._page("4-10")._tpa_phase_plan()
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0].ref, 2)
+
+    def test_run_refuses_a_list_no_hub_can_bridge(self) -> None:
+        w = self._page("1-3")
+        w._tpa_phase_run()
+        text = w.tpa_phase_status.text()
+        self.assertIn("1, 3", text)
+        self.assertIn("5-10", text)            # says what would fix it
+
+    def test_a_neighbour_is_fine_once_something_can_bridge_it(self) -> None:
+        _cfg, _layout, _models, stages = self._page("1,2,5")._tpa_phase_plan()
+        self.assertEqual([(s.ref, s.targets) for s in stages],
+                         [(2, (5,)), (5, (1,))])
+
+    def test_a_typo_is_named_as_a_typo_not_as_an_unreachable_pair(self) -> None:
+        """Out-of-range and missing-η come first: they are the likelier fault."""
+        w = self._page("1,3,99")
+        w._tpa_phase_run()
+        self.assertIn("out of range", w.tpa_phase_status.text())
+
+    # ---- loading a recorded cascade ------------------------------------
+    def _load_cascade(self):
+        w = self._page("1-10")
+        with unittest.mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            staticmethod(lambda *a, **k: (str(self.CASCADE_CSV), "")),
+        ):
+            w._tpa_phase_load()
+        self.assertTrue(w.tpa_phase_results, w.tpa_phase_status.text())
+        return w
+
+    def test_one_file_carrying_two_references_loads_as_one_run(self) -> None:
+        w = self._load_cascade()
+        self.assertEqual(sorted(w.tpa_phase_results), list(range(1, 11))[:1]
+                         + [3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertEqual(w.tpa_phase_root, 2)
+        self.assertEqual(w.tpa_phase_ref.value(), 2)
+
+    def test_each_target_is_re_fit_against_the_reference_it_was_swept_on(self) -> None:
+        w = self._load_cascade()
+        self.assertEqual(w.tpa_phase_results[1].ref_index, 5)
+        self.assertEqual(w.tpa_phase_results[4].ref_index, 2)
+
+    def test_the_loaded_phases_are_the_hand_merged_ones(self) -> None:
+        w = self._load_cascade()
+        for k, chain in sorted(w.tpa_phase_chains.items()):
+            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], places=6,
+                                   msg=f"pair {k}")
+
+    def test_the_table_shows_the_root_referred_phase_not_the_hub_one(self) -> None:
+        w = self._load_cascade()
+        row = sorted(w.tpa_phase_results).index(1)
+        shown = float(w.tpa_phase_table.item(row, 1).text())
+        self.assertAlmostEqual(shown, np.degrees(self.MERGED_DPHI[1]), places=2)
+        # and NOT the hop it was measured over, which is a different number
+        self.assertNotAlmostEqual(
+            shown, np.degrees(w.tpa_phase_results[1].fit.dphi_comb), places=1)
+
+    def test_the_quality_columns_still_describe_the_measured_hop(self) -> None:
+        w = self._load_cascade()
+        row = sorted(w.tpa_phase_results).index(1)
+        fit = w.tpa_phase_results[1].fit
+        self.assertAlmostEqual(float(w.tpa_phase_table.item(row, 7).text()),
+                               fit.r2, places=5)
+        self.assertAlmostEqual(float(w.tpa_phase_table.item(row, 5).text()),
+                               fit.a * 1e3, places=3)
+
+    def test_a_chained_row_says_where_it_came_from(self) -> None:
+        w = self._load_cascade()
+        tip = w.tpa_phase_table.item(sorted(w.tpa_phase_results).index(1),
+                                     0).toolTip()
+        self.assertIn("hub 5", tip)
+        direct = w.tpa_phase_table.item(sorted(w.tpa_phase_results).index(4),
+                                        0).toolTip()
+        self.assertIn("directly", direct)
+
+    def test_the_error_bars_are_the_chained_ones(self) -> None:
+        w = self._load_cascade()
+        row = sorted(w.tpa_phase_results).index(1)
+        chain, fit = w.tpa_phase_chains[1], w.tpa_phase_results[1].fit
+        self.assertAlmostEqual(float(w.tpa_phase_table.item(row, 2).text()),
+                               np.degrees(chain.err_total), places=2)
+        # bigger than the hop alone: the hub's own fringe noise is in there
+        self.assertGreater(chain.err_total, fit.dphi_comb_err_total)
+
+    def test_the_run_path_fits_each_stage_against_its_own_reference(self) -> None:
+        """What _tpa_phase_finished does with a sweep's results, minus the sweep.
+
+        The load path rebuilds its stages from the file; this is the other
+        caller, where the stages come from the planner and each target must
+        still be fit against the reference its stage drove.
+        """
+        w = self._load_cascade()
+        results = dict(w.tpa_phase_results)
+        for r in results.values():             # discard the fits, keep the rows
+            r.fit = None
+        _cfg, _layout, models, stages = self._page("1-10")._tpa_phase_plan()
+        failed = w._tpa_phase_fit_results(results, models, 2, stages)
+        self.assertEqual(failed, [])
+        self.assertEqual(w.tpa_phase_chains[1].via, 5)
+        self.assertEqual(w.tpa_phase_chains[4].via, 2)
+        for k, chain in sorted(w.tpa_phase_chains.items()):
+            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], places=6,
+                                   msg=f"pair {k}")
+
+    def test_a_pair_is_not_chained_onto_a_hub_that_never_fit(self) -> None:
+        """A stage-2 pair with a dead hub has no route home, and says so."""
+        w = self._load_cascade()
+        results = dict(w.tpa_phase_results)
+        for r in results.values():
+            r.fit = None
+        _cfg, _layout, models, stages = self._page("1-10")._tpa_phase_plan()
+        broken = {k: v for k, v in models.items() if k != 5}
+        failed = w._tpa_phase_fit_results(results, broken, 2, stages)
+        self.assertIn(5, [int(s.split()[1].rstrip(":")) for s in failed])
+        self.assertNotIn(1, w.tpa_phase_chains)
+        self.assertIn(4, w.tpa_phase_chains)
+
+    # ---- saving --------------------------------------------------------
+    def test_the_saved_json_is_rooted_at_the_reference_and_keeps_the_path(self) -> None:
+        from calibration_module.fit.phase import load_comb_phase_json
+        w = self._load_cascade()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "calib_step7_meas_x.csv"
+            with unittest.mock.patch.object(
+                QtWidgets.QFileDialog, "getSaveFileName",
+                staticmethod(lambda *a, **k: (str(out), "")),
+            ):
+                w._tpa_phase_save()
+            js = out.with_name("calib_step7_result_x.json")
+            self.assertTrue(js.is_file(), w.tpa_phase_status.text())
+            payload = json.loads(js.read_text(encoding="utf-8"))
+
+            step7 = payload["step7"]
+            self.assertEqual(step7["ref_index"], 2)
+            self.assertEqual(
+                [(s["ref"], tuple(s["targets"])) for s in step7["cascade"]["stages"]],
+                [(2, (4, 5, 6, 7, 8, 9, 10)), (5, (1, 3))])
+
+            by_pair = {c["tgt_index"]: c["fit"] for c in step7["channels"]}
+            for k, want in self.MERGED_DPHI.items():
+                self.assertAlmostEqual(by_pair[k]["dphi_comb_rad"], want,
+                                       places=6, msg=f"pair {k}")
+            self.assertEqual(by_pair[1]["chained"]["via"], 5)
+            self.assertNotIn("chained", by_pair[4])
+
+            # the file step 8 reads, read the way step 8 reads it
+            ref, entries = load_comb_phase_json(js, method="fixed_comb_only")
+            self.assertEqual(ref, 2)
+            self.assertEqual(sorted(entries), [1, 3, 4, 5, 6, 7, 8, 9, 10])
+
+    def test_the_saved_csv_still_records_the_reference_per_target(self) -> None:
+        from calibration_module.fit.phase import references_in_csv
+        w = self._load_cascade()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "calib_step7_meas_x.csv"
+            with unittest.mock.patch.object(
+                QtWidgets.QFileDialog, "getSaveFileName",
+                staticmethod(lambda *a, **k: (str(out), "")),
+            ):
+                w._tpa_phase_save()
+            self.assertEqual(references_in_csv(out)[1], 5)
+            self.assertEqual(references_in_csv(out)[4], 2)
+
+    def test_a_single_reference_run_records_no_cascade_block(self) -> None:
+        """Nothing changes for a run that never needed a hub."""
+        w = self._load()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "calib_step7_meas_x.csv"
+            with unittest.mock.patch.object(
+                QtWidgets.QFileDialog, "getSaveFileName",
+                staticmethod(lambda *a, **k: (str(out), "")),
+            ):
+                w._tpa_phase_save()
+            payload = json.loads(
+                out.with_name("calib_step7_result_x.json").read_text("utf-8"))
+            self.assertNotIn("cascade", payload["step7"])
+            for ch in payload["step7"]["channels"]:
+                self.assertNotIn("chained", ch["fit"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -95,10 +95,17 @@ from calibration_module.fit.phase import (  # noqa: E402
     PhaseResult,
     load_pair_models,
     load_phase_csv,
-    reference_in_csv,
+    references_in_csv,
     save_comb_phase_json,
     targets_in_csv,
     write_meas_csv,
+)
+from calibration_module.fit.cascade import (  # noqa: E402
+    MIN_PAIR_SEP,
+    Stage,
+    chain_fits,
+    plan_cascade,
+    plan_lines,
 )
 from calibration_module.fit.report import plot_fringe  # noqa: E402
 from calibration_module.fit.sigma import STD_FLOOR_V  # noqa: E402
@@ -296,7 +303,14 @@ def save_plot(fit: PhaseFit, tgt: int, path) -> None:
 # ======================================================================
 
 def _run_sweep(step6: Path, fit_after: bool) -> None:
-    """Sweep every target pair vs the shared reference; write one raw CSV."""
+    """Sweep every target pair back to the reference; write one raw CSV.
+
+    Not necessarily against it.  A pair adjacent to the reference cannot be
+    measured against it at all, so :func:`~calibration_module.fit.cascade.plan_cascade`
+    splits the run into stages, each with its own reference, and the fit chains
+    the far ones back.  One reference and no neighbours is the one-stage case,
+    which is what this always did.
+    """
     if not TGT_INDICES:
         raise ValueError("no target pairs -- pass --targets, e.g. --targets 2,3,4,5,6")
     layout = _load_layout(step6)
@@ -304,11 +318,14 @@ def _run_sweep(step6: Path, fit_after: bool) -> None:
     drive = build_xw_sweep(CONFIG)
     secs = run_seconds(drive, ACQ)
     values = [x for x, _, _, _ in drive]
+    stages = plan_cascade(TGT_INDICES, CONFIG.ref_index,
+                          n_pairs=layout.n_channels)
+    n_targets = sum(len(s) for s in stages)
     print(f"Step 7 v2: {len(drive)} points + 1 dark per target "
           f"(~{secs/60:.1f} min/target)")
-    print(f"Targets: {list(TGT_INDICES)} vs reference {CONFIG.ref_index} "
-          f"(held at {CONFIG.ref_level:g})  "
-          f"(~{secs * len(TGT_INDICES) / 60:.0f} min total)")
+    for line in plan_lines(stages, CONFIG.ref_index, seconds_per_target=secs):
+        print(f"  {line}")
+    print(f"Reference held at {CONFIG.ref_level:g}")
     print(f"Ramp: x_t = w_t over {values}")
     print(f"Layout: {layout.channel_width_px} px window + "
           f"{layout.pitch_px - layout.channel_width_px} px pad "
@@ -320,17 +337,21 @@ def _run_sweep(step6: Path, fit_after: bool) -> None:
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
     results: list[PhaseResult] = []
     per_target = len(drive) + 1
-    total = per_target * len(TGT_INDICES)
+    total = per_target * n_targets
+    done = 0
     try:
-        for n, k in enumerate(TGT_INDICES):
-            print(f"\n=== Sweep: pair {k} vs reference {CONFIG.ref_index} ===")
-            results.append(measure_target(
-                daq, slm, layout, k, drive,
-                cfg=CONFIG, acq=ACQ,
-                step0=n * per_target, total=total,
-                progress_callback=lambda p: print(p.line()),
-                log=print,
-            ))
+        for stage in stages:
+            stage_cfg = replace(CONFIG, ref_index=stage.ref)
+            for k in stage.targets:
+                print(f"\n=== Sweep: pair {k} vs reference {stage.ref} ===")
+                results.append(measure_target(
+                    daq, slm, layout, k, drive,
+                    cfg=stage_cfg, acq=ACQ,
+                    step0=done * per_target, total=total,
+                    progress_callback=lambda p: print(p.line()),
+                    log=print,
+                ))
+                done += 1
     finally:
         slm.close_slm()
         daq.disconnect()
@@ -359,33 +380,50 @@ def fit_csv(path: str | Path, step6: Path) -> None:
     timestamp so a refit never clobbers an earlier result.
     """
     targets = targets_in_csv(path, TGT_INDICES)
-    # The CSV knows its own reference -- every row records it -- so it wins
+    # The CSV knows its own reference(s) -- every row records one -- so it wins
     # over CONFIG, which describes the NEXT sweep and has no business
     # deciding how an existing one is read.  Without this, re-fitting a file
     # recorded against a different reference asks step 6 for a pair that was
     # never the reference, and every target fails for a reason that looks
-    # like arithmetic.
-    recorded_ref = reference_in_csv(path)
-    ref = CONFIG.ref_index if recorded_ref is None else recorded_ref
-    if recorded_ref is not None and recorded_ref != CONFIG.ref_index:
+    # like arithmetic.  A cascaded run records TWO, one per stage; the root is
+    # the one nothing else measured (self-rows do not count as measuring).
+    recorded = references_in_csv(path)
+    measured = {k for k, r in recorded.items() if k != r}
+    roots = sorted(set(recorded.values()) - measured)
+    if len(roots) > 1:
+        raise ValueError(
+            f"{Path(path).name} has no single root: references {roots} are all "
+            f"unmeasured in it, which means two runs were concatenated"
+        )
+    ref = CONFIG.ref_index if not roots else roots[0]
+    if roots and roots[0] != CONFIG.ref_index:
         print(f"Reference: {Path(path).name} was swept against pair "
-              f"{recorded_ref}; using that, not CONFIG's {CONFIG.ref_index}")
-    models = _load_models(step6, [k for k in targets if k != ref], ref=ref)
-    fittable = [k for k in targets if k in models and k != ref]
+              f"{roots[0]}; using that, not CONFIG's {CONFIG.ref_index}")
+    ref_of = {k: recorded.get(k, ref) for k in targets}
+    models = _load_models(
+        step6, sorted({k for k in targets if k != ref}
+                      | {r for k, r in ref_of.items() if k != ref}),
+        ref=ref)
+    fittable = [k for k in targets
+                if k in models and k != ref and ref_of[k] in models]
     if not fittable:
         raise ValueError(
             f"no fittable target in {path}: found targets {targets}, but have "
             f"step-6 models only for {sorted(models)} "
             f"(reference is pair {ref})"
         )
+    stages = _stages_from_refs(ref_of, fittable, ref)
     print(f"Fitting pair(s) {fittable} vs reference {ref} from "
           f"{path} (one free parameter: dPhi_comb)")
+    if any(s.depth for s in stages):
+        for line in plan_lines(stages, ref):
+            print(f"  as recorded: {line}")
 
     stamp = time.strftime("%m%d_%H%M")
     fits: dict[int, PhaseFit] = {}
     for k in fittable:
-        print(f"\n=== pair {k} vs reference {ref} ===")
-        result = load_phase_csv(path, models[k], models[ref],
+        print(f"\n=== pair {k} vs reference {ref_of[k]} ===")
+        result = load_phase_csv(path, models[k], models[ref_of[k]],
                                 comb_only=True, single_beam_bg=SINGLE_BEAM_BG,
                                 only_tgt=k)
         dts = result.per_trial_darks()
@@ -398,6 +436,20 @@ def fit_csv(path: str | Path, step6: Path) -> None:
         print(f"Plot saved to {plot_path}")
         fits[k] = result.fit
 
+    # Refer every fit back to the ROOT reference.  A one-stage run is the
+    # identity here; a cascaded one sums each pair's hops and propagates the
+    # error with the hub's eta counted ONCE, coherently across the two hops it
+    # appears in (see cascade.ChainedPhase).
+    chains = chain_fits(fits, stages, ref)
+    chained = {k: c for k, c in chains.items() if c.chained}
+    if chained:
+        print(f"\nChained to reference {ref}:")
+        for k, c in sorted(chained.items()):
+            print(f"  pair {k} via {c.via}: "
+                  f"{np.degrees(fits[k].dphi_comb):+.2f} deg (measured) "
+                  f"{np.degrees(c.dphi_raw - fits[k].dphi_comb):+.2f} deg (hub) "
+                  f"-> {c.dphi_deg:+.2f} +/- {np.degrees(c.err_total):.2f} deg")
+
     # Persist the fitted spectrum {Phi_k} as ONE combined JSON (step3 + step6
     # carried over verbatim from --step6) -- the single input for downstream
     # consumers.  NOTE the "comb-slm" convention recorded per fit: these phases
@@ -406,8 +458,39 @@ def fit_csv(path: str | Path, step6: Path) -> None:
     save_comb_phase_json({(k, METHOD): f for k, f in fits.items()},
                          step6, out_json, ref_index=ref,
                          csv_path=str(Path(path).resolve()),
-                         single_beam_bg=SINGLE_BEAM_BG)
+                         single_beam_bg=SINGLE_BEAM_BG,
+                         chains=chains,
+                         extra={"cascade": {
+                             "min_sep": MIN_PAIR_SEP,
+                             "stages": [{"ref": s.ref, "targets": list(s.targets),
+                                         "depth": s.depth} for s in stages],
+                         }} if chained else None)
     print(f"\nCombined step-7 result (step3 + step6 + step7) saved to {out_json}")
+
+
+def _stages_from_refs(ref_of: dict[int, int], fittable, root: int) -> list[Stage]:
+    """Rebuild the stage list from what the CSV recorded, root-first.
+
+    A re-fit does not re-plan: the file says which reference each target was
+    swept against, and that is the truth about it however the run was planned.
+    Ordering by depth is what lets :func:`chain_fits` resolve a hub before
+    whatever hangs off it.
+    """
+    by_ref: dict[int, list[int]] = {}
+    for k in sorted(fittable):
+        by_ref.setdefault(int(ref_of[k]), []).append(int(k))
+    depth = {int(root): 0}
+    stages: list[Stage] = []
+    pending = dict(by_ref)
+    while pending:
+        ready = [r for r in sorted(pending) if r in depth] or sorted(pending)
+        for r in ready:
+            targets = pending.pop(r)
+            stages.append(Stage(ref=r, targets=tuple(targets),
+                                depth=depth.get(r, 0)))
+            for k in targets:
+                depth.setdefault(k, depth.get(r, 0) + 1)
+    return stages
 
 
 def _index_list(text: str) -> list[int]:
