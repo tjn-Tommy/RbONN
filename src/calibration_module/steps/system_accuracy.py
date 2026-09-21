@@ -105,6 +105,17 @@ Order.  Reads are shuffled and B is spread through the run, because running the
 ladder in level order would alias slow drift straight onto the level axis -- the
 one axis this is trying to measure.
 
+PMT temperature
+---------------
+``--pmt`` logs the PMT's thermistor (Keithley 2400, ohms and TH10K degrees)
+next to every read, so a night of hourly runs can be plotted against the
+detector's own temperature rather than against the room's.  The 2400 settings
+are imported from ``drafts/daq_pmt_monitor.py``, which owns them; the reading
+is cached for ``--pmt-period`` seconds (default 60), since the bead's time
+constant is minutes and a per-read GPIB round trip would add minutes to a run.
+The run brackets itself with a reading in the CSV meta, and a 2400 that fails
+blanks the two columns rather than ending the run.
+
 Output: ``system_accuracy_<MMDD_HHMM>.json`` (every pattern, written BEFORE the
 hardware is touched, so an interrupted run is still reproducible) and
 ``.csv`` beside it, partial if the run is stopped.
@@ -143,6 +154,10 @@ from calibration_module.fit.verify import (  # noqa: E402
     saturate,
     write_verify_csv,
 )
+from calibration_module.measure.pmt_temp import (  # noqa: E402,F401
+    PMT_PERIOD_S,
+    PmtTemperature,
+)
 from calibration_module.steps import calib_npair_verify as S8  # noqa: E402
 
 # ---- The run ----
@@ -159,6 +174,11 @@ Y_SAT_V = 4.82                  # two-photon saturation, fitted on the 0916 10-p
 # ---- The read ----
 T_BOTH_DIM_S = 10.0             # window at the run's dimmest prediction
 T_BOTH_BRIGHT_S = 5.0           # ... linear down to this at its brightest
+
+# ---- The PMT thermistor (--pmt) ----
+# Both live in calibration_module.measure.pmt_temp so steps 6 and 7 stamp their
+# rows from the same implementation; re-exported here because --pmt, the tests
+# and every caller that says SA.PmtTemperature predate the move.
 
 OUT_DIR = S8.OUT_DIR
 
@@ -231,7 +251,7 @@ def build(models, phases, pairs, *, seed: int, ladder: int = LADDER,
 
 def collect(step7: Path, *, pairs=None, method=None, out_dir=None, ladder: int = LADDER,
             seed: int | None = None, y_sat: float | None = Y_SAT_V,
-            dry_run: bool = False) -> str | None:
+            dry_run: bool = False, pmt: "PmtTemperature | None" = None) -> str | None:
     """Solve the run, write its JSON, drive it, write the CSV."""
     out = Path(OUT_DIR if out_dir is None else out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -305,17 +325,23 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None, ladder: int =
     return _drive(step7, pairs, patterns, preds, coh, models, phases,
                   out=out, stamp=stamp, json_path=json_path, y_sat=y_sat,
                   meta={"n_pairs": len(pairs), "seed": seed,
-                        "y_max_v": scale.fs, "y_sat_v": y_sat})
+                        "y_max_v": scale.fs, "y_sat_v": y_sat},
+                  pmt=pmt)
 
 
 def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
            out: Path, stamp: str, json_path: Path, meta: dict,
-           y_sat: float | None, columns: Sequence[str] = (), extra_of=None):
+           y_sat: float | None, columns: Sequence[str] = (), extra_of=None,
+           pmt: "PmtTemperature | None" = None):
     """Display every pattern in read order and write the CSV, partial or not.
 
     ``extra_of(i, pattern)`` adds per-read columns beyond the standard ones;
     ``columns`` names them, in CSV order.  Each read's window comes from
     :func:`read_window` over ``preds``.
+
+    ``pmt``, if given, adds its two columns to every read and brackets the run
+    with a reading in the meta, so a night of runs can be plotted against PMT
+    temperature.
     """
     x = np.stack([p.x for p in patterns])[None]      # (1 block, P, n)
     w = np.stack([p.w for p in patterns])[None]
@@ -328,6 +354,18 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
                **(extra_of(i, p) if extra_of else {})}
               for i, (p, c, q) in enumerate(zip(patterns, coh, preds))]]
 
+    meta = dict(meta)
+    if pmt is not None:
+        columns = [*columns, *PmtTemperature.COLUMNS]
+        first = pmt.read()          # also seeds the cache for the first patterns
+        meta["pmt_resource"] = pmt.resource
+        meta["pmt_period_s"] = f"{pmt.period_s:g}"
+        meta.update({f"{k}_start": v for k, v in first.items()})
+        print(f"PMT       : {pmt.resource}  "
+              + (f"{first['pmt_c']} C ({first['pmt_ohm_Ohm']} Ohm)"
+                 if first["pmt_c"] else "unavailable")
+              + f", resampled every {pmt.period_s:g} s")
+
     slm = S8.connect_slm(S8.SLM_DISPLAY_NO, S8.USB_SLM_NO)
     daq = S8.connect_daq(device=S8.DAQ_DEVICE, channel=S8.DAQ_CHANNEL,
                          t_both=S8.ACQ.t_both_s, t_single=S8.ACQ.t_single_s,
@@ -338,13 +376,18 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
     csv_path = None
     try:
         S8.run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
-                        rows=rows, extra=extra, y_sat=y_sat, t_both_of=t_both)
+                        rows=rows, extra=extra, y_sat=y_sat, t_both_of=t_both,
+                        row_hook=pmt)
     except BaseException as exc:
         status = (f"partial ({type(exc).__name__} after {len(rows)} of "
                   f"{len(patterns)} reads)")
         raise
     finally:
         try:
+            if pmt is not None:
+                # The 2400 is independent of the SLM and DAQ, so this last
+                # reading is worth having even when the run died mid-way.
+                meta.update({f"{k}_end": v for k, v in pmt.read().items()})
             if rows:            # on disk before anything else can fail
                 csv_path = write_verify_csv(
                     out / f"system_accuracy_{stamp}.csv", pairs, rows,
@@ -366,7 +409,8 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
 def collect_loo(step7: Path, *, pairs=None, ladder: int = LOO_LADDER,
                 method=None, out_dir=None, seed: int | None = None,
                 bracket: bool = True, y_sat: float | None = Y_SAT_V,
-                dry_run: bool = False) -> str | None:
+                dry_run: bool = False,
+                pmt: "PmtTemperature | None" = None) -> str | None:
     """Family A on the full pool and on the pool minus each pair, interleaved.
 
     One block, one CSV: every read drives all ``len(pool)`` slots, the excluded
@@ -462,7 +506,8 @@ def collect_loo(step7: Path, *, pairs=None, ladder: int = LOO_LADDER,
                   meta={"n_pairs": len(pool), "seed": seed, "mode": "loo",
                         "ladder": ladder, "y_max_v": full.fs, "y_sat_v": y_sat},
                   columns=["subset"],
-                  extra_of=lambda i, p: {"subset": tag_of[id(p)]})
+                  extra_of=lambda i, p: {"subset": tag_of[id(p)]},
+                  pmt=pmt)
 
 
 def report_plan(patterns, preds, coh, fs: float, t_both) -> None:
@@ -532,6 +577,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--y-sat", type=float, default=Y_SAT_V, metavar="V",
                         help=f"two-photon saturation Y_sat in volts (default "
                              f"{Y_SAT_V:g}; 0 for the linear model)")
+    parser.add_argument("--pmt", nargs="?", const="", default=None, metavar="RESOURCE",
+                        help="log the PMT thermistor (Keithley 2400) beside every "
+                             "read: adds pmt_ohm_Ohm and pmt_c columns, sampled "
+                             f"every {PMT_PERIOD_S:g} s.  The instrument settings "
+                             "come from drafts/daq_pmt_monitor.py; give a VISA "
+                             "resource to override its address")
+    parser.add_argument("--pmt-period", type=float, default=PMT_PERIOD_S, metavar="S",
+                        help=f"--pmt only: seconds between 2400 readings "
+                             f"(default {PMT_PERIOD_S:g})")
     parser.add_argument("--dry-run", action="store_true",
                         help="solve the patterns, write the JSON, print the plan; "
                              "touch no hardware")
@@ -541,6 +595,14 @@ def main(argv: list[str] | None = None) -> int:
         wanted = S8.select_pairs(args.p)
     except ValueError as exc:
         parser.error(str(exc))
+
+    pmt = None
+    if args.pmt is not None and not args.dry_run:
+        try:
+            pmt = PmtTemperature(args.pmt or None, period_s=args.pmt_period)
+        except Exception as exc:        # noqa: BLE001
+            # A missing VISA stack must not cost the run the accuracy data.
+            print(f"--pmt ignored ({type(exc).__name__}: {exc})")
 
     loo = args.loo or (args.csv is not None and "_loo_" in Path(args.csv).name)
     if args.csv is not None:
@@ -555,12 +617,12 @@ def main(argv: list[str] | None = None) -> int:
                                ladder=LOO_LADDER if args.ladder is None else args.ladder,
                                method=args.method, out_dir=args.out,
                                seed=args.seed, bracket=args.bracket,
-                               y_sat=args.y_sat, dry_run=args.dry_run)
+                               y_sat=args.y_sat, dry_run=args.dry_run, pmt=pmt)
     else:
         csv_path = collect(args.step7, pairs=wanted, method=args.method,
                            ladder=LADDER if args.ladder is None else args.ladder,
                            out_dir=args.out, seed=args.seed, y_sat=args.y_sat,
-                           dry_run=args.dry_run)
+                           dry_run=args.dry_run, pmt=pmt)
     if csv_path is not None:
         print(f"Re-report with:  python {Path(__file__).name} "
               f"--step7 {args.step7} {csv_path}")

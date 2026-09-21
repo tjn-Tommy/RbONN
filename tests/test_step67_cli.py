@@ -155,5 +155,70 @@ class RunnerPassesTheFlagsTests(_TmpCase):
         self.assertIn(8, self.argv)
 
 
+class PmtFlagTests(_TmpCase):
+    """--no-pmt and --pmt-period on both steps.
+
+    Logging is ON by default, so the flag under test is the one that turns it
+    off; what a sweep then hands ``_run_sweep`` is the thing worth asserting,
+    because everything downstream keys off ``pmt is None``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.s6 = _load("_s6_pmt", STEPS / "calib_step6_v2.py")
+        self.s7 = _load("_s7_pmt", STEPS / "calib_step7_v2.py")
+
+    def _sweep_kwargs(self, mod, argv):
+        """Run main() far enough to see what it would pass to _run_sweep."""
+        seen = {}
+
+        def fake_sweep(*a, **kw):
+            seen.update(kw)
+
+        with _quiet(), mock.patch.object(mod, "_run_sweep", fake_sweep):
+            mod.main(argv)
+        return seen
+
+    def test_step6_logs_by_default_and_no_pmt_turns_it_off(self):
+        argv = ["--step3", str(STEP3), "--pairs", "2,3"]
+        with mock.patch.object(self.s6, "open_pmt") as op:
+            self._sweep_kwargs(self.s6, argv)
+        self.assertTrue(op.call_args.kwargs["enabled"])
+
+        with mock.patch.object(self.s6, "open_pmt") as op:
+            self._sweep_kwargs(self.s6, argv + ["--no-pmt"])
+        self.assertFalse(op.call_args.kwargs["enabled"])
+
+    def test_step7_logs_by_default_and_no_pmt_turns_it_off(self):
+        argv = ["--step6", str(STEP6), "--targets", "2,3", "--ref", "1"]
+        with mock.patch.object(self.s7, "open_pmt") as op:
+            self._sweep_kwargs(self.s7, argv)
+        self.assertTrue(op.call_args.kwargs["enabled"])
+
+        with mock.patch.object(self.s7, "open_pmt") as op:
+            self._sweep_kwargs(self.s7, argv + ["--no-pmt"])
+        self.assertFalse(op.call_args.kwargs["enabled"])
+
+    def test_the_period_and_the_resource_reach_open_pmt(self):
+        for mod, argv in (
+            (self.s6, ["--step3", str(STEP3), "--pairs", "2,3"]),
+            (self.s7, ["--step6", str(STEP6), "--targets", "2,3", "--ref", "1"]),
+        ):
+            with self.subTest(mod=mod.__name__):
+                with mock.patch.object(mod, "open_pmt") as op:
+                    self._sweep_kwargs(mod, argv + ["--pmt-period", "5",
+                                                    "--pmt-resource", "GPIB0::9::INSTR"])
+                self.assertEqual(op.call_args.args, ("GPIB0::9::INSTR", 5.0))
+
+    def test_a_missing_2400_does_not_stop_a_sweep(self):
+        """open_pmt swallows it, so _run_sweep is still reached with pmt=None."""
+        # patched where open_pmt LOOKS it up, not where the step imported it
+        with mock.patch("calibration_module.measure.pmt_temp.PmtTemperature",
+                        side_effect=RuntimeError("no VISA")):
+            seen = self._sweep_kwargs(
+                self.s6, ["--step3", str(STEP3), "--pairs", "2,3"])
+        self.assertIsNone(seen["pmt"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -203,6 +203,7 @@ def measure_target(
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
+    row_hook: Callable[[], Mapping[str, str]] | None = None,
 ) -> PhaseResult:
     """Drive one target pair against the reference over ``drive`` -> raw rows.
 
@@ -218,6 +219,12 @@ def measure_target(
     ``step0``/``total`` let a multi-target run report one continuous progress
     count; they affect nothing but the numbers in :class:`PhaseV2Progress`.
     Raises :data:`PhaseV2Aborted` if ``stop_event`` is set between acquisitions.
+
+    ``row_hook`` is called once per acquisition for the two PMT-thermistor cells
+    stored beside every row -- in practice
+    :meth:`~calibration_module.measure.pmt_temp.PmtTemperature.sample`, whose
+    cached reading costs a GPIB round trip only once a minute.  The dark is read
+    before the first hook call, so it is not stamped.
     """
     from slm_module.encoding import encode_to_pattern
 
@@ -263,6 +270,7 @@ def measure_target(
     emit(0, (0.0, 0.0, 0.0, 0.0), dark_v, dark_std, dark_range, True)
 
     rows: list[tuple[float, float, float, float, float, float]] = []
+    cells: list[tuple[str, str]] = []
     for offset, (x_t, w_t, x_r, w_r) in enumerate(drive, start=1):
         check_stop()
         display(x_t, w_t, x_r, w_r)
@@ -270,6 +278,9 @@ def measure_target(
             monitor, single=False, acq=acq, timeout=read_timeout, log=log
         )
         rows.append((x_t, w_t, x_r, w_r, mean_v, std_v))
+        if row_hook is not None:
+            s = row_hook()
+            cells.append((s.get("pmt_ohm_Ohm", ""), s.get("pmt_c", "")))
         emit(offset, (x_t, w_t, x_r, w_r), mean_v, std_v, range_v, False)
 
     def col(i: int) -> np.ndarray:
@@ -282,4 +293,6 @@ def measure_target(
         voltage_mean_v=col(4), voltage_std_v=col(5),
         dark_v=np.full(len(rows), float(dark_v)),
         n_trials=1,
+        pmt_ohm=np.array([c[0] for c in cells], dtype=object) if cells else None,
+        pmt_c=np.array([c[1] for c in cells], dtype=object) if cells else None,
     )

@@ -191,7 +191,8 @@ def range_for(pred_v: float) -> tuple[float, float]:
 
 def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
                  acq: PairV2Acq = ACQ, encode=None, log=print,
-                 extra=None, y_sat: float | None = None, t_both_of=None) -> None:
+                 extra=None, y_sat: float | None = None, t_both_of=None,
+                 row_hook=None) -> None:
     """Drive every block's patterns; append one row per read to ``rows``.
 
     ``x`` and ``w`` are ``(len(blocks), patterns, n)``.  ``rows`` is the caller's
@@ -202,6 +203,12 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
     each row, so a caller can label its reads without this function knowing what
     the labels mean.  It defaults to ``None``, which is exactly the behaviour
     every existing caller gets.
+
+    ``row_hook(row)``, if given, is called with each finished row just before it
+    is appended, so a caller can add columns it can only measure *during* the
+    run -- unlike ``extra``, which is fixed before the first read.  It runs
+    between the DAQ read and the next SLM frame, so a slow instrument there
+    stretches the run but never overlaps an acquisition.  It must not raise.
 
     ``y_sat`` is passed to :func:`predict`, so a pattern's range, logged diff and
     ``pred_v`` all use the saturated model.  ``t_both_of(pred_v)``, if given,
@@ -269,6 +276,8 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
                    "range_v": used, "pred_v": pred}
             if extra is not None:
                 row.update(extra[b][j])
+            if row_hook is not None:
+                row_hook(row)
             rows.append(row)
             log(f"[{i}/{total}] {pairs_tag(driven)} #{j + 1}: "
                 f"{(mean - dark) * 1e3:9.4f} mV  pred {pred * 1e3:9.4f}  "

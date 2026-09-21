@@ -759,5 +759,20 @@ class CascadeTests(_WindowCase):
                 self.assertNotIn("chained", ch["fit"])
 
 
+class PmtCheckboxTests(_WindowCase):
+    """The Step-7 tab has its own switch, on by default, beside its own DAQ box."""
+
+    def test_it_is_on_by_default(self) -> None:
+        self.assertTrue(self.win.tpa_phase_pmt.isChecked())
+
+    def test_it_is_not_the_step6_checkbox(self) -> None:
+        """Step 7 has its own DAQ settings, so it has its own switch too."""
+        w = self.win
+        self.assertIsNot(w.tpa_phase_pmt, w.tpa_pmt)
+        w.tpa_phase_pmt.setChecked(False)
+        self.assertTrue(w.tpa_pmt.isChecked())
+        w.tpa_phase_pmt.setChecked(True)
+
+
 if __name__ == "__main__":
     unittest.main()

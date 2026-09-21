@@ -75,6 +75,18 @@ Each point is one fixed-duration ``daq_module`` acquisition like step 6:
 ``t_both_s`` for the sweep points (the reference is on, so they are bright),
 low-passed at the ``DAQMonitorSettings`` bandwidth.  Every CSV row records the
 mean, its trace std and the std ratio (std/|mean|).
+
+PMT temperature
+---------------
+Every row also carries the PMT thermistor (Keithley 2400, ohms and TH10K
+degrees) in ``pmt_ohm_Ohm`` and ``pmt_c``, and the CSV brackets itself with a
+start and end reading in its ``# key,value`` meta.  A step-7 run is ~20 minutes
+of bench time in which the reference amplitude is assumed constant, so what the
+detector's temperature did while it ran is worth having on the same rows.  ON by
+default (``--no-pmt`` turns it off), re-read at most every ``--pmt-period``
+seconds (default 60) with the rows in between repeating the last reading.  A
+missing or failing 2400 blanks the two columns rather than ending the run.  One
+GPIB, one 2400: do NOT run ``drafts/daq_pmt_monitor.py`` alongside a sweep.
 """
 
 from __future__ import annotations
@@ -116,6 +128,11 @@ from calibration_module.measure.phase_v2 import (  # noqa: E402
     build_xw_sweep,
     measure_target,
     run_seconds,
+)
+from calibration_module.measure.pmt_temp import (  # noqa: E402
+    PMT_PERIOD_S,
+    PmtTemperature,
+    open_pmt,
 )
 from calibration_module.fit.slm_response import (  # noqa: E402
     calibration_result_from_dict,
@@ -302,7 +319,8 @@ def save_plot(fit: PhaseFit, tgt: int, path) -> None:
 # the run
 # ======================================================================
 
-def _run_sweep(step6: Path, fit_after: bool) -> None:
+def _run_sweep(step6: Path, fit_after: bool, *,
+               pmt: "PmtTemperature | None" = None) -> None:
     """Sweep every target pair back to the reference; write one raw CSV.
 
     Not necessarily against it.  A pair adjacent to the reference cannot be
@@ -331,6 +349,17 @@ def _run_sweep(step6: Path, fit_after: bool) -> None:
           f"{layout.pitch_px - layout.channel_width_px} px pad "
           f"(pitch {layout.pitch_px} px)")
 
+    meta: dict[str, object] = {}
+    if pmt is not None:
+        first = pmt.read()          # seeds the cache, so row 1 is not blank
+        meta["pmt_resource"] = pmt.resource
+        meta["pmt_period_s"] = f"{pmt.period_s:g}"
+        meta.update({f"{k}_start": v for k, v in first.items()})
+        print(f"PMT       : {pmt.resource}  "
+              + (f"{first['pmt_c']} C ({first['pmt_ohm_Ohm']} Ohm)"
+                 if first["pmt_c"] else "unavailable")
+              + f", resampled every {pmt.period_s:g} s")
+
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
                       t_both=ACQ.t_both_s, t_single=ACQ.t_single_s,
@@ -350,14 +379,18 @@ def _run_sweep(step6: Path, fit_after: bool) -> None:
                     step0=done * per_target, total=total,
                     progress_callback=lambda p: print(p.line()),
                     log=print,
+                    row_hook=None if pmt is None else pmt.sample,
                 ))
                 done += 1
     finally:
         slm.close_slm()
         daq.disconnect()
+        if pmt is not None:
+            meta.update({f"{k}_end": v for k, v in pmt.read().items()})
 
     stamp = time.strftime("%m%d_%H%M")
-    csv_path = write_meas_csv(results, CALIB_PATH / f"calib_step7_meas_{stamp}.csv")
+    csv_path = write_meas_csv(results, CALIB_PATH / f"calib_step7_meas_{stamp}.csv",
+                              meta=meta)
     n_rows = sum(r.trial.size for r in results)
     print(f"\nSaved {n_rows} rows to {csv_path}")  # raw rows on disk BEFORE fitting
     if not fit_after:
@@ -540,6 +573,20 @@ def main(argv: list[str] | None = None) -> int:
         "--meas", "-m", action="store_true",
         help="sweep and write the raw CSV only; do not fit",
     )
+    parser.add_argument(
+        "--no-pmt", dest="pmt", action="store_false",
+        help="do not log the PMT thermistor (on by default; a missing 2400 is "
+             "not an error either way, it just blanks the two columns)",
+    )
+    parser.add_argument(
+        "--pmt-resource", default=None, metavar="VISA",
+        help="VISA address of the 2400 (default: daq_pmt_monitor.K2400_RESOURCE)",
+    )
+    parser.add_argument(
+        "--pmt-period", type=float, default=PMT_PERIOD_S, metavar="S",
+        help=f"seconds between 2400 readings; rows in between repeat the last "
+             f"one (default {PMT_PERIOD_S:g})",
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     TGT_INDICES = args.targets
@@ -551,7 +598,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.csv is not None:            # offline re-fit, no hardware
         fit_csv(args.csv, args.step6)
         return 0
-    _run_sweep(args.step6, fit_after=not args.meas)
+    _run_sweep(args.step6, fit_after=not args.meas,
+               pmt=open_pmt(args.pmt_resource, args.pmt_period,
+                            enabled=args.pmt))
     return 0
 
 

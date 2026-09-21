@@ -334,7 +334,10 @@ def load_tpa_pair_csv(
     """
     grouped: dict[int, list[tuple[int, float, float, float, float]]] = defaultdict(list)
     with open(Path(path), newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        # v2 CSVs may end in trailing "# key,value" meta lines (the PMT
+        # thermistor brackets the sweep there); skipping them is what keeps the
+        # promise that either version can re-fit either file.
+        for row in csv.DictReader(l for l in f if not l.startswith("#")):
             idx = int(float(row["pair_index"]))
             std_v = float(row["voltage_std_v"])  # the fit weight; every CSV records it
             grouped[idx].append(

@@ -426,5 +426,55 @@ class Step7HandoffTests(_WindowCase):
         self.assertNotIn("q_x", w.tpa_fits[3].bg)
 
 
+class PmtCheckboxTests(_WindowCase):
+    """The Step-6 tab's "Log PMT temperature" switch.
+
+    On by default, and the sweep must ask it rather than the module default --
+    a GUI run that silently recorded nothing is the failure this is guarding.
+    """
+
+    def test_it_is_on_by_default(self) -> None:
+        self.assertTrue(self.win.tpa_pmt.isChecked())
+
+    def test_the_meta_helpers_bracket_a_sweep(self) -> None:
+        from gui.app import _pmt_meta_start, _pmt_meta_end
+
+        class _Pmt:
+            resource, period_s = "GPIB0::21::INSTR", 60.0
+
+            def __init__(self):
+                self.n = 0
+
+            def read(self):
+                self.n += 1
+                return {"pmt_ohm_Ohm": f"907{self.n}", "pmt_c": f"27.{self.n}"}
+
+        pmt = _Pmt()
+        meta = _pmt_meta_start(pmt)
+        self.assertEqual(meta["pmt_c_start"], "27.1")
+        self.assertEqual(meta["pmt_resource"], "GPIB0::21::INSTR")
+        _pmt_meta_end(pmt, meta)
+        self.assertEqual(meta["pmt_c_end"], "27.2")
+
+    def test_no_thermistor_means_no_meta_at_all(self) -> None:
+        from gui.app import _pmt_meta_start, _pmt_meta_end
+
+        meta = _pmt_meta_start(None)
+        _pmt_meta_end(None, meta)
+        self.assertEqual(meta, {})
+
+    def test_a_load_takes_the_meta_from_the_file_not_the_session(self) -> None:
+        """Otherwise Save would stamp loaded rows with this session's sweep."""
+        from unittest import mock
+
+        w = self.win
+        w.tpa_meta = {"pmt_c_start": "99.9"}        # left over from a sweep here
+        with mock.patch.object(
+                QtWidgets.QFileDialog, "getOpenFileName",
+                return_value=(str(MEAS_CSV), "")):
+            w._tpa_load()
+        self.assertNotIn("pmt_c_start", w.tpa_meta)
+
+
 if __name__ == "__main__":
     unittest.main()

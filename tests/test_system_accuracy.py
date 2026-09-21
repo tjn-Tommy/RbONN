@@ -14,6 +14,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -23,6 +24,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from calibration_module.fit import levels, levels_report as R, verify as V  # noqa: E402
 from calibration_module.steps import calib_npair_verify as S8  # noqa: E402
 from calibration_module.steps import system_accuracy as SA  # noqa: E402
+from calibration_module.fit import pair_v2 as P6, phase as PH  # noqa: E402
+from calibration_module.fit.pair import load_tpa_pair_csv  # noqa: E402
+from calibration_module.measure.pmt_temp import open_pmt  # noqa: E402
 
 RUN = ROOT / "src" / "calib_data" / "run_0911_10pairs_w20g30"
 STEP7 = RUN / "calib_step7_result_0911_2037.json"
@@ -474,6 +478,228 @@ class LooCollectTests(unittest.TestCase):
                 meta={"step7_json": STEP7}, extra=["kind"])
             with self.assertRaises(ValueError):
                 R.loo_table(path, STEP7)
+
+
+class _FakeK2400:
+    """Stands in for the GPIB stack: hands back scripted ohms, counts the reads."""
+
+    def __init__(self, *values):
+        self.values = list(values)
+        self.calls = 0
+
+    def __call__(self, resource, **kwargs):
+        self.calls += 1
+        value = self.values[min(self.calls - 1, len(self.values) - 1)]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class PmtTemperatureTests(unittest.TestCase):
+    """The --pmt row hook: caching, alignment and failure isolation.
+
+    The 2400 and its VISA stack are replaced wholesale, so this runs anywhere;
+    what is under test is the caching and the never-raise contract, which is
+    what an unattended overnight run depends on.
+    """
+
+    def _pmt(self, fake, **kwargs):
+        """A PmtTemperature whose instrument layer is ``fake``."""
+        pmt_mod = SimpleNamespace(
+            K2400_RESOURCE="GPIB0::21::INSTR", K2400_FOUR_WIRE=False,
+            K2400_NPLC=10.0, K2400_CURRENT=None, K2400_COMPLIANCE=21.0,
+            K2400_TIMEOUT_S=10.0)
+        stubs = {"daq_pmt_monitor": pmt_mod,
+                 "monitor_lib": SimpleNamespace(read_ohm_2400=fake)}
+        saved = {k: sys.modules.get(k) for k in stubs}
+        sys.modules.update(stubs)
+        try:
+            return SA.PmtTemperature(**kwargs)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    del sys.modules[k]
+                else:
+                    sys.modules[k] = v
+
+    def test_10_kohm_is_25_c(self):
+        pmt = self._pmt(_FakeK2400(10_000.0))
+        cells = pmt.read()
+        self.assertAlmostEqual(float(cells["pmt_c"]), 25.0, places=3)
+        self.assertEqual(float(cells["pmt_ohm_Ohm"]), 10_000.0)
+
+    def test_the_reading_is_cached_between_samples(self):
+        """175 reads must not cost 175 GPIB round trips -- that is the whole point."""
+        fake = _FakeK2400(10_000.0, 12_000.0)
+        pmt = self._pmt(fake, period_s=3600.0)
+        first = pmt.sample()
+        for _ in range(20):
+            self.assertEqual(pmt.sample(), first)
+        self.assertEqual(fake.calls, 1)
+
+        pmt._t_last -= 3601.0                       # the period has now passed
+        second = pmt.sample()
+        self.assertEqual(fake.calls, 2)
+        self.assertNotEqual(second["pmt_ohm_Ohm"], first["pmt_ohm_Ohm"])
+        self.assertGreater(float(first["pmt_c"]), float(second["pmt_c"]))
+
+    def test_a_dead_2400_blanks_the_cells_and_does_not_raise(self):
+        pmt = self._pmt(_FakeK2400(RuntimeError("GPIB timeout")))
+        row = {"pred_v": 0.0}
+        pmt(row)                                    # must not raise
+        self.assertEqual(row["pmt_ohm_Ohm"], "")
+        self.assertEqual(row["pmt_c"], "")
+
+    def test_over_range_and_off_curve_readings_are_blank_not_wrong(self):
+        for value in (float("inf"), 1e9):           # open circuit, off the TH10K table
+            with self.subTest(value=value):
+                pmt = self._pmt(_FakeK2400(value))
+                self.assertEqual(pmt.read(), {"pmt_ohm_Ohm": "", "pmt_c": ""})
+
+    def test_the_hook_stamps_every_read_and_survives_the_csv(self):
+        models, phases, pairs = model()
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        patterns = patterns[:6]
+        slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
+        daq = _FakeDAQ(slm, models, phases)
+        x = np.stack([p.x for p in patterns])[None]
+        w = np.stack([p.w for p in patterns])[None]
+        pmt = self._pmt(_FakeK2400(10_000.0), period_s=3600.0)
+
+        rows: list[dict] = []
+        S8.run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
+                        rows=rows, acq=replace(S8.ACQ, settle_s=0.0, t_both_s=0.0,
+                                               t_single_s=0.0),
+                        encode=_encode, log=lambda _: None, row_hook=pmt)
+
+        self.assertEqual(len(rows), len(patterns))
+        self.assertTrue(all(r["pmt_c"] for r in rows))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = V.write_verify_csv(Path(tmp) / "pmt.csv", pairs, rows,
+                                      meta={"step7_json": STEP7},
+                                      extra=list(SA.PmtTemperature.COLUMNS))
+            header, first = Path(path).read_text().splitlines()[:2]
+        self.assertEqual(header.split(",")[-2:], list(SA.PmtTemperature.COLUMNS))
+        self.assertAlmostEqual(float(first.split(",")[-1]), 25.0, places=3)
+
+    def test_run_patterns_without_a_hook_is_unchanged(self):
+        models, phases, pairs = model()
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        patterns = patterns[:3]
+        slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
+        x = np.stack([p.x for p in patterns])[None]
+        w = np.stack([p.w for p in patterns])[None]
+        rows: list[dict] = []
+        S8.run_patterns(_FakeDAQ(slm, models, phases), slm, layout, [tuple(pairs)],
+                        x, w, models, phases, rows=rows,
+                        acq=replace(S8.ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0),
+                        encode=_encode, log=lambda _: None)
+        self.assertTrue(all("pmt_c" not in r for r in rows))
+
+
+class PmtInStepsSixAndSevenTests(unittest.TestCase):
+    """Steps 6 and 7 carry the thermistor in two trailing columns.
+
+    The contract that matters is compatibility: the columns and the meta lines
+    must not change what either step's fit produces, and a v1 re-fit of a v2
+    step-6 CSV -- which that CSV's docstring promises -- must still work with
+    both present.
+    """
+
+    S6_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step6v2_meas_0917_1811.csv"
+    S7_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step7_meas_0917_1831.csv"
+    S6_JSON = ROOT / "src/calib_data/calib_0917_1617/calib_step6v2_result_0917_1811.json"
+    META = {"pmt_resource": "GPIB0::21::INSTR", "pmt_period_s": "60",
+            "pmt_c_start": "27.2379", "pmt_c_end": "27.2146"}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    # ---- step 6 ----------------------------------------------------------
+    def test_step6_rows_round_trip_with_and_without_the_thermistor(self):
+        rows = {2: [(0, 0.5, 0.5, 0.01, 1e-4, "9070.1", "27.2379")],
+                3: [(1, 0.9, 0.9, 0.03, 2e-4)]}          # an old 5-tuple row
+        path = P6.write_meas_csv(rows, self.tmp / "s6.csv", meta=self.META)
+        back = P6.load_meas_csv(path)
+        self.assertEqual(back[2][0], (0, 0.5, 0.5, 0.01, 1e-4, "9070.1", "27.2379"))
+        self.assertEqual(back[3][0][5:], ("", ""))       # blank, not missing
+        self.assertEqual(P6.meas_csv_meta(path)["pmt_c_end"], "27.2146")
+
+    def test_step6_average_levels_takes_5_and_7_tuples_alike(self):
+        seven = [(0, 0.5, 0.5, 0.01, 1e-4, "9070", "27.2"),
+                 (1, 0.5, 0.5, 0.02, 1e-4, "9071", "27.1")]
+        five = [r[:5] for r in seven]
+        a, b = P6.average_levels(seven), P6.average_levels(five)
+        self.assertEqual(len(a), 1)
+        np.testing.assert_allclose(a[0].means, b[0].means)
+
+    def test_a_v1_refit_survives_the_new_columns_and_the_meta_lines(self):
+        """The v2 CSV promises v1 can still re-fit it; that must stay true."""
+        before = {c.index: c.fit.eta
+                  for c in load_tpa_pair_csv(self.S6_CSV).channels if c.fit}
+        rows = P6.load_meas_csv(self.S6_CSV)
+        stamped = {k: [r[:5] + ("9070.1", "27.2379") for r in v]
+                   for k, v in rows.items()}
+        path = P6.write_meas_csv(stamped, self.tmp / "s6_pmt.csv", meta=self.META)
+        after = {c.index: c.fit.eta
+                 for c in load_tpa_pair_csv(path).channels if c.fit}
+        self.assertEqual(before.keys(), after.keys())
+        self.assertEqual(len(before), 10)
+        for k in before:                    # bit-identical, not merely close
+            self.assertEqual(before[k], after[k], f"pair {k} moved")
+
+    # ---- step 7 ----------------------------------------------------------
+    def _models(self):
+        return PH.load_pair_models(self.S6_JSON)
+
+    def test_step7_columns_round_trip_and_do_not_move_the_fit(self):
+        models = self._models()
+        r0 = PH.load_phase_csv(self.S7_CSV, models[4], models[2], only_tgt=4,
+                               single_beam_bg=True, comb_only=True)
+        self.assertIsNone(r0.pmt_c, "a CSV with no thermistor must load as None")
+
+        n = r0.trial.size
+        r0.pmt_ohm = np.array(["9070.1"] * n, dtype=object)
+        r0.pmt_c = np.array([f"{27.2 - i * 0.001:.4f}" for i in range(n)],
+                            dtype=object)
+        path = PH.write_meas_csv([r0], self.tmp / "s7.csv", meta=self.META)
+        r1 = PH.load_phase_csv(path, models[4], models[2], only_tgt=4,
+                               single_beam_bg=True, comb_only=True)
+        self.assertEqual(r1.fit.dphi_comb, r0.fit.dphi_comb)
+        self.assertEqual(list(r1.pmt_c), list(r0.pmt_c))
+        self.assertEqual(list(r1.pmt_ohm), list(r0.pmt_ohm))
+
+    def test_a_step7_sweep_without_the_thermistor_stays_none(self):
+        """Not a column of blanks: None is what says the sweep never logged it."""
+        models = self._models()
+        r0 = PH.load_phase_csv(self.S7_CSV, models[4], models[2], only_tgt=4,
+                               comb_only=True)
+        path = PH.write_meas_csv([r0], self.tmp / "s7_bare.csv")
+        r1 = PH.load_phase_csv(path, models[4], models[2], only_tgt=4,
+                               comb_only=True)
+        self.assertIsNone(r1.pmt_c)
+        self.assertIsNone(r1.pmt_ohm)
+
+    # ---- the on-by-default switch ---------------------------------------
+    def test_open_pmt_returns_none_instead_of_raising(self):
+        """Steps 6 and 7 log by default, so a missing 2400 must cost two columns.
+
+        Not the calibration: PmtTemperature's constructor is the one place that
+        still raises, and open_pmt is what stands between it and an hour of
+        bench time.
+        """
+        said: list[str] = []
+        with mock.patch("calibration_module.measure.pmt_temp.PmtTemperature",
+                        side_effect=RuntimeError("no VISA backend")):
+            self.assertIsNone(open_pmt(log=said.append))
+        self.assertTrue(any("no VISA backend" in m for m in said), said)
+
+    def test_open_pmt_off_never_touches_the_instrument(self):
+        with mock.patch("calibration_module.measure.pmt_temp.PmtTemperature",
+                        side_effect=AssertionError("must not be constructed")):
+            self.assertIsNone(open_pmt(enabled=False))
 
 
 if __name__ == "__main__":

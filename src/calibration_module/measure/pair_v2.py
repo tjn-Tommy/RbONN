@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -245,7 +245,8 @@ def measure_pair(
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
-) -> list[tuple[int, float, float, float, float]]:
+    row_hook: Callable[[], Mapping[str, str]] | None = None,
+) -> list[tuple]:
     """Run one pair's interleaved schedule -> raw ``(rep, x, w, mean, std)`` rows.
 
     ``index`` is the pair LABEL; ``cfg.slot`` maps it onto the 0-based drive
@@ -258,6 +259,12 @@ def measure_pair(
     across pairs; they affect nothing but the numbers in
     :class:`PairV2Progress`.  Raises :class:`PairV2Aborted` if ``stop_event``
     is set between acquisitions.
+
+    ``row_hook`` is called once per acquisition for two extra cells appended to
+    every row -- in practice
+    :meth:`~calibration_module.measure.pmt_temp.PmtTemperature.sample`, whose
+    cached reading costs a GPIB round trip only once a minute.  Without it the
+    rows are the plain 5-tuples and the CSV's two thermistor columns are blank.
     """
     from slm_module.encoding import encode_to_pattern
 
@@ -266,7 +273,7 @@ def measure_pair(
     total = len(schedule) if total is None else total
     slot = cfg.slot(index)
 
-    rows: list[tuple[int, float, float, float, float]] = []
+    rows: list[tuple] = []
     for offset, (rep, x_val, w_val) in enumerate(schedule):
         if stop_event is not None and stop_event.is_set():
             raise PairV2Aborted("step-6 sweep stopped by request")
@@ -284,7 +291,11 @@ def measure_pair(
         mean_v, std_v, range_v = read_point_autorange(
             monitor, single=single, acq=acq, timeout=read_timeout, log=log
         )
-        rows.append((rep, float(x_val), float(w_val), mean_v, std_v))
+        row = (rep, float(x_val), float(w_val), mean_v, std_v)
+        if row_hook is not None:
+            cells = row_hook()
+            row += (cells.get("pmt_ohm_Ohm", ""), cells.get("pmt_c", ""))
+        rows.append(row)
         if progress_callback is not None:
             progress_callback(PairV2Progress(
                 step=step0 + offset + 1, total=total, pair_index=index,

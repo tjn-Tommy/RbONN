@@ -132,6 +132,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -158,6 +159,7 @@ __all__ = [
     "make_plot",
     "save_plot",
     "write_meas_csv",
+    "meas_csv_meta",
     "load_meas_csv",
     "save_combined_json",
 ]
@@ -359,6 +361,10 @@ DEFAULT_CONFIG = PairV2Config()
 _CSV_HEADER = [
     "trial", "pair_index", "x", "w", "product",
     "voltage_mean_v", "voltage_std_v", "std_ratio",
+    # The PMT thermistor, blank when the sweep ran without it.  Trailing and
+    # read back by name, so v1's loader -- which the v2 CSV promises to stay
+    # compatible with -- is unaffected by their presence or absence.
+    "pmt_ohm_Ohm", "pmt_c",
 ]
 
 _BLOCK_ORDER = {"dark": 0, "x-only": 1, "w-only": 2, "cross": 3}
@@ -454,9 +460,13 @@ class Level:
 
 
 def average_levels(rows) -> list[Level]:
-    """Group raw ``(rep, x, w, mean_v, std_v)`` rows into repeat-averaged levels."""
+    """Group raw ``(rep, x, w, mean_v, std_v)`` rows into repeat-averaged levels.
+
+    Rows may carry the two PMT-thermistor cells after ``std_v``; the fit has no
+    use for them, so only the first five fields are read.
+    """
     grouped: dict[tuple[float, float], list[tuple[float, float]]] = {}
-    for _rep, x, w, mean_v, std_v in rows:
+    for _rep, x, w, mean_v, std_v in (r[:5] for r in rows):
         grouped.setdefault((round(float(x), 6), round(float(w), 6)), []).append(
             (float(mean_v), float(std_v))
         )
@@ -1234,12 +1244,19 @@ def save_plot(fit: PairV2Fit, path: str | Path) -> Path:
 # ======================================================================
 # persistence
 # ======================================================================
-def write_meas_csv(rows_by_pair: dict[int, list], path: str | Path) -> Path:
+def write_meas_csv(rows_by_pair: dict[int, list], path: str | Path,
+                   *, meta: Mapping[str, object] | None = None) -> Path:
     """Raw rows, v1's column layout (``trial`` carries the repeat index).
 
     Keeping v1's columns means the same file can be re-fit with v1's joint
     6-parameter estimator for a direct comparison of the two estimators on
     identical data.
+
+    A row is ``(rep, x, w, mean_v, std_v)`` or that plus the two PMT-thermistor
+    cells; rows without them get the columns blank, so one sweep's file has one
+    shape whether or not the 2400 was there.  ``meta``, if given, is appended as
+    trailing ``# key,value`` lines -- where the run brackets itself with a
+    start and end temperature.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1247,26 +1264,49 @@ def write_meas_csv(rows_by_pair: dict[int, list], path: str | Path) -> Path:
         writer = csv.writer(f)
         writer.writerow(_CSV_HEADER)
         for index in sorted(rows_by_pair):
-            for rep, x, w, mean_v, std_v in rows_by_pair[index]:
+            for row in rows_by_pair[index]:
+                rep, x, w, mean_v, std_v = row[:5]
+                ohm, celsius = (row[5], row[6]) if len(row) >= 7 else ("", "")
                 ratio = abs(std_v / mean_v) if mean_v else float("inf")
                 writer.writerow([int(rep), index, f"{x:.6g}", f"{w:.6g}",
                                  f"{x*w:.6g}", f"{mean_v:.9g}", f"{std_v:.9g}",
-                                 f"{ratio:.6g}"])
+                                 f"{ratio:.6g}", ohm, celsius])
+        for key, value in (meta or {}).items():
+            writer.writerow([f"# {key}", value])
     return out
 
 
 def load_meas_csv(path: str | Path) -> dict[int, list]:
-    """Read a v2 measurement CSV back into ``{pair_index: rows}``."""
+    """Read a v2 measurement CSV back into ``{pair_index: rows}``.
+
+    Rows come back as 7-tuples carrying the PMT-thermistor cells as written --
+    strings, blank where the sweep had no 2400 -- so a load/save round trip does
+    not quietly drop the temperature.  The fit reads only the first five
+    (:func:`average_levels`).
+    """
     rows_by_pair: dict[int, list] = {}
     with open(Path(path), newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        for row in csv.DictReader(l for l in f if not l.startswith("#")):
             index = int(float(row["pair_index"]))
             rows_by_pair.setdefault(index, []).append((
                 int(float(row.get("trial", 0))),
                 float(row["x"]), float(row["w"]),
                 float(row["voltage_mean_v"]), float(row["voltage_std_v"]),
+                row.get("pmt_ohm_Ohm") or "", row.get("pmt_c") or "",
             ))
     return rows_by_pair
+
+
+def meas_csv_meta(path: str | Path) -> dict[str, str]:
+    """The trailing ``# key,value`` lines of a measurement CSV, as a dict."""
+    meta: dict[str, str] = {}
+    with open(Path(path), newline="", encoding="utf-8") as f:
+        for raw in f:
+            if raw.startswith("#"):
+                parts = raw.lstrip("#").strip().split(",")
+                if len(parts) >= 2:
+                    meta[parts[0].strip()] = ",".join(parts[1:]).strip()
+    return meta
 
 
 def _checks_dict(fit: PairV2Fit) -> dict:

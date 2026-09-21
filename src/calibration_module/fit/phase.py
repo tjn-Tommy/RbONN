@@ -515,6 +515,11 @@ class PhaseResult:
     n_trials: int = 1
     fit: PhaseFit | None = None
     csv_path: str | None = None
+    # The PMT thermistor beside each row, as written: strings, blank where the
+    # 2400 was absent, None when the sweep did not log it at all.  The fit never
+    # touches them -- they are here so the CSV round trip keeps them.
+    pmt_ohm: np.ndarray | None = field(default=None, repr=False)
+    pmt_c: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def dark(self) -> float:
@@ -1064,10 +1069,14 @@ _MEAS_CSV_HEADER = [
     "trial", "tgt_index", "ref_index",
     "phi_xt_deg", "phi_wt_deg", "x_t", "w_t", "x_r", "w_r",
     "dark_v", "voltage_mean_v", "voltage_std_v", "std_ratio",
+    # The PMT thermistor, blank when the sweep ran without it.  Trailing and
+    # read back by name, so a v1 refit of this file is unaffected.
+    "pmt_ohm_Ohm", "pmt_c",
 ]
 
 
-def write_meas_csv(results: Sequence[PhaseResult], path: str | Path) -> str:
+def write_meas_csv(results: Sequence[PhaseResult], path: str | Path,
+                   *, meta: Mapping[str, object] | None = None) -> str:
     """Raw rows for one or more target pairs, in a single CSV.
 
     :func:`write_phase_csv`'s column layout plus a trailing ``std_ratio``
@@ -1078,6 +1087,9 @@ def write_meas_csv(results: Sequence[PhaseResult], path: str | Path) -> str:
     :func:`load_phase_csv`'s ``only_tgt``.
 
     Byte-compatible with a v1 CSV -- either version can refit either file.
+
+    ``meta``, if given, is appended as trailing ``# key,value`` lines, which is
+    where the run brackets itself with a start and end PMT temperature.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1085,9 +1097,13 @@ def write_meas_csv(results: Sequence[PhaseResult], path: str | Path) -> str:
         writer = csv.writer(f)
         writer.writerow(_MEAS_CSV_HEADER)
         for result in results:
-            for t, x_t, w_t, x_r, w_r, dark_v, mean_v, std_v in zip(
+            n = len(result.trial)
+            ohms = result.pmt_ohm if result.pmt_ohm is not None else [""] * n
+            cels = result.pmt_c if result.pmt_c is not None else [""] * n
+            for t, x_t, w_t, x_r, w_r, dark_v, mean_v, std_v, ohm, celsius in zip(
                 result.trial, result.x_t, result.w_t, result.x_r, result.w_r,
                 result.dark_v, result.voltage_mean_v, result.voltage_std_v,
+                ohms, cels,
             ):
                 phi_xt = np.degrees(2.0 * float(phi_half(x_t)))
                 phi_wt = np.degrees(2.0 * float(phi_half(w_t)))
@@ -1097,8 +1113,10 @@ def write_meas_csv(results: Sequence[PhaseResult], path: str | Path) -> str:
                      f"{phi_xt:.4g}", f"{phi_wt:.4g}",
                      f"{x_t:.6g}", f"{w_t:.6g}", f"{x_r:.6g}", f"{w_r:.6g}",
                      f"{dark_v:.9g}", f"{mean_v:.9g}", f"{std_v:.9g}",
-                     f"{ratio:.6g}"]
+                     f"{ratio:.6g}", ohm, celsius]
                 )
+        for key, value in (meta or {}).items():
+            writer.writerow([f"# {key}", value])
     for result in results:
         result.csv_path = str(out)
     return str(out)
@@ -1216,7 +1234,7 @@ def load_phase_csv(
                 if len(parts) == 2 and parts[0].strip() == "dark_mean_v":
                     file_dark = float(parts[1])
 
-    rows: list[tuple[int, float, float, float, float, float, float, float | None]] = []
+    rows: list[tuple] = []
     tgt_index, ref_index = tgt_model.index, ref_model.index
     with open(Path(path), newline="", encoding="utf-8") as f:
         for row in csv.DictReader(line for line in f if not line.startswith("#")):
@@ -1232,6 +1250,7 @@ def load_phase_csv(
                 float(row["voltage_mean_v"]),
                 std_v,
                 float(dv) if dv not in (None, "") else None,
+                row.get("pmt_ohm_Ohm") or "", row.get("pmt_c") or "",
             ))
             tgt_index = row_tgt
             ref_index = int(float(row.get("ref_index", ref_index)))
@@ -1260,6 +1279,12 @@ def load_phase_csv(
         dark_v=dark_v,
         n_trials=int(trials.max()) + 1 if trials.size else 1,
         csv_path=str(Path(path).resolve()),
+        # only carried through when the file actually has them, so a CSV with no
+        # thermistor round-trips back to None rather than to a column of blanks
+        pmt_ohm=(np.array([r[8] for r in rows], dtype=object)
+                 if any(r[8] for r in rows) else None),
+        pmt_c=(np.array([r[9] for r in rows], dtype=object)
+               if any(r[9] for r in rows) else None),
     )
     fit_result(result, tgt_model, ref_model, frac=frac,
                single_beam_bg=single_beam_bg, comb_only=comb_only)

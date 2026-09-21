@@ -51,6 +51,19 @@ joint 6-parameter estimator for comparison::
 
 That is the cross-check that justifies the change: same rows, two estimators.
 
+PMT temperature
+---------------
+Every row carries the PMT thermistor (Keithley 2400, ohms and TH10K degrees) in
+``pmt_ohm_Ohm`` and ``pmt_c``, and the CSV brackets itself with a start and end
+reading in its ``# key,value`` meta -- so a drifting eta can be read against the
+detector's own temperature rather than against the room's.  It is ON by default
+(``--no-pmt`` turns it off); the 2400 is re-read at most every ``--pmt-period``
+seconds (default 60) and the rows in between repeat the last reading, since the
+bead's time constant is minutes and a per-row GPIB round trip would add ~90 s to
+a sweep and measure nothing extra.  A missing or failing 2400 blanks the two
+columns rather than ending the run.  One GPIB, one 2400: do NOT run
+``drafts/daq_pmt_monitor.py`` alongside a sweep.
+
 Output is one ``calib_step6v2_result_MMDD_HHMM.json`` embedding the input
 Step-3 calibration, and carrying ``a_x, q_x, a_w, q_w, d`` and ``eta`` per pair
 (a q that was not fitted is written out as an exact zero)
@@ -87,6 +100,11 @@ from calibration_module.measure.pair_v2 import (  # noqa: E402
     build_schedule,
     measure_pair,
     run_seconds,
+)
+from calibration_module.measure.pmt_temp import (  # noqa: E402
+    PMT_PERIOD_S,
+    PmtTemperature,
+    open_pmt,
 )
 from calibration_module.fit.slm_response import load_calibration_result  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
@@ -183,7 +201,8 @@ def _pair_wavelengths(layout, index: int) -> tuple[float, float, float]:
 # the run
 # ======================================================================
 
-def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False) -> None:
+def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False,
+               pmt: "PmtTemperature | None" = None) -> None:
     """Drive every pair's interleaved schedule; optionally fit, plot and save."""
     if not PAIR_INDICES:
         raise ValueError("no pairs to calibrate -- pass --pairs, e.g. --pairs 2,3,4,5,6")
@@ -205,6 +224,17 @@ def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False) ->
           f"{layout.pitch_px - layout.channel_width_px} px pad "
           f"(pitch {layout.pitch_px} px), encoding {CONFIG.encoding_method!r}")
 
+    meta: dict[str, object] = {}
+    if pmt is not None:
+        first = pmt.read()          # seeds the cache, so row 1 is not blank
+        meta["pmt_resource"] = pmt.resource
+        meta["pmt_period_s"] = f"{pmt.period_s:g}"
+        meta.update({f"{k}_start": v for k, v in first.items()})
+        print(f"PMT       : {pmt.resource}  "
+              + (f"{first['pmt_c']} C ({first['pmt_ohm_Ohm']} Ohm)"
+                 if first["pmt_c"] else "unavailable")
+              + f", resampled every {pmt.period_s:g} s")
+
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
                       t_both=ACQ.t_both_s, t_single=ACQ.t_single_s,
@@ -220,14 +250,18 @@ def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False) ->
                 step0=n * len(schedule), total=total,
                 progress_callback=lambda p: print(p.line()),
                 log=print,
+                row_hook=None if pmt is None else pmt.sample,
             )
     finally:
         slm.close_slm()
         daq.disconnect()
+        if pmt is not None:
+            meta.update({f"{k}_end": v for k, v in pmt.read().items()})
 
     stamp = time.strftime("%m%d_%H%M")
     csv_path = write_meas_csv(rows_by_pair,
-                              CALIB_PATH / f"calib_step6v2_meas_{stamp}.csv")
+                              CALIB_PATH / f"calib_step6v2_meas_{stamp}.csv",
+                              meta=meta)
     n_rows = sum(len(v) for v in rows_by_pair.values())
     print(f"\nSaved {n_rows} rows to {csv_path}")  # raw rows on disk BEFORE fitting
     if not fit_after:
@@ -338,6 +372,20 @@ def main(argv: list[str] | None = None) -> int:
         "--anchor", action="store_true",
         help="put the measured D(0) into the fit, pinning the intercept on data",
     )
+    parser.add_argument(
+        "--no-pmt", dest="pmt", action="store_false",
+        help="do not log the PMT thermistor (on by default; a missing 2400 is "
+             "not an error either way, it just blanks the two columns)",
+    )
+    parser.add_argument(
+        "--pmt-resource", default=None, metavar="VISA",
+        help="VISA address of the 2400 (default: daq_pmt_monitor.K2400_RESOURCE)",
+    )
+    parser.add_argument(
+        "--pmt-period", type=float, default=PMT_PERIOD_S, metavar="S",
+        help=f"seconds between 2400 readings; rows in between repeat the last "
+             f"one (default {PMT_PERIOD_S:g})",
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     PAIR_INDICES = args.pairs
@@ -348,7 +396,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.csv is not None:            # offline re-fit, no hardware
         fit_csv(args.csv, args.step3, include_anchor=args.anchor)
         return 0
-    _run_sweep(args.step3, fit_after=not args.meas, include_anchor=args.anchor)
+    _run_sweep(args.step3, fit_after=not args.meas, include_anchor=args.anchor,
+               pmt=open_pmt(args.pmt_resource, args.pmt_period,
+                            enabled=args.pmt))
     return 0
 
 

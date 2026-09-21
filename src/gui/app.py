@@ -147,6 +147,8 @@ from calibration_module.measure.phase_v2 import (
     measure_target,
     run_seconds as phase_run_seconds,   # NOT pair_v2's: a step-7 Drive is a 4-tuple
 )
+from calibration_module.fit.pair_v2 import meas_csv_meta
+from calibration_module.measure.pmt_temp import open_pmt
 from calibration_module.fit.report import plot_fringe
 from slm_module.keepalive import SLMKeepAlive
 from .common import (
@@ -158,6 +160,40 @@ from .common import (
 from .live_plots import BatchResultsTable, LiveLossCanvas
 from .osa_monitor import LiveSpectrumView, OSATraceBridge
 from .style import DARK_STYLESHEET
+
+
+#: Both acquisition tabs offer the same switch, so they explain it the same way.
+PMT_CHECKBOX_TIP = (
+    "Record the PMT thermistor (Keithley 2400) next to every row, as "
+    "pmt_ohm_Ohm and pmt_c in the saved CSV.\n"
+    "The 2400 is read at most once a minute and the rows in between repeat the "
+    "last reading \N{EM DASH} the bead's time constant is minutes, so a "
+    "per-row round trip would cost bench time and measure nothing extra.\n"
+    "One GPIB bus, one 2400: do NOT run daq_pmt_monitor.py at the same time. "
+    "A missing or failing 2400 is not an error, it just leaves the two columns "
+    "blank."
+)
+
+
+def _pmt_meta_start(pmt) -> dict[str, Any]:
+    """Open a sweep's CSV meta with the thermistor, seeding its cache.
+
+    The first read is taken BEFORE the first acquisition so row 1 carries a
+    temperature rather than the blank of an unprimed cache.
+    """
+    if pmt is None:
+        return {}
+    first = pmt.read()
+    meta: dict[str, Any] = {"pmt_resource": pmt.resource,
+                            "pmt_period_s": f"{pmt.period_s:g}"}
+    meta.update({f"{k}_start": v for k, v in first.items()})
+    return meta
+
+
+def _pmt_meta_end(pmt, meta: dict[str, Any]) -> None:
+    """Close it with a final reading, so an aborted sweep is bracketed too."""
+    if pmt is not None:
+        meta.update({f"{k}_end": v for k, v in pmt.read().items()})
 
 
 # a calibration progress callback marshalled onto the GUI thread via a signal
@@ -508,6 +544,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # config has to start from the measurement, not from a fitted result.
         self.tpa_fits: list[PairV2Fit] = []
         self.tpa_rows: dict[int, list] = {}
+        # The last sweep's PMT-thermistor meta, written into the CSV on Save.
+        # Cleared by a Load, whose rows came from someone else's sweep.
+        self.tpa_meta: dict[str, Any] = {}
+        self.tpa_phase_meta: dict[str, Any] = {}
         self.tpa_stop_event: threading.Event | None = None
         self.tpa_phase_results: dict[int, PhaseResult] = {}
         # Every fitted pair referred back to the ROOT reference, hops and all;
@@ -4702,6 +4742,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "flat-top back under the rail, so a clipped read is a silently wrong "
             "mean rather than an error."
         )
+        self.tpa_pmt = QtWidgets.QCheckBox("Log PMT temperature")
+        self.tpa_pmt.setChecked(True)
+        self.tpa_pmt.setToolTip(PMT_CHECKBOX_TIP)
 
         rows = [
             ("Channel", self.tpa_daq_channel), ("Sample rate", self.tpa_daq_rate),
@@ -4714,6 +4757,7 @@ class MainWindow(QtWidgets.QMainWindow):
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_invert, len(rows), 0, 1, 2)
         grid.addWidget(self.tpa_autorange, len(rows) + 1, 0, 1, 2)
+        grid.addWidget(self.tpa_pmt, len(rows) + 2, 0, 1, 2)
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -5046,9 +5090,13 @@ class MainWindow(QtWidgets.QMainWindow):
         def report(progress: PairV2Progress) -> None:
             self.tpa_progress.emit(progress)
 
+        pmt = open_pmt(enabled=self.tpa_pmt.isChecked(),
+                       log=lambda m: self._log(f"[step 6] {m}"))
+
         def work() -> dict[str, Any]:
             daq.configure_monitor(settings)
             rows_by_pair: dict[int, list] = {}
+            meta = _pmt_meta_start(pmt)
             try:
                 for n, index in enumerate(pairs):
                     rows_by_pair[index] = measure_pair(
@@ -5057,12 +5105,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         read_timeout=read_timeout,
                         step0=n * len(schedule), total=total,
                         progress_callback=report, stop_event=stop_event,
+                        row_hook=None if pmt is None else pmt.sample,
                     )
             except PairV2Aborted:
+                _pmt_meta_end(pmt, meta)
                 return {"status": "aborted", "rows": rows_by_pair, "cfg": cfg,
-                        "layout": layout}
+                        "layout": layout, "meta": meta}
+            _pmt_meta_end(pmt, meta)
             return {"status": "ok", "rows": rows_by_pair, "cfg": cfg,
-                    "layout": layout}
+                    "layout": layout, "meta": meta}
 
         self._run_slm_task(
             "TPA η pair sweep (v2)", work, self._tpa_finished, self._tpa_error
@@ -5129,6 +5180,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tpa_status.setText("Sweep stopped before any pair finished.")
             self._tpa_close_dialog(False, "Stopped before any pair finished.")
             return
+        self.tpa_meta = payload.get("meta") or {}
         failed = self._tpa_fit_rows(rows, payload["cfg"], payload.get("layout"))
         self._tpa_set_running(False)
         self._tpa_fill_table()
@@ -5349,6 +5401,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             layout = None
             note3 = f"  · wavelengths NaN ({exc})"
+        # A Load re-fits someone else's sweep, so its thermistor bracket comes
+        # from the file rather than from this session -- otherwise a Save would
+        # stamp the loaded rows with the meta of whatever ran here last.
+        self.tpa_meta = meas_csv_meta(path)
         failed = self._tpa_fit_rows(rows, cfg, layout)
         self._tpa_fill_table()
         self._tpa_redraw()
@@ -5381,7 +5437,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         csv_path, json_path, png_path = _save_paths(path)
-        written = [Path(write_meas_csv(self.tpa_rows, csv_path)).name]
+        written = [Path(write_meas_csv(self.tpa_rows, csv_path,
+                                       meta=self.tpa_meta)).name]
 
         step3 = self._tpa_step3_path()
         if step3 is None or not step3.is_file():
@@ -5505,6 +5562,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "flat-top back under the rail, so a clipped read is a silently wrong "
             "mean rather than an error."
         )
+        self.tpa_phase_pmt = QtWidgets.QCheckBox("Log PMT temperature")
+        self.tpa_phase_pmt.setChecked(True)
+        self.tpa_phase_pmt.setToolTip(PMT_CHECKBOX_TIP)
 
         rows = [
             ("Channel", self.tpa_phase_daq_channel),
@@ -5520,6 +5580,7 @@ class MainWindow(QtWidgets.QMainWindow):
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_phase_invert, len(rows), 0, 1, 2)
         grid.addWidget(self.tpa_phase_autorange, len(rows) + 1, 0, 1, 2)
+        grid.addWidget(self.tpa_phase_pmt, len(rows) + 2, 0, 1, 2)
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -5960,10 +6021,14 @@ class MainWindow(QtWidgets.QMainWindow):
         def report(progress: PhaseV2Progress) -> None:
             self.tpa_phase_progress.emit(progress)
 
+        pmt = open_pmt(enabled=self.tpa_phase_pmt.isChecked(),
+                       log=lambda m: self._log(f"[step 7] {m}"))
+
         def work() -> dict[str, Any]:
             daq.configure_monitor(settings)
             results: dict[int, PhaseResult] = {}
             done = 0
+            meta = _pmt_meta_start(pmt)
             try:
                 for stage in stages:
                     # Each stage drives its OWN reference; everything else about
@@ -5976,13 +6041,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             read_timeout=read_timeout,
                             step0=done * per_target, total=total,
                             progress_callback=report, stop_event=stop_event,
+                            row_hook=None if pmt is None else pmt.sample,
                         )
                         done += 1
             except PhaseV2Aborted:
+                _pmt_meta_end(pmt, meta)
                 return {"status": "aborted", "results": results, "cfg": cfg,
-                        "models": models, "stages": stages}
+                        "models": models, "stages": stages, "meta": meta}
+            _pmt_meta_end(pmt, meta)
             return {"status": "ok", "results": results, "cfg": cfg,
-                    "models": models, "stages": stages}
+                    "models": models, "stages": stages, "meta": meta}
 
         self._run_slm_task(
             "TPA comb-phase sweep (v2)", work,
@@ -6116,6 +6184,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 False, "Stopped before any target finished."
             )
             return
+        self.tpa_phase_meta = payload.get("meta") or {}
         cfg = payload["cfg"]
         # A run stopped part-way may have finished stage 1 but not the stage
         # hanging off it, so plan only over what actually came back -- otherwise
@@ -6372,6 +6441,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Already fitted by load_phase_csv; this only re-refers them to the root,
         # over stages rebuilt from what the file recorded rather than planned.
         self.tpa_phase_results = loaded
+        self.tpa_phase_meta = meas_csv_meta(path)     # see the step-6 Load
         self.tpa_phase_root = root
         self.tpa_phase_stages = self._tpa_phase_stages_for(loaded, root)
         self.tpa_phase_chains = chain_fits(
@@ -6439,7 +6509,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         csv_path, json_path, png_path = _save_paths(path)
         results = [r for _, r in sorted(self.tpa_phase_results.items())]
-        written = [Path(write_phase_meas_csv(results, csv_path)).name]
+        written = [Path(write_phase_meas_csv(results, csv_path,
+                                             meta=self.tpa_phase_meta)).name]
 
         step6 = self._tpa_phase_step6_path()
         if step6 is None or not step6.is_file():
