@@ -28,6 +28,19 @@ now `calib_0917_1617/`, `accuracy_0917_1834/` and `accuracy_0917_0010/`.
 so a night of accuracy runs can no longer land in the calibration folder it was
 built from. Don't hard-code `OUT` back to a `calib_` folder.
 
+A folder holding a *series* of runs keeps one `system_accuracy_combined.csv`
+instead of one CSV per run: the per-run files were 18 and 12 copies of the same
+53-column header, only comparable once you knew which file a row came from. The
+combined file promotes each run's trailing `# key,value` metadata to `meta_*`
+columns and adds `run` and `run_start`, so every row says for itself which run,
+which hour and which step-7 calibration it belongs to. Nothing is recomputed --
+it is a concatenation, verified field by field against the originals before they
+were removed. The per-run report PNGs are kept.
+
+Do not merge two such folders into one table. `accuracy_0917_1834` was built on
+`calib_0917_1617` and `accuracy_0917_0010` on `run_0916_10pairs_w15g35`; they
+share no drive vectors and their residuals are not comparable.
+
 Older runs still carry the legacy `run_<MMDD>_<desc>` form. Renaming them is
 not free — see below.
 

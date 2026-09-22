@@ -150,6 +150,14 @@ from calibration_module.measure.phase_v2 import (
 from calibration_module.fit.pair_v2 import meas_csv_meta
 from calibration_module.measure.pmt_temp import open_pmt
 from calibration_module.fit.report import plot_fringe
+from calibration_module.measure.patterns import PatternsAborted, run_patterns
+from calibration_module.fit.step8_report import print_result as step8_print_result
+from calibration_module.fit.verify import (
+    load_forward_model as verify_load_forward_model,
+    predict as verify_predict,
+    write_verify_csv as verify_write_csv,
+)
+from calibration_module.steps import calib_step8 as STEP8
 from slm_module.keepalive import SLMKeepAlive
 from .common import (
     CalibrationProgressDialog,
@@ -941,6 +949,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tpa_center_page = self._build_tpa_center_tab()
         self._tpa_center_page.setVisible(False)
         tabs.addTab(self._build_tpa_phase_tab(), "Step 7 · Comb Phase")
+        tabs.addTab(self._build_step8_tab(), "Step 8 · Saturation")
         # There is deliberately no unified "run every stage" page.  Steps 1-3
         # read the OSA and steps 6-7 read the DAQ through the TPA cell, so the
         # bench has to be re-plumbed by hand partway down the chain: an
@@ -6229,6 +6238,360 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tpa_phase_close_dialog(
             False, "Comb-phase sweep failed (see Status log)"
         )
+
+    # ======================================================================
+    # Step 8 -- the saturation constant
+    # ======================================================================
+    #
+    # Deliberately the thinnest calibration page here.  Steps 6 and 7 fit a
+    # model per pair and need a table, a per-target plot and a cascade to be
+    # read at all; step 8 fits ONE number from ONE sweep, so anything more than
+    # "which step 7, how many rungs, Run" would be furniture.  The run itself is
+    # driven through the same measure/patterns loop the CLI uses, against the
+    # DAQ and SLM this window already has open -- calib_step8.collect() opens
+    # its own and must not be called from here.
+
+    def _build_step8_tab(self) -> QtWidgets.QWidget:
+        page = self._page_shell("Two-Photon Saturation (Y_sat)")
+        page.layout().addWidget(self._caption(
+            "Steps 6 and 7 never read above ~66 mV, where the atoms are linear "
+            "to ~1 %, so neither can see saturation. This sweeps the whole "
+            "output scale and fits the one constant that matters once a real "
+            "computation drives full scale: Y_sat, in "
+            "Y_pred = Y / (1 + Y / Y_sat). The gain is pinned to g = 1, which "
+            "DEFINES this run as the gain anchor -- a later run measures its "
+            "own gain as the ratio of its reads to this run's reads on the same "
+            "drives."
+        ))
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self._build_step8_controls())
+        split.addWidget(self._build_step8_results())
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([360, 1040])
+        page.layout().addWidget(split, 1)
+        return page
+
+    def _build_step8_controls(self) -> QtWidgets.QWidget:
+        col = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(col)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(12)
+
+        src = self._panel("Input · step 7 result")
+        grid = QtWidgets.QGridLayout(src)
+        self.step8_step7_edit = QtWidgets.QLineEdit()
+        self.step8_step7_edit.setPlaceholderText("calib_step7_result_*.json")
+        browse = QtWidgets.QPushButton("Browse")
+        browse.clicked.connect(lambda: self._browse_open_into(
+            self.step8_step7_edit, "Select step-7 result",
+            "JSON Files (*.json)"))
+        grid.addWidget(QtWidgets.QLabel("Step 7 JSON"), 0, 0)
+        grid.addWidget(self.step8_step7_edit, 0, 1)
+        grid.addWidget(browse, 0, 2)
+        self.step8_step7_note = self._caption(
+            "That one file is the whole forward model: its embedded step 3 is "
+            "the layout, step 6 the etas, step 7 the phases.")
+        grid.addWidget(self.step8_step7_note, 1, 0, 1, 3)
+        box.addWidget(src)
+
+        sweep = self._panel("Sweep")
+        grid = QtWidgets.QGridLayout(sweep)
+        self.step8_ladder = self._spin(16, 400, STEP8.LADDER)
+        self.step8_ladder.setToolTip(
+            "Patterns across the scale, one per stratum of [0, Y_max], each a "
+            "fresh random drive. The closed-form full-scale drive is added at "
+            "both ends on top of these, and is where the fit gets its leverage."
+        )
+        self.step8_ladder.valueChanged.connect(self._step8_update_estimate)
+        grid.addWidget(QtWidgets.QLabel("Ladder rungs"), 0, 0)
+        grid.addWidget(self.step8_ladder, 0, 1)
+
+        self.step8_daq_channel = QtWidgets.QLineEdit("ai0")
+        grid.addWidget(QtWidgets.QLabel("DAQ channel"), 1, 0)
+        grid.addWidget(self.step8_daq_channel, 1, 1)
+
+        self.step8_daq_rate = QtWidgets.QDoubleSpinBox()
+        self.step8_daq_rate.setRange(1.0, 2_000_000.0)
+        self.step8_daq_rate.setDecimals(0)
+        self.step8_daq_rate.setValue(1000.0)
+        self.step8_daq_rate.setSuffix(" S/s")
+        grid.addWidget(QtWidgets.QLabel("Sample rate"), 2, 0)
+        grid.addWidget(self.step8_daq_rate, 2, 1)
+
+        self.step8_daq_fcut = self._double_spin(0.1, 100_000.0, 20.0, " Hz", 1)
+        grid.addWidget(QtWidgets.QLabel("Detector BW"), 3, 0)
+        grid.addWidget(self.step8_daq_fcut, 3, 1)
+
+        self.step8_pmt = QtWidgets.QCheckBox("Log PMT thermistor (Keithley 2400)")
+        self.step8_pmt.setToolTip(
+            "Adds pmt_ohm_Ohm and pmt_c beside every read. Do not enable this "
+            "while anything else is talking to the 2400 -- one GPIB bus, one "
+            "instrument.")
+        grid.addWidget(self.step8_pmt, 4, 0, 1, 2)
+        box.addWidget(sweep)
+
+        run = self._panel("Run")
+        grid = QtWidgets.QGridLayout(run)
+        self.step8_run_button = QtWidgets.QPushButton("Run Sweep")
+        self.step8_run_button.clicked.connect(self._step8_run)
+        self.step8_stop_button = QtWidgets.QPushButton("Stop")
+        self.step8_stop_button.setEnabled(False)
+        self.step8_stop_button.clicked.connect(self._step8_stop)
+        self.step8_refit_button = QtWidgets.QPushButton("Re-fit a CSV\N{HORIZONTAL ELLIPSIS}")
+        self.step8_refit_button.clicked.connect(self._step8_refit)
+        grid.addWidget(self.step8_run_button, 0, 0)
+        grid.addWidget(self.step8_stop_button, 0, 1)
+        grid.addWidget(self.step8_refit_button, 1, 0, 1, 2)
+        self.step8_estimate = self._caption("")
+        grid.addWidget(self.step8_estimate, 2, 0, 1, 2)
+        self.step8_status = QtWidgets.QLabel("Idle")
+        self.step8_status.setWordWrap(True)
+        grid.addWidget(self.step8_status, 3, 0, 1, 2)
+        box.addWidget(run)
+
+        box.addStretch(1)
+        self._step8_update_estimate()
+        return col
+
+    def _build_step8_results(self) -> QtWidgets.QWidget:
+        col = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(col)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(12)
+
+        self.step8_result_text = QtWidgets.QPlainTextEdit()
+        self.step8_result_text.setReadOnly(True)
+        self.step8_result_text.setMaximumHeight(190)
+        self.step8_result_text.setPlaceholderText(
+            "The fitted Y_sat lands here, with the predicted-vs-measured full "
+            "scale and the gain lever.")
+        box.addWidget(self._panel_with_widget("Fit", self.step8_result_text))
+
+        self.step8_plot_label = QtWidgets.QLabel(
+            "The report renders here once the sweep has been fitted.")
+        self.step8_plot_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.step8_plot_label.setMinimumHeight(360)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.step8_plot_label)
+        box.addWidget(self._panel_with_widget("Report", scroll), 1)
+        return col
+
+    # ---- plan and estimate -------------------------------------------------
+    def _step8_step7_path(self) -> Path:
+        text = self.step8_step7_edit.text().strip()
+        if not text:
+            raise ValueError("Pick a step-7 result JSON first.")
+        path = Path(text)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} does not exist")
+        return path
+
+    def _step8_update_estimate(self) -> None:
+        """Reads and minutes, before the bench is asked for anything.
+
+        Only the count and the windows, not the solved plan: solving the ladder
+        takes seconds and this runs on every spinbox tick.
+        """
+        n = self.step8_ladder.value() + 2
+        mid = (STEP8.T_BOTH_DIM_S + STEP8.T_BOTH_BRIGHT_S) / 2 + STEP8.ACQ.settle_s
+        self.step8_estimate.setText(
+            f"{n} reads, roughly {n * mid / 60:.0f} min "
+            f"(windows run {STEP8.T_BOTH_DIM_S:g} s at the bottom of the scale "
+            f"to {STEP8.T_BOTH_BRIGHT_S:g} s at the top)")
+
+    def _step8_set_running(self, running: bool) -> None:
+        self.step8_run_button.setEnabled(not running)
+        self.step8_refit_button.setEnabled(not running)
+        self.step8_stop_button.setEnabled(running)
+        self.step8_ladder.setEnabled(not running)
+
+    def _step8_stop(self) -> None:
+        if getattr(self, "step8_stop_event", None) is not None:
+            self.step8_stop_event.set()
+            self.step8_status.setText("Stopping after the current read\N{HORIZONTAL ELLIPSIS}")
+
+    # ---- the run -----------------------------------------------------------
+    def _step8_run(self) -> None:
+        try:
+            step7 = self._step8_step7_path()
+            models, phases, _ref = verify_load_forward_model(step7)
+            pairs = sorted(models)
+            seed = int(np.random.SeedSequence().entropy % 2**32)
+            scale, patterns, preds = STEP8.build(
+                models, phases, pairs, seed=seed,
+                ladder=self.step8_ladder.value())
+            layout = STEP8.load_layout(step7, pairs)
+        except (ValueError, FileNotFoundError) as exc:
+            self.step8_status.setText(str(exc))
+            return
+        except Exception as exc:                      # noqa: BLE001
+            self.step8_status.setText(f"Step 7: {exc}")
+            return
+
+        daq = self.daq_controller
+        if daq is None or not daq.is_connected:
+            self.step8_status.setText("Connect the DAQ first (DAQ page).")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.step8_status.setText("Open the SLM on the SLM Control page first.")
+            return
+
+        acq = STEP8.ACQ
+        t_both = STEP8.read_window(preds)
+        secs = STEP8.run_seconds(preds, t_both)
+        settings = DAQMonitorSettings(
+            channel=self.step8_daq_channel.text().strip() or "ai0",
+            sample_rate=self.step8_daq_rate.value(),
+            duration=acq.t_both_s, single_duration=acq.t_single_s,
+            hold=0.0,                       # run_patterns owns the settle
+            min_val=-acq.range_v, max_val=acq.range_v,
+            f_cut=self.step8_daq_fcut.value(),
+        )
+
+        out = Path(STEP8.OUT_DIR)
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%m%d_%H%M")
+        coh = [float(verify_predict(models, phases, pairs, p.x, p.w, coherent=True))
+               for p in patterns]
+        x = np.stack([p.x for p in patterns])[None]
+        w = np.stack([p.w for p in patterns])[None]
+        extra = [[{"kind": p.kind, "label": p.label, "seq": i,
+                   "target_alpha": f"{p.target_alpha:.6f}",
+                   "alpha": f"{p.alpha:.6f}",
+                   "coherent_v": f"{c:.9g}", "sb_pred_v": f"{q - c:.9g}",
+                   "t_both_s": f"{t_both(q):.3f}"}
+                  for i, (p, c, q) in enumerate(zip(patterns, coh, preds))]]
+
+        self.step8_status.setText(
+            f"Running\N{HORIZONTAL ELLIPSIS} {len(patterns)} reads, "
+            f"~{secs / 60:.0f} min, Y_max {scale.fs * 1e3:.1f} mV")
+        self._step8_set_running(True)
+        self._open_calibration_dialog(on_stop=self._step8_stop)
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.note([
+                f"{len(patterns)} reads \N{MIDDLE DOT} ladder "
+                f"{self.step8_ladder.value()} + 2 at full scale",
+                f"Y_max {scale.fs * 1e3:.3f} mV \N{MIDDLE DOT} 4-bit step "
+                f"{scale.fs / 15 * 1e3:.3f} mV",
+                "Predictions are LINEAR: this run fits Y_sat, so it assumes none.",
+            ])
+
+        stop_event = threading.Event()
+        self.step8_stop_event = stop_event
+        pmt = open_pmt(enabled=self.step8_pmt.isChecked(),
+                       log=lambda m: self._log(f"[step 8] {m}"))
+
+        def work() -> dict[str, Any]:
+            daq.configure_monitor(settings)
+            rows: list[dict] = []
+            meta = {"n_pairs": len(pairs), "y_max_v": scale.fs}
+            columns: list[str] = []
+            status = "complete"
+            if pmt is not None:
+                columns = list(pmt.COLUMNS)
+                meta.update({f"{k}_start": v for k, v in pmt.read().items()})
+            try:
+                run_patterns(daq, controller, layout, [tuple(pairs)], x, w,
+                             models, phases, rows=rows, acq=acq, extra=extra,
+                             y_sat=None, t_both_of=t_both, row_hook=pmt,
+                             stop_event=stop_event,
+                             log=lambda m: self._log(f"[step 8] {m}"))
+            except PatternsAborted as exc:
+                status = f"partial ({exc})"
+            finally:
+                if pmt is not None:
+                    meta.update({f"{k}_end": v for k, v in pmt.read().items()})
+            if not rows:
+                return {"status": status, "csv": None}
+            csv_path = verify_write_csv(
+                out / f"calib_step8_{stamp}.csv", pairs, rows,
+                meta={"step7_json": Path(step7).resolve(), "seed": seed,
+                      "status": status, **meta},
+                extra=["kind", "label", "seq", "target_alpha", "alpha",
+                       "coherent_v", "sb_pred_v", "t_both_s", *columns])
+            result = STEP8.fit_and_write(
+                csv_path, step7, out_dir=out,
+                log=lambda m: self._log(f"[step 8] {m}"))
+            return {"status": status, "csv": csv_path, "result": result}
+
+        self._run_slm_task("Step 8 saturation sweep", work,
+                           self._step8_finished, self._step8_error)
+
+    def _step8_refit(self) -> None:
+        """Fit a CSV that is already on disk -- no hardware, no sweep."""
+        try:
+            step7 = self._step8_step7_path()
+        except (ValueError, FileNotFoundError) as exc:
+            self.step8_status.setText(str(exc))
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select a step-8 CSV", str(STEP8.OUT_DIR), "CSV Files (*.csv)")
+        if not path:
+            return
+        self._step8_set_running(True)
+        self.step8_status.setText(f"Fitting {Path(path).name}\N{HORIZONTAL ELLIPSIS}")
+
+        def work() -> dict[str, Any]:
+            return {"status": "complete", "csv": Path(path),
+                    "result": STEP8.fit_and_write(
+                        path, step7, out_dir=Path(path).parent,
+                        log=lambda m: self._log(f"[step 8] {m}"))}
+
+        self._run_task("Step 8 re-fit", work,
+                       self._step8_finished, self._step8_error)
+
+    def _step8_finished(self, payload: dict[str, Any]) -> None:
+        self.step8_stop_event = None
+        self._step8_set_running(False)
+        csv_path = payload.get("csv")
+        if csv_path is None:
+            self.step8_status.setText("Stopped before the first read; nothing written.")
+            if self.calibration_dialog is not None:
+                self.calibration_dialog.finish(False, "Nothing was read")
+            return
+
+        result = payload["result"]
+        partial = not str(payload.get("status", "")).startswith("complete")
+        lines: list[str] = []
+        step8_print_result(result, log=lines.append)
+        if partial:
+            lines.insert(0, f"RUN WAS {payload['status'].upper()} -- the fit below "
+                            f"is on what was read before it stopped.")
+        self.step8_result_text.setPlainText("\n".join(lines).strip())
+
+        self._step8_show_png(Path(result["png"]))
+        self.step8_status.setText(
+            f"Y_sat = {result['y_sat_v']:.4f} \N{PLUS-MINUS SIGN} "
+            f"{result['sigma_v']:.4f} V"
+            + ("  (LIMIT: the sweep could not bound it)" if result["unbounded"] else "")
+            + f"  \N{MIDDLE DOT} {Path(csv_path).name}")
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.finish(
+                not partial and not result["unbounded"],
+                f"Y_sat = {result['y_sat_v']:.4f} V")
+
+    def _step8_show_png(self, png: Path) -> None:
+        if not png.exists():
+            self.step8_plot_label.setText(f"{png.name} was not written")
+            return
+        pixmap = QtGui.QPixmap(str(png))
+        if pixmap.isNull():
+            self.step8_plot_label.setText(f"{png.name} could not be rendered")
+            return
+        self.step8_plot_label.setPixmap(pixmap.scaledToWidth(
+            max(720, self.step8_plot_label.width()),
+            QtCore.Qt.SmoothTransformation))
+
+    def _step8_error(self, _error: str) -> None:
+        self.step8_stop_event = None
+        self._step8_set_running(False)
+        self.step8_status.setText("Saturation sweep failed (see Status log)")
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.finish(False, "Saturation sweep failed")
 
     # ---- results table -----------------------------------------------------
     def _tpa_phase_fill_table(self) -> None:

@@ -98,9 +98,9 @@ STEPS = {
         "in_flag": "--step6", "pairs_attr": "TGT_INDICES", "pairs_flag": "--targets",
         "ref_flag": "--ref",
         "result_glob": "calib_step7_result_*.json"},
-    8: {"module": "calib_npair_verify", "out_attr": "OUT_DIR",
-        "in_flag": "--step7", "pairs_attr": "PAIRS", "n_flag": "--n",
-        "result_glob": None},
+    8: {"module": "calib_step8", "out_attr": "OUT_DIR",
+        "in_flag": "--step7", "pairs_attr": "PAIRS",
+        "result_glob": "calib_step8_result_*.json"},
 }
 
 

@@ -132,7 +132,9 @@ class RunnerPassesTheFlagsTests(_TmpCase):
             "calib_step7_v2": SimpleNamespace(
                 CALIB_PATH=None, TGT_INDICES=[], CONFIG=PhaseV2Config(ref_index=1),
                 main=fake(7, "calib_step7_result_0000_0000.json")),
-            "calib_npair_verify": SimpleNamespace(OUT_DIR=None, PAIRS=[], main=fake(8, None)),
+            "calib_step8": SimpleNamespace(
+                OUT_DIR=None, PAIRS=[],
+                main=fake(8, "calib_step8_result_0000_0000.json")),
         }
         patch = mock.patch.object(self.runner, "_load_step", lambda stem: self.mods[stem])
         patch.start()

@@ -1,7 +1,7 @@
 """Drives that land on a chosen fraction of full scale -- the system-accuracy patterns.
 
-Step 8 drives ``x_k, w_k`` uniform in a box.  With ten pairs that is useless for
-anything but the bottom of the scale: ``E = sum_k z_k`` is a random phasor sum,
+Driving ``x_k, w_k`` uniform in a box -- what the n-pair verification this
+module replaced did -- is useless for anything but the bottom of the scale: ``E = sum_k z_k`` is a random phasor sum,
 so ``|E|^2`` concentrates near the INCOHERENT value ``sum_k |z_k|^2`` ~ Y_max/10.
 Measured on the 0911 runs, uniform drives give ``Y/Y_max`` a mean of 0.096 and
 ``P(Y > 0.5 Y_max) = 5e-6`` -- the 0911 10-pair run covered 4..24 % of full
@@ -9,14 +9,20 @@ scale, seven of its eight patterns below 10 %.  A 4-bit computation has to
 divide the WHOLE scale into sixteen levels, so it has to be verified over the
 whole scale.
 
-This module builds the three pattern families ``system_accuracy.py`` drives:
+This module builds the pattern families the level sweeps drive:
 
-    A  level_patterns    one pattern per stratum of [0, Y_max], each a fresh
-                         random drive -- model error against level
-    B  repeat_patterns   ONE drive per level, repeated -- readout reproducibility
-                         against level, which is the 4-bit noise budget
-    C  psi_scan_patterns the support-optimal drive for a fan of projection axes
-                         -- where full scale actually is, and the phase error
+    A  level_patterns      one pattern per stratum of [0, Y_max], each a fresh
+                           random drive -- model error against level
+    F  full_scale_pattern  the closed-form drive that reaches Y_max exactly --
+                           the ceiling, measured rather than predicted
+    B  repeat_patterns     ONE drive per level, repeated -- readout
+                           reproducibility, the 4-bit noise budget
+    C  psi_scan_patterns   the support-optimal drive for a fan of projection
+                           axes -- where full scale is, and the phase error
+
+``calib_step8.py`` drives A and F: one free parameter, Y_sat, and the ceiling
+is where the whole of its leverage lives.  B and C are kept because runs on
+disk contain them and ``levels_report.py`` still reads those.
 
 Only A needs solving.  Given a target ``alpha``, roll a uniform random drive and
 move it as little as possible until it predicts ``alpha * Y_max``::
@@ -84,10 +90,7 @@ __all__ = [
     "level_patterns",
     "repeat_patterns",
     "psi_scan_patterns",
-    "loo_subsets",
-    "subset_tag",
-    "pad_to_pool",
-    "loo_patterns",
+    "full_scale_pattern",
 ]
 
 #: ``u = asin sqrt(x)`` for ``x`` in [0, 1], so the box is [0, pi/2] per knob.
@@ -108,7 +111,7 @@ class Pattern:
     the CSV so a row can be traced back to the family that produced it.
     """
 
-    kind: str                   # "A" ladder, "B" repeats, "C" psi scan
+    kind: str                   # "A" ladder, "B" repeats, "C" psi scan, "F" ceiling
     x: np.ndarray
     w: np.ndarray
     alpha: float
@@ -332,6 +335,35 @@ def level_patterns(models: Mapping[int, PairModel], phases: Mapping[int, float],
 
 
 # ======================================================================
+# F -- the ceiling
+# ======================================================================
+
+def full_scale_pattern(models: Mapping[int, PairModel], phases: Mapping[int, float],
+                       driven: Sequence[int], *, label: str = "FS") -> Pattern:
+    """The closed-form drive that reaches ``Y_max`` exactly -- the top of the scale.
+
+    :func:`level_patterns` deliberately stops short of ``alpha = 1``: at exactly
+    1 the level set is a single point, so there is no random drive to find and
+    its top stratum only ever APPROACHES the ceiling.  That single point is
+    this one, and it needs no solver -- :func:`attenuated_drive` at
+    ``alpha = 1`` is the ``Y_max`` ray itself.
+
+    Driving it is what turns a PREDICTED full scale into a measured one.  It is
+    also where a saturation fit has nearly all of its leverage: the curvature
+    the fit is looking for grows with ``|E|^2`` and vanishes at the bottom of
+    the scale, so a sweep that never reaches the ceiling cannot bound ``Y_sat``.
+    """
+    scale = _scale_of(models, phases, driven)
+    drive = attenuated_drive(scale, 1.0)
+    x, w = _round_drive(drive, drive)
+    eta = np.asarray(scale.amplitudes, dtype=float)
+    phi = np.asarray(scale.phases, dtype=float)
+    return Pattern(kind="F", x=x, w=w,
+                   alpha=_achieved(x, w, eta, phi, scale.fs),
+                   label=label, target_alpha=1.0, exact=True)
+
+
+# ======================================================================
 # B -- the repeats
 # ======================================================================
 
@@ -445,79 +477,3 @@ def psi_scan_patterns(models: Mapping[int, PairModel], phases: Mapping[int, floa
                            alpha=_achieved(x, w, eta, phi, scale.fs),
                            label=f"C{off:+.0f}deg", psi_deg=np.degrees(scale.psi) + off))
     return out
-
-
-# ======================================================================
-# leave-one-out: the same ladder on several pair subsets
-# ======================================================================
-#
-# The question is whether one pair's calibration is dragging the machine down.
-# Running its subset alone cannot answer it: every subset has its own Y_max, so
-# a residual in mV is on a different scale in every run, and dropping a BRIGHT
-# pair shrinks the level step enough to look like a calibration failure on its
-# own.  Running ALL the leave-one-out subsets fixes that -- the other nine are
-# the null distribution for the tenth, and the Y_max trend is visible across
-# them rather than confounded with the one comparison being made.
-#
-# They also have to be driven INTERLEAVED, not one subset after another.  Eleven
-# ladders back to back is two hours end to end; any drift over that window lands
-# straight on the subset axis, which is the axis being measured.  Shuffled
-# together, drift is common mode.  Padding (below) is what makes that possible:
-# every read drives the same ten slots, so the whole sweep is one block.
-
-def loo_subsets(pool: Sequence[int]) -> list[tuple[int, ...]]:
-    """The full ``pool`` first, then the pool minus each pair in turn."""
-    pool = tuple(int(k) for k in pool)
-    return [pool] + [tuple(k for k in pool if k != m) for m in pool]
-
-
-def subset_tag(sub: Sequence[int], pool: Sequence[int]) -> str:
-    """``"all"``, or ``"drop7"`` / ``"drop1+10"`` for what ``sub`` leaves out."""
-    out = [str(k) for k in pool if k not in set(sub)]
-    return "all" if not out else "drop" + "+".join(out)
-
-
-def pad_to_pool(p: Pattern, sub: Sequence[int], pool: Sequence[int]) -> Pattern:
-    """``p``, solved on ``sub``, re-expressed over ``pool`` with the rest at zero.
-
-    A pair at ``x = w = 0`` contributes no field (``eta sqrt(xw) = 0``) and no
-    single-beam background (``a_x x + q_x x^2 + ... = 0``), so the padded pattern
-    predicts exactly what it predicted on the subset.  It also DISPLAYS the same
-    thing: ``run_patterns`` starts each frame from zeros and fills only the slots
-    it is handed, so writing 0.0 into a slot and omitting it are the same array.
-    """
-    idx = {int(k): i for i, k in enumerate(pool)}
-    x, w = np.zeros(len(pool)), np.zeros(len(pool))
-    for i, k in enumerate(sub):
-        x[idx[int(k)]], w[idx[int(k)]] = p.x[i], p.w[i]
-    return replace(p, x=x, w=w)
-
-
-def loo_patterns(models: Mapping[int, PairModel], phases: Mapping[int, float],
-                 pool: Sequence[int], count: int, *, seed: int,
-                 alpha_hi: float = 0.995,
-                 subsets: Sequence[Sequence[int]] | None = None,
-                 ) -> tuple[list[tuple[int, ...]], dict[str, FullScale], list[Pattern]]:
-    """``(subsets, scales, patterns)`` -- ``count`` A patterns for every subset.
-
-    Every subset gets the same seed, so the stratum grid and the random starts
-    are matched: two subsets' ladders ask for the same fractions of their own
-    full scales, in the same order, and a difference between them is not
-    sampling.  ``patterns`` come back padded to ``pool`` and tagged in ``label``
-    as ``A/<tag>/<i>``; ``scales[tag].fs`` is that subset's own ``Y_max``, which
-    is the only thing its residuals can be divided by.
-    """
-    pool = [int(k) for k in pool]
-    subs = [tuple(int(k) for k in s) for s in
-            (loo_subsets(pool) if subsets is None else subsets)]
-    scales: dict[str, FullScale] = {}
-    out: list[Pattern] = []
-    for sub in subs:
-        tag = subset_tag(sub, pool)
-        scales[tag] = full_scale({k: models[k] for k in sub},
-                                 {k: phases[k] for k in sub}, sub)
-        for i, p in enumerate(level_patterns(models, phases, sub, count,
-                                             seed=seed, alpha_hi=alpha_hi)):
-            out.append(replace(pad_to_pool(p, sub, pool),
-                               label=f"A/{tag}/{i:03d}"))
-    return subs, scales, out

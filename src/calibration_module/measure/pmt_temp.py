@@ -1,6 +1,6 @@
 """The PMT thermistor (Keithley 2400) as a per-row column for any calibration step.
 
-Split out of ``steps/system_accuracy.py`` so steps 6, 7 and the accuracy run all
+Split out of the step-8 sweep so steps 6, 7 and 8 all
 stamp their rows from one implementation -- a temperature logged beside a step-6
 eta and one logged beside an accuracy read must be the same measurement, or
 comparing them across steps is meaningless.

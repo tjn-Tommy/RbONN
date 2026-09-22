@@ -8,6 +8,7 @@ columns coming back misaligned -- shows up there as a non-zero residual.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -22,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from calibration_module.fit import levels, levels_report as R, verify as V  # noqa: E402
-from calibration_module.steps import calib_npair_verify as S8  # noqa: E402
-from calibration_module.steps import system_accuracy as SA  # noqa: E402
+from calibration_module.measure import patterns as S8  # noqa: E402
+from calibration_module.steps import calib_step8 as SA  # noqa: E402
 from calibration_module.fit import pair_v2 as P6, phase as PH  # noqa: E402
 from calibration_module.fit.pair import load_tpa_pair_csv  # noqa: E402
 from calibration_module.measure.pmt_temp import open_pmt  # noqa: E402
@@ -82,21 +83,36 @@ class BuildTests(unittest.TestCase):
             cls.models, cls.phases, cls.pairs, seed=101)
 
     def counts(self):
-        return {k: sum(1 for p in self.patterns if p.kind == k) for k in "ABC"}
+        return {k: sum(1 for p in self.patterns if p.kind == k) for k in "ABCF"}
 
-    def test_every_family_is_present(self):
+    def test_the_sweep_is_the_ladder_and_the_ceiling_and_nothing_else(self):
         c = self.counts()
         self.assertEqual(c["A"], SA.LADDER)
-        self.assertEqual(c["B"], len(SA.REPEAT_ALPHAS) * SA.REPEATS)
-        self.assertEqual(c["C"], 2 * len(levels.PSI_OFFSETS_DEG))
+        self.assertEqual(c["F"], 2)
+        self.assertEqual(c["B"], 0)
+        self.assertEqual(c["C"], 0)
 
-    def test_the_scan_brackets_the_run(self):
-        n = len(levels.PSI_OFFSETS_DEG)
-        self.assertTrue(all(p.kind == "C" for p in self.patterns[:n]))
-        self.assertTrue(all(p.kind == "C" for p in self.patterns[-n:]))
-        self.assertTrue(all(p.label.endswith("@start") for p in self.patterns[:n]))
-        self.assertTrue(all(p.label.endswith("@end") for p in self.patterns[-n:]))
-        self.assertFalse(any(p.kind == "C" for p in self.patterns[n:-n]))
+    def test_the_ceiling_brackets_the_run(self):
+        self.assertEqual(self.patterns[0].kind, "F")
+        self.assertEqual(self.patterns[-1].kind, "F")
+        self.assertTrue(self.patterns[0].label.endswith("@start"))
+        self.assertTrue(self.patterns[-1].label.endswith("@end"))
+        self.assertFalse(any(p.kind == "F" for p in self.patterns[1:-1]))
+
+    def test_the_ceiling_is_exactly_full_scale(self):
+        """The fit lives at the top, so the top has to BE the top."""
+        for p in (self.patterns[0], self.patterns[-1]):
+            self.assertAlmostEqual(p.alpha, 1.0, places=6)
+            self.assertTrue(p.exact)
+        # and both ends drive the identical frame, or the drift bracket is not one
+        np.testing.assert_array_equal(self.patterns[0].x, self.patterns[-1].x)
+        np.testing.assert_array_equal(self.patterns[0].w, self.patterns[-1].w)
+
+    def test_the_ladder_reaches_the_ceiling(self):
+        """alpha_hi is 1 now: the psi scan used to own the top and is gone."""
+        self.assertEqual(SA.LADDER_ALPHA_MAX, 1.0)
+        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
+        self.assertGreater(alpha.max(), 0.97)
 
     def test_the_ladder_is_not_in_level_order(self):
         """Ascending order would alias drift onto the level axis."""
@@ -104,17 +120,6 @@ class BuildTests(unittest.TestCase):
         self.assertFalse(alpha == sorted(alpha))
         # and not merely reversed either
         self.assertGreater(np.mean(np.abs(np.diff(alpha))), 0.2)
-
-    def test_the_repeats_are_spread_through_the_run(self):
-        pos = {}
-        for i, p in enumerate(self.patterns):
-            if p.kind == "B":
-                pos.setdefault(p.target_alpha, []).append(i)
-        for alpha, where in pos.items():
-            self.assertEqual(len(where), SA.REPEATS)
-            gaps = np.diff(where)
-            # evenly spread: no repeat may sit adjacent to its neighbour
-            self.assertGreater(gaps.min(), len(self.patterns) / (2 * SA.REPEATS))
 
     def test_the_ladder_covers_the_scale(self):
         alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
@@ -137,19 +142,28 @@ class CollectTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.models, cls.phases, cls.pairs = model()
-        # The fake bench reads instantly, so the whole plan runs here -- a
-        # truncated one would cut B down to a single repeat per level.
+        # The fake bench reads instantly, so the whole plan runs here.
         cls.scale, cls.patterns, cls.preds = SA.build(
             cls.models, cls.phases, cls.pairs, seed=7)
+        # Step 8 drives A and F only, but levels_report.py still has to read the
+        # A+B+C runs already on disk, so those paths are exercised against a
+        # plan built here rather than against one the step can still produce.
+        scan = levels.psi_scan_patterns(cls.models, cls.phases, cls.pairs)
+        cls.legacy = (
+            [replace(q, label=q.label + "@start") for q in scan]
+            + levels.level_patterns(cls.models, cls.phases, cls.pairs, 12, seed=7)
+            + levels.repeat_patterns(cls.models, cls.phases, cls.pairs,
+                                     (0.25, 0.75), 4, seed=8)
+            + [replace(q, label=q.label + "@end") for q in scan])
 
     def setUp(self):
         self.layout = SimpleNamespace(n_channels=len(self.pairs))
-        self.acq = replace(S8.ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0)
+        self.acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0)
 
-    def _collect(self, noise=0.0):
+    def _collect(self, noise=0.0, pats=None):
         slm = _FakeSLM()
         daq = _FakeDAQ(slm, self.models, self.phases, noise=noise)
-        pats = self.patterns
+        pats = self.patterns if pats is None else pats
         x = np.stack([p.x for p in pats])[None]
         w = np.stack([p.w for p in pats])[None]
         coh = [float(V.predict(self.models, self.phases, self.pairs, p.x, p.w,
@@ -166,9 +180,9 @@ class CollectTests(unittest.TestCase):
                         encode=_encode, log=lambda _: None, extra=extra)
         return rows
 
-    def _report(self, rows, tmp):
+    def _report(self, rows, tmp, name="calib_step8_test"):
         path = V.write_verify_csv(
-            Path(tmp) / "system_accuracy_test.csv", self.pairs, rows,
+            Path(tmp) / f"{name}.csv", self.pairs, rows,
             meta={"step7_json": STEP7, "y_max_v": self.scale.fs, "status": "complete"},
             extra=["kind", "label", "seq", "target_alpha", "alpha",
                    "coherent_v", "sb_pred_v"])
@@ -218,7 +232,7 @@ class CollectTests(unittest.TestCase):
         self.assertGreater(len(spanned), 1, "the ladder should span several ranges")
 
     def test_repeats_of_one_drive_are_one_group(self):
-        rows = self._collect(noise=1e-4)
+        rows = self._collect(noise=1e-4, pats=self.legacy)
         with tempfile.TemporaryDirectory() as tmp:
             reads, _ = self._report(rows, tmp)
         for alpha, ys in R.repeat_spread(reads):
@@ -227,7 +241,7 @@ class CollectTests(unittest.TestCase):
 
     def test_a_perfect_bench_puts_full_scale_where_the_model_says(self):
         """C's fit must recover shift 0 and scale 1 when nothing is wrong."""
-        rows = self._collect()
+        rows = self._collect(pats=self.legacy)
         with tempfile.TemporaryDirectory() as tmp:
             reads, _ = self._report(rows, tmp)
         peak = R.psi_peak(reads)
@@ -238,7 +252,7 @@ class CollectTests(unittest.TestCase):
 
     def test_a_phase_error_shows_up_as_a_shifted_peak(self):
         """The zero above is only worth something if a real error moves it."""
-        rows = self._collect()
+        rows = self._collect(pats=self.legacy)
         with tempfile.TemporaryDirectory() as tmp:
             reads, _ = self._report(rows, tmp)
         c = reads.kind == "C"
@@ -252,7 +266,7 @@ class CollectTests(unittest.TestCase):
         self.assertAlmostEqual(peak["start"]["peak_deg"], 10.0, places=1)
 
     def test_the_report_writes_a_png(self):
-        rows = self._collect(noise=1e-4)
+        rows = self._collect(noise=1e-4, pats=self.legacy)
         with tempfile.TemporaryDirectory() as tmp:
             path = V.write_verify_csv(
                 Path(tmp) / "system_accuracy_test.csv", self.pairs, rows,
@@ -261,6 +275,109 @@ class CollectTests(unittest.TestCase):
                        "coherent_v", "sb_pred_v"])
             R.report_csv(path, STEP7, out_dir=tmp)
             self.assertTrue((Path(tmp) / "system_accuracy_test_report.png").exists())
+
+
+class YSatFitTests(unittest.TestCase):
+    """The one number step 8 exists to produce."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models, cls.phases, cls.pairs = model()
+        cls.scale, cls.patterns, cls.preds = SA.build(
+            cls.models, cls.phases, cls.pairs, seed=11, ladder=40)
+        cls.pred = np.array([float(V.predict(cls.models, cls.phases, cls.pairs,
+                                             p.x, p.w, coherent=True))
+                             for p in cls.patterns])
+
+    def test_it_recovers_a_y_sat_it_was_given(self):
+        """Saturate a perfect bench by hand; the fit must find the constant back."""
+        for truth in (3.0, 5.0, 12.0):
+            got = V.fit_y_sat(V.saturate(self.pred, truth), self.pred)
+            self.assertAlmostEqual(got["y_sat_v"], truth, places=2)
+            self.assertLess(got["rmse_v"], 1e-5)      # 0.01 mV: grid resolution
+            self.assertFalse(got["unbounded"])
+
+    def test_noise_widens_the_interval_but_keeps_the_answer(self):
+        rng = np.random.default_rng(0)
+        y = V.saturate(self.pred, 5.0) + rng.normal(0, 2e-3, self.pred.size)
+        got = V.fit_y_sat(y, self.pred, np.full(self.pred.size, 2e-3))
+        self.assertLess(abs(got["y_sat_v"] - 5.0), 5 * got["sigma_v"])
+        self.assertGreater(got["sigma_v"], 0.0)
+        self.assertLess(got["lo_v"], 5.0)
+        self.assertGreater(got["hi_v"], 5.0)
+
+    def test_a_dim_sweep_cannot_bound_it_and_says_so(self):
+        """The whole reason the ladder now runs to alpha = 1.
+
+        The curvature grows with |E|^2, so at the bottom of the scale it sits
+        under the noise and no fit there can bound Y_sat.  Same noise, same
+        model, same number of reads -- only the brightness differs, and that
+        alone decides whether the answer is a measurement or a limit.
+        """
+        rng = np.random.default_rng(3)
+        noise = 2e-3                            # what the bench actually delivers
+        for scale, want_unbounded in ((0.02, True), (1.0, False)):
+            dim = self.pred * scale
+            y = V.saturate(dim, 5.0) + rng.normal(0, noise, dim.size)
+            got = V.fit_y_sat(y, dim, np.full(dim.size, noise))
+            self.assertEqual(got["unbounded"], want_unbounded,
+                             f"at {100 * scale:g} % of full scale")
+
+    def test_the_gain_lever_is_reported(self):
+        """A g=1 Y_sat is levered by Y_sat/Y_max; the caller has to be told."""
+        got = V.fit_y_sat(V.saturate(self.pred, 5.0), self.pred)
+        self.assertAlmostEqual(got["gain_lever"],
+                               got["y_sat_v"] / self.pred.max(), places=9)
+        self.assertAlmostEqual(got["gain_lever"], 5.0 / self.pred.max(), places=2)
+        self.assertGreater(got["gain_lever"], 5.0)
+
+    def test_the_ceiling_reads_give_measured_full_scale(self):
+        """F is what turns a predicted Y_max into a measured one."""
+        truth = 5.0
+        slm = _FakeSLM()
+        daq = _FakeDAQ(slm, self.models, self.phases, noise=0.0)
+        layout = SimpleNamespace(n_channels=len(self.pairs))
+        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0)
+        x = np.stack([p.x for p in self.patterns])[None]
+        w = np.stack([p.w for p in self.patterns])[None]
+        full = [float(V.predict(self.models, self.phases, self.pairs, p.x, p.w))
+                for p in self.patterns]
+        extra = [[{"kind": p.kind, "label": p.label, "seq": i,
+                   "target_alpha": f"{p.target_alpha:.6f}", "alpha": f"{p.alpha:.6f}",
+                   "coherent_v": f"{c:.9g}", "sb_pred_v": f"{q - c:.9g}"}
+                  for i, (p, c, q) in enumerate(zip(self.patterns, self.pred, full))]]
+        rows: list[dict] = []
+        S8.run_patterns(daq, slm, layout, [tuple(self.pairs)], x, w,
+                        self.models, self.phases, rows=rows, acq=acq,
+                        encode=_encode, log=lambda _: None, extra=extra)
+        # the fake bench is linear, so saturate its coherent reads by hand
+        for row, c in zip(rows, self.pred):
+            row["mean_v"] = row["dark_v"] + V.saturate(c, truth) + (row["pred_v"] - c)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = V.write_verify_csv(
+                Path(tmp) / "calib_step8_0000_0000.csv", self.pairs, rows,
+                meta={"step7_json": STEP7, "y_max_v": self.scale.fs,
+                      "status": "complete"},
+                extra=["kind", "label", "seq", "target_alpha", "alpha",
+                       "coherent_v", "sb_pred_v"])
+            result = SA.fit_and_write(path, STEP7, out_dir=tmp, log=lambda *_: None)
+            written = json.loads(
+                (Path(tmp) / "calib_step8_result_0000_0000.json").read_text())
+            self.assertTrue((Path(tmp) / "calib_step8_0000_0000_ysat.png").exists())
+
+        self.assertAlmostEqual(result["y_sat_v"], truth, places=2)
+        fs = result["full_scale"]
+        self.assertEqual(result["n_full_scale"], 2)
+        # the ceiling was driven, so measured |E|^2 must come back at Y_max
+        self.assertAlmostEqual(fs["y_max_meas_v"], self.scale.fs, places=4)
+        self.assertAlmostEqual(fs["y_max_pred_v"], self.scale.fs, places=9)
+        # a perfect bench does not drift between the two ends
+        self.assertAlmostEqual(fs["drift_frac"], 0.0, places=9)
+        # and the JSON downstream reads carries the anchor it was defined by
+        self.assertAlmostEqual(written["y_sat_v"], result["y_sat_v"])
+        self.assertEqual(Path(written["gain_reference"]["csv"]).name,
+                         "calib_step8_0000_0000.csv")
 
 
 class CsvCompatibilityTests(unittest.TestCase):
@@ -310,174 +427,6 @@ class CsvCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         err = V.evaluate(blocks[0], models, phases)
         self.assertLess(err.nrmse_pct, 1e-6)
-
-
-class LooBuildTests(unittest.TestCase):
-    """The leave-one-out plan: padding, matched strata, and the interleave."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.models, cls.phases, cls.pool = model()
-        cls.subs, cls.scales, cls.flat = levels.loo_patterns(
-            cls.models, cls.phases, cls.pool, 4, seed=3)
-
-    def test_the_pool_and_every_leave_one_out(self):
-        self.assertEqual(len(self.subs), len(self.pool) + 1)
-        self.assertEqual(self.subs[0], tuple(self.pool))
-        self.assertEqual({levels.subset_tag(s, self.pool) for s in self.subs},
-                         {"all"} | {f"drop{k}" for k in self.pool})
-
-    def test_padding_does_not_change_the_prediction(self):
-        """The whole single-block design rests on this."""
-        for sub in self.subs:
-            solved = levels.level_patterns(self.models, self.phases, sub, 3, seed=3)
-            for p in solved:
-                on_sub = V.predict(self.models, self.phases, sub, p.x, p.w)
-                padded = levels.pad_to_pool(p, sub, self.pool)
-                on_pool = V.predict(self.models, self.phases, self.pool,
-                                    padded.x, padded.w)
-                self.assertAlmostEqual(float(on_sub), float(on_pool), places=12)
-
-    def test_an_excluded_pair_is_driven_to_nothing(self):
-        idx = {k: i for i, k in enumerate(self.pool)}
-        for p in self.flat:
-            tag = p.label.split("/")[1]
-            for k in self.pool:
-                if tag == f"drop{k}":
-                    self.assertEqual(p.x[idx[k]], 0.0)
-                    self.assertEqual(p.w[idx[k]], 0.0)
-
-    def test_every_subset_gets_the_same_stratum_grid(self):
-        """Matched alphas, so a difference between subsets is not sampling."""
-        by_tag: dict[str, list[float]] = {}
-        for p in self.flat:
-            by_tag.setdefault(p.label.split("/")[1], []).append(p.target_alpha)
-        grids = list(by_tag.values())
-        self.assertEqual(len(grids), len(self.pool) + 1)
-        for g in grids[1:]:
-            np.testing.assert_allclose(g, grids[0])
-
-    def test_a_subsets_full_scale_is_its_own(self):
-        full = self.scales["all"].fs
-        for sub in self.subs[1:]:
-            tag = levels.subset_tag(sub, self.pool)
-            self.assertLess(self.scales[tag].fs, full)
-            self.assertAlmostEqual(
-                self.scales[tag].fs,
-                V.full_scale({k: self.models[k] for k in sub},
-                             {k: self.phases[k] for k in sub}, sub).fs)
-
-    def test_the_subsets_are_interleaved_not_run_back_to_back(self):
-        """Eleven ladders in a row would put drift straight on the subset axis."""
-        rng = np.random.default_rng(3 + 3)
-        order = [self.flat[i].label.split("/")[1]
-                 for i in rng.permutation(len(self.flat))]
-        runs = 1 + sum(1 for a, b in zip(order, order[1:]) if a != b)
-        self.assertGreater(runs, 0.7 * len(order))
-
-
-class LooCollectTests(unittest.TestCase):
-    """The sweep through the CSV and the report, against a fake bench."""
-
-    LADDER = 5
-
-    @classmethod
-    def setUpClass(cls):
-        cls.models, cls.phases, cls.pool = model()
-        cls.subs, cls.scales, flat = levels.loo_patterns(
-            cls.models, cls.phases, cls.pool, cls.LADDER, seed=11)
-        rng = np.random.default_rng(11 + 3)
-        cls.patterns = [flat[i] for i in rng.permutation(len(flat))]
-
-    def _report(self, tmp, truth_phases=None, noise=0.0):
-        slm = _FakeSLM()
-        daq = _FakeDAQ(slm, self.models, truth_phases or self.phases, noise=noise)
-        pats = self.patterns
-        x = np.stack([p.x for p in pats])[None]
-        w = np.stack([p.w for p in pats])[None]
-        coh = [float(V.predict(self.models, self.phases, self.pool, p.x, p.w,
-                               coherent=True)) for p in pats]
-        full = [float(V.predict(self.models, self.phases, self.pool, p.x, p.w))
-                for p in pats]
-        extra = [[{"kind": p.kind, "label": p.label, "seq": i,
-                   "subset": p.label.split("/")[1],
-                   "target_alpha": f"{p.target_alpha:.6f}", "alpha": f"{p.alpha:.6f}",
-                   "coherent_v": f"{c:.9g}", "sb_pred_v": f"{q - c:.9g}"}
-                  for i, (p, c, q) in enumerate(zip(pats, coh, full))]]
-        rows: list[dict] = []
-        S8.run_patterns(daq, slm, SimpleNamespace(n_channels=len(self.pool)),
-                        [tuple(self.pool)], x, w, self.models, self.phases,
-                        rows=rows, acq=replace(S8.ACQ, settle_s=0.0, t_both_s=0.0,
-                                               t_single_s=0.0),
-                        encode=_encode, log=lambda _: None, extra=extra)
-        path = V.write_verify_csv(
-            Path(tmp) / "system_accuracy_loo_test.csv", self.pool, rows,
-            meta={"step7_json": STEP7, "mode": "loo", "status": "complete"},
-            extra=["kind", "label", "seq", "target_alpha", "alpha",
-                   "coherent_v", "sb_pred_v", "subset"])
-        return R.loo_table(path, STEP7)
-
-    def test_one_row_per_subset(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            rows, meta = self._report(tmp)
-        self.assertEqual([r["subset"] for r in rows],
-                         ["all"] + [f"drop{k}" for k in self.pool])
-        self.assertTrue(all(r["N"] == self.LADDER for r in rows))
-        self.assertEqual(meta["pool"], list(self.pool))
-
-    def test_a_perfect_bench_reads_zero_everywhere(self):
-        """Catches a padding, subset or full-scale mix-up anywhere in the chain."""
-        with tempfile.TemporaryDirectory() as tmp:
-            rows, _ = self._report(tmp)
-        for r in rows:
-            self.assertLess(abs(r["rms_lsb"]), 1e-6, r["subset"])
-
-    def test_each_subset_is_scaled_by_its_own_full_scale(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            rows, _ = self._report(tmp)
-        for r in rows:
-            tag = r["subset"]
-            self.assertAlmostEqual(r["y_max_v"], self.scales[tag].fs)
-            self.assertAlmostEqual(r["level_step_v"], self.scales[tag].fs / 15.0)
-
-    def test_a_miscalibrated_pair_is_the_subset_that_drops_it(self):
-        """The load-bearing one: does the sweep find the pair it is looking for?
-
-        The bench runs with pair 1's phase 25 deg off what the model believes.
-        Every subset that still drives pair 1 inherits that error; the one that
-        leaves it out does not, so ``drop1`` has to come out best.
-        """
-        truth = dict(self.phases)
-        truth[self.pool[0]] += np.radians(25.0)
-        with tempfile.TemporaryDirectory() as tmp:
-            rows, _ = self._report(tmp, truth_phases=truth)
-        by = {r["subset"]: r["rms_lsb"] for r in rows}
-        best = min((r for r in rows if r["subset"] != "all"),
-                   key=lambda r: r["rms_lsb"])["subset"]
-        self.assertEqual(best, f"drop{self.pool[0]}")
-        self.assertLess(by[f"drop{self.pool[0]}"], 1e-6)
-        self.assertGreater(by["all"], 1e-3)
-
-    def test_the_report_writes_a_png(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            rows, meta = self._report(tmp)
-            R.print_loo(rows, meta)
-            png = Path(tmp) / "loo.png"
-            R.plot_loo(rows, png)
-            self.assertTrue(png.exists() and png.stat().st_size > 0)
-
-    def test_a_run_without_the_subset_column_is_refused(self):
-        """A plain system-accuracy CSV must not be read as a sweep."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = V.write_verify_csv(
-                Path(tmp) / "plain.csv", self.pool,
-                [{"block": 0, "driven": tuple(self.pool),
-                  "x": [0.5] * len(self.pool), "w": [0.5] * len(self.pool),
-                  "dark_v": 0.0, "mean_v": 0.0, "std_v": 0.0, "range_v": 0.1,
-                  "pred_v": 0.0, "kind": "A"}],
-                meta={"step7_json": STEP7}, extra=["kind"])
-            with self.assertRaises(ValueError):
-                R.loo_table(path, STEP7)
 
 
 class _FakeK2400:
@@ -568,7 +517,7 @@ class PmtTemperatureTests(unittest.TestCase):
 
         rows: list[dict] = []
         S8.run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
-                        rows=rows, acq=replace(S8.ACQ, settle_s=0.0, t_both_s=0.0,
+                        rows=rows, acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0,
                                                t_single_s=0.0),
                         encode=_encode, log=lambda _: None, row_hook=pmt)
 
@@ -592,7 +541,7 @@ class PmtTemperatureTests(unittest.TestCase):
         rows: list[dict] = []
         S8.run_patterns(_FakeDAQ(slm, models, phases), slm, layout, [tuple(pairs)],
                         x, w, models, phases, rows=rows,
-                        acq=replace(S8.ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0),
+                        acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0),
                         encode=_encode, log=lambda _: None)
         self.assertTrue(all("pmt_c" not in r for r in rows))
 

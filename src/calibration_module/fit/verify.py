@@ -106,6 +106,88 @@ def saturate(y, y_sat: float | None):
     return y / (1.0 + y / float(y_sat))
 
 
+def fit_y_sat(y, pred, sigma=None, *, y_lo: float = 2.0, y_hi: float = 40.0,
+              points: int = 20001) -> dict:
+    """Fit ``Y_sat`` to reads ``y`` against LINEAR predictions ``pred``.
+
+    ``pred`` is the unsaturated model output -- :func:`predict` with
+    ``y_sat=None`` -- and ``y`` the dark- and background-subtracted read.
+    ``sigma`` weights the residuals; ``None`` weights every read equally.
+    One free parameter: the gain is pinned to 1.
+
+    The grid is uniform in ``1/Y_sat``, not in ``Y_sat``, because that is the
+    parameter the model is linear in -- ``1/y = 1/Y + 1/Y_sat`` -- so a uniform
+    ``Y_sat`` grid would spend most of its points where the data says nothing.
+    The quoted uncertainty is the ``Delta chi^2 = 1`` interval mapped back
+    through the inverse, which is why it comes out asymmetric in ``Y_sat``.
+
+    THE GAIN CAVEAT, which decides what this number means.  With ``g`` pinned
+    to 1 any detector gain error is absorbed into ``Y_sat`` and levered by
+    roughly ``Y_sat / max(pred)`` -- about 12x on a sweep reaching 400 mV.  Over
+    one night of hourly runs on the unchanged 0917 bench a ``g = 1`` ``Y_sat``
+    swung 4.39..5.44 V while tracking the separately measured gain at r = 0.98;
+    with the gain left free it sat at 6.84 +- 0.20 V with no trend.  So a fitted
+    ``Y_sat`` is a property of the hour it was measured in as much as of the
+    atoms.  That is not a defect here -- it is the point.  This fit DEFINES
+    ``g = 1``, and a later run measures its gain as the ratio of its reads to
+    this run's reads on the same drives.  Re-fitting on another day gives a
+    different ``Y_sat`` without either being wrong; what must not happen is
+    mixing one day's ``Y_sat`` with another day's reads.
+    """
+    y = np.asarray(y, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    w = (np.ones_like(y) if sigma is None
+         else 1.0 / np.asarray(sigma, dtype=float))
+    if y.size < 3:
+        raise ValueError(f"need at least 3 reads to fit Y_sat, got {y.size}")
+
+    inv = np.linspace(1.0 / float(y_hi), 1.0 / float(y_lo), int(points))
+    # (points, n): the saturated prediction at every trial 1/Y_sat at once
+    resid = (y[None, :] - pred[None, :] / (1.0 + pred[None, :] * inv[:, None])) * w
+    chi2 = np.sum(resid ** 2, axis=1)
+    i = int(np.argmin(chi2))
+
+    if sigma is None:
+        # Delta chi^2 = 1 only means something once chi^2 is in units of sigma.
+        # With no sigma supplied the residuals are raw volts, chi^2 is ~1e-6 and
+        # the interval would swallow the whole grid, so take the scatter at the
+        # best fit AS the sigma.  This is NOT Birge-scaling a fit that already
+        # has real sigmas -- load_reads always supplies those, and that branch
+        # is left exactly as the weights say.
+        var = float(chi2[i]) / max(y.size - 1, 1)
+        if var > 0:
+            chi2 = chi2 / var
+        else:
+            # Exact data: the fit is pinned to one grid point, and the honest
+            # interval is the grid resolution, not zero.
+            chi2 = np.where(np.arange(chi2.size) == i, 0.0, np.inf)
+
+    within = chi2 <= chi2[i] + 1.0
+    lo_inv, hi_inv = float(inv[within].min()), float(inv[within].max())
+    y_sat = float(1.0 / inv[i])
+    # hi in 1/Y_sat is lo in Y_sat, hence the swap
+    lo_v, hi_v = 1.0 / hi_inv, 1.0 / lo_inv
+    edge = i in (0, len(inv) - 1) or within[0] or within[-1]
+
+    def rms(model):
+        return float(np.sqrt(np.mean((y - model) ** 2)))
+
+    return {
+        "y_sat_v": y_sat,
+        "sigma_v": float((hi_v - lo_v) / 2.0),
+        "lo_v": float(lo_v), "hi_v": float(hi_v),
+        "rmse_v": rms(saturate(pred, y_sat)),
+        "rmse_linear_v": rms(pred),
+        "n": int(y.size),
+        "max_pred_v": float(pred.max()),
+        #: Y_sat / max(pred) -- how hard a gain error is levered into Y_sat.
+        "gain_lever": float(y_sat / pred.max()) if pred.max() > 0 else float("nan"),
+        #: True -> the Delta chi^2 = 1 interval ran into the grid; the sweep
+        #: did not go bright enough to bound Y_sat and the value is a limit.
+        "unbounded": bool(edge),
+    }
+
+
 def predict(models: Mapping[int, PairModel], phases: Mapping[int, float],
             driven: Sequence[int], x, w, *, coherent: bool = False,
             y_sat: float | None = None) -> np.ndarray:

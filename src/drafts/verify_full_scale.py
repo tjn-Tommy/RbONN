@@ -47,7 +47,7 @@ from calibration_module.fit.verify import (  # noqa: E402
     support_h,
     write_verify_csv,
 )
-from calibration_module.steps import calib_npair_verify as S8  # noqa: E402
+from calibration_module.steps import calib_step8 as S8  # noqa: E402
 
 PSI_OFFSET_DEG = 30.0       # the two rotated controls sit at psi* +/- this
 
