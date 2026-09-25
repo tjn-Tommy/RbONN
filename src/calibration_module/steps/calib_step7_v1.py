@@ -57,7 +57,7 @@ with ``R_1`` the fully-on reference amplitude.  Sweeping ``v`` 0.1 -> 1.0 sweeps
 The fit (in :mod:`calibration_module.fit.phase`).  Every point is reduced to
 ``(g, dPhi_SLM)`` from its commanded intensities.  It floats ``dPhi_comb`` in
 
-    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_comb - dPhi_SLM) + step-6 background + d
+    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb) + step-6 background + d
 
 with ``a`` := reference amplitude and ``b`` := target amplitude, both taken from
 step 6 -- either ratio-locked with a boxed shared gain ``s`` (``--bounded``) or

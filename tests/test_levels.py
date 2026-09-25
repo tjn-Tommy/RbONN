@@ -34,12 +34,20 @@ def toy(etas, phases, *, single_beam: float = 0.0):
 
 
 def real():
-    """The 0911 w20g30 forward model, or a skip if the run folder is gone."""
+    """The 0911 w20g30 forward model, or a skip if the run folder is gone.
+
+    The stored phases are negated on the way in: that JSON predates the
+    project's single sign convention (2026-09-25) and holds ``-Phi_k``, while
+    ``load_forward_model`` now reads ``dphi_comb_rad`` as ``Phi_k`` verbatim.
+    The geometry tests below are about THIS run's real spectrum -- negating
+    ``Phi`` is not a symmetry of the reachable set, because ``t = u + v`` can
+    only advance a phasor -- so the sign has to be right here.
+    """
     if not STEP7.exists():
         raise unittest.SkipTest(f"{STEP7} not in the tree")
     from calibration_module.fit.verify import load_forward_model
     models, phases, _ = load_forward_model(STEP7)
-    return models, phases, sorted(models)
+    return models, {k: -v for k, v in phases.items()}, sorted(models)
 
 
 class ParametrisationTests(unittest.TestCase):

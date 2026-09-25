@@ -1,5 +1,34 @@
 # RbONN
 
+## The model
+
+One forward model. Every fit in this project is taken under it, every consumer
+evaluates it, and nothing anywhere negates or reinterprets a sign:
+
+$$u_k = \arcsin\sqrt{x_k} \qquad v_k = \arcsin\sqrt{w_k}$$
+$$E = \sum_k \eta_k \sqrt{x_k w_k}\, e^{\,i\,[\,u_k + v_k + \Phi_k\,]}$$
+$$Y = \frac{|E|^2}{1 + |E|^2 / Y_{sat}}$$
+
+$x_k, w_k \in [0,1]$ are the commanded intensities of the pair's two SLM
+channels. A channel's field phase is half its panel retardance, and that is the
+same number that sets its amplitude — $u_k$ appears in both, so amplitude and
+phase are welded together and $(\sum_k \eta_k)^2$ is out of reach (see
+`fit/verify.py`). $\Phi_k$ is the pair's comb phase from step 7, stored in
+exactly this sign. $\eta_k$ is step 6's.
+
+Interfering a target pair against the reference therefore gives
+$\cos(\Delta\Phi_{SLM} + \Delta\Phi_{comb})$, which is what step 7 fits — so a
+stored `dphi_comb_rad` **is** $\Phi_k$ above. Step-7 JSONs written before
+2026-09-25 carry a `"convention": "comb-slm"` tag and hold $-\Phi_k$; they are
+not migrated, and nothing reads that tag any more. Re-run step 7 rather than
+trusting one.
+
+Two things sit outside $E$ and are not part of it: each channel's single-beam
+response ($a_x x + q_x x^2 + a_w w + q_w w^2$, detector response to one beam
+rather than TPA field, so it adds linearly and outside the saturation) and the
+dark. `verify.predict(..., coherent=True)` is the equation above; without it the
+single-beam background is added back, because that is what the ADC sees.
+
 ## Code status
 
 Which files are being developed, and which are kept only so something else keeps
@@ -17,7 +46,7 @@ running. Nothing marked **legacy** or **dead** should be imported from new code.
 | `src/calibration_module/fit/pair_v2.py` | **current** step 6 estimator — the difference fit (`D(w) = Y(1,w) − Ŷ(0,w) = η²w + a_x + q_x`) over 31 acquisitions on 10 repeated levels, plus 6 verification levels. Driver-free: `tests/test_pair_v2.py` runs the whole estimator off a committed CSV with no fake instrument. `PairV2Config` carries what a fit was specified with, so two configurations can coexist in one process. |
 | `src/calibration_module/measure/pair_v2.py` | step 6 acquisition — one pair's interleaved schedule, the near-rail ±0.1 → ±0.2 V escalation and the TIA sign convention. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
 | `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner (287 lines) — constants, then load layout → `measure.pair_v2` → `fit.pair_v2` → CSV/JSON/PNG. Holds no physics. |
-| `src/calibration_module/fit/phase.py` | **current** step 7 fit — the fringe `Y = a² + b²g² + 2abg·cos(ΔΦ_comb − ΔΦ_SLM)` with `a`, `b`, the single-beam background and the dark ALL pinned to step 6, so `ΔΦ_comb` is the one free parameter. Also owns the phase CSV/JSON formats and the β₂ dispersion check. Driver-free. |
+| `src/calibration_module/fit/phase.py` | **current** step 7 fit — the fringe `Y = a² + b²g² + 2abg·cos(ΔΦ_SLM + ΔΦ_comb)` with `a`, `b`, the single-beam background and the dark ALL pinned to step 6, so `ΔΦ_comb` is the one free parameter. That cosine argument is the project's ONE sign convention, so a stored `dphi_comb_rad` IS Φₖ in the forward model — nothing negates it. Also owns the phase CSV/JSON formats. Driver-free. |
 | `src/calibration_module/measure/phase_v2.py` | step 7 acquisition — one target pair swept against the held reference, the all-off dark, and step 6's near-rail escalation reused rather than retyped. `PhaseV2Config` is the drive (reference, ramp, levels); `PhaseV2Acq` the timing and input range. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
 | `src/calibration_module/steps/calib_step7_v2.py` | the step 7 runner (423 lines) — constants, then load the step-6 JSON → `measure.phase_v2` → `fit.phase` → CSV/JSON/PNG. Holds no physics. `--step6` is required and has no default. |
 | `src/calibration_module/fit/verify.py` | the n-pair check — predicts `Y = |Σ η√(xw)·e^{i(φ½(x)+φ½(w)+Φ)}|² + background` for any drive with nothing free, and quotes the error against each block's full scale `FS = Y_max − Y_min = Y_max` — the ceiling the pairs can actually be driven to, found by a 1-D support scan over the projection axis ψ. The free-phase `S² = (Σ_k η_k)²` is *not* it: a pair only reaches `|z_k| = η_k` with its phase pinned to `Φ_k`, so `S²` over-predicts by 54–67 % on the 0908–0911 runs. Also the verify CSV, which reads old step-8 CSVs too. Driver-free. |

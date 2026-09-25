@@ -25,18 +25,11 @@ constants they silently measured whichever pairs the last edit left in them.
 
 What changed vs :mod:`calib_step7_v1`
 -------------------------------------
-1. **Sign convention.**  The fringe is ``cos(dPhi_comb - dPhi_SLM)``: the panel
-   phase SUBTRACTS from the comb phase (it compensates the comb's dispersion,
-   so the fringe peaks where the two match), where v1 had
-   ``cos(dPhi_SLM + dPhi_comb)``.  Since ``cos`` is even the two differ only in
-   the SIGN of the recovered ``dPhi_comb`` -- a v2 ``Phi_k`` is the negative of
-   a v1 one, so do NOT feed a v2 JSON to a consumer written against v1's
-   forward model without flipping the sign.
-2. **Nothing floats but the phase.**  ``a = eta_ref*g_ref``, ``b = eta_tgt``,
+1. **Nothing floats but the phase.**  ``a = eta_ref*g_ref``, ``b = eta_tgt``,
    the single-beam response and the dark are ALL taken from step 6 / the
    measured all-off read, so ``dPhi_comb`` is the ONLY free parameter.
-3. **Both arms stop below 1.0** (0904 on).  See :class:`PhaseV2Config`.
-4. **The reads are inverted at the source.**  The transimpedance amplifier
+2. **Both arms stop below 1.0** (0904 on).  See :class:`PhaseV2Config`.
+3. **The reads are inverted at the source.**  The transimpedance amplifier
    outputs a NEGATIVE voltage for positive light, so ``ACQ.invert`` records a
    positive light signal and the CSV on disk already holds one.  v1's ``--flip``
    post-processing is gone with it.
@@ -54,7 +47,7 @@ field ``sqrt(v)*exp(i theta/2)``, so the target field amplitude is
 ``g = sqrt(x_t w_t) = sin^2(theta/2)``, the reference's is ``g_ref``, and
 ``dPhi_SLM = theta - theta_ref``::
 
-    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_comb - dPhi_SLM)
+    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb)
         + step-6 single-beam background
 
 Sweeping ``v`` 0.1 -> 0.9 sweeps ``theta`` over ~37..143 deg, tracing most of
@@ -485,8 +478,9 @@ def fit_csv(path: str | Path, step6: Path) -> None:
 
     # Persist the fitted spectrum {Phi_k} as ONE combined JSON (step3 + step6
     # carried over verbatim from --step6) -- the single input for downstream
-    # consumers.  NOTE the "comb-slm" convention recorded per fit: these phases
-    # are the NEGATIVE of v1's (see the module docstring).
+    # consumers.  A stored dphi_comb_rad IS Phi_k in the forward model
+    # E = sum_k eta_k sqrt(x_k w_k) exp(i[u_k + v_k + Phi_k]); nothing negates
+    # it on the way out or on the way back in.
     out_json = CALIB_PATH / f"calib_step7_result_{stamp}.json"
     save_comb_phase_json({(k, METHOD): f for k, f in fits.items()},
                          step6, out_json, ref_index=ref,

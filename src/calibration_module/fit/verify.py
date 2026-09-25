@@ -4,8 +4,17 @@ Steps 3-7 calibrate every parameter the forward model needs.  For a block of
 ``n`` pairs driven at ``(x_k, w_k)``, every other pair off, the dark-subtracted
 detector output is predicted with nothing left free::
 
-    E = sum_k  eta_k sqrt(x_k w_k) exp(i [phi_half(x_k) + phi_half(w_k) + Phi_k])
-    Y = |E|^2 + sum_k single_beam_k(x_k, w_k)
+    u_k = asin sqrt(x_k)                    v_k = asin sqrt(w_k)
+    E   = sum_k  eta_k sqrt(x_k w_k) exp(i [u_k + v_k + Phi_k])
+    Y   = |E|^2 / (1 + |E|^2 / Y_sat)  +  sum_k single_beam_k(x_k, w_k)
+
+THE model -- there is one, it is this, and every fit in the project is taken
+under it.  ``u_k = phi_half(x_k)``: a channel's field phase is half its panel
+retardance, which is the same number that sets its amplitude, so amplitude and
+phase are welded together (see the note above :func:`support_h`).  ``Phi_k`` is
+the pair's comb phase from step 7, stored in exactly this sign -- no consumer
+negates it.  The saturation acts on the TPA field only; ``single_beam_k`` is
+detector response to each beam separately and adds outside it, linearly.
 
 The error is quoted against the block's FULL SCALE -- the range an n-pair
 computation has to divide into levels::
@@ -63,9 +72,15 @@ def load_forward_model(
 ) -> tuple[dict[int, PairModel], dict[int, float], int]:
     """``(models, phases, ref)`` for ``pairs`` out of a combined step-7 JSON.
 
-    ``phases[k]`` is in radians in the ``slm+comb`` convention :func:`predict`
-    uses, with ``phases[ref] = 0``.  ``pairs=None`` takes every pair the file
+    ``phases[k]`` is ``Phi_k`` in radians, exactly as :func:`predict` uses it,
+    with ``phases[ref] = 0``.  ``pairs=None`` takes every pair the file
     calibrates end to end: the reference plus each target with a stored fit.
+
+    A stored ``dphi_comb_rad`` IS ``Phi_k``: step 7 fits
+    ``cos(dPhi_SLM + dPhi_comb)``, the one convention of this project, so this
+    reads it through untouched.  Files written before 2026-09-25 carry a
+    ``"convention": "comb-slm"`` tag and hold the NEGATED phase; they are not
+    migrated and are read as-is, so re-run step 7 rather than trusting one.
     """
     step7 = Path(step7)
     models = load_pair_models([step7])
@@ -74,12 +89,7 @@ def load_forward_model(
     for k, ch in entries.items():
         if int(k) == int(ref):
             continue                       # the reference defines Phi = 0
-        fit = ch["fit"]
-        # Step 7 v2 fits cos(dPhi_comb - dPhi_SLM); the field here is
-        # exp(i[phi_half(x) + phi_half(w) + Phi]), so its Phi is the negative.
-        # A v1 JSON stores no convention and is already slm+comb.
-        conv = str(fit.get("convention") or "slm+comb")
-        phases[int(k)] = (-1.0 if conv == "comb-slm" else 1.0) * float(fit["dphi_comb_rad"])
+        phases[int(k)] = float(ch["fit"]["dphi_comb_rad"])
     calibrated = sorted(k for k in phases if k in models)
     pairs = calibrated if pairs is None else sorted(int(k) for k in pairs)
     missing = [k for k in pairs if k not in calibrated]

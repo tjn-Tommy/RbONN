@@ -24,14 +24,17 @@ The field model
 Each SLM channel carries a comb line.  Pair ``n`` uses two channels, ``x`` and
 ``w``, and the panel puts a phase depth ``theta`` on each::
 
-    x_n = C_n^x sin(theta_n^x / 2) exp(-j theta_n^x / 2) exp(j Psi_n^x)
-    w_n = C_n^w sin(theta_n^w / 2) exp(-j theta_n^w / 2) exp(j Psi_n^w)
+    x_n = C_n^x sin(theta_n^x / 2) exp(+j theta_n^x / 2) exp(j Psi_n^x)
+    w_n = C_n^w sin(theta_n^w / 2) exp(+j theta_n^w / 2) exp(j Psi_n^w)
 
 ``theta`` is what we tune (the commanded intensity is ``I = sin^2(theta/2)``, so
 ``theta = 2 asin(sqrt(I))`` and the CSVs record ``I``); ``C`` is the channel's
-power; ``Psi`` is the comb phase it arrives with.  NOTE the ``exp(-j theta/2)``:
-the panel phase SUBTRACTS, which is why the step-7 v2 fringe is
-``cos(dPhi_comb - dPhi_SLM)``.
+power; ``Psi`` is the comb phase it arrives with.  The panel phase ADDS
+(``exp(+j theta/2)``, i.e. ``u = theta/2 = asin sqrt(I)``), so a pair's field is
+``eta sqrt(x w) exp(j[u + v + Phi])`` and the fringe is
+``cos(dPhi_SLM + dPhi_comb)`` -- THE model, the one every fit in the project is
+taken under.  Flipping this sign here is what forced a sign flip downstream;
+the generator and the fitters now agree without one.
 
 The comb phase, with the pair's two lines sitting SYMMETRICALLY about the
 two-photon centre (``+n`` and ``-n`` comb lines, ``Delta = 2 pi f_rep``)::
@@ -45,10 +48,9 @@ dispersion ``beta2`` survives.  Against the reference pair that is
 
     dPhi_comb,i = Phi_i - Phi_1 = 2 beta2 (Omega_i^2 - Omega_1^2)
 
-which is what step-7 v2's verification plots and fits.  Its slope is taken
-against ``u = Omega_1^2 - Omega_i^2``, so ``slope = -2 beta2``.  NOTE that this
-needs the REAL comb lines (m_1 = 10000, m_i = 12000, 14000, ...), not the pair
-index -- see the COMB_LINE block below.
+which is the spectrum step 7 recovers.  NOTE that this needs the REAL comb
+lines (m_1 = 10000, m_i = 12000, 14000, ...), not the pair index -- see the
+COMB_LINE block below.
 
 The measured signal
 -------------------
@@ -98,9 +100,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from calibration_module.fit.pair import load_tpa_pair_csv  # noqa: E402
 from calibration_module.fit.phase import (  # noqa: E402
     PairModel,
-    fit_beta2,
     load_phase_csv,
-    phase_covariance,
 )
 
 # ======================================================================
@@ -249,8 +249,8 @@ def signal(x_vals, w_vals) -> float:
     for i in PAIRS:
         s = _slot(i)
         # x_i and w_i exactly as written in the module docstring
-        xi = C_X[s] * np.sin(th_x[s] / 2.0) * np.exp(-1j * th_x[s] / 2.0 + 1j * psi(i, "x"))
-        wi = C_W[s] * np.sin(th_w[s] / 2.0) * np.exp(-1j * th_w[s] / 2.0 + 1j * psi(i, "w"))
+        xi = C_X[s] * np.sin(th_x[s] / 2.0) * np.exp(1j * th_x[s] / 2.0 + 1j * psi(i, "x"))
+        wi = C_W[s] * np.sin(th_w[s] / 2.0) * np.exp(1j * th_w[s] / 2.0 + 1j * psi(i, "w"))
         field += ETA[s] * xi * wi
         single += (A_X[s] * x_vals[s] + Q_X[s] * x_vals[s] ** 2
                    + A_W[s] * w_vals[s] + Q_W[s] * w_vals[s] ** 2)
@@ -380,8 +380,8 @@ def truth_payload() -> dict:
             }
             for i in PAIRS
         ],
-        # Phi_t - Phi_r = 2 beta2 Delta^2 (m_t^2 - m_r^2) = -2 beta2 * u, with
-        # u = Omega_r^2 - Omega_t^2 the regressor step-7 v2's fit_beta2 uses.
+        # Phi_t - Phi_r = 2 beta2 Delta^2 (m_t^2 - m_r^2), i.e. slope -2*beta2
+        # against u = Omega_r^2 - Omega_t^2.  Recorded as truth only.
         "beta2_slope_vs_u_s2": -2.0 * BETA2_S2,
     }
 
@@ -407,20 +407,6 @@ def print_truth() -> None:
     print(f"   (a/q in mV, Phi = 2*beta2*Omega_i^2, dPhi vs pair {REF_INDEX})")
     print("Recoverable: eta*CxCw (5), a/q per channel (20), d (1), dPhi_comb (4), beta2 (1).")
     print("NOT recoverable: eta and C separately, beta1, absolute Phi (only diffs, mod 2pi).")
-    print("\nPaste into calib_step7_v2.py to make its verification physical")
-    print("  -- either explicitly, per pair:")
-    print(f"    PAIR_OMEGA = {{{', '.join(f'{i}: {omega(i):.6e}' for i in PAIRS)}}}")
-    print("  -- or, equivalently, in pair-index form (uniform comb):")
-    print( "    PAIR_OMEGA = None")
-    zero_index = PAIR_INDEX_BASE - COMB_LINE_0 / COMB_LINE_STEP
-    print(f"    OMEGA_ZERO_INDEX = {zero_index:<8.6g}"
-          f"# pair index where Omega = 0 (base - m_first/dm)")
-    print(f"    OMEGA_STEP = {COMB_LINE_STEP*DELTA:.6e}   # dm * Delta, rad/s per pair index")
-    print( '    OMEGA_UNIT = "rad/s"')
-    print(f"    BETA2_NOMINAL = {-2.0*BETA2_S2:+.6e}   # expected slope vs u (= -2*beta2)")
-    print(f"  OMEGA_ZERO_INDEX is NOT {PAIR_INDEX_BASE}: pair {PAIRS[0]} sits "
-          f"{COMB_LINE_0} comb lines out, not at the centre.  Dropping that offset")
-    print("  drops the linear-in-index part of Phi and gets beta2 wrong by ~4x here.")
 
 
 # ======================================================================
@@ -464,7 +450,7 @@ def check_step6(csv_path: Path) -> dict[int, PairModel]:
 
 
 def check_step7(csv_path: Path, models: dict[int, PairModel]) -> None:
-    """Re-fit dPhi_comb per target with the step-7 v2 fit, then verify beta2.
+    """Re-fit dPhi_comb per target with the step-7 v2 fit, compare against truth.
 
     Uses the models fitted from the synthetic step-6 CSV -- not the truth
     values -- so this exercises the real chain, step-6 errors and all.  That is
@@ -499,62 +485,6 @@ def check_step7(csv_path: Path, models: dict[int, PairModel]) -> None:
               f"(+) {np.degrees(fit.dphi_comb_err_eta):.3f} (step-6 eta) deg   "
               f"[d(dPhi)/d(eta): ref {fit.dphi_deta_ref:+.2f}, "
               f"tgt {fit.dphi_deta_tgt:+.2f} rad per unit eta]")
-
-    if len(fits) < 2:
-        print("need >= 2 targets for the beta2 check")
-        return
-    pairs = sorted(fits)
-    # Full covariance, not four independent sigmas: every target is pinned to the
-    # SAME eta_ref, so its error slides the whole spectrum instead of scattering
-    # it.  fit_beta2 then takes the sigmas from sqrt(diag(cov)) and does GLS.
-    cov = phase_covariance(fits, pairs)
-    bfit = fit_beta2(pairs,
-                     [fits[k].dphi_comb for k in pairs],
-                     [fits[k].dphi_comb_err for k in pairs],   # ignored: cov wins
-                     [omega(k) for k in pairs],
-                     omega_ref=omega(REF_INDEX), max_branch=2,
-                     beta2=-2.0 * BETA2_S2,     # beta2 is known here, not fitted
-                     cov=cov)
-    print("\n=== Check: measured dPhi_comb,i vs beta2 (Om_ref^2 - Om_i^2) ===")
-    print(f"beta2 held at the truth {-2.0*BETA2_S2:+.6e} s^2 "
-          f"(GDD {BETA2_S2/(1e-15)**2:.1f} fs^2) -- nothing is fitted here, the")
-    print("two traces are just compared point by point:")
-    print("  sigma includes the pinned step-6 eta; eta_ref is COMMON to every "
-          "target, so\n  'pull*' is the covariance-whitened residual -- that is "
-          "the N(0,1) one to judge on")
-    for k, mo, me, rr, se, pl, pw in zip(pairs, bfit.model, bfit.phi_used,
-                                         bfit.residuals, bfit.dphi_comb_err,
-                                         bfit.pulls, bfit.pulls_white):
-        print(f"  pair {k}:  model {np.degrees(mo):>+8.3f}   "
-              f"measured {np.degrees(me):>+8.3f}   "
-              f"diff {np.degrees(rr):>+7.3f} +/- {np.degrees(se):.3f} deg  "
-              f"(pull {pl:>+5.1f}, pull* {pw:>+5.1f})")
-    rms = float(np.sqrt(np.mean(np.degrees(bfit.residuals) ** 2)))
-    print(f"residual rms = {rms:.3f} deg   max |pull| = {bfit.max_abs_pull:.2f}   "
-          f"max |pull*| = {bfit.max_abs_pull_white:.2f}   "
-          f"chi2 = r^T C^-1 r = {bfit.chi2_gls:.2f} over {bfit.n_targets} targets   "
-          f"branches {[int(b) for b in bfit.branch]}")
-    print(f"free-slope fit, for reference only: {bfit.beta2_free:+.6e} "
-          f"+/- {bfit.beta2_free_err:.2e} s^2  -> GDD "
-          f"{(-bfit.beta2_free/2.0)/(1e-15)**2:.2f} fs^2 "
-          f"(truth {BETA2_S2/(1e-15)**2:.2f})")
-    # Judge on the whitened pull: the raw per-point pull still counts the one
-    # shared eta_ref shift once per target, so it reads high on a good spectrum.
-    if bfit.max_abs_pull_white > 3.0:
-        print(f"  ** CHECK: a pair sits >3 sigma off truth "
-              f"(max |pull*| = {bfit.max_abs_pull_white:.2f})")
-        # eta is not the only thing step 7 pins.  The single-beam background
-        # (a_x, q_x, a_w, q_w) is taken from the same step-6 fit and is NOT
-        # propagated anywhere, and on this generator it moves dPhi_comb by as
-        # much as eta does (~0.3 deg on a 0.2 deg sigma).  So a pull* over 3
-        # here is the background term missing from cov, not a broken phase fit
-        # -- swap the fitted models for the truth ones to see it vanish.
-        print("     the pinned step-6 single-beam background is NOT in cov "
-              "(only eta is);\n     it shifts dPhi_comb by a comparable amount, "
-              "so pull* is an upper bound")
-    else:
-        print(f"  OK: every pair within 3 sigma of the model "
-              f"(max |pull*| = {bfit.max_abs_pull_white:.2f})")
 
 
 # ======================================================================

@@ -6,12 +6,11 @@ renders into a caller-supplied :class:`matplotlib.figure.Figure` (works with any
 backend -- Agg for PNGs, the Qt canvas in the GUI) and never calls ``savefig``
 itself.
 
-:func:`plot_fringe` serves both estimators, so it must not assume either one's
-shape: it takes the cosine argument from the fit's own ``convention`` and its
-error bars from ``std_total``, both of which collapse to the v1 behaviour for a
-fit that floated a/b.  Hard-coding v1's sign here silently mirrored a v2
-(``fit_phase_fixed``) fringe about ``dPhi_SLM = 0`` -- the curve missed the data
-by ``2 dPhi_comb`` while every printed number stayed right.
+:func:`plot_fringe` serves both estimators.  Every fit in the project fits the
+same cosine argument, ``cos(dPhi_SLM + dPhi_comb)``
+(:func:`~calibration_module.fit.phase.fringe_arg`), so the curve is drawn the
+way it was fitted; the error bars come from ``std_total``, which collapses to
+``std`` for a fit that floated a/b.
 """
 from __future__ import annotations
 
@@ -31,10 +30,10 @@ def plot_fringe(fig, fit, tgt: int) -> None:
     fitted model (interference + the pinned step-6 single-beam background).
     Right: the pulls.
 
-    Renders either fit convention: the cosine argument comes from
-    :meth:`~calibration_module.fit.phase.PhaseFit.fringe_arg`, so a
-    ``fit_phase_fixed`` result (step-7 v2, ``"comb-slm"``) draws the same way
-    round as it was fitted rather than mirrored.
+    The cosine argument comes from
+    :meth:`~calibration_module.fit.phase.PhaseFit.fringe_arg`
+    (``dPhi_SLM + dPhi_comb``, the project's one convention), so the curve is
+    drawn the way it was fitted.
 
     Error bars and pulls are taken against ``std_total`` -- the point spread
     with the pinned step-6 eta's model error folded in.  For a fit that floated
@@ -72,8 +71,7 @@ def plot_fringe(fig, fit, tgt: int) -> None:
     model = (fit.a**2 + fit.b**2 * g_s**2
              + 2.0 * fit.a * fit.b * g_s * np.cos(fit.fringe_arg(dslm))
              + bg_s + fit.offset)
-    arg = (r"\Delta\Phi_{comb}-\Delta\Phi_{SLM}" if fit.convention == "comb-slm"
-           else r"\Delta\Phi_{SLM}+\Delta\Phi_{comb}")
+    arg = r"\Delta\Phi_{SLM}+\Delta\Phi_{comb}"
     ax1.plot(np.degrees(dslm), model * 1e3, "-", color="tab:blue", lw=1.6,
              label=rf"fit: $a^2+b^2\sin^4+2ab\sin^2\cos({arg})$")
     ax1.errorbar(dphi, fit.y * 1e3, yerr=std_tot * 1e3, fmt="o", ms=5,
