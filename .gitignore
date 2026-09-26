@@ -9,3 +9,4 @@ refractor_codex.md
 AGENT.md
 # fit plots are regenerable output; the CSV/JSON they come from is tracked
 src/calib_data/**/*.png
+CLAUDE.md
