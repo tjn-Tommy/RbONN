@@ -19,7 +19,12 @@ class EncodingChannel:
     wavelength_nm: float
     # measured transfer curve from the nearest calibration coordinate
     levels: np.ndarray = field(repr=False)           # SLM levels swept (ascending)
-    intensity_curve: np.ndarray = field(repr=False)  # measured normalised power
+    # Measured normalised power.  Empty is allowed on a ``"fit"`` channel that
+    # was handed a ``transfer_fit``: the raw sweep lives in the step-3 CSV and
+    # no longer in calib.json, and inverting the fit does not need it.  Only
+    # ``level_for_interp`` does, and it says so when it is asked without one.
+    intensity_curve: np.ndarray = field(
+        repr=False, default_factory=lambda: np.asarray([], dtype=float))
 
     # How level_for() inverts the transfer curve:
     #   "fit"    -- invert the fitted sin^2 model (calibration_module.fit.transfer).
@@ -50,6 +55,25 @@ class EncodingChannel:
             raise ValueError(
                 f"unknown encoding method {self.method!r}; expected 'fit' or 'interp'"
             )
+        curve = np.asarray(self.intensity_curve, dtype=float).reshape(-1)
+        if curve.size == 0:
+            if self.transfer_fit is None:
+                raise TransferFitError(
+                    f"channel {self.side}{self.index} has neither a measured "
+                    f"curve nor a transfer fit -- nothing to encode through"
+                )
+            if self.method != "fit":
+                raise ValueError(
+                    f"channel {self.side}{self.index} has method "
+                    f"{self.method!r} but no measured curve to interpolate"
+                )
+            # Nothing to interpolate; level_for_interp raises if asked.
+            self._seg_levels = np.asarray([], dtype=self.levels.dtype)
+            self._seg_curve = np.asarray([], dtype=float)
+            self.on_level = self.transfer_fit.on_level
+            self.off_level = self.transfer_fit.off_level
+            return
+
         if self.method == "fit" and self.transfer_fit is None:
             self.transfer_fit = fit_transfer_curve(self.levels, self.intensity_curve)
 
@@ -118,6 +142,12 @@ class EncodingChannel:
         ``method="fit"`` they differ from ``off_level``/``on_level``.
         """
         val = float(np.clip(val, 0.0, 1.0))
+        if self._seg_curve.size == 0:
+            raise TransferFitError(
+                f"channel {self.side}{self.index} carries no measured curve to "
+                f"interpolate -- it came from a calib.json, whose step-3 section "
+                f"stores the fit; the sweep is in its step3_*.csv"
+            )
         off_p = float(self._seg_curve[0])
         on_p = float(self._seg_curve[-1])
         target = off_p + val * (on_p - off_p)
@@ -515,14 +545,27 @@ def channel_layout_from_calibration(
         raise ValueError(
             f"unknown encoding method {method!r}; expected 'fit' or 'interp'"
         )
-    if calib.intensity_levels is None:
-        raise ValueError("CalibrationResult has no intensity data (Step 3c not run)")
-
     coords = np.asarray(calib.coordinates, dtype=float)
     wls = np.asarray(calib.wavelength, dtype=float)
-    intens = np.asarray(calib.intensity_levels, dtype=float)
     levels = np.asarray(calib.level_range, dtype=int)
     n = coords.size
+
+    # A calib.json step-3 section stores the fits and leaves the raw sweep in
+    # its CSV, so the curves can legitimately be absent.  Then the fits ARE the
+    # calibration and there has to be one per channel; without either, there is
+    # no transfer curve at all and step 3 was not run.
+    stored_fits = getattr(calib, "transfer_fits", None)
+    curves_only = calib.intensity_levels is None
+    if curves_only and (stored_fits is None or len(stored_fits) != n):
+        raise ValueError(
+            "CalibrationResult has neither intensity curves nor one transfer "
+            f"fit per channel ({n} coordinates, "
+            f"{0 if stored_fits is None else len(stored_fits)} fits) "
+            "-- step 3 not run"
+        )
+    intens = (np.zeros((n, levels.size), dtype=float) if curves_only
+              else np.asarray(calib.intensity_levels, dtype=float))
+
     if n < 4 or n % 2:
         raise ValueError(
             f"channel calibration needs an even number of coordinates (>= 4), got {n}"
@@ -639,7 +682,11 @@ def channel_layout_from_calibration(
             x_end=x_start + width,
             wavelength_nm=float(wls[row]),
             levels=levels.copy(),
-            intensity_curve=intens[row].copy(),
+            # Empty, not a row of zeros, when the file carries fits only: a
+            # zero curve would let level_for_interp return nonsense instead of
+            # saying it has nothing to interpolate.
+            intensity_curve=(np.asarray([], dtype=float) if curves_only
+                             else intens[row].copy()),
             method=method,
             transfer_fit=None if fits is None else fits[row],
         )

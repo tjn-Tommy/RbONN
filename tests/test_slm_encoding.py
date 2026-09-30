@@ -20,6 +20,7 @@ from slm_module.encoding import (
     optimize_from_osa,
 )
 from calibration_module.fit.slm_response import CalibrationResult
+from calibration_module.fit.transfer import TransferFitError, fit_transfer_curves
 import slm_module.analysis as analysis
 from slm_module.analysis import (
     ChannelSpectrum,
@@ -645,8 +646,53 @@ class ChannelLayoutFromCalibrationTests(unittest.TestCase):
             min_level=0,
             level_range=calib.level_range,
         )
-        with self.assertRaisesRegex(ValueError, "no intensity data"):
+        # Neither curves nor fits: there is no transfer curve at all.  A step-3
+        # section carrying fits ALONE is fine -- the two tests below.
+        with self.assertRaisesRegex(ValueError, "neither intensity curves nor"):
             channel_layout_from_calibration(bare)
+
+    def _fits_only(self) -> CalibrationResult:
+        """What a calib.json step-3 section is: the fits, and no raw sweep.
+
+        The curves moved out to ``step3_*.csv``, so the loader has to rebuild the
+        layout from ``transfer_fits`` alone.
+        """
+        calib = self._calib(self.GRID)
+        calib.transfer_fits = fit_transfer_curves(
+            calib.level_range, calib.intensity_levels)
+        calib.intensity_levels = None
+        calib.raw_intensity_levels = None
+        return calib
+
+    def test_encodes_identically_without_the_raw_curves(self) -> None:
+        """Dropping the curves from the JSON must not move a single level."""
+        with_curves = channel_layout_from_calibration(self._calib(self.GRID),
+                                                      warn=False)
+        fits_only = channel_layout_from_calibration(self._fits_only(), warn=False)
+
+        self.assertEqual(len(fits_only.all_channels), len(with_curves.all_channels))
+        for before, after in zip(with_curves.all_channels, fits_only.all_channels):
+            self.assertEqual(before.wavelength_nm, after.wavelength_nm)
+            self.assertEqual((before.x_start, before.x_end),
+                             (after.x_start, after.x_end))
+            self.assertEqual((before.on_level, before.off_level),
+                             (after.on_level, after.off_level))
+            for value in np.linspace(0.0, 1.0, 21):
+                self.assertEqual(before.level_for(float(value)),
+                                 after.level_for(float(value)))
+
+    def test_interpolating_a_fits_only_channel_says_why_it_cannot(self) -> None:
+        layout = channel_layout_from_calibration(self._fits_only(), warn=False)
+        channel = layout.all_channels[0]
+        self.assertEqual(channel.intensity_curve.size, 0)
+        with self.assertRaisesRegex(TransferFitError, "no measured curve"):
+            channel.level_for_interp(0.5)
+
+    def test_fits_only_needs_one_fit_per_channel(self) -> None:
+        calib = self._fits_only()
+        calib.transfer_fits = calib.transfer_fits[:-1]
+        with self.assertRaisesRegex(ValueError, "neither intensity curves nor"):
+            channel_layout_from_calibration(calib, warn=False)
 
 
 class MeasurePairColRatioTests(unittest.TestCase):
