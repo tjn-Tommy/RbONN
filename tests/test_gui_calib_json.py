@@ -131,6 +131,23 @@ class StepPageTests(_WindowCase):
         self.assertNotEqual(w.tpa_phase_step6_label.property("status"), "error",
                             w.tpa_phase_step6_label.text())
 
+    def test_the_save_dialog_opens_in_the_run_the_page_is_pointed_at(self) -> None:
+        """The folder saved into IS the run that gets the section.
+
+        A bare default filename opened the dialog wherever Qt last was, which
+        made it easy to write the sweep into a folder with no step-3 section and
+        get a refusal instead of a calibration.
+        """
+        w = self.win
+        w.tpa_step3_edit.setText(str(RUN))
+        self.addCleanup(w.tpa_step3_edit.setText, "")
+        offered = Path(w._save_into_run(w._tpa_step3_path(), "x.csv"))
+        self.assertEqual(offered.parent, RUN)
+
+        # With no run chosen there is nothing to default to, and the bare name
+        # is right: the dialog has to ask.
+        self.assertEqual(w._save_into_run(None, "x.csv"), "x.csv")
+
     def test_step_8_reads_the_forward_model_out_of_a_run_folder(self) -> None:
         """A directory is not is_file(), which left this panel silently idle."""
         w = self.win

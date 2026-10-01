@@ -5234,19 +5234,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"[step 6] fit failed — {line}")
 
     def _tpa_save(self) -> None:
-        """Raw CSV, the combined JSON step 7 reads, and one PNG per pair.
+        """Raw CSV, the run's step6 section, and one PNG per pair.
 
-        The JSON embeds the Step-3 calibration this run was encoded through --
-        the file named on this page, verbatim -- so a step-7 run needs that one
-        file and cannot be pointed at a layout the etas were not measured under.
+        The folder the CSV goes into is the run that gets the section, and the
+        dialog opens in the run named on this page -- so the etas land beside
+        the step-3 layout they were measured through.  Writing them DROPS that
+        run's step 7 and step 8: they were fitted against the previous step 6.
 
         The rows are written first and unconditionally.  A measurement is an
         hour of bench time and must never be lost to a missing or unreadable
-        step-3 file, which is only needed for the derived JSON.
+        calibration, which is only needed for the derived section.
         """
         if not self.tpa_fits:
             return
-        default = f"calib_step6v2_meas_{time.strftime('%m%d_%H%M')}.csv"
+        default = self._save_into_run(
+            self._tpa_step3_path(),
+            f"calib_step6v2_meas_{time.strftime('%m%d_%H%M')}.csv")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Step-6 v2 Result", default, "CSV (*.csv)"
         )
@@ -7250,7 +7253,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not self.tpa_phase_results:
             return
-        default = f"calib_step7_meas_{time.strftime('%m%d_%H%M')}.csv"
+        default = self._save_into_run(
+            self._tpa_phase_step6_path(),
+            f"calib_step7_meas_{time.strftime('%m%d_%H%M')}.csv")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Step-7 Result", default, "CSV (*.csv)"
         )
@@ -8987,6 +8992,19 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setRange(minimum, maximum)
         spin.setValue(value)
         return spin
+
+    def _save_into_run(self, run: Path | None, name: str) -> str:
+        """The Save dialog's default path: ``name`` inside the chosen run folder.
+
+        The folder a sweep is saved into IS the run its section lands in, so
+        offering a bare filename -- which opens the dialog wherever Qt happened
+        to be -- made it easy to write the CSV somewhere with no step-3 section
+        and get nothing but a refusal.  Pointing the dialog at the run named on
+        the page makes the common case one click.
+        """
+        if run is None:
+            return name
+        return str(Path(run) / name)
 
     def _run_chain(self, run: Path) -> str:
         """``"step2 09-28 · step3 09-29 · step6 —"`` for a run folder's status pill.
