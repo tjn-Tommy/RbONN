@@ -42,6 +42,7 @@ from psu_module.controller import (
 )
 from calibration_module.fit.legacy_intensity import CalibrationFit, fit_calibration, load_calibration_csv
 from calibration_module.fit.slm_response import (
+    load_step2_map,
     CalibrationResult,
     calibration_result_from_dict,
     load_calibration_result,
@@ -103,7 +104,9 @@ from slm_module.optimization import (
     validate_independent_profile,
 )
 from calibration_module.calib_file import (
+    CALIB_NAME as CALIB_FILE_NAME,
     STEP_ORDER as CALIB_STEP_ORDER,
+    calib_path as calib_file_path,
     load_calib,
 )
 from calibration_module.fit.pair_v2 import (
@@ -1490,8 +1493,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"calib_step{step}_{time.strftime('%m%d_%H%M')}{suffix}"
 
     def _default_calib_dir(self) -> Path:
-        """src/calib_data — where blank output fields put their results."""
-        return Path(__file__).resolve().parents[2] / "calib_data"
+        """src/calib_data — where blank output fields put their results.
+
+        ``parents[1]`` is ``src``: this file is ``src/gui/app.py``.  It was
+        ``parents[2]`` from the package reorganisation until 2026-09-30, i.e. the
+        repo root, so the default pointed at a directory that does not exist and
+        auto-discovery silently found nothing.
+        """
+        return Path(__file__).resolve().parents[1] / "calib_data"
 
     def _output_row(self, step: int | str, key: str, label: str, is_csv: bool) -> QtWidgets.QWidget:
         """An output path edit + Browse, stored under self.step_widgets[step][key].
@@ -2177,10 +2186,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _enc_autostart(self) -> None:
         """Load local calibration and build the default layout on first show."""
         calib = self._enc_get_calib()
-        if calib is None or calib.intensity_levels is None:
+        if calib is None or not calib.encodable:
             self._enc_log(
                 "No calibration found. Run Step 3 on the Calibration page, or use "
-                "'Load other…' to pick a result file."
+                "'Load other…' to pick a run folder's calib.json."
             )
             return
         self._enc_build_layout()
@@ -2194,24 +2203,33 @@ class MainWindow(QtWidgets.QMainWindow):
         stamp = time.strftime("%H:%M:%S")
         self.enc_log.appendPlainText(f"[{stamp}] {message}")
 
-    # calibration results are named calib_step*.json (calib_step3.json,
-    # calib_step33.json, ...); the encoder needs a step-3 intensity result.
-    _CALIB_RE = re.compile(r"^calib_step.*\.json$", re.IGNORECASE)
+    # A run directory's calib.json, or a pre-v3 standalone calib_step*.json.
+    # Both are things the encoder can take a step-3 channel grid out of, and
+    # leaving calib.json out of this pattern is why auto-discovery stopped
+    # finding anything once the runs were migrated.
+    _CALIB_RE = re.compile(r"^(calib\.json|calib_step.*\.json)$", re.IGNORECASE)
 
     def _enc_local_calib_path(self) -> Path | None:
         """Locate the newest usable project-local calibration result.
 
-        Scans the working dir, project root, and src/calib_data (the default
-        output dir) for calib_step*.json files and returns the most recently
-        modified one that loads as a valid intensity (step-3) result. Files
-        without intensity_levels (step-1/step-2 outputs) are skipped so the
-        encoder never auto-loads an unusable calibration.
+        Scans the working dir, the project root, src/calib_data and each run
+        directory under it, and returns the most recently modified calibration
+        that can actually drive the encoder.  One whose step-3 section is missing
+        -- a run that has only reached step 1 or 2 -- is skipped rather than
+        auto-loaded, which is the whole reason this walks the files itself.
         """
         search_dirs = [
             Path.cwd(),
             Path(__file__).resolve().parents[3],
             self._default_calib_dir(),
         ]
+        # Each run directory holds its own calib.json, so the run folders are
+        # where the calibrations actually live now.
+        try:
+            search_dirs += [d for d in self._default_calib_dir().iterdir()
+                            if d.is_dir() and d.name != "archive"]
+        except OSError:
+            pass
         matches: dict[Path, float] = {}
         for directory in search_dirs:
             try:
@@ -2225,7 +2243,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 calib = load_calibration_result(str(path))
             except Exception:
                 continue
-            if calib.intensity_levels is not None:
+            if calib.encodable:
                 return path
         return None
 
@@ -2233,7 +2251,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Calibration source: explicit override → in-memory result → local file."""
         if self._enc_calib_override is not None:
             return self._enc_calib_override
-        if self.calibration_result is not None and self.calibration_result.intensity_levels is not None:
+        if self.calibration_result is not None and self.calibration_result.encodable:
             self.enc_calib_label.setText("Calibration: in-memory (from Step 3 / loaded fit)")
             return self.calibration_result
         local = self._enc_local_calib_path()
@@ -2248,8 +2266,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _enc_browse_calib(self) -> None:
+        # A run's calib.json by name; load_calibration_result also takes the
+        # directory, and the pre-v3 standalone results still open.
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Calibration Result", "", "JSON Files (*.json)"
+            self, "Open a run's calib.json", "", "JSON Files (*.json)"
         )
         if not path:
             return
@@ -2272,9 +2292,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ``pitch - 5`` (the Step-3c default gap).
         """
         calib = self._enc_get_calib()
-        if calib is None or calib.intensity_levels is None:
+        if calib is None or not calib.encodable:
             self.enc_layout_status.setText(
-                "No calibration available. Run Step 3c or load a result file."
+                "No calibration available. Run Step 3 or load a run's calib.json."
             )
             return
 
@@ -6293,14 +6313,17 @@ class MainWindow(QtWidgets.QMainWindow):
             f"\N{PLUS-MINUS SIGN}{STEP8.ACQ.range_v:g} V, dark included)")
 
     def _step8_step7_changed(self) -> None:
-        """Show where this step-7's Y_max lands, and gate the probe.
+        """Show where this run's Y_max lands, and gate the probe.
 
-        Runs on every keystroke, so it does nothing until the text names a file
-        that exists -- which for a browsed path is once.  ``full_scale`` is a
-        prediction and touches no hardware.
+        Runs on every keystroke, so it does nothing until the text names a run
+        folder (or a calib.json) that is there -- which for a browsed path is
+        once.  ``full_scale`` is a prediction and touches no hardware.
         """
         text = self.step8_step7_edit.text().strip()
-        path = Path(text) if text else None
+        # A run folder is what the box takes, so resolve it to its calib.json
+        # before asking whether it exists -- a directory is not is_file(), and
+        # testing that directly left the panel silently idle.
+        path = calib_file_path(text) if text else None
         if path is None or not path.is_file():
             self.step8_y_max = None
             self._step8_plan_for = None
@@ -7395,7 +7418,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         calib = self._enc_get_calib()
-        if calib is None or calib.intensity_levels is None:
+        if calib is None or not calib.encodable:
             self.tpa_center_status.setText(
                 "No Step 3 calibration available for rebuilding the layout."
             )
@@ -9663,15 +9686,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if index == 1:  # from file (JSON snapshot or coordinate-wavelength CSV)
             path = widgets["in_path"].text().strip()
             if not path:
-                raise ValueError("choose a Step 2 result or wavelength-map CSV")
-            if path.lower().endswith(".csv"):
-                result = load_wavelength_map_csv(
-                    path,
-                    min_level=widgets["min"].value(),
-                    max_level=widgets["max"].value(),
-                )
-            else:
-                result = load_calibration_result(path)
+                raise ValueError("choose a run folder, its calib.json, or a "
+                                 "wavelength-map CSV")
+            # A run's step-2 map is its section's levels plus its CSV's line, so
+            # one loader covers all three of calib.json, a run folder and a bare
+            # CSV -- and a pre-v3 standalone step-2 JSON still opens below.
+            result = self._load_step2_source(
+                path, widgets["min"].value(), widgets["max"].value())
         else:  # memory
             result = self.calibration_result
             if result is None:
@@ -9688,19 +9709,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.fast_channel_source_combo.currentIndex() == 1:
             path = self.fast_channel_step2_edit.text().strip()
             if not path:
-                raise ValueError("choose a Step 2 result or wavelength-map CSV")
-            if path.lower().endswith(".csv"):
-                min_level = self.fast_channel_min_spin.value()
-                max_level = self.fast_channel_max_spin.value()
-                if max_level < min_level:
-                    raise ValueError("CSV max level must be >= min level")
-                result = load_wavelength_map_csv(
-                    path,
-                    min_level=min_level,
-                    max_level=max_level,
-                )
-            else:
-                result = load_calibration_result(path)
+                raise ValueError("choose a run folder, its calib.json, or a "
+                                 "wavelength-map CSV")
+            min_level = self.fast_channel_min_spin.value()
+            max_level = self.fast_channel_max_spin.value()
+            if max_level < min_level:
+                raise ValueError("max level must be >= min level")
+            result = self._load_step2_source(path, min_level, max_level)
         else:
             result = self.calibration_result
             if result is None:
@@ -9713,6 +9728,24 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("the Step 2 source has no coordinate -> wavelength map")
         self._require_levels(result)
         return result
+
+    def _load_step2_source(self, path: str, min_level: int,
+                           max_level: int) -> CalibrationResult:
+        """A step-2 wavelength map from whatever the operator pointed at.
+
+        A run folder or its ``calib.json`` goes through
+        :func:`~calibration_module.fit.slm_response.load_step2_map`, which pairs
+        the section's levels with the CSV's line.  A bare coordinate ->
+        wavelength CSV has no levels of its own, so the spinboxes supply them.
+        A pre-v3 standalone step-2 JSON still loads as itself.
+        """
+        target = Path(path).expanduser()
+        if target.is_dir() or target.name == CALIB_FILE_NAME:
+            return load_step2_map(target, fallback_min_max=(min_level, max_level))
+        if target.suffix.lower() == ".csv":
+            return load_wavelength_map_csv(
+                target, min_level=min_level, max_level=max_level)
+        return load_calibration_result(target)
 
     def _load_input_result(
         self, index: int, path: str, empty_msg: str, no_path_msg: str

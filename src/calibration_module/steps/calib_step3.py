@@ -37,7 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from calibration_module.calib_file import load_calib, write_section  # noqa: E402
 from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
-    load_wavelength_map_csv,
+    load_step2_map,
     step3_section,
     write_intensity_calibration_csv,
 )
@@ -74,19 +74,8 @@ USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode swit
 
 
 def load_step2(run: Path) -> CalibrationResult:
-    """The run's step-2 map: its CSV for the line, its section for the levels.
-
-    The two halves are deliberately apart -- a thousand measured coordinates are
-    a table, the polynomial and the off/on levels are not -- so the map is read
-    from the CSV the section points at and the levels come from the section.
-    """
-    calib = load_calib(run)
-    section = calib.section(2)
-    return load_wavelength_map_csv(
-        calib.csv_path(2),
-        min_level=section.get("min_level", CSV_MIN_MAX[0]),
-        max_level=section.get("max_level", CSV_MIN_MAX[1]),
-    )
+    """The run's step-2 map -- see :func:`fit.slm_response.load_step2_map`."""
+    return load_step2_map(run, fallback_min_max=CSV_MIN_MAX)
 
 
 def main(argv: list[str] | None = None) -> None:

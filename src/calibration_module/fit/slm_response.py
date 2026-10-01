@@ -52,6 +52,27 @@ class CalibrationResult:
     channel_width_px: int | None = None
     gap_px: int | None = None
 
+    @property
+    def encodable(self) -> bool:
+        """Whether a channel layout can be built from this.
+
+        True when there is one transfer fit per channel -- which is what a
+        calib.json step-3 section carries, its raw sweep having moved to the CSV
+        -- or when the measured curves are here to be fitted.  Distinct from
+        :attr:`has_curves`: the encoder needs the fits, a plot of the sweep needs
+        the curves, and a v3 section can do the first but not the second.
+        """
+        if self.intensity_levels is not None:
+            return True
+        fits = self.transfer_fits
+        n = np.asarray(self.coordinates, dtype=float).size
+        return bool(fits) and len(fits) == n and n > 0
+
+    @property
+    def has_curves(self) -> bool:
+        """Whether the measured sweep itself is here, for plotting or re-fitting."""
+        return self.intensity_levels is not None
+
 
 def _driven_geometry(
     seed: "CalibrationResult",
@@ -787,6 +808,19 @@ def calibration_result_from_dict(payload: dict) -> CalibrationResult:
     None then, and the encoder fits the stored curves at load time instead.
     """
 
+    # A run's calib.json, or any wrapper carrying a step-3 section: take that
+    # section.  The payload keys are the same either way, so a caller does not
+    # have to know which of the two it was handed -- and the alternative was
+    # reading a v3 file as a CalibrationResult full of silent defaults.
+    if "step3" not in payload and payload.get("schema") == "rbonn_calib_v3":
+        raise ValueError(
+            "this calib.json has no step3 section, so there is no channel "
+            "calibration in it (sections: "
+            + ", ".join(k for k in payload if k.startswith("step")) + ")"
+        )
+    if isinstance(payload.get("step3"), dict):
+        payload = payload["step3"]
+
     raw_fits = payload.get("transfer_fits")
     fits = (
         [TransferFit.from_dict(entry) for entry in raw_fits]
@@ -811,9 +845,19 @@ def calibration_result_from_dict(payload: dict) -> CalibrationResult:
 
 
 def load_calibration_result(path: str | Path) -> CalibrationResult:
-    """Rebuild a CalibrationResult written by save_calibration_result."""
+    """The channel calibration at ``path``: a run directory, or a JSON file.
 
-    src = Path(path).resolve()
+    Takes a run directory or its ``calib.json`` (the step-3 section comes back),
+    a pre-v3 standalone result from :func:`save_calibration_result`, or an older
+    combined step-6/step-7 result (its embedded ``step3``).  All four are things
+    somebody has reasonably pointed this at, and which one it is does not change
+    what the caller wanted.
+    """
+
+    src = Path(path).expanduser()
+    if src.is_dir():
+        src = src / "calib.json"
+    src = src.resolve()
     if not src.is_file():
         raise FileNotFoundError(f"Calibration result not found: {src}")
     with open(src, "r", encoding="utf-8") as file:
@@ -880,6 +924,36 @@ def load_wavelength_map_csv(
         level_range=levels,
     )
 
+
+def load_step2_map(run: str | Path, *,
+                   fallback_min_max: tuple[int, int] = (0, 1023)) -> CalibrationResult:
+    """A run's px -> nm map: the line from its CSV, the levels from its section.
+
+    The two halves are deliberately apart -- a thousand measured coordinates are
+    a table, the polynomial and the off/on levels are not -- so neither
+    :func:`load_calibration_result` (which gives the step-3 CHANNEL grid) nor the
+    CSV alone (which carries no levels) is the whole answer.  This is what step 3
+    and the GUI's step-2 source both need, and it is one function so they cannot
+    disagree about it.
+
+    ``run`` is a run directory, its ``calib.json``, or a bare coordinate ->
+    wavelength CSV; a bare CSV has no levels of its own, so it gets
+    ``fallback_min_max``.
+    """
+    src = Path(run).expanduser()
+    if src.is_file() and src.suffix.lower() == ".csv":
+        low, high = fallback_min_max
+        return load_wavelength_map_csv(src, min_level=low, max_level=high)
+
+    from calibration_module.calib_file import load_calib
+
+    calib = load_calib(src)
+    section = calib.section(2)
+    return load_wavelength_map_csv(
+        calib.csv_path(2),
+        min_level=section.get("min_level", fallback_min_max[0]),
+        max_level=section.get("max_level", fallback_min_max[1]),
+    )
 
 def _to_jsonable(value: Any) -> Any:
     if value is None:
