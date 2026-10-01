@@ -1,8 +1,8 @@
 """Step 8 -- the two-photon saturation constant, and the gain anchor.
 
-    python src/calibration_module/steps/calib_step8.py --step7 RESULT.json --dry-run
-    python src/calibration_module/steps/calib_step8.py --step7 RESULT.json
-    python src/calibration_module/steps/calib_step8.py --step7 RESULT.json some.csv
+    python src/calibration_module/steps/calib_step8.py --run RUNDIR --dry-run
+    python src/calibration_module/steps/calib_step8.py --run RUNDIR
+    python src/calibration_module/steps/calib_step8.py --run RUNDIR some.csv
 
 Steps 6 and 7 fit the forward model -- the per-pair ``eta`` and single-beam
 response, then the relative phases ``Phi_k``.  Both read at most ~66 mV, where
@@ -205,18 +205,24 @@ the two columns rather than ending the run.
 
 Output
 ------
-``calib_step8_patterns_<MMDD_HHMM>.json``  every pattern, written BEFORE the
-hardware is touched, so an interrupted run is still reproducible.
+``calib_step8_patterns_<MMDD_HHMM>.csv``   every pattern, written BEFORE the
+                                           hardware is touched, so an
+                                           interrupted run is still
+                                           reproducible.  A CSV and not a JSON
+                                           because a run directory holds exactly
+                                           one JSON, and a pattern list is a
+                                           table anyway; the scalars it was
+                                           solved under ride in ``#`` meta lines.
 ``calib_step8_<MMDD_HHMM>.csv``            one row per read, partial if stopped.
-``calib_step8_result_<MMDD_HHMM>.json``    the fitted ``Y_sat`` -- what steps
-                                           downstream read.
 ``calib_step8_<MMDD_HHMM>_ysat.png``       the three-panel report.
 
-All four go to ``--out`` (default :data:`OUT_DIR`) as soon as they exist: a
-script run is a run somebody asked for.  The GUI is the other way round -- it
-stages a sweep in a temp directory and writes into ``OUT_DIR`` only when Save
-is pressed, so an abandoned run does not have to be recognised and deleted
-later.
+The fitted ``Y_sat`` goes into the run's ``calib.json`` as its ``step8``
+section -- what everything downstream reads.
+
+All of them go into ``--run`` as soon as they exist: a script run is a run
+somebody asked for.  The GUI is the other way round -- it stages a sweep in a
+temp directory and writes into the run directory only when Save is pressed, so
+an abandoned run does not have to be recognised and deleted later.
 
 Not a unittest (it needs real hardware) -- run it directly.
 """
@@ -244,6 +250,7 @@ from calibration_module.fit.verify import (  # noqa: E402
     full_scale,
     load_forward_model,
     predict,
+    write_plan_csv,
     write_verify_csv,
 )
 from calibration_module.measure.bench import connect_daq, connect_slm  # noqa: E402
@@ -259,15 +266,16 @@ from calibration_module.measure.pmt_temp import (  # noqa: E402,F401
     PMT_PERIOD_S,
     PmtTemperature,
 )
+from calibration_module.calib_file import load_calib, write_section  # noqa: E402
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "src/calib_data"   # output directory; --out overrides it
+CALIB_PATH = REPO_ROOT / "src/calib_data"   # the run directory; --run sets it
 
-# The step-7 result is NOT here -- it is the required --step7 argument, as
-# step 6's --step3 and step 7's --step6 are.
+# The run directory is NOT here -- it is the required --run argument, as it is
+# for steps 6 and 7.
 
-PAIRS = None                # None -> every pair the step-7 result calibrates; --p overrides
-PHASE_METHOD = None         # stored step-7 fit; None -> the single one a v2 JSON has
+PAIRS = None                # None -> every pair the run's calib.json calibrates; --p overrides
+PHASE_METHOD = None         # stored step-7 fit; None -> the single one a v2 run has
 
 SLM_DISPLAY_NO = None       # None -> auto-detect the LCOS-SLM display
 USB_SLM_NO = 1              # SLM_Ctrl_* device index for the DVI-mode switch
@@ -282,7 +290,7 @@ ACQ = DEFAULT_ACQ
 # ---- The run ----
 LADDER = 30                     # rungs in the bright band, one per stratum
 LADDER_LOW = 6                  # rungs below it -- forward-model checks, not leverage
-SEED = None                     # None -> a fresh seed, printed and written to the JSON
+SEED = None                     # None -> a fresh seed, printed and written to the plan CSV
 
 # ---- Where the ladder starts and stops ----
 #
@@ -451,7 +459,7 @@ def build(models, phases, pairs, *, seed: int, ladder: int = LADDER,
 # collect
 # ======================================================================
 
-def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
+def collect(run: Path, *, pairs=None, method=None, out_dir=None,
             ladder: int = LADDER, low: int = LADDER_LOW,
             ceiling_v: float = LADDER_CEILING_V,
             floor_v: float = LADDER_FLOOR_V, low_v: float = LADDER_LOW_V,
@@ -461,7 +469,7 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
     out = Path(OUT_DIR if out_dir is None else out_dir)
     out.mkdir(parents=True, exist_ok=True)
     wanted = select_pairs(PAIRS if pairs is None else pairs)
-    models, phases, ref = load_forward_model(step7, pairs=wanted, method=method)
+    models, phases, ref = load_forward_model(run, pairs=wanted, method=method)
     pairs = sorted(models)
     if seed is None:
         seed = SEED if SEED is not None else int(np.random.SeedSequence().entropy % 2**32)
@@ -475,7 +483,7 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
            for p in patterns]
     secs = run_seconds(len(patterns))
 
-    print(f"Step 7 in : {step7}")
+    load_calib(run).print_chain()
     print(f"Pairs     : {pairs}  (N = {len(pairs)}, reference {ref})")
     print(f"Full scale: Y_max {scale.fs * 1e3:.4f} mV   S^2 {scale.bound * 1e3:.4f} mV "
           f"({100 * scale.headroom:.1f} %)   psi* {np.degrees(scale.psi):.2f} deg")
@@ -499,42 +507,33 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
               + (" ..." if len(fell_back) > 6 else ""))
 
     stamp = time.strftime("%m%d_%H%M")
-    json_path = out / f"calib_step8_patterns_{stamp}.json"
-    json_path.write_text(json.dumps({
-        "step7_json": str(Path(step7).resolve()),
-        "pairs": pairs, "reference": ref, "method": method, "seed": seed,
-        "Y_max_v": scale.fs, "S2_v": scale.bound, "psi_rad": scale.psi,
-        "level_step_v": scale.fs / 15.0,
-        "eta": dict(zip(map(str, pairs), scale.amplitudes)),
-        "phi_rad": dict(zip(map(str, pairs), scale.phases)),
-        "config": {"ladder": ladder, "ladder_low": low,
-                   "ceiling_v": ceiling_v, "floor_v": floor_v,
-                   "low_v": low_v, "alpha": lv,
-                   "t_meas_s": ACQ.t_meas_s, "range_v": ACQ.range_v},
-        "patterns": [
-            {"seq": i, "kind": p.kind, "label": p.label,
-             "target_alpha": p.target_alpha, "alpha": p.alpha,
-             "coherent_v": c, "pred_v": q, "t_meas_s": ACQ.t_meas_s, "exact": p.exact,
-             "x": dict(zip(map(str, pairs), map(float, p.x))),
-             "w": dict(zip(map(str, pairs), map(float, p.w)))}
-            for i, (p, c, q) in enumerate(zip(patterns, coh, preds))
-        ],
-    }, indent=2), encoding="utf-8")
-    print(f"\nPatterns written to {json_path}")
+    plan_path = write_plan_csv(
+        out / f"calib_step8_patterns_{stamp}.csv", patterns, preds, coh,
+        pairs=pairs, scale=scale,
+        meta={"step7_ran": load_calib(run).ran(7),
+              "reference": ref, "method": method, "seed": seed,
+              "Y_max_v": scale.fs, "S2_v": scale.bound, "psi_rad": scale.psi,
+              "level_step_v": scale.fs / 15.0,
+              "ladder": ladder, "ladder_low": low,
+              "ceiling_v": ceiling_v, "floor_v": floor_v, "low_v": low_v,
+              "alpha_floor": lv["floor"], "alpha_cap": lv["cap"],
+              "alpha_low": lv["low"], "alpha_capped": lv["capped"],
+              "t_meas_s": ACQ.t_meas_s, "range_v": ACQ.range_v})
+    print(f"\nPatterns written to {plan_path}")
 
     if dry_run:
         report_plan(patterns, preds, coh, scale.fs, ceiling_v=ceiling_v,
                     floor_v=floor_v, low_v=low_v)
         return None
 
-    return _drive(step7, pairs, patterns, preds, coh, models, phases,
-                  out=out, stamp=stamp, json_path=json_path,
+    return _drive(run, pairs, patterns, preds, coh, models, phases,
+                  out=out, stamp=stamp, plan_path=plan_path,
                   meta={"n_pairs": len(pairs), "seed": seed, "y_max_v": scale.fs},
                   pmt=pmt)
 
 
-def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
-           out: Path, stamp: str, json_path: Path, meta: dict,
+def _drive(run, pairs, patterns, preds, coh, models, phases, *,
+           out: Path, stamp: str, plan_path: Path, meta: dict,
            columns: Sequence[str] = (), extra_of=None,
            pmt: "PmtTemperature | None" = None):
     """Display every pattern in read order and write the CSV, partial or not.
@@ -571,7 +570,7 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
                       t_both=ACQ.t_meas_s, t_single=ACQ.t_meas_s,
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
-    layout = load_layout(step7, pairs)
+    layout = load_layout(run, pairs)
     rows: list[dict] = []
     status = "complete"
     csv_path = None
@@ -592,8 +591,9 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
             if rows:            # on disk before anything else can fail
                 csv_path = write_verify_csv(
                     out / f"calib_step8_{stamp}.csv", pairs, rows,
-                    meta={"step7_json": Path(step7).resolve(),
-                          "patterns_json": json_path, "status": status, **meta},
+                    meta={"step7_ran": load_calib(run).ran(7),
+                          "patterns_csv": Path(plan_path).name,
+                          "status": status, **meta},
                     extra=["kind", "label", "seq", "target_alpha", "alpha",
                            "coherent_v", "sb_pred_v", "t_meas_s", "peak_v",
                            *columns])
@@ -727,27 +727,23 @@ def print_probe(d: dict, log=print) -> None:
 # the fit
 # ======================================================================
 
-def fit_and_write(csv_path, step7, *, pairs=None, method=None, out_dir=None,
+def fit_and_write(csv_path, run, *, pairs=None, method=None, out_dir=None,
                   log=print) -> dict:
-    """Fit ``Y_sat`` on a step-8 CSV, write the result JSON and the PNG.
+    """Fit ``Y_sat`` on a step-8 CSV, write the step8 section and the PNG.
 
-    The result JSON is what everything downstream reads.  It carries the CSV it
-    came from, because a ``Y_sat`` and the reads that defined ``g = 1`` are one
-    object: a later run measures its gain against THESE reads, so quoting the
-    constant without saying which sweep produced it is how the two get mixed.
+    The section records the CSV it came from, because a ``Y_sat`` and the reads
+    that defined ``g = 1`` are one object: a later run measures its gain against
+    THOSE reads, so quoting the constant without saying which sweep produced it
+    is how the two get mixed.
     """
     from calibration_module.fit.step8_report import report_csv
 
     csv_path = Path(csv_path)
-    out = Path(csv_path.parent if out_dir is None else out_dir)
-    result = report_csv(csv_path, step7, pairs=pairs, method=method,
+    out = Path(run if out_dir is None else out_dir)
+    result = report_csv(csv_path, run, pairs=pairs, method=method,
                         out_dir=out, log=log)
 
-    stamp = csv_path.stem.replace("calib_step8_", "")
-    result_path = out / f"calib_step8_result_{stamp}.json"
-    result_path.write_text(json.dumps({
-        "step7_json": str(Path(step7).resolve()),
-        "csv": str(csv_path.resolve()),
+    section = {
         "y_sat_v": result["y_sat_v"],
         "y_sat_sigma_v": result["sigma_v"],
         "y_sat_lo_v": result["lo_v"], "y_sat_hi_v": result["hi_v"],
@@ -755,17 +751,18 @@ def fit_and_write(csv_path, step7, *, pairs=None, method=None, out_dir=None,
         "gain_lever": result["gain_lever"],
         "rmse_v": result["rmse_v"], "rmse_linear_v": result["rmse_linear_v"],
         "n_reads": result["n"], "n_ladder": result["n_ladder"],
-        "png": result.get("png"),
+        "png": None if not result.get("png") else Path(result["png"]).name,
         "full_scale": result.get("full_scale", {}),
-        # g = 1 is DEFINED by the reads in the CSV above.  A later run divides
-        # its reads on a subset of those same drives by them to get its gain.
-        "gain_reference": {"convention": "g = 1 at this sweep",
-                           "csv": str(csv_path.resolve())},
-    }, indent=2), encoding="utf-8")
-    # Same reason the PNG path is in here: the caller that asked for a
-    # different out_dir should not have to re-derive the name from the CSV.
-    result["result_json"] = str(result_path)
-    log(f"Result written to {result_path}")
+        # g = 1 is DEFINED by the reads in this section's csv.  A later run
+        # divides its reads on a subset of those same drives by them to get its
+        # gain, so the convention is recorded with the constant it qualifies.
+        "gain_reference": {"convention": "g = 1 at this sweep"},
+    }
+    calib = write_section(run, 8, section, csv=csv_path, log=None)
+    # Same reason the PNG name is in the section: the caller that asked for a
+    # different out_dir should not have to re-derive it from the CSV.
+    result["result_json"] = str(calib.path)
+    log(f"Y_sat written to {calib.path}")
     return result
 
 
@@ -834,13 +831,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Step 8: fit the two-photon saturation constant Y_sat from "
                     "one level sweep, and anchor g = 1 for everything "
                     "downstream.",
-        epilog="--step7 has no default: that one file is the whole forward model "
-               "(its embedded step 3 is the layout, step 6 the etas, step 7 the "
-               "phases), so running against the wrong one reports a saturation "
-               "constant that is really a file mix-up.",
+        epilog="--run has no default: that one directory's calib.json is the "
+               "whole forward model (step 3 the layout, step 6 the etas, step 7 "
+               "the phases), so running against the wrong one reports a "
+               "saturation constant that is really a file mix-up.",
     )
-    parser.add_argument("--step7", required=True, type=Path, metavar="JSON",
-                        help="combined step-7 result JSON (required)")
+    parser.add_argument("--run", required=True, type=Path, metavar="DIR",
+                        help="run directory holding calib.json; the Y_sat is "
+                             "written back into it as its step8 section (required)")
     parser.add_argument("csv", nargs="?", type=Path,
                         help="re-fit this recorded CSV offline instead of collecting")
     parser.add_argument("--p", nargs="+", type=int, default=None, metavar="PAIR",
@@ -877,9 +875,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="stored step-7 fit to predict from")
     parser.add_argument("--seed", type=int, default=None,
                         help="reproduce a previous run's patterns")
-    parser.add_argument("--out", type=Path, default=None, metavar="DIR",
-                        help=f"directory for the JSON, CSV and PNGs, created if "
-                             f"missing (default {OUT_DIR})")
     parser.add_argument("--pmt", nargs="?", const="", default=None, metavar="RESOURCE",
                         help="log the PMT thermistor (Keithley 2400) beside every "
                              "read: adds pmt_ohm_Ohm and pmt_c columns, sampled "
@@ -890,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"--pmt only: seconds between 2400 readings "
                              f"(default {PMT_PERIOD_S:g})")
     parser.add_argument("--dry-run", action="store_true",
-                        help="solve the patterns, write the JSON, print the plan; "
+                        help="solve the patterns, write the plan CSV, print it; "
                              "touch no hardware")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -900,8 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     if args.csv is not None:
-        fit_and_write(args.csv, args.step7, pairs=wanted, method=args.method,
-                      out_dir=args.out)
+        fit_and_write(args.csv, args.run, pairs=wanted, method=args.method)
         return 0
 
     pmt = None
@@ -912,16 +906,16 @@ def main(argv: list[str] | None = None) -> int:
             # A missing VISA stack must not cost the run the sweep.
             print(f"--pmt ignored ({type(exc).__name__}: {exc})")
 
-    csv_path = collect(args.step7, pairs=wanted, method=args.method,
+    csv_path = collect(args.run, pairs=wanted, method=args.method,
                        ladder=args.ladder, low=args.low,
                        ceiling_v=args.ceiling_mv / 1e3,
                        floor_v=args.floor_mv / 1e3, low_v=args.low_mv / 1e3,
-                       out_dir=args.out,
+                       out_dir=args.run,
                        seed=args.seed, dry_run=args.dry_run, pmt=pmt)
     if csv_path is not None:
-        fit_and_write(csv_path, args.step7, method=args.method, out_dir=args.out)
+        fit_and_write(csv_path, args.run, method=args.method)
         print(f"\nRe-fit with:  python {Path(__file__).name} "
-              f"--step7 {args.step7} {csv_path}")
+              f"--run {args.run} {csv_path}")
     return 0
 
 

@@ -34,7 +34,8 @@ from pathlib import Path
 import numpy as np
 
 from .sigma import floor_std
-from .verify import full_scale, load_forward_model, load_verify_csv, predict, saturate
+from .verify import (full_scale, load_forward_model, load_verify_csv,
+                     note_step7_moved, predict, saturate)
 
 __all__ = ["Reads", "load_reads", "report_csv"]
 
@@ -77,7 +78,7 @@ class Reads:
         return np.clip((self.alpha * (LEVELS - 1)).astype(int), 0, LEVELS - 1)
 
 
-def load_reads(path, step7, *, pairs=None, method=None,
+def load_reads(path, run, *, pairs=None, method=None,
                y_sat: float | None = None) -> tuple[Reads, dict]:
     """``(reads, meta)`` for a system-accuracy CSV, predictions recomputed."""
     _, blocks, meta = load_verify_csv(path)
@@ -90,7 +91,7 @@ def load_reads(path, step7, *, pairs=None, method=None,
                          f"a system-accuracy CSV: every row needs the "
                          f"family/level label the sweep writes)")
     driven = list(block.driven)
-    models, phases, _ = load_forward_model(step7, pairs=pairs or driven, method=method)
+    models, phases, _ = load_forward_model(run, pairs=pairs or driven, method=method)
     scale = full_scale(models, phases, driven)
 
     # Predict here rather than trust the stored column: a CSV re-read against a
@@ -395,18 +396,15 @@ def make_plot(reads: Reads, peak: dict, fs: float, path) -> None:
     plt.close(fig)
 
 
-def report_csv(path, step7, *, pairs=None, method=None, out_dir=None,
+def report_csv(path, run, *, pairs=None, method=None, out_dir=None,
                y_sat: float | None = None) -> Reads:
     """Recompute a recorded run and write its report; no hardware."""
     path = Path(path)
     out_dir = Path(path.parent if out_dir is None else out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    reads, meta = load_reads(path, step7, pairs=pairs, method=method, y_sat=y_sat)
+    reads, meta = load_reads(path, run, pairs=pairs, method=method, y_sat=y_sat)
     _note_y_sat(path, meta, y_sat)
-    recorded = meta.get("step7_json")
-    if recorded and Path(recorded).name != Path(step7).name:
-        print(f"NOTE: {path.name} was collected against {Path(recorded).name}; "
-              f"reporting against {Path(step7).name}")
+    note_step7_moved(run, meta)
 
     peak = psi_peak(reads)
     fs = print_report(reads, peak, meta)

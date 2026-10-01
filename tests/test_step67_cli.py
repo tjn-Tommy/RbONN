@@ -1,8 +1,12 @@
 """Steps 6 and 7 v2 from the command line.
 
-The pair lists are required flags (step 6 ``--pairs``, step 7 ``--targets`` and
-``--ref``), ``--out`` moves every output, and the 6 -> 7 -> 8 runner passes
-those flags through.  Refits only -- no hardware.
+``--run`` names the run directory -- the one calib.json every step reads and
+writes back into -- and the pair lists are required flags (step 6 ``--pairs``,
+step 7 ``--targets`` and ``--ref``).  The 6 -> 7 -> 8 runner passes those
+through.  Refits only -- no hardware.
+
+The archived fixtures are frozen in the pre-v3 shape on purpose, so the run
+directories here are seeded from them (see ``calib_fixtures.seed_run``).
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from calibration_module.measure.phase_v2 import PhaseV2Config  # noqa: E402
+from calib_fixtures import seed_run  # noqa: E402
 
 RUN = REPO / "src/calib_data/archive/2026-09/run_0908_1444"
 STEP3 = RUN / "calib_step3c_0907_1358_pad10.json"
@@ -50,6 +56,14 @@ class _TmpCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
 
+    def run3(self) -> Path:
+        """A run directory carrying only the archived step-3 section."""
+        return seed_run(self.tmp / "run3", step3=STEP3)
+
+    def run6(self) -> Path:
+        """A run directory carrying the archived step-3 AND step-6 sections."""
+        return seed_run(self.tmp / "run6", step3=STEP6, step6=STEP6)
+
 
 class Step6CliTests(_TmpCase):
     def setUp(self):
@@ -58,28 +72,33 @@ class Step6CliTests(_TmpCase):
 
     def test_it_will_not_run_without_pairs(self):
         with _quiet(), self.assertRaises(SystemExit) as cm:
-            self.s6.main(["--step3", str(STEP3)])
+            self.s6.main(["--run", str(self.tmp)])
         self.assertEqual(cm.exception.code, 2)
 
     def test_a_malformed_pair_list_is_rejected(self):
         for bad in ("2,x", ","):
             with _quiet(), self.assertRaises(SystemExit):
-                self.s6.main(["--step3", str(STEP3), "--pairs", bad])
+                self.s6.main(["--run", str(self.tmp), "--pairs", bad])
 
     def test_a_sweep_with_no_pairs_stops_before_the_hardware(self):
         with mock.patch.object(self.s6, "connect_slm", side_effect=AssertionError), \
                 self.assertRaises(ValueError):
-            self.s6._run_sweep(STEP3, fit_after=False)
+            self.s6._run_sweep(self.run3(), fit_after=False)
 
-    def test_refit_takes_the_pairs_and_writes_into_out(self):
-        out = self.tmp / "nested" / "w25g20"
+    def test_refit_writes_the_section_and_the_plots_into_the_run(self):
+        run = self.run3()
         with _quiet():
-            rc = self.s6.main(["--step3", str(STEP3), "--pairs", "2,3,4,5,6",
-                               "--out", str(out), str(STEP6_CSV)])
+            rc = self.s6.main(["--run", str(run), "--pairs", "2,3,4,5,6",
+                               str(STEP6_CSV)])
         self.assertEqual(rc, 0)
         self.assertEqual(self.s6.PAIR_INDICES, [2, 3, 4, 5, 6])
-        self.assertEqual(len(list(out.glob("calib_step6v2_result_*.json"))), 1)
-        self.assertEqual(len(list(out.glob("calib_step6v2_pair*_*.png"))), 5)
+        self.assertEqual([p.name for p in run.glob("*.json")], ["calib.json"])
+        self.assertEqual(len(list(run.glob("step6_pair*_*.png"))), 5)
+
+        from calibration_module.calib_file import load_calib
+        calib = load_calib(run)
+        self.assertEqual(calib.steps(), [3, 6])
+        self.assertEqual(calib.csv_path(6), STEP6_CSV.resolve())
 
 
 class Step7CliTests(_TmpCase):
@@ -88,8 +107,8 @@ class Step7CliTests(_TmpCase):
         self.s7 = _load("_s7_cli", STEPS / "calib_step7_v2.py")
 
     def test_it_will_not_run_without_targets_or_ref(self):
-        for argv in (["--step6", str(STEP6), "--ref", "2"],
-                     ["--step6", str(STEP6), "--targets", "2,3"]):
+        for argv in (["--run", str(self.tmp), "--ref", "2"],
+                     ["--run", str(self.tmp), "--targets", "2,3"]):
             with _quiet(), self.assertRaises(SystemExit) as cm:
                 self.s7.main(argv)
             self.assertEqual(cm.exception.code, 2)
@@ -97,18 +116,21 @@ class Step7CliTests(_TmpCase):
     def test_a_sweep_with_no_targets_stops_before_the_hardware(self):
         with mock.patch.object(self.s7, "connect_slm", side_effect=AssertionError), \
                 self.assertRaises(ValueError):
-            self.s7._run_sweep(STEP6, fit_after=False)
+            self.s7._run_sweep(self.run6(), fit_after=False)
 
-    def test_refit_takes_targets_and_ref_and_writes_into_out(self):
-        out = self.tmp / "w20g25"
+    def test_refit_writes_the_section_and_the_plots_into_the_run(self):
+        run = self.run6()
         with _quiet():
-            rc = self.s7.main(["--step6", str(STEP6), "--targets", "2,3,4,5,6",
-                               "--ref", "2", "--out", str(out), str(STEP7_CSV)])
+            rc = self.s7.main(["--run", str(run), "--targets", "2,3,4,5,6",
+                               "--ref", "2", str(STEP7_CSV)])
         self.assertEqual(rc, 0)
         self.assertEqual(self.s7.TGT_INDICES, [2, 3, 4, 5, 6])
         self.assertEqual(self.s7.CONFIG.ref_index, 2)
-        self.assertEqual(len(list(out.glob("calib_step7_result_*.json"))), 1)
-        self.assertEqual(len(list(out.glob("calib_step7v2_pair*_*.png"))), 4)
+        self.assertEqual([p.name for p in run.glob("*.json")], ["calib.json"])
+        self.assertEqual(len(list(run.glob("step7_pair*_*.png"))), 4)
+
+        from calibration_module.calib_file import load_calib
+        self.assertEqual(load_calib(run).steps(), [3, 6, 7])
 
 
 class RunnerPassesTheFlagsTests(_TmpCase):
@@ -117,43 +139,57 @@ class RunnerPassesTheFlagsTests(_TmpCase):
         self.runner = _load("_runner_cli", REPO / "src/drafts/calib_step6-8_v2.py")
         self.argv: dict[int, list[str]] = {}
 
-        def fake(n, result):
+        def fake(n, writes_section):
+            """A step that records its argv and writes the section it would.
+
+            It has to write a real section: the chain checks for one after each
+            step, because a sweep can succeed while its fit fails and that used
+            to surface only as a confusing error one step later.
+            """
+            from calibration_module.calib_file import write_section
+
             def main(argv):
                 self.argv.setdefault(n, []).extend(argv)
-                if result:
-                    (self.tmp / result).write_text("{}", encoding="utf-8")
+                if writes_section:
+                    run = Path(argv[argv.index("--run") + 1])
+                    write_section(run, n, {"fake": True}, log=None)
                 return 0
             return main
 
         self.mods = {
             "calib_step6_v2": SimpleNamespace(
-                CALIB_PATH=None, PAIR_INDICES=[],
-                main=fake(6, "calib_step6v2_result_0000_0000.json")),
+                CALIB_PATH=None, PAIR_INDICES=[], main=fake(6, True)),
             "calib_step7_v2": SimpleNamespace(
                 CALIB_PATH=None, TGT_INDICES=[], CONFIG=PhaseV2Config(ref_index=1),
-                main=fake(7, "calib_step7_result_0000_0000.json")),
+                main=fake(7, True)),
             "calib_step8": SimpleNamespace(
-                OUT_DIR=None, PAIRS=[],
-                main=fake(8, "calib_step8_result_0000_0000.json")),
+                OUT_DIR=None, PAIRS=[], main=fake(8, True)),
         }
         patch = mock.patch.object(self.runner, "_load_step", lambda stem: self.mods[stem])
         patch.start()
         self.addCleanup(patch.stop)
 
     def _run(self, **kw):
+        """One run folder across calls, so --start-at resumes a real one."""
+        if not hasattr(self, "_run_dir"):
+            self._run_dir = self.run3()
         with _quiet():
-            return self.runner.run_sequence(run_dir=self.tmp, step3=STEP3,
+            return self.runner.run_sequence(run_dir=self._run_dir,
                                             pairs=[2, 3, 4], ref_index=2, **kw)
 
-    def test_steps_6_and_7_get_the_pairs_and_the_reference(self):
+    def test_steps_6_and_7_get_the_run_folder_the_pairs_and_the_reference(self):
         self.assertEqual(self._run(stop_at=7), 0)
-        self.assertEqual(self.argv[6][2:], ["--pairs", "2,3,4"])
-        self.assertEqual(self.argv[7][2:], ["--targets", "2,3,4", "--ref", "2"])
+        self.assertEqual(self.argv[6], ["--run", str(self._run_dir),
+                                        "--pairs", "2,3,4"])
+        self.assertEqual(self.argv[7], ["--run", str(self._run_dir),
+                                        "--targets", "2,3,4", "--ref", "2"])
 
-    def test_stop_at_7_skips_the_verify(self):
-        self._run(stop_at=7)
+    def test_stop_at_7_skips_the_verify_and_8_resumes_from_the_sections(self):
+        self.assertEqual(self._run(stop_at=7), 0)
         self.assertNotIn(8, self.argv)
-        self._run(start_at=8, verify_n=(1,))
+        # Steps 6 and 7 left their sections behind, which is the only thing
+        # --start-at 8 needs; nothing was carried between the two calls.
+        self.assertEqual(self._run(start_at=8, verify_n=(1,)), 0)
         self.assertIn(8, self.argv)
 
 
@@ -169,6 +205,8 @@ class PmtFlagTests(_TmpCase):
         super().setUp()
         self.s6 = _load("_s6_pmt", STEPS / "calib_step6_v2.py")
         self.s7 = _load("_s7_pmt", STEPS / "calib_step7_v2.py")
+        self.r3 = self.run3()
+        self.r6 = self.run6()
 
     def _sweep_kwargs(self, mod, argv):
         """Run main() far enough to see what it would pass to _run_sweep."""
@@ -182,7 +220,7 @@ class PmtFlagTests(_TmpCase):
         return seen
 
     def test_step6_logs_by_default_and_no_pmt_turns_it_off(self):
-        argv = ["--step3", str(STEP3), "--pairs", "2,3"]
+        argv = ["--run", str(self.r3), "--pairs", "2,3"]
         with mock.patch.object(self.s6, "open_pmt") as op:
             self._sweep_kwargs(self.s6, argv)
         self.assertTrue(op.call_args.kwargs["enabled"])
@@ -192,7 +230,7 @@ class PmtFlagTests(_TmpCase):
         self.assertFalse(op.call_args.kwargs["enabled"])
 
     def test_step7_logs_by_default_and_no_pmt_turns_it_off(self):
-        argv = ["--step6", str(STEP6), "--targets", "2,3", "--ref", "1"]
+        argv = ["--run", str(self.r6), "--targets", "2,3", "--ref", "1"]
         with mock.patch.object(self.s7, "open_pmt") as op:
             self._sweep_kwargs(self.s7, argv)
         self.assertTrue(op.call_args.kwargs["enabled"])
@@ -203,8 +241,8 @@ class PmtFlagTests(_TmpCase):
 
     def test_the_period_and_the_resource_reach_open_pmt(self):
         for mod, argv in (
-            (self.s6, ["--step3", str(STEP3), "--pairs", "2,3"]),
-            (self.s7, ["--step6", str(STEP6), "--targets", "2,3", "--ref", "1"]),
+            (self.s6, ["--run", str(self.r3), "--pairs", "2,3"]),
+            (self.s7, ["--run", str(self.r6), "--targets", "2,3", "--ref", "1"]),
         ):
             with self.subTest(mod=mod.__name__):
                 with mock.patch.object(mod, "open_pmt") as op:
@@ -218,7 +256,7 @@ class PmtFlagTests(_TmpCase):
         with mock.patch("calibration_module.measure.pmt_temp.PmtTemperature",
                         side_effect=RuntimeError("no VISA")):
             seen = self._sweep_kwargs(
-                self.s6, ["--step3", str(STEP3), "--pairs", "2,3"])
+                self.s6, ["--run", str(self.r3), "--pairs", "2,3"])
         self.assertIsNone(seen["pmt"])
 
 

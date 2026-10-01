@@ -102,6 +102,10 @@ from slm_module.optimization import (
     run_osa_optimization_batch,
     validate_independent_profile,
 )
+from calibration_module.calib_file import (
+    STEP_ORDER as CALIB_STEP_ORDER,
+    load_calib,
+)
 from calibration_module.fit.pair_v2 import (
     PairV2Config,
     PairV2Fit,
@@ -109,8 +113,8 @@ from calibration_module.fit.pair_v2 import (
     burst_rows,
     fit_pair,
     load_meas_csv,
-    save_combined_json,
     save_plot,
+    save_step6_section,
     write_meas_csv,
 )
 from calibration_module.measure.pair_v2 import (
@@ -135,7 +139,7 @@ from calibration_module.fit.phase import (
     load_pair_models,
     drop_bursts,
     load_phase_csv,
-    save_comb_phase_json,
+    save_step7_section,
     references_in_csv,
     targets_in_csv,
     write_meas_csv as write_phase_meas_csv,
@@ -965,16 +969,20 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._build_step1_tab(), "Step 1 · Min/Max")
         tabs.addTab(self._build_step2_tab(), "Step 2 · Wavelength")
-        # Step 3a (the per-coordinate sweep) is gone: 3b/3c cover it with the
-        # channel-grid DAQ scan, which is what the encoder and steps 6-8 read.
-        # Its "Run All (1->2->3)" button and channel-map preview went with it.
-        # The fit/plot widgets it used to host did not: _on_step_finished feeds
-        # every CSV-producing step -- 3b and 3c included -- into that flow, so
-        # the container is still built, just with no page to sit on.
+        # Step 3a (the per-coordinate sweep) is gone: the channel-grid DAQ scan
+        # covers it, and that is what the encoder and steps 6-8 read.  Its
+        # "Run All (1->2->3)" button and channel-map preview went with it.  The
+        # fit/plot widgets it used to host did not: _on_step_finished feeds every
+        # CSV-producing step into that flow, so the container is still built,
+        # just with no page to sit on.
         self._fit_backing = self._build_step3_fit_backing()
         self._fit_backing.setVisible(False)
-        tabs.addTab(self._build_fast_channel_calibration_page(), "Step 3b · Fast Channels")
-        tabs.addTab(self._build_step3c_page(), "Step 3c · Channels (DAQ)")
+        # The OSA-based 3b is built but NOT tabbed, the way 4b and 6b are: the
+        # DAQ scan below is the step 3 this bench runs, and two tabs for one step
+        # is how a sweep ends up done through the wrong one.  See the README's
+        # Legacy section.
+        self._build_fast_channel_calibration_page()
+        tabs.addTab(self._build_step3c_page(), "Step 3 · Channels (DAQ)")
         # Mod Error page is built but not shown as a tab: the Encoding Gain
         # (TPA Encoding page) and Quick Test sweeps read its ana_* OSA
         # sweep-settings widgets.
@@ -4711,8 +4719,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return sorted(out)
 
     def _tpa_browse_step3(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Step-3 calibration for this sweep", "", "JSON (*.json)"
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Run folder for this sweep", ""
         )
         if path:
             self.tpa_step3_edit.setText(path)
@@ -4722,39 +4730,35 @@ class MainWindow(QtWidgets.QMainWindow):
         return Path(text) if text else None
 
     def _tpa_load_step3(self):
-        """``(calibration, layout)`` from the named file, or raise.
+        """``(calibration, layout)`` from the run folder's step-3 section, or raise.
 
         The layout is rebuilt here rather than taken from the Encoding page so
-        that what this sweep drives is decided by one named file, exactly as the
-        offline script's ``--step3`` decides it.  Same loader, same method, so a
-        GUI run and a terminal run against the same file drive the same pixels.
+        that what this sweep drives is decided by one named run, exactly as the
+        offline script's ``--run`` decides it.  Same loader, so a GUI run and a
+        terminal run against the same folder drive the same pixels.
         """
-        path = self._tpa_step3_path()
-        if path is None:
-            raise ValueError("no Step-3 calibration chosen")
-        if not path.is_file():
-            raise FileNotFoundError(f"Step-3 calibration not found: {path}")
-        calib = load_calibration_result(path)
-        layout = channel_layout_from_calibration(
-            calib
-        )
-        return calib, layout
+        run = self._tpa_step3_path()
+        if run is None:
+            raise ValueError("no run folder chosen")
+        calib = load_calib(run)
+        result = calib.step3_result()
+        return result, channel_layout_from_calibration(result)
 
     def _tpa_describe_step3(self) -> None:
-        """Say what the chosen file actually is, before an hour is spent on it."""
-        path = self._tpa_step3_path()
-        if path is None:
+        """Say what the chosen run holds, before an hour is spent on it."""
+        run = self._tpa_step3_path()
+        if run is None:
             self._set_status(self.tpa_step3_label,
-                             "No Step-3 calibration chosen — required to run.", "off")
+                             "No run folder chosen — required to run.", "off")
             return
         try:
             _calib, layout = self._tpa_load_step3()
         except Exception as exc:
-            self._set_status(self.tpa_step3_label, f"{path.name}: {exc}", "error")
+            self._set_status(self.tpa_step3_label, f"{run.name}: {exc}", "error")
             return
         self._set_status(
             self.tpa_step3_label,
-            f"{path.name} · {layout.n_channels} pairs · "
+            f"{run.name} · {self._run_chain(run)} · {layout.n_channels} pairs · "
             f"{layout.channel_width_px} px window + "
             f"{layout.pitch_px - layout.channel_width_px} px pad",
             "ok",
@@ -5228,30 +5232,32 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        csv_path, json_path, png_path = _save_paths(path)
+        csv_path, _json, png_path = _save_paths(path)
         written = [Path(write_meas_csv(self.tpa_rows, csv_path,
                                        meta=self.tpa_meta)).name]
 
-        step3 = self._tpa_step3_path()
-        if step3 is None or not step3.is_file():
+        # The run is the folder saved into, which is the whole point of one
+        # calib.json per directory: there is no second path to keep in step.
+        run = csv_path.parent
+        try:
+            _calib, layout = self._tpa_load_step3()
+        except Exception as exc:                        # noqa: BLE001
             self.tpa_status.setText(
-                f"Saved {written[0]} — no Step-3 calibration set, so the combined "
-                "JSON was not written (step 7 could not read it)."
+                f"Saved {written[0]} — no usable run folder ({exc}), so the "
+                "step6 section was not written (step 7 could not read it)."
             )
             return
         try:
-            _calib, layout = self._tpa_load_step3()
-            js = save_combined_json(
-                self.tpa_fits, json_path, step3=step3,
-                center_wl=float(getattr(layout, "center_wl", 0.0)),
-            )
-            written.append(Path(js).name)
+            calib = save_step6_section(
+                self.tpa_fits, run, csv=csv_path,
+                center_wl=float(getattr(layout, "center_wl", 0.0)), log=None)
+            written.append(f"step6 -> {calib.path.name}")
             for fit in self.tpa_fits:
                 png = png_path(fit.index)
                 save_plot(fit, png)
             written.append(f"{len(self.tpa_fits)} PNG(s)")
         except Exception as exc:
-            self.tpa_status.setText(f"Saved {written[0]}; JSON/plots failed: {exc}")
+            self.tpa_status.setText(f"Saved {written[0]}; section/plots failed: {exc}")
             return
         self.tpa_status.setText("Saved " + "  +  ".join(written))
 
@@ -5549,8 +5555,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- inputs ------------------------------------------------------------
     def _tpa_phase_browse_step6(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Combined Step-6 result for this sweep", "", "JSON (*.json)"
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Run folder for this sweep", ""
         )
         if path:
             self.tpa_phase_step6_edit.setText(path)
@@ -5560,32 +5566,22 @@ class MainWindow(QtWidgets.QMainWindow):
         return Path(text) if text else None
 
     def _tpa_phase_load_step6(self):
-        """``(layout, models)`` from the named step-6 JSON, or raise.
+        """``(layout, models)`` from the chosen run folder, or raise.
 
-        Both halves come out of the one file, exactly as the offline runner's
-        ``--step6`` does it: the embedded Step-3 payload builds the layout, the
-        fitted pairs give the etas the fringe amplitudes are pinned to.  That is
+        Both halves come out of the one calib.json, exactly as the offline
+        runner's ``--run`` does it: the step-3 section builds the layout, the
+        step-6 pairs give the etas the fringe amplitudes are pinned to.  That is
         what guarantees the phase is measured through the aperture those etas
         were calibrated under.
         """
         path = self._tpa_phase_step6_path()
         if path is None:
-            raise ValueError("no Step-6 result chosen")
-        if not path.is_file():
-            raise FileNotFoundError(f"Step-6 result not found: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        step3 = payload.get("step3")
-        if step3 is None:
-            raise ValueError(
-                "no embedded 'step3' calibration — this is not a combined "
-                "step-6 result"
-            )
-        layout = channel_layout_from_calibration(
-            calibration_result_from_dict(step3)
-        )
-        models = load_pair_models([path])
+            raise ValueError("no run folder chosen")
+        calib = load_calib(path)
+        layout = channel_layout_from_calibration(calib.step3_result())
+        models = load_pair_models([calib.path])
         if not models:
-            raise ValueError("no fitted pairs in the 'step6' section")
+            raise ValueError("no fitted pairs in the run's step6 section")
         return layout, models
 
     def _tpa_phase_describe_step6(self) -> None:
@@ -6037,12 +6033,11 @@ class MainWindow(QtWidgets.QMainWindow):
         src = self._panel("Input · step 7 result")
         grid = QtWidgets.QGridLayout(src)
         self.step8_step7_edit = QtWidgets.QLineEdit()
-        self.step8_step7_edit.setPlaceholderText("calib_step7_result_*.json")
+        self.step8_step7_edit.setPlaceholderText("run folder holding calib.json")
         browse = QtWidgets.QPushButton("Browse")
-        browse.clicked.connect(lambda: self._browse_open_into(
-            self.step8_step7_edit, "Select step-7 result",
-            "JSON Files (*.json)"))
-        grid.addWidget(QtWidgets.QLabel("Step 7 JSON"), 0, 0)
+        browse.clicked.connect(lambda: self._browse_dir_into(
+            self.step8_step7_edit, "Select the run folder"))
+        grid.addWidget(QtWidgets.QLabel("Run folder"), 0, 0)
         grid.addWidget(self.step8_step7_edit, 0, 1)
         grid.addWidget(browse, 0, 2)
         # Numbers only, and empty until there is a forward model to quote:
@@ -7238,16 +7233,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        csv_path, json_path, png_path = _save_paths(path)
+        csv_path, _json, png_path = _save_paths(path)
         results = [r for _, r in sorted(self.tpa_phase_results.items())]
         written = [Path(write_phase_meas_csv(results, csv_path,
                                              meta=self.tpa_phase_meta)).name]
 
-        step6 = self._tpa_phase_step6_path()
-        if step6 is None or not step6.is_file():
+        # The run is the folder saved into; its step3 and step6 sections are
+        # what this spectrum is referred to, and save_step7_section checks them.
+        try:
+            load_calib(csv_path.parent).require(3, 6)
+        except Exception as exc:                        # noqa: BLE001
             self.tpa_phase_status.setText(
-                f"Saved {written[0]} — no Step-6 result set, so the combined "
-                "JSON was not written (step 8 could not read it)."
+                f"Saved {written[0]} — {exc}, so the step7 section was not "
+                "written (step 8 could not read it)."
             )
             return
         fits = {
@@ -7266,15 +7264,16 @@ class MainWindow(QtWidgets.QMainWindow):
         root = (self.tpa_phase_root if self.tpa_phase_root is not None
                 else self._tpa_phase_config().ref_index)
         try:
-            js = save_comb_phase_json(
-                fits, step6, json_path,
+            calib = save_step7_section(
+                fits, csv_path.parent,
                 ref_index=root,
-                csv_path=str(csv_path.resolve()),
+                csv=csv_path,
                 single_beam_bg=self.tpa_phase_single_beam.isChecked(),
                 chains=self.tpa_phase_chains,
                 extra=self._tpa_phase_plan_payload(),
+                log=None,
             )
-            written.append(Path(js).name)
+            written.append(f"step7 -> {calib.path.name}")
             for (k, _method), fit in fits.items():
                 png = png_path(k)
                 fig = Figure(figsize=(12, 5))
@@ -8966,6 +8965,29 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setValue(value)
         return spin
 
+    def _run_chain(self, run: Path) -> str:
+        """``"step2 09-28 · step3 09-29 · step6 —"`` for a run folder's status pill.
+
+        The same chain the offline runners print before touching the bench, short
+        enough for one line.  A section that predates one above it is marked, not
+        refused -- whether that matters is the operator's call, but it is not
+        going to be a surprise.
+        """
+        try:
+            calib = load_calib(run)
+        except Exception as exc:                        # noqa: BLE001
+            return f"no calib.json ({exc.__class__.__name__})"
+        stale = calib.stale()
+        parts = []
+        for step in CALIB_STEP_ORDER:
+            ran = calib.ran(step)
+            if ran is None:
+                parts.append(f"step{step} —")
+                continue
+            mark = " (stale)" if step in stale else ""
+            parts.append(f"step{step} {ran[5:10].replace('-', '-')}{mark}")
+        return " · ".join(parts)
+
     def _set_status(self, label: QtWidgets.QLabel, text: str, status: str) -> None:
         """Update a status pill label (status in: ok, error, off)."""
         label.setText(text)
@@ -9375,6 +9397,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _browse_open_into(self, edit: QtWidgets.QLineEdit, caption: str, filt: str) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, caption, "", filt)
+        if path:
+            edit.setText(path)
+
+    def _browse_dir_into(self, edit: QtWidgets.QLineEdit, caption: str) -> None:
+        """Pick a run FOLDER.  Steps 6, 7 and 8 all take one, not a named file."""
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, caption, "")
         if path:
             edit.setText(path)
 

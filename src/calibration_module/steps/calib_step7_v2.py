@@ -1,27 +1,27 @@
 """Step 7 v2 -- comb phase dPhi_comb per pair, ONE free parameter.
 
 Needs real hardware for the sweep; the refit path is offline.  Either way
-``--step6``, ``--targets`` and ``--ref`` are required and have no default::
+``--run``, ``--targets`` and ``--ref`` are required and have no default::
 
-    S="--step6 src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_result_0907_1757.json --targets 2,3,4,5,6 --ref 2"
+    S="--run src/calib_data/run_0930 --targets 2,3,4,5,6 --ref 2"
     python src/calibration_module/steps/calib_step7_v2.py $S
-    python src/calibration_module/steps/calib_step7_v2.py $S --out DIR   # CSV, JSON, PNGs into DIR
     python src/calibration_module/steps/calib_step7_v2.py $S --meas
     python src/calibration_module/steps/calib_step7_v2.py $S some.csv
 
 A sweep fits the CSV it just wrote (``--meas`` stops after the CSV).  Either way
-the fit writes a combined ``calib_step7_result_*.json`` -- the step-3 + step-6
-payloads carried over from ``--step6`` plus the fitted ``{Phi_k}`` spectrum --
-the single input downstream consumers read.
+the fit writes the ``{Phi_k}`` spectrum back into the run's ``calib.json`` as its
+``step7`` section, beside the ``step3`` layout it was driven through and the
+``step6`` etas its amplitudes are pinned to.
 
-There is deliberately no default step-6 path, for the same reason step 6 has no
-default ``--step3``: it used to be a constant edited by hand, so the file it
-named drifted out from under the script every time a run was filed away.  That
-one file decides both what is driven (its embedded step-3 calibration IS the
-channel layout) and what the fringe amplitudes are pinned to, so running against
-the wrong one does not fail -- it reports a phase measured under a different
-aperture.  The targets and the reference are required for the same reason: as
-constants they silently measured whichever pairs the last edit left in them.
+``--run`` is a run DIRECTORY holding one ``calib.json``.  There is deliberately
+no default, for the same reason step 6 has none: the path used to be a constant
+edited by hand, so the file it named drifted out from under the script every time
+a run was filed away.  That one file decides both what is driven (its step-3
+section IS the channel layout) and what the fringe amplitudes are pinned to, so
+running against the wrong one does not fail -- it reports a phase measured under
+a different aperture.  The targets and the reference are required for the same
+reason: as constants they silently measured whichever pairs the last edit left
+in them.
 
 What changed vs :mod:`calib_step7_v1`
 -------------------------------------
@@ -101,7 +101,7 @@ from calibration_module.fit.phase import (  # noqa: E402
     load_pair_models,
     load_phase_csv,
     references_in_csv,
-    save_comb_phase_json,
+    save_step7_section,
     targets_in_csv,
     write_meas_csv,
 )
@@ -128,16 +128,13 @@ from calibration_module.measure.pmt_temp import (  # noqa: E402
     PmtTemperature,
     open_pmt,
 )
-from calibration_module.fit.slm_response import (  # noqa: E402
-    calibration_result_from_dict,
-)
-from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
+from calibration_module.calib_file import load_calib  # noqa: E402
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "src/calib_data"   # output directory; --out overrides it
+CALIB_PATH = REPO_ROOT / "src/calib_data"   # the run directory; --run sets it
 
-# Neither the step-6 result nor the pairs are here -- they are the required
-# --step6, --targets and --ref arguments.  See the module docstring for why they
+# Neither the run directory nor the pairs are here -- they are the required
+# --run, --targets and --ref arguments.  See the module docstring for why they
 # have no default.  Left empty, so code that imports this module and sweeps
 # without setting the list fails before touching the hardware.
 TGT_INDICES: list[int] = []
@@ -183,27 +180,16 @@ DAQ_CHANNEL = "ai0"
 # inputs  (layout + step-6 models, both out of the one combined JSON)
 # ======================================================================
 
-def _load_layout(step6: Path):
-    """Channel layout from the Step-3 calibration EMBEDDED in the step-6 JSON.
+def _load_layout(run: Path):
+    """Channel layout from the run's step-3 section.
 
-    ``save_combined_json`` stores the raw step-3 payload under ``"step3"``, so
-    the layout this run drives is guaranteed to be the one the step-6 etas were
-    calibrated under.  There is one encoding convention -- the fitted sin^2
-    inversion -- so there is nothing left to read back and disagree about.
+    One directory, one calib.json: the layout this run drives sits beside the
+    step-6 etas in the same file, and writing a new step 3 drops the step 6, so
+    the two cannot describe different apertures.  There is one encoding
+    convention -- the fitted sin^2 inversion -- so there is nothing left to read
+    back and disagree about either.
     """
-    step6 = Path(step6)
-    if not step6.is_file():
-        raise FileNotFoundError(f"Step-6 result not found: {step6}")
-    import json
-
-    payload = json.loads(step6.read_text(encoding="utf-8"))
-    step3 = payload.get("step3")
-    if step3 is None:
-        raise ValueError(
-            f"{step6} has no embedded 'step3' calibration; point --step6 at a "
-            f"combined step-6 result (calib_step6_v2 save_combined_json)"
-        )
-    layout = channel_layout_from_calibration(calibration_result_from_dict(step3))
+    layout = load_calib(run).layout()
     for name, idx in ([("ref_index", CONFIG.ref_index)]
                       + [("TGT_INDICES", k) for k in TGT_INDICES]):
         if not (0 <= CONFIG.slot(idx) < layout.n_channels):
@@ -215,20 +201,20 @@ def _load_layout(step6: Path):
     return layout
 
 
-def _load_models(step6: Path, targets, *, ref: int | None = None):
+def _load_models(run: Path, targets, *, ref: int | None = None):
     """Step-6 pair models; require the reference and every requested target.
 
     ``ref`` defaults to ``CONFIG.ref_index`` -- a sweep is about to drive it --
     but a re-fit passes the reference the CSV itself records instead.
     """
     ref = CONFIG.ref_index if ref is None else ref
-    models = load_pair_models([Path(step6)])
+    models = load_pair_models([load_calib(run).path])
     needed = [("reference", ref)] + [("target", k) for k in targets]
     for role, idx in needed:
         if idx not in models:
             raise ValueError(
                 f"no step-6 model for {role} pair index {idx}; found "
-                f"{sorted(models)} in {step6}"
+                f"{sorted(models)} in {load_calib(run).path}"
             )
     print(f"Step 6: eta[ref {ref}] = {models[ref].eta:.4g} ; "
           + " ".join(f"eta[{k}]={models[k].eta:.4g}" for k in targets))
@@ -304,7 +290,7 @@ def save_plot(fit: PhaseFit, tgt: int, path) -> None:
 # the run
 # ======================================================================
 
-def _run_sweep(step6: Path, fit_after: bool, *,
+def _run_sweep(run: Path, fit_after: bool, *,
                pmt: "PmtTemperature | None" = None) -> None:
     """Sweep every target pair back to the reference; write one raw CSV.
 
@@ -316,8 +302,9 @@ def _run_sweep(step6: Path, fit_after: bool, *,
     """
     if not TGT_INDICES:
         raise ValueError("no target pairs -- pass --targets, e.g. --targets 2,3,4,5,6")
-    layout = _load_layout(step6)
-    print(f"Step 6 in: {step6}")
+    layout = _load_layout(run)
+    # The whole chain, stamps and all, before the laser is asked for anything.
+    load_calib(run).print_chain()
     drive = build_xw_sweep(CONFIG)
     secs = run_seconds(drive, ACQ)
     values = [x for x, _, _, _ in drive]
@@ -379,12 +366,12 @@ def _run_sweep(step6: Path, fit_after: bool, *,
     n_rows = sum(r.trial.size for r in results)
     print(f"\nSaved {n_rows} rows to {csv_path}")  # raw rows on disk BEFORE fitting
     if not fit_after:
-        print(f"Fit with:  python {Path(__file__).name} --step6 {step6} {csv_path}")
+        print(f"Fit with:  python {Path(__file__).name} --run {run} {csv_path}")
         return
-    fit_csv(csv_path, step6)
+    fit_csv(csv_path, run)
 
 
-def fit_csv(path: str | Path, step6: Path) -> None:
+def fit_csv(path: str | Path, run: Path) -> None:
     """Re-fit an already-recorded CSV offline (no hardware).
 
     Needs two inputs: this CSV plus the combined step-6 JSON for each pair's
@@ -419,7 +406,7 @@ def fit_csv(path: str | Path, step6: Path) -> None:
               f"{roots[0]}; using that, not CONFIG's {CONFIG.ref_index}")
     ref_of = {k: recorded.get(k, ref) for k in targets}
     models = _load_models(
-        step6, sorted({k for k in targets if k != ref}
+        run, sorted({k for k in targets if k != ref}
                       | {r for k, r in ref_of.items() if k != ref}),
         ref=ref)
     fittable = [k for k in targets
@@ -463,7 +450,7 @@ def fit_csv(path: str | Path, step6: Path) -> None:
                       f"{b['voltage_mean_v']*1e3:+.4f} mV with a "
                       f"{b['voltage_std_v']*1e3:.4f} mV trace std")
         report(result.fit, result.tgt_index, result.ref_index)
-        plot_path = CALIB_PATH / f"calib_step7v2_pair{k}_{stamp}.png"
+        plot_path = CALIB_PATH / f"step7_pair{k}_{stamp}.png"
         save_plot(result.fit, result.tgt_index, plot_path)
         print(f"Plot saved to {plot_path}")
         fits[k] = result.fit
@@ -487,7 +474,6 @@ def fit_csv(path: str | Path, step6: Path) -> None:
     # consumers.  A stored dphi_comb_rad IS Phi_k in the forward model
     # E = sum_k eta_k sqrt(x_k w_k) exp(i[u_k + v_k + Phi_k]); nothing negates
     # it on the way out or on the way back in.
-    out_json = CALIB_PATH / f"calib_step7_result_{stamp}.json"
     # Recorded per target so a result can always be traced back to the rows that
     # made it, and so a run whose bench was glitching cannot later be mistaken
     # for a clean one.  Written whether or not the run cascaded.
@@ -500,13 +486,12 @@ def fit_csv(path: str | Path, step6: Path) -> None:
         }
     if bursts:
         extra["dropped_bursts"] = {str(k): v for k, v in bursts.items()}
-    save_comb_phase_json({(k, METHOD): f for k, f in fits.items()},
-                         step6, out_json, ref_index=ref,
-                         csv_path=str(Path(path).resolve()),
-                         single_beam_bg=SINGLE_BEAM_BG,
-                         chains=chains,
-                         extra=extra or None)
-    print(f"\nCombined step-7 result (step3 + step6 + step7) saved to {out_json}")
+    calib = save_step7_section({(k, METHOD): f for k, f in fits.items()},
+                               run, ref_index=ref, csv=Path(path),
+                               single_beam_bg=SINGLE_BEAM_BG,
+                               chains=chains,
+                               extra=extra or None)
+    print(f"\nStep-7 spectrum -> {calib.path}")
 
 
 def _stages_from_refs(ref_of: dict[int, int], fittable, root: int) -> list[Stage]:
@@ -551,14 +536,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="calib_step7_v2.py",
         description="Step 7 v2 -- comb phase dPhi_comb per pair (one free parameter).",
-        epilog="--step6, --targets and --ref have no default.  --step6 decides both what is "
+        epilog="--run, --targets and --ref have no default.  --run decides both what is "
                "driven (its embedded step-3 calibration IS the layout) and what "
                "the fringe amplitudes are pinned to, so running against the "
                "wrong one reports a phase measured under a different aperture.",
     )
     parser.add_argument(
-        "--step6", required=True, type=Path, metavar="JSON",
-        help="combined step-6 result JSON: layout + pinned etas (required)",
+        "--run", required=True, type=Path, metavar="DIR",
+        help="run directory holding calib.json: its step3 section is the "
+             "layout and its step6 section the pinned etas (required)",
     )
     parser.add_argument(
         "--targets", required=True, type=_index_list, metavar="2,3,4",
@@ -567,11 +553,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ref", required=True, type=int, metavar="K",
         help="reference pair label, Phi = 0 (required)",
-    )
-    parser.add_argument(
-        "--out", type=Path, default=None, metavar="DIR",
-        help=f"directory for the CSV, JSON and PNGs, created if missing "
-             f"(default {CALIB_PATH})",
     )
     parser.add_argument(
         "csv", nargs="?", type=Path,
@@ -599,14 +580,13 @@ def main(argv: list[str] | None = None) -> int:
 
     TGT_INDICES = args.targets
     CONFIG = replace(CONFIG, ref_index=args.ref)
-    if args.out is not None:
-        CALIB_PATH = args.out
+    CALIB_PATH = args.run
     Path(CALIB_PATH).mkdir(parents=True, exist_ok=True)
 
     if args.csv is not None:            # offline re-fit, no hardware
-        fit_csv(args.csv, args.step6)
+        fit_csv(args.csv, args.run)
         return 0
-    _run_sweep(args.step6, fit_after=not args.meas,
+    _run_sweep(args.run, fit_after=not args.meas,
                pmt=open_pmt(args.pmt_resource, args.pmt_period,
                             enabled=args.pmt))
     return 0

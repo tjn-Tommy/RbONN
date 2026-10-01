@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from calibration_module.fit.levels_report import load_reads
-from calibration_module.fit.verify import fit_y_sat, saturate
+from calibration_module.fit.verify import fit_y_sat, note_step7_moved, saturate
 
 #: A 4-bit computation divides full scale into this many levels.
 LEVELS = 16
@@ -30,7 +30,7 @@ def _unsaturate(y, y_sat: float):
     return np.where(head > 0, y / np.where(head > 0, head, np.nan), np.inf)
 
 
-def fit_from_csv(path, step7, *, pairs=None, method=None) -> tuple:
+def fit_from_csv(path, run, *, pairs=None, method=None) -> tuple:
     """``(reads, result)`` -- fit ``Y_sat`` to a step-8 CSV.
 
     Reads are loaded with ``y_sat=None`` on purpose: the fit needs the LINEAR
@@ -40,7 +40,7 @@ def fit_from_csv(path, step7, *, pairs=None, method=None) -> tuple:
     (they are the most informative points on the curve) and also reported
     separately as measured-vs-predicted full scale.
     """
-    reads, meta = load_reads(path, step7, pairs=pairs, method=method, y_sat=None)
+    reads, meta = load_reads(path, run, pairs=pairs, method=method, y_sat=None)
     result = fit_y_sat(reads.y, reads.pred, reads.sigma)
 
     f = reads.of("F")
@@ -202,17 +202,14 @@ def make_plot(reads, result: dict, out_path: Path) -> Path:
     return out_path
 
 
-def report_csv(path, step7, *, pairs=None, method=None, out_dir=None,
+def report_csv(path, run, *, pairs=None, method=None, out_dir=None,
                log=print) -> dict:
     """Fit a recorded step-8 CSV, print the result, write the PNG.  No hardware."""
     path = Path(path)
     out_dir = Path(path.parent if out_dir is None else out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    reads, result, meta = fit_from_csv(path, step7, pairs=pairs, method=method)
-    recorded = meta.get("step7_json")
-    if recorded and Path(recorded).name != Path(step7).name:
-        log(f"NOTE: this CSV was driven from {Path(recorded).name}, and is being "
-            f"fitted against {Path(step7).name}")
+    reads, result, meta = fit_from_csv(path, run, pairs=pairs, method=method)
+    note_step7_moved(run, meta, log=log)
     print_result(result, log=log)
     png = make_plot(reads, result, out_dir / f"{path.stem}_ysat.png")
     # The report knows where it put the PNG; nothing downstream should have to

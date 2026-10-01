@@ -43,7 +43,12 @@ from calibration_module.measure.phase_v2 import (  # noqa: E402
 )
 
 RUN = REPO / "src/calib_data/archive/2026-09/run_0907_1724"
-STEP6 = RUN / "calib_step6v2_result_0907_1757.json"
+#: The archived combined step-6 result the run folder below is seeded from.
+STEP6_LEGACY = RUN / "calib_step6v2_result_0907_1757.json"
+#: The run folder the page is pointed at: one calib.json with step3 + step6.
+#: Seeded in setUpModule, because the archive is frozen in the old shape and a
+#: page that now takes a directory needs one to exist.
+STEP6: Path
 MEAS_CSV = RUN / "calib_step7_meas_0907_1808.csv"
 RESULT_JSON = RUN / "calib_step7_result_0907_1808.json"
 
@@ -62,11 +67,25 @@ RECORDED_DPHI = {
 }
 
 _app: QtWidgets.QApplication | None = None
+_run_tmp = None
 
 
 def setUpModule() -> None:
-    global _app
+    global _app, STEP6, _run_tmp
+    import tempfile as _tempfile
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from calib_fixtures import seed_run
+
+    _run_tmp = _tempfile.TemporaryDirectory()
+    STEP6 = seed_run(Path(_run_tmp.name) / "run_0907", step3=STEP6_LEGACY,
+                     step6=STEP6_LEGACY)
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def tearDownModule() -> None:
+    if _run_tmp is not None:
+        _run_tmp.cleanup()
 
 
 class _WindowCase(unittest.TestCase):
@@ -209,15 +228,15 @@ class StepSixInputTests(_WindowCase):
         w = self.win
         w.tpa_phase_step6_edit.setText("")
         w._tpa_phase_run()
-        self.assertIn("Step-6", w.tpa_phase_status.text())
+        self.assertIn("no run folder", w.tpa_phase_status.text())
 
-    def test_run_refuses_a_path_that_is_not_there(self) -> None:
+    def test_run_refuses_a_folder_that_is_not_there(self) -> None:
         w = self.win
-        w.tpa_phase_step6_edit.setText(str(RUN / "nope.json"))
+        w.tpa_phase_step6_edit.setText(str(RUN / "no_such_run"))
         w._tpa_phase_run()
-        self.assertIn("not found", w.tpa_phase_status.text())
+        self.assertIn("no calib.json", w.tpa_phase_status.text())
 
-    def test_a_valid_file_is_described_before_the_run(self) -> None:
+    def test_a_valid_run_is_described_before_the_run(self) -> None:
         w = self.win
         w.tpa_phase_step6_edit.setText(str(STEP6))
         text = w.tpa_phase_step6_label.text()
@@ -225,21 +244,22 @@ class StepSixInputTests(_WindowCase):
         self.assertIn("6 pairs", text)
         self.assertIn("2-6", text)          # the etas it actually carries
 
-    def test_a_step_6_json_without_step_3_is_refused(self) -> None:
-        """A bare pair summary cannot build a layout, so it cannot drive a run."""
+    def test_a_run_without_step_3_is_refused(self) -> None:
+        """A step 6 with no layout above it cannot drive a run."""
+        from calibration_module.calib_file import write_section
+
         w = self.win
         with tempfile.TemporaryDirectory() as tmp:
-            bare = Path(tmp) / "bare.json"
-            payload = json.loads(STEP6.read_text(encoding="utf-8"))
-            bare.write_text(json.dumps({"step6": payload["step6"]}),
-                            encoding="utf-8")
+            bare = Path(tmp) / "bare"
+            payload = json.loads(STEP6_LEGACY.read_text(encoding="utf-8"))
+            write_section(bare, 6, payload["step6"], log=None)
             w.tpa_phase_step6_edit.setText(str(bare))
             self.assertIn("step3", w.tpa_phase_step6_label.text())
             w._tpa_phase_run()
             self.assertIn("step3", w.tpa_phase_status.text())
 
     def test_the_layout_is_the_one_step_6_measured_under(self) -> None:
-        """Same file, same loader, same encoding marker as the offline runner."""
+        """Same run, same loader as the offline runner."""
         w = self.win
         w.tpa_phase_step6_edit.setText(str(STEP6))
         layout, models = w._tpa_phase_load_step6()
@@ -345,15 +365,19 @@ class RecordedReferenceTests(_WindowCase):
         self.assertEqual(w.tpa_phase_ref.value(), REF_INDEX)
 
     def test_a_missing_reference_eta_is_one_error_naming_the_cause(self) -> None:
+        from calib_fixtures import seed_run
+
         w = self.win
         with tempfile.TemporaryDirectory() as tmp:
-            payload = json.loads(STEP6.read_text(encoding="utf-8"))
+            payload = json.loads(STEP6_LEGACY.read_text(encoding="utf-8"))
             payload["step6"]["channels"] = [
                 c for c in payload["step6"]["channels"]
                 if c["index"] != REF_INDEX
             ]
-            bad = Path(tmp) / "no_reference.json"
-            bad.write_text(json.dumps(payload), encoding="utf-8")
+            stripped = Path(tmp) / "stripped.json"
+            stripped.write_text(json.dumps(payload), encoding="utf-8")
+            bad = seed_run(Path(tmp) / "no_reference",
+                           step3=STEP6_LEGACY, step6=stripped)
             w.tpa_phase_step6_edit.setText(str(bad))
             with unittest.mock.patch.object(
                 QtWidgets.QFileDialog, "getOpenFileName",
@@ -373,11 +397,16 @@ class RecordedReferenceTests(_WindowCase):
 
 
 class SaveRoundTripTests(_WindowCase):
-    def test_saved_json_carries_the_whole_chain(self) -> None:
+    def test_the_saved_run_carries_the_whole_chain(self) -> None:
         """Step 8 needs this one file: layout, etas, and the phases."""
+        from calib_fixtures import seed_run
+
         w = self._load()
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "calib_step7_meas_0910_2025.csv"
+            run = seed_run(Path(tmp) / "run_s7", step3=STEP6_LEGACY,
+                           step6=STEP6_LEGACY)
+            w.tpa_phase_step6_edit.setText(str(run))
+            target = run / "calib_step7_meas_0910_2025.csv"
             with unittest.mock.patch.object(
                 QtWidgets.QFileDialog, "getSaveFileName",
                 staticmethod(lambda *a, **k: (str(target), "")),
@@ -385,17 +414,17 @@ class SaveRoundTripTests(_WindowCase):
                 w._tpa_phase_save()
 
             self.assertTrue(target.is_file(), w.tpa_phase_status.text())
-            js_path = target.with_name("calib_step7_result_0910_2025.json")
-            self.assertTrue(js_path.is_file(), w.tpa_phase_status.text())
-            self.assertEqual(len(list(target.parent.glob("*.json"))), 1,
-                             "the JSON is named like the script's, not the CSV")
+            jsons = list(run.glob("*.json"))
+            self.assertEqual([q.name for q in jsons], ["calib.json"],
+                             "a run directory holds exactly one JSON")
 
-            payload = json.loads(js_path.read_text(encoding="utf-8"))
+            payload = json.loads(jsons[0].read_text(encoding="utf-8"))
             self.assertEqual(sorted(payload),
-                             ["encoding", "step3", "step6", "step7"])
+                             ["schema", "step3", "step6", "step7"])
             self.assertIn("transfer_fits", payload["step3"])
             self.assertEqual(payload["step7"]["ref_index"], REF_INDEX)
             self.assertTrue(payload["step7"]["single_beam_bg"])
+            self.assertEqual(payload["step7"]["csv"], target.name)
 
             got = {c["tgt_index"]: c["fit"]["dphi_comb_rad"]
                    for c in payload["step7"]["channels"]}
@@ -406,14 +435,14 @@ class SaveRoundTripTests(_WindowCase):
                 self.assertAlmostEqual(got[k], want, places=8)
 
             self.assertEqual(
-                len(list(target.parent.glob("calib_step7_pair*_0910_2025.png"))), 4,
+                len(list(run.glob("calib_step7_pair*_0910_2025.png"))), 4,
                 "one fringe PNG per target, same renderer as the page",
             )
+        w.tpa_phase_step6_edit.setText(str(STEP6))
 
-    def test_the_rows_survive_a_missing_step_6_file(self) -> None:
+    def test_the_rows_survive_a_folder_with_no_calibration(self) -> None:
         """An hour of bench time must never be lost to an unreadable input."""
         w = self._load()
-        w.tpa_phase_step6_edit.setText("")
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "rows_only.csv"
             with unittest.mock.patch.object(
@@ -423,7 +452,7 @@ class SaveRoundTripTests(_WindowCase):
                 w._tpa_phase_save()
             self.assertTrue(target.is_file())
             self.assertFalse(list(target.parent.glob("*.json")))
-            self.assertIn("no Step-6 result", w.tpa_phase_status.text())
+            self.assertIn("no calib.json", w.tpa_phase_status.text())
         w.tpa_phase_step6_edit.setText(str(STEP6))
 
     def test_the_saved_csv_re_fits_to_the_same_phases(self) -> None:
@@ -730,17 +759,24 @@ class CascadeTests(_WindowCase):
         self.assertIn(4, w.tpa_phase_chains)
 
     # ---- saving --------------------------------------------------------
-    def test_the_saved_json_is_rooted_at_the_reference_and_keeps_the_path(self) -> None:
+    def test_the_saved_section_is_rooted_at_the_reference_and_keeps_the_path(self) -> None:
+        import shutil
+
         from calibration_module.fit.phase import load_comb_phase_json
         w = self._load_cascade()
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "calib_step7_meas_x.csv"
+            # Save into a RUN: a copy of the 0916 one, which is how a run is
+            # inherited now.  The step7 this writes replaces the one in it.
+            run = Path(tmp) / "run_0916_copy"
+            run.mkdir()
+            shutil.copy2(self.RUN10 / "calib.json", run / "calib.json")
+            out = run / "calib_step7_meas_x.csv"
             with unittest.mock.patch.object(
                 QtWidgets.QFileDialog, "getSaveFileName",
                 staticmethod(lambda *a, **k: (str(out), "")),
             ):
                 w._tpa_phase_save()
-            js = out.with_name("calib_step7_result_x.json")
+            js = run / "calib.json"
             self.assertTrue(js.is_file(), w.tpa_phase_status.text())
             payload = json.loads(js.read_text(encoding="utf-8"))
 
@@ -777,19 +813,24 @@ class CascadeTests(_WindowCase):
 
     def test_a_single_reference_run_records_no_cascade_block(self) -> None:
         """Nothing changes for a run that never needed a hub."""
+        from calib_fixtures import seed_run
+
         w = self._load()
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "calib_step7_meas_x.csv"
+            run = seed_run(Path(tmp) / "run_plain", step3=STEP6_LEGACY,
+                           step6=STEP6_LEGACY)
+            w.tpa_phase_step6_edit.setText(str(run))
+            out = run / "calib_step7_meas_x.csv"
             with unittest.mock.patch.object(
                 QtWidgets.QFileDialog, "getSaveFileName",
                 staticmethod(lambda *a, **k: (str(out), "")),
             ):
                 w._tpa_phase_save()
-            payload = json.loads(
-                out.with_name("calib_step7_result_x.json").read_text("utf-8"))
+            payload = json.loads((run / "calib.json").read_text("utf-8"))
             self.assertNotIn("cascade", payload["step7"])
             for ch in payload["step7"]["channels"]:
                 self.assertNotIn("chained", ch["fit"])
+        w.tpa_phase_step6_edit.setText(str(STEP6))
 
 
 class PmtCheckboxTests(_WindowCase):

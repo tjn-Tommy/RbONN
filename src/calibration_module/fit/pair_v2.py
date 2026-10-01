@@ -163,7 +163,7 @@ __all__ = [
     "write_meas_csv",
     "meas_csv_meta",
     "load_meas_csv",
-    "save_combined_json",
+    "save_step6_section",
 ]
 
 
@@ -1378,28 +1378,34 @@ def _background_dict(fit: PairV2Fit) -> dict:
     }
 
 
-def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
-                       *, step3: dict | str | Path, center_wl: float = 0.0,
-                       dropped_bursts: dict[int, list[dict]] | None = None) -> Path:
-    """Step-3 calibration + every v2 pair fit, in the schema step 7 reads.
+def save_step6_section(fits: list[PairV2Fit], run: str | Path,
+                       *, center_wl: float = 0.0,
+                       dropped_bursts: dict[int, list[dict]] | None = None,
+                       csv: str | Path | None = None,
+                       log=print):
+    """Write every v2 pair fit as the ``step6`` section of the run's calib.json.
 
     ``channels[].fit.{eta, eta_err, params.{a_x,q_x,a_w,q_w,d}.value}`` is the
     contract :meth:`calibration_module.fit.phase.PairModel.from_json_channel`
-    parses, so step 7 consumes a v2 result with no change.  The v2-specific
+    parses, so step 7 consumes this section with no change.  The v2-specific
     numbers (the slope, the fit window, both checks) ride alongside it.
 
-    ``step3`` is the Step-3 calibration to embed, either already parsed or a
-    path to read.  It is a parameter rather than a module constant because
-    the GUI already holds the calibration it built its layout from, and
-    re-reading a path would let the file on disk drift from the layout the
-    sweep actually ran with.
+    The step-3 calibration is NOT copied in.  It is already the ``step3`` section
+    of the same file, and writing a new one drops this section, so the layout a
+    result was measured through cannot drift from the layout the file reports --
+    which is what embedding a copy used to be guarding against.
 
-    ``dropped_bursts`` maps a pair index to the burst acquisitions
-    (:func:`burst_rows`) left out of its fit.  Recorded per pair so a result can
-    always be traced back to the rows that made it, and so a run whose bench was
-    glitching cannot be mistaken later for a clean one.
+    ``csv`` is the sweep this fit came from, stored relative to the run
+    directory.  ``dropped_bursts`` maps a pair index to the burst acquisitions
+    (:func:`burst_rows`) left out of its fit, so a result can always be traced
+    back to the rows that made it and a run whose bench was glitching cannot be
+    mistaken later for a clean one.
     """
-    out_path = Path(out_path)
+    from calibration_module.calib_file import load_calib, write_section
+
+    # A step 6 with no layout above it is not interpretable; say so before the
+    # file is touched rather than leaving a section nothing can read.
+    load_calib(run, missing_ok=True).require(3)
     cfg = fits[0].cfg
 
     def _fit_dict(fit: PairV2Fit) -> dict:
@@ -1456,9 +1462,5 @@ def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
             for fit in fits
         ],
     }
-    if not isinstance(step3, dict):
-        step3 = json.loads(Path(step3).read_text(encoding="utf-8"))
-    out_path.write_text(json.dumps({"step3": step3, "step6": step6}, indent=2),
-                        encoding="utf-8")
-    return out_path
+    return write_section(run, 6, step6, csv=csv, log=log)
 

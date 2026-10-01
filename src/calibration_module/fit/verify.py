@@ -55,10 +55,12 @@ __all__ = [
     "BlockError",
     "evaluate",
     "pairs_tag",
+    "write_plan_csv",
     "write_verify_csv",
     "load_verify_csv",
     "drive_bounds",
     "check_sign",
+    "note_step7_moved",
 ]
 
 
@@ -66,11 +68,46 @@ __all__ = [
 # the forward model
 # ======================================================================
 
+def note_step7_moved(run, meta, log=print) -> bool:
+    """Warn when a recorded CSV was driven under a different step 7 than this one.
+
+    Every run's file is now called ``calib.json``, so the old check -- compare
+    the recorded filename against the one being fitted -- could never catch this
+    again.  What identifies a step 7 is its ``ran`` stamp, which the driving run
+    writes into the CSV meta as ``step7_ran``, so that is what is compared.
+
+    Returns True when it said something.  A CSV from before the stamp existed
+    carries no ``step7_ran`` and is passed over in silence: there is nothing to
+    compare, and inventing a warning for every historical file would train the
+    operator to ignore the one that matters.
+    """
+    from calibration_module.calib_file import load_calib
+
+    recorded = str(meta.get("step7_ran") or "").strip()
+    if not recorded:
+        return False
+    try:
+        current = load_calib(run).ran(7)
+    except Exception:                       # not a v3 file; nothing to compare
+        return False
+    if current and recorded != current:
+        log(f"NOTE: this CSV was driven under the step 7 of {recorded}, and is "
+            f"being fitted against the one of {current} -- the phases have been "
+            f"re-fitted since the sweep")
+        return True
+    return False
+
+
+
 def load_forward_model(
-    step7: str | Path, *, pairs: Sequence[int] | None = None,
+    run: str | Path, *, pairs: Sequence[int] | None = None,
     method: str | None = None,
 ) -> tuple[dict[int, PairModel], dict[int, float], int]:
-    """``(models, phases, ref)`` for ``pairs`` out of a combined step-7 JSON.
+    """``(models, phases, ref)`` for ``pairs`` out of a run's calib.json.
+
+    ``run`` is a run directory or the ``calib.json`` inside it; both the step-6
+    etas and the step-7 phases come from that one file, which is what makes them
+    a matched pair rather than two files that happen to be named alike.
 
     ``phases[k]`` is ``Phi_k`` in radians, exactly as :func:`predict` uses it,
     with ``phases[ref] = 0``.  ``pairs=None`` takes every pair the file
@@ -82,7 +119,9 @@ def load_forward_model(
     ``"convention": "comb-slm"`` tag and hold the NEGATED phase; they are not
     migrated and are read as-is, so re-run step 7 rather than trusting one.
     """
-    step7 = Path(step7)
+    from calibration_module.calib_file import calib_path
+
+    step7 = calib_path(run)
     models = load_pair_models([step7])
     ref, entries = load_comb_phase_json(step7, method=method)
     phases = {int(ref): 0.0}
@@ -538,6 +577,48 @@ def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapp
             f.write(f"# {key},{value}\n")
     return str(out)
 
+
+def write_plan_csv(path: str | Path, patterns: Sequence, preds: Sequence[float],
+                   coh: Sequence[float], *, pairs: Sequence[int], scale,
+                   meta: Mapping[str, object]) -> str:
+    """Step 8's pattern plan, written BEFORE the hardware is touched.
+
+    One row per pattern, ``x_k``/``w_k`` per pair exactly as
+    :func:`write_verify_csv` lays them out, so the plan and the reads it
+    produced line up column for column.  The scalars the plan was solved under
+    -- the step-7 stamp, the seed, ``Y_max``, the ladder geometry -- go in the
+    same trailing ``# key,value`` meta lines every other CSV here uses.
+
+    A CSV rather than the JSON this used to be: a run directory holds exactly
+    one JSON, and a list of patterns was always a table.  The ``exact`` column
+    is what it was before -- False where a pattern fell back to the
+    deterministic drive because the solver could not hit its target alpha.
+    """
+    pairs = sorted(int(k) for k in pairs)
+    out = Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["seq", "kind", "label", "target_alpha", "alpha",
+                         "coherent_v", "pred_v", "exact"]
+                        + [c for k in pairs for c in (f"x_{k}", f"w_{k}")])
+        amps = dict(zip(pairs, getattr(scale, "amplitudes", [])))
+        phis = dict(zip(pairs, getattr(scale, "phases", [])))
+        for i, (p, c, q) in enumerate(zip(patterns, coh, preds)):
+            drive = dict(zip(pairs, zip(p.x, p.w)))
+            line = [i, p.kind, p.label,
+                    "" if p.target_alpha is None else f"{p.target_alpha:.9g}",
+                    f"{p.alpha:.9g}", f"{c:.9g}", f"{q:.9g}", p.exact]
+            for k in pairs:
+                xk, wk = drive.get(k, (0.0, 0.0))
+                line += [f"{float(xk):.6f}", f"{float(wk):.6f}"]
+            writer.writerow(line)
+        for key, value in meta.items():
+            f.write(f"# {key},{value}\n")
+        for k in pairs:                 # the model, one line per pair
+            f.write(f"# eta_{k},{amps.get(k, float('nan')):.9g}\n")
+            f.write(f"# phi_rad_{k},{phis.get(k, float('nan')):.9g}\n")
+    return str(out)
 
 def load_verify_csv(path: str | Path) -> tuple[list[int], list[VerifyBlock], dict[str, str]]:
     """``(pairs, blocks, meta)`` from a verify CSV or an older step-8 CSV.

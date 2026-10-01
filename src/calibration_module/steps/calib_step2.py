@@ -30,10 +30,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from calibration_module.calib_file import write_section  # noqa: E402
 from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
     load_calibration_result,
-    save_calibration_result,
+    step2_section,
+    write_wavelength_map_csv,
 )
 from calibration_module.measure.bench import (  # noqa: E402
     connect_osa,
@@ -121,10 +123,12 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         osa.disconnect()
 
-    path = save_calibration_result(clipped, args.out / f"calib_step2_{stamp}.json")
+    # CSV first: the map is on disk before anything else can fail.
+    csv_path = write_wavelength_map_csv(clipped, args.out / f"step2_{stamp}.csv")
+    calib = write_section(args.out, 2, step2_section(clipped), csv=csv_path)
     print(f"\n{clipped.coordinates.size} of {swept.coordinates.size} swept coordinates "
           f"kept ({swept.wavelength.min():.3f}-{swept.wavelength.max():.3f} nm swept)")
-    print(f"Saved -> {path}")
+    print(f"Saved -> {calib.path}\n         {csv_path}")
 
 
 if __name__ == "__main__":

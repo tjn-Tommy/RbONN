@@ -1,22 +1,27 @@
-"""Step 3c -- per-channel transfer curves on the DAQ, one channel window at a time.
+"""Step 3 -- per-channel transfer curves on the DAQ, one channel window at a time.
 
-Needs the DAQ and the SLM.  ``--step2`` is required: a step-2 JSON, or a
-coordinate -> wavelength CSV (its min/max levels are then ``CSV_MIN_MAX``)::
+Needs the DAQ and the SLM.  ``--run`` is required: a run directory holding one
+``calib.json`` whose ``step2`` section gives the px -> nm line::
 
-    python src/calibration_module/steps/calib_step3c.py --step2 calib_step2_0910_1737.json
-    python src/calibration_module/steps/calib_step3c.py --step2 FILE --width 20 --gap 30
-    python src/calibration_module/steps/calib_step3c.py --step2 FILE --out DIR
+    python src/calibration_module/steps/calib_step3.py --run src/calib_data/run_0930
+    python src/calibration_module/steps/calib_step3.py --run DIR --width 20 --gap 30
 
 Tiles ``CHANNELS_PER_SIDE`` mirror-symmetric channels around ``TARGET_NM`` on
-the step-2 line, skipping any that overlaps ``GUARD_BANDS_NM``, then lights
-each channel at each of ``LEVELS`` and reads the bucket detector against one
-all-dark frame.  Writes ``calib_step3c_MMDD_HHMM.json`` and ``.csv`` -- the
-JSON is the ``--step3`` that ``calib_step6_v2.py`` encodes every level through,
-and it records the ``--width`` / ``--gap`` it swept.
+the step-2 line, skipping any that overlaps ``GUARD_BANDS_NM``, then lights each
+channel at each of ``LEVELS`` and reads the bucket detector against one all-dark
+frame.  Writes ``step3_MMDD_HHMM.csv`` with the sweep and the ``step3`` section
+of ``calib.json`` with the FITTED transfer curves -- which is what
+``calib_step6_v2.py`` encodes every level through, and it records the
+``--width`` / ``--gap`` it swept.
 
-This is the runner only: the sweep is
-:func:`calibration_module.measure.slm_response.run_step3c`, the same call the
-GUI's Step 3c tab makes.  The constants below are that tab's defaults.
+Writing this section DROPS the run's step 6, 7 and 8: a new channel grid is a
+new aperture, and etas measured through the old one describe a bench that no
+longer exists.
+
+This was ``calib_step3c.py``; the OSA-based 3b is legacy (see the README).  The
+sweep itself is :func:`calibration_module.measure.slm_response.run_step3c`, the
+same call the GUI's Step 3 tab makes.  The constants below are that tab's
+defaults.
 """
 
 from __future__ import annotations
@@ -29,11 +34,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from calibration_module.calib_file import load_calib, write_section  # noqa: E402
 from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
-    load_calibration_result,
     load_wavelength_map_csv,
-    save_calibration_result,
+    step3_section,
     write_intensity_calibration_csv,
 )
 from calibration_module.measure.bench import connect_slm, print_progress  # noqa: E402
@@ -68,31 +73,39 @@ SLM_DISPLAY_NO = None            # None -> auto-detect the LCOS-SLM display
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch
 
 
-def load_step2(path: Path) -> CalibrationResult:
-    """A step-2 JSON, or a coordinate -> wavelength CSV given ``CSV_MIN_MAX``."""
-    if path.suffix.lower() == ".csv":
-        low, high = CSV_MIN_MAX
-        return load_wavelength_map_csv(path, min_level=low, max_level=high)
-    return load_calibration_result(path)
+def load_step2(run: Path) -> CalibrationResult:
+    """The run's step-2 map: its CSV for the line, its section for the levels.
+
+    The two halves are deliberately apart -- a thousand measured coordinates are
+    a table, the polynomial and the off/on levels are not -- so the map is read
+    from the CSV the section points at and the levels come from the section.
+    """
+    calib = load_calib(run)
+    section = calib.section(2)
+    return load_wavelength_map_csv(
+        calib.csv_path(2),
+        min_level=section.get("min_level", CSV_MIN_MAX[0]),
+        max_level=section.get("max_level", CSV_MIN_MAX[1]),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--step2", type=Path, required=True,
-                        help="step-2 JSON or coordinate/wavelength CSV")
+    parser.add_argument("--run", type=Path, required=True, metavar="DIR",
+                        help="run directory holding calib.json; its step2 "
+                             "section is the wavelength map, and the CSV and "
+                             "step3 section land there (required)")
     parser.add_argument("--width", type=int, default=WIDTH_PX,
                         help=f"channel window, px (default {WIDTH_PX})")
     parser.add_argument("--gap", type=int, default=GAP_PX,
                         help=f"dark pad between channels, px (default {GAP_PX})")
-    parser.add_argument("--out", type=Path, default=CALIB_PATH,
-                        help=f"output directory (default {CALIB_PATH})")
     args = parser.parse_args(argv)
-    step2 = load_step2(args.step2)
-    args.out.mkdir(parents=True, exist_ok=True)
+    args.run.mkdir(parents=True, exist_ok=True)
+    step2 = load_step2(args.run)
     stamp = time.strftime("%m%d_%H%M")
 
-    print(f"Step 2 in: {args.step2}")
-    print(f"Step 3c: {2 * CHANNELS_PER_SIDE} channels around {TARGET_NM:g} nm, "
+    load_calib(args.run).print_chain()
+    print(f"Step 3: {2 * CHANNELS_PER_SIDE} channels around {TARGET_NM:g} nm, "
           f"width {args.width} px, gap {args.gap} px, "
           f"{len(LEVELS)} levels {LEVELS[0]}..{LEVELS[-1]}")
     if GUARD_BANDS_NM:
@@ -122,11 +135,13 @@ def main(argv: list[str] | None = None) -> None:
         daq.disconnect()
 
     result = sweep.result
-    json_path = save_calibration_result(result, args.out / f"calib_step3c_{stamp}.json")
-    csv_path = write_intensity_calibration_csv(result, args.out / f"calib_step3c_{stamp}.csv")
+    # CSV first: the sweep is on disk before a fit can fail on it.
+    csv_path = write_intensity_calibration_csv(
+        result, args.run / f"step3_{stamp}.csv")
+    calib = write_section(args.run, 3, step3_section(result), csv=csv_path)
     print(f"\n{result.coordinates.size} channels, pitch {args.width + args.gap} px, "
           f"centre x={sweep.center_coordinate:.3f} px")
-    print(f"Saved -> {json_path}\n         {csv_path}")
+    print(f"Saved -> {calib.path}\n         {csv_path}")
 
 
 if __name__ == "__main__":

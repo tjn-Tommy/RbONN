@@ -30,10 +30,12 @@ from PyQt5 import QtWidgets
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from calibration_module.fit.pair_v2 import load_meas_csv  # noqa: E402
 from calibration_module.fit.phase import PairModel, load_pair_models  # noqa: E402
 from calibration_module.measure.pair_v2 import DEFAULT_ACQ  # noqa: E402
+from calib_fixtures import seed_run  # noqa: E402
 
 MEAS_CSV = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
 STEP3 = REPO / "src/calib_data/archive/2026-09/run_0908_1444/calib_step3c_0907_1358_pad10.json"
@@ -175,13 +177,19 @@ class AcquisitionSettingsTests(_WindowCase):
 
 
 class StepThreeInputTests(_WindowCase):
-    """The Step-3 calibration is named on the page and required to run.
+    """The RUN FOLDER is named on the page and required to run.
 
-    It is not inherited from the Encoding page: every level of the sweep is
-    encoded through it, so a run against the wrong one does not fail, it
-    calibrates a different aperture. Naming it per run is also what makes a GUI
-    run and a ``--step3`` terminal run the same run.
+    Its step-3 section is not inherited from the Encoding page: every level of
+    the sweep is encoded through it, so a run against the wrong one does not
+    fail, it calibrates a different aperture. Naming it per run is also what
+    makes a GUI run and a ``--run`` terminal run the same run.
     """
+
+    def setUp(self) -> None:
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.run = seed_run(Path(tmp.name) / "run_x", step3=STEP3)
 
     def tearDown(self) -> None:
         self.win.tpa_step3_edit.setText("")
@@ -190,39 +198,39 @@ class StepThreeInputTests(_WindowCase):
         w = self.win
         w.tpa_step3_edit.setText("")
         w._tpa_run()
-        self.assertIn("Step 3", w.tpa_status.text())
-        self.assertIn("no Step-3 calibration", w.tpa_status.text())
+        self.assertIn("no run folder", w.tpa_status.text())
 
     def test_run_refuses_a_path_that_is_not_there(self) -> None:
         w = self.win
-        w.tpa_step3_edit.setText(str(STEP3.parent / "no_such_file.json"))
+        w.tpa_step3_edit.setText(str(self.run.parent / "no_such_run"))
         w._tpa_run()
-        self.assertIn("not found", w.tpa_status.text())
+        self.assertIn("no calib.json", w.tpa_status.text())
 
-    def test_a_valid_file_is_described_before_the_run(self) -> None:
-        """An hour of bench time deserves a look at the file first."""
+    def test_a_valid_run_is_described_before_the_run(self) -> None:
+        """An hour of bench time deserves a look at the folder first."""
         w = self.win
-        w.tpa_step3_edit.setText(str(STEP3))
+        w.tpa_step3_edit.setText(str(self.run))
         text = w.tpa_step3_label.text()
-        self.assertIn(STEP3.name, text)
+        self.assertIn(self.run.name, text)
+        self.assertIn("step3", text)                 # the stamp chain
         self.assertRegex(text, r"\d+ pairs")
         self.assertRegex(text, r"\d+ px window")
         self.assertEqual(w.tpa_step3_label.property("status"), "ok")
 
-    def test_a_bad_file_is_flagged_not_silently_ignored(self) -> None:
+    def test_a_folder_without_a_calib_json_is_flagged(self) -> None:
         w = self.win
-        w.tpa_step3_edit.setText(str(MEAS_CSV))       # a CSV, not a calibration
+        w.tpa_step3_edit.setText(str(MEAS_CSV.parent))   # no calib.json in there
         self.assertEqual(w.tpa_step3_label.property("status"), "error")
 
     def test_layout_matches_the_offline_loader(self) -> None:
-        """Same file, same loader, same method -> the same pixels get driven."""
-        from calibration_module.fit.slm_response import load_calibration_result
+        """Same run, same loader -> the same pixels get driven."""
+        from calibration_module.calib_file import load_calib
         from slm_module.encoding import channel_layout_from_calibration
 
         w = self.win
-        w.tpa_step3_edit.setText(str(STEP3))
+        w.tpa_step3_edit.setText(str(self.run))
         _calib, gui_layout = w._tpa_load_step3()
-        offline = channel_layout_from_calibration(load_calibration_result(STEP3))
+        offline = channel_layout_from_calibration(load_calib(self.run).step3_result())
         self.assertEqual(gui_layout.n_channels, offline.n_channels)
         self.assertEqual(gui_layout.channel_width_px, offline.channel_width_px)
         self.assertEqual(gui_layout.pitch_px, offline.pitch_px)
@@ -287,51 +295,58 @@ class ResultsTableTests(_WindowCase):
 
 
 class SaveRoundTripTests(_WindowCase):
-    def test_saved_json_is_what_step_7_reads(self) -> None:
-        """The point of the combined file: step 7 needs this one file, not two."""
+    def setUp(self) -> None:
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def test_the_save_writes_the_step6_section_step_7_reads(self) -> None:
+        """One directory, one JSON: the save merges into the run it saved into."""
         w = self._load()
-        w.tpa_step3_edit.setText(str(STEP3))
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "calib_step6v2_meas_0910_1938.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_save()
+        run = seed_run(self.tmp / "run_y", step3=STEP3)
+        w.tpa_step3_edit.setText(str(run))
+        target = run / "calib_step6v2_meas_0910_1938.csv"
+        with unittest.mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            staticmethod(lambda *a, **k: (str(target), "")),
+        ):
+            w._tpa_save()
 
-            self.assertTrue(target.is_file(), w.tpa_status.text())
-            js_path = target.with_name("calib_step6v2_result_0910_1938.json")
-            self.assertTrue(js_path.is_file(), w.tpa_status.text())
-            self.assertEqual(len(list(target.parent.glob("*.json"))), 1,
-                             "the JSON is named like the script's, not the CSV")
+        self.assertTrue(target.is_file(), w.tpa_status.text())
+        jsons = list(run.glob("*.json"))
+        self.assertEqual([p.name for p in jsons], ["calib.json"],
+                         "a run directory holds exactly one JSON")
 
-            payload = json.loads(js_path.read_text(encoding="utf-8"))
-            self.assertEqual(sorted(payload), ["step3", "step6"])
-            self.assertIn("transfer_fits", payload["step3"])
+        payload = json.loads(jsons[0].read_text(encoding="utf-8"))
+        self.assertEqual(sorted(payload), ["schema", "step3", "step6"])
+        self.assertIn("transfer_fits", payload["step3"])
+        # The section points back at the sweep it was fitted from.
+        self.assertEqual(payload["step6"]["csv"], target.name)
 
-            models = load_pair_models(str(js_path))
-            self.assertEqual(sorted(models), [2, 3, 4, 5, 6])
-            self.assertAlmostEqual(models[5].eta, RECORDED_ETA[3], places=12)
+        models = load_pair_models(str(jsons[0]))
+        self.assertEqual(sorted(models), [2, 3, 4, 5, 6])
+        self.assertAlmostEqual(models[5].eta, RECORDED_ETA[3], places=12)
 
-            self.assertEqual(
-                len(list(target.parent.glob("calib_step6v2_pair*_0910_1938.png"))), 5,
-                "one diagnostic PNG per pair, same renderer as the offline script",
-            )
+        self.assertEqual(
+            len(list(run.glob("calib_step6v2_pair*_0910_1938.png"))), 5,
+            "one diagnostic PNG per pair, same renderer as the offline script",
+        )
 
-    def test_save_without_a_calibration_still_writes_the_rows(self) -> None:
-        """The measurement must never be lost to a missing step-3 file."""
+    def test_save_without_a_run_still_writes_the_rows(self) -> None:
+        """The measurement must never be lost to a missing calibration."""
         w = self._load()
+        target = self.tmp / "bare" / "rows_only.csv"
+        target.parent.mkdir()
         w.tpa_step3_edit.setText("")
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "rows_only.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_save()
-            self.assertTrue(target.is_file())
-            self.assertFalse(list(target.parent.glob("*.json")))
-            self.assertIn("no Step-3 calibration", w.tpa_status.text())
+        with unittest.mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            staticmethod(lambda *a, **k: (str(target), "")),
+        ):
+            w._tpa_save()
+        self.assertTrue(target.is_file())
+        self.assertFalse(list(target.parent.glob("*.json")))
+        self.assertIn("no usable run folder", w.tpa_status.text())
 
 
 class ProgressDialogTests(_WindowCase):
@@ -397,24 +412,25 @@ class ProgressDialogTests(_WindowCase):
 
 
 class Step7HandoffTests(_WindowCase):
-    def test_step_7_loads_the_saved_file_not_this_page_s_memory(self) -> None:
-        """The handoff is a named file, not the tab's last result.
+    def test_step_7_loads_the_saved_run_not_this_page_s_memory(self) -> None:
+        """The handoff is a run folder, not the tab's last result.
 
         Step 7 pins its fringe amplitudes to these etas AND builds its layout
-        from the step-3 payload beside them, so it takes one file it can record
-        in its own output -- there is deliberately no path by which a step-7 run
-        is driven by something with no file on disk.
+        from the step-3 section beside them, so it takes the one folder it can
+        record in its own output -- there is deliberately no path by which a
+        step-7 run is driven by something with nothing on disk.
         """
         w = self._load()
-        w.tpa_step3_edit.setText(str(STEP3))
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "handoff.csv"
+            run = seed_run(Path(tmp) / "run_h", step3=STEP3)
+            w.tpa_step3_edit.setText(str(run))
+            target = run / "handoff.csv"
             with unittest.mock.patch.object(
                 QtWidgets.QFileDialog, "getSaveFileName",
                 staticmethod(lambda *a, **k: (str(target), "")),
             ):
                 w._tpa_save()
-            w.tpa_phase_step6_edit.setText(str(target.with_name("handoff_result.json")))
+            w.tpa_phase_step6_edit.setText(str(run))
             layout, models = w._tpa_phase_load_step6()
             self.assertEqual(sorted(models), [2, 3, 4, 5, 6])
             self.assertAlmostEqual(models[5].eta, RECORDED_ETA[3], places=12)

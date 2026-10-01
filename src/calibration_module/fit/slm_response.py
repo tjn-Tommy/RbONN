@@ -683,6 +683,99 @@ def save_calibration_result(
     return out
 
 
+# ======================================================================
+# calib.json sections  (steps 1-3)
+# ======================================================================
+#
+# One directory, one JSON: each of these returns what its step contributes, and
+# the raw sweep stays in the sibling CSV.  What a section keeps is what cannot
+# be re-derived from that CSV without re-running an optimizer -- the fitted
+# transfer curves above all, because re-deriving them per load would let a scipy
+# version move the encoding between steps 6, 7 and 8.
+
+def step1_section(result: CalibrationResult) -> dict:
+    """Step 1: the off/on grayscale levels, and the sweep that found them."""
+    return {
+        "min_level": _to_jsonable(result.min_level),
+        "max_level": _to_jsonable(result.max_level),
+        "level_range": _to_jsonable(result.level_range),
+    }
+
+
+def step2_section(result: CalibrationResult) -> dict:
+    """Step 2: the px -> nm fit, with the map itself in the sibling CSV.
+
+    The 1000-odd measured coordinates were the bulk of the old step-2 JSON and
+    are a two-column table, so they live in ``step2_*.csv`` now -- written by
+    :func:`write_wavelength_map_csv` and read back by
+    :func:`load_wavelength_map_csv`, which steps 3 already accepted as a hand
+    CSV.  What stays here is what that CSV cannot carry: the polynomial and the
+    off/on levels.
+    """
+    return {
+        "min_level": _to_jsonable(result.min_level),
+        "max_level": _to_jsonable(result.max_level),
+        "wavelength_fit_coefficients": _to_jsonable(
+            result.wavelength_fit_coefficients),
+    }
+
+
+def step3_section(result: CalibrationResult, *, fit_transfer: bool = True) -> dict:
+    """Step 3: the channel grid and its FITTED transfer curves, no raw sweep.
+
+    ``intensity_levels`` / ``raw_intensity_levels`` are exactly the columns of
+    ``step3_*.csv``, so they are not duplicated here.  What is left is the
+    channel layout -- a wavelength and coordinate per channel, the window/pad
+    split it was swept with, the levels swept -- plus one
+    :class:`~calibration_module.fit.transfer.TransferFit` per channel, which IS
+    the encoding from here on: ``channel_layout_from_calibration`` inverts these
+    and nothing re-fits them.
+
+    A channel whose curve will not fit is fatal here, unlike in
+    :func:`save_calibration_result`, which could fall back on storing the curves.
+    There is no fallback left: without a fit that channel cannot be encoded at
+    all, and the right moment to say so is now -- the sweep is already safe in
+    the CSV -- rather than at the start of a step-6 run.
+    """
+    fits = result.transfer_fits
+    if fit_transfer and fits is None and result.intensity_levels is not None:
+        fits = fit_transfer_curves(result.level_range, result.intensity_levels)
+    if fits is None:
+        raise TransferFitError(
+            "step 3 has no transfer fits and none could be made -- the section "
+            "would carry no encoding at all.  The sweep is in the CSV; re-fit it "
+            "or re-measure the channels that failed"
+        )
+    return {
+        "wavelength": _to_jsonable(result.wavelength),
+        "coordinates": _to_jsonable(result.coordinates),
+        "min_level": _to_jsonable(result.min_level),
+        "max_level": _to_jsonable(result.max_level),
+        "level_range": _to_jsonable(result.level_range),
+        "wavelength_fit_coefficients": _to_jsonable(
+            result.wavelength_fit_coefficients),
+        "transfer_fits": [f.to_dict() for f in fits],
+        # The window/pad split, so the encoder drives the aperture that was
+        # actually calibrated instead of inferring one from the pitch.
+        "channel_width_px": result.channel_width_px,
+        "gap_px": result.gap_px,
+    }
+
+
+def write_wavelength_map_csv(result: CalibrationResult, path: str | Path) -> Path:
+    """Step 2's px -> nm map as the two-column CSV its section points at."""
+    out = Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    coordinates = np.asarray(result.coordinates, dtype=float).reshape(-1)
+    wavelengths = np.asarray(result.wavelength, dtype=float).reshape(-1)
+    with open(out, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["coordinate_px", "wavelength_nm"])
+        for coordinate, wavelength in zip(coordinates, wavelengths):
+            writer.writerow([repr(float(coordinate)), repr(float(wavelength))])
+    return out
+
+
 def calibration_result_from_dict(payload: dict) -> CalibrationResult:
     """Rebuild a CalibrationResult from a save_calibration_result payload dict.
 

@@ -54,7 +54,7 @@ class PhaseReportRenderTests(unittest.TestCase):
 
 
 class CombPhaseJsonTests(unittest.TestCase):
-    """save_comb_phase_json / load_comb_phase_json round trip (no hardware)."""
+    """save_step7_section / load_comb_phase_json round trip (no hardware)."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -83,27 +83,33 @@ class CombPhaseJsonTests(unittest.TestCase):
     def test_round_trip_and_method_selection(self) -> None:
         import json
 
-        from calibration_module.fit.phase import load_comb_phase_json, save_comb_phase_json
-
-        step6 = self.out / "step6.json"
-        step6.write_text(
-            json.dumps({"step3": {"probe": 1}, "step6": {"channels": []}}),
-            encoding="utf-8",
+        from calibration_module.calib_file import write_section
+        from calibration_module.fit.phase import (
+            load_comb_phase_json,
+            save_step7_section,
         )
+
+        # The sections step 7 is written on top of; it refuses without them.
+        write_section(self.out, 3, {"probe": 1}, log=None)
+        write_section(self.out, 6, {"channels": []}, log=None)
         fits = {
             (3, "bounded"): self._fit(0.30, 1.0),
             (3, "fix"): self._fit(0.29, 0.0),
             (5, "bounded"): self._fit(-0.23, 1.0),
             (5, "fix"): self._fit(-0.51, 0.0),
         }
-        out = self.out / "step7.json"
-        save_comb_phase_json(fits, step6, out, ref_index=1,
-                             csv_path="meas.csv", single_beam_bg=True)
+        calib = save_step7_section(fits, self.out, ref_index=1,
+                                   csv=self.out / "meas.csv",
+                                   single_beam_bg=True, log=None)
+        out = calib.path
 
         payload = json.loads(out.read_text(encoding="utf-8"))
-        self.assertEqual(payload["step3"], {"probe": 1})   # carried over verbatim
-        self.assertEqual(payload["step6"], {"channels": []})
+        # Not copied forward any more: they are sections of this same file.
+        self.assertEqual(payload["step3"]["probe"], 1)
+        self.assertEqual(payload["step6"]["channels"], [])
         self.assertEqual(payload["step7"]["ref_index"], 1)
+        self.assertEqual(payload["step7"]["csv"], "meas.csv")
+        self.assertNotIn("step6_json", payload["step7"])
 
         ref, entries = load_comb_phase_json(out, method="bounded")
         self.assertEqual(ref, 1)

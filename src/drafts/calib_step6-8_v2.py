@@ -16,25 +16,24 @@ self-contained folder that can be zipped, moved or thrown away whole.
 Wiring
 ------
 Each step script is imported by path.  Its output directory is a module-level
-constant this runner rebinds; its input -- and for steps 6 and 7 the pair list
-(``--pairs`` / ``--targets``) and step 7's ``--ref`` -- are required flags
-passed through ``main(argv)``:
+constant this runner rebinds, and every step takes the same ``--run <folder>``;
+steps 6 and 7 additionally take the pair list (``--pairs`` / ``--targets``) and
+step 7 its ``--ref``, passed through ``main(argv)``:
 
-===========  =============================  ==================
-step         input flag                     output dir rebound
-===========  =============================  ==================
-6 (v2)       ``--step3``  <- newest          ``CALIB_PATH``
-             ``calib_step3c_*.json``
-7 (v2)       ``--step6``  <- step 6's        ``CALIB_PATH``
-             ``calib_step6v2_result_*``
-8 (verify)   ``--step7``  <- step 7's        ``OUT_DIR``
-             ``calib_step7_result_*``,
-             once per ``--verify-n``
-===========  =============================  ==================
+===========  =========================  ==================
+step         reads from calib.json      output dir rebound
+===========  =========================  ==================
+6 (v2)       ``step3``                  ``CALIB_PATH``
+7 (v2)       ``step3`` + ``step6``      ``CALIB_PATH``
+8 (verify)   ``step3`` + ``step6``      ``OUT_DIR``
+             + ``step7``, once per
+             ``--verify-n``
+===========  =========================  ==================
 
-Only step 6 reaches outside the run folder, for the step-3 calibration; steps 7
-and 8 are chained to the file the previous step just wrote, found by globbing
-the (initially empty) run folder for that step's result pattern.
+Nothing is chained by this script any more.  Each step writes its section into
+the run folder's one ``calib.json`` and the next step reads it from there, so
+there is no result file to glob for and no path to carry -- the run folder has
+to arrive with a ``step3`` section in it, which is what ``--run-dir`` names.
 
 ``--flip`` is never passed to any step: the DAQ sign on this rig is positive.
 
@@ -63,8 +62,6 @@ CALIB_PATH = REPO_ROOT / "src/calib_data"       # where run folders are created
 
 # ---- Edit these to match your setup ----
 RUN_PREFIX = "run"                   # run folder is <RUN_PREFIX>_<MMDD_HHMM>
-STEP3_GLOB = "calib_step3c_*.json"   # step 6's input; newest by mtime wins
-STEP3_SKIP_DIRS = ("archive",)       # subtrees the step-3 search ignores
 
 # One pair list for all three steps (step 6 PAIR_INDICES, step 7 TGT_INDICES,
 # step 8 PAIRS), so the three cannot disagree -- a pair measured in 6 but missing
@@ -84,23 +81,20 @@ REF_INDEX = 2                   # step 7's reference pair (Phi = 0); must be in 
 # overrides it.
 VERIFY_N = (1, 2)
 
-# Per step: module stem, the glob that finds the result it hands downstream, and
-# the constants to rebind.  ``result_glob = None`` marks the terminal step.
-# Every step takes its input as a REQUIRED command-line flag rather than a module
-# constant -- that constant was exactly what let a filed-away run drift out from
-# under the script -- so it goes in argv.  A step with an ``n_flag`` is run once
-# per entry of VERIFY_N.
+# Per step: module stem, the constants to rebind, and its pair flags.  Every
+# step now takes ``--run <run folder>`` and reads its own input out of that
+# folder's one calib.json, so there is nothing for this script to carry from one
+# step to the next and no result file to go looking for -- which is the whole
+# point of the layout.  A step with an ``n_flag`` is run once per entry of
+# VERIFY_N.
 STEPS = {
     6: {"module": "calib_step6_v2", "out_attr": "CALIB_PATH",
-        "in_flag": "--step3", "pairs_attr": "PAIR_INDICES", "pairs_flag": "--pairs",
-        "result_glob": "calib_step6v2_result_*.json"},
+        "needs": (3,), "pairs_attr": "PAIR_INDICES", "pairs_flag": "--pairs"},
     7: {"module": "calib_step7_v2", "out_attr": "CALIB_PATH",
-        "in_flag": "--step6", "pairs_attr": "TGT_INDICES", "pairs_flag": "--targets",
-        "ref_flag": "--ref",
-        "result_glob": "calib_step7_result_*.json"},
+        "needs": (3, 6), "pairs_attr": "TGT_INDICES", "pairs_flag": "--targets",
+        "ref_flag": "--ref"},
     8: {"module": "calib_step8", "out_attr": "OUT_DIR",
-        "in_flag": "--step7", "pairs_attr": "PAIRS",
-        "result_glob": "calib_step8_result_*.json"},
+        "needs": (3, 6, 7), "pairs_attr": "PAIRS"},
 }
 
 
@@ -142,42 +136,6 @@ def _load_step(stem: str):
     sys.modules[stem] = mod         # register before exec, as import does
     spec.loader.exec_module(mod)
     return mod
-
-
-def _newest(directory: Path, pattern: str) -> Path | None:
-    """Newest file matching ``pattern`` directly in ``directory`` (not below)."""
-    hits = [p for p in directory.glob(pattern) if p.is_file()]
-    if not hits:
-        return None
-    return max(hits, key=lambda p: (p.stat().st_mtime, p.name))
-
-
-def resolve_step3(explicit: str | None) -> Path:
-    """The step-3b calibration step 6 starts from: the newest one in calib_data.
-
-    Searched RECURSIVELY: calib_data holds both loose files and per-run folders
-    (this script's own output, ``run_0903/`` and friends), and the newest step 3b
-    normally sits inside the most recent of those rather than at the top level.
-    ``STEP3_SKIP_DIRS`` keeps the search out of the archive.
-
-    Ordered by mtime rather than by the MMDD_HHMM in the name -- the name has no
-    year, so name order breaks across a new year while mtime does not.
-    """
-    if explicit:
-        path = Path(explicit).expanduser()
-        if not path.is_absolute():
-            path = (Path.cwd() / path).resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"--step3 file not found: {path}")
-        return path
-    hits = [p for p in CALIB_PATH.rglob(STEP3_GLOB)
-            if p.is_file() and not any(d in p.parts for d in STEP3_SKIP_DIRS)]
-    if not hits:
-        raise FileNotFoundError(
-            f"no {STEP3_GLOB} under {CALIB_PATH} -- run step 3b first, or pass "
-            f"--step3 PATH"
-        )
-    return max(hits, key=lambda p: (p.stat().st_mtime, p.name))
 
 
 def make_run_dir(explicit: str | None, *, create: bool = True) -> Path:
@@ -235,25 +193,18 @@ def _set_ref_index(mod, ref_index) -> int | None:
     return None
 
 
-def run_step(n: int, run_dir: Path, in_path: Path, *, pairs=None,
+def run_step(n: int, run_dir: Path, *, pairs=None,
              ref_index=None, dry_run: bool = False,
              verify_n=VERIFY_N) -> Path | None:
-    """Point step ``n`` at this run folder, run it, return its result JSON.
+    """Point step ``n`` at this run folder and run it.
 
-    ``in_path`` is what the step reads (step 3 for step 6, the previous step's
-    combined JSON for 7 and 8).  The result is found by globbing the run folder
-    afterwards: the steps stamp their own filenames and return nothing.
-
-    Under --dry-run ``in_path`` may be a plain string standing in for a file the
-    previous step has not written yet; it is printed but never bound.
+    Nothing is returned and nothing is carried: the step writes its section into
+    ``run_dir/calib.json``, which is where the next step looks for it.
     """
     spec = STEPS[n]
-    pending = isinstance(in_path, str)          # dry-run placeholder, not a path
     mod = _load_step(spec["module"])
     setattr(mod, spec["out_attr"], run_dir)     # all outputs -> the run folder
-    argv: list[str] = []
-    if not pending:
-        argv += [spec["in_flag"], str(in_path)]
+    argv: list[str] = ["--run", str(run_dir)]
     runs = ([[spec["n_flag"], str(k)] for k in verify_n]
             if spec.get("n_flag") else [[]])
     if pairs is not None:
@@ -268,8 +219,8 @@ def run_step(n: int, run_dir: Path, in_path: Path, *, pairs=None,
         argv += [spec["ref_flag"], str(ref)]
 
     head = (f"\n{'=' * 70}\n== STEP {n}  ({spec['module']})\n"
-            f"==   in   : {in_path if pending else _rel(in_path)}\n"
-            f"==   out  : {_rel(run_dir)}\n"
+            f"==   run  : {_rel(run_dir)}\n"
+            f"==   reads: {', '.join(f'step{k}' for k in spec['needs'])}\n"
             f"==   pairs: {getattr(mod, spec['pairs_attr'])}")
     if ref is not None:
         head += f"   ref: {ref}"
@@ -288,29 +239,48 @@ def run_step(n: int, run_dir: Path, in_path: Path, *, pairs=None,
                 f"step {n} ({spec['module']} {' '.join(extra)}) returned {rc}")
     print(f"\n-- step {n} finished in {(time.time() - t0) / 60:.1f} min")
 
-    if spec["result_glob"] is None:
-        return None
-    result = _newest(run_dir, spec["result_glob"])
-    if result is None:
+    # The section it was supposed to write, or the next step has nothing to
+    # read: a sweep can succeed while its fit fails, and that used to show up
+    # only as a confusing error one step later.
+    from calibration_module.calib_file import load_calib
+
+    calib = load_calib(run_dir)
+    if n not in calib:
         raise RuntimeError(
-            f"step {n} wrote no {spec['result_glob']} into {run_dir} -- the "
-            f"sweep may have run while the fit failed, so there is nothing to "
-            f"hand to the next step"
+            f"step {n} wrote no step{n} section into {calib.path} -- the sweep "
+            f"may have run while the fit failed, so there is nothing for the "
+            f"next step to read"
         )
-    print(f"-- step {n} result: {_rel(result)}")
+    result = calib.path
+    print(f"-- step {n} wrote step{n} ({calib.ran(n)}) into {_rel(result)}")
     return result
 
 
 def _write_manifest(run_dir: Path, manifest: dict) -> None:
-    """Rewrite sequence.json after each step, so a crash still leaves a record."""
+    """Rewrite sequence.txt after each step, so a crash still leaves a record.
+
+    Text, not JSON: a run folder holds exactly one JSON and it is the
+    calibration.  Nothing reads this file -- it is for the operator reading back
+    what a night did -- so a flat ``key: value`` dump is all it ever needed.
+    """
     manifest["outputs"] = sorted(
-        p.name for p in run_dir.iterdir()
-        if p.is_file() and p.name not in ("sequence.json", "run.log"))
-    (run_dir / "sequence.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8")
+        q.name for q in run_dir.iterdir()
+        if q.is_file() and q.name not in ("sequence.txt", "run.log"))
+    lines = []
+    for key, value in manifest.items():
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            lines += [f"  {k}: {v}" for k, v in value.items()]
+        elif isinstance(value, list):
+            lines.append(f"{key}:")
+            lines += [f"  {v}" for v in value]
+        else:
+            lines.append(f"{key}: {value}")
+    (run_dir / "sequence.txt").write_text("\n".join(lines) + "\n",
+                                          encoding="utf-8")
 
 
-def run_sequence(*, run_dir: Path, step3: Path, start_at: int = 6,
+def run_sequence(*, run_dir: Path, start_at: int = 6,
                  stop_at: int = 8, pairs=None, ref_index=None,
                  dry_run: bool = False, verify_n=VERIFY_N) -> int:
     order = [n for n in (6, 7, 8) if start_at <= n <= stop_at]
@@ -321,32 +291,36 @@ def run_sequence(*, run_dir: Path, step3: Path, start_at: int = 6,
         "pairs": list(pairs) if pairs else None,
         "ref_index": ref_index,
         "verify_n": list(verify_n),
-        "inputs": {"step3": _rel(step3)},
         "status": "running",
         "outputs": [],
     }
 
-    # Resuming mid-sequence: the skipped steps' results have to be in the run
-    # folder already, since that is the only place the chain looks for them.
-    carried = step3
-    for n in (6, 7):
-        if n >= start_at:
-            break
-        got = _newest(run_dir, STEPS[n]["result_glob"])
-        if got is None:
-            print(f"ERROR: --start-at {start_at} needs step {n}'s "
-                  f"{STEPS[n]['result_glob']} in {_rel(run_dir)}, found none")
+    # Every step reads its input out of the run folder's calib.json, so
+    # resuming is just a question of whether the sections it needs are there.
+    from calibration_module.calib_file import CalibFileError, load_calib
+
+    if order and not dry_run:
+        try:
+            calib = load_calib(run_dir)
+        except CalibFileError as exc:
+            print(f"ERROR: {exc}")
             return 2
-        carried = got
-        manifest["inputs"][f"step{n}_result"] = _rel(got)
-        print(f"Reusing step {n} result: {_rel(got)}")
+        missing = [k for k in STEPS[order[0]]["needs"] if k not in calib]
+        if missing:
+            print(f"ERROR: --start-at {order[0]} needs "
+                  + ", ".join(f"step{k}" for k in missing)
+                  + f" in {_rel(calib.path)}, which has "
+                  + (", ".join(f"step{k}" for k in calib.steps()) or "nothing"))
+            return 2
+        for line in calib.chain_lines():
+            print(f"  {line}")
 
     if not dry_run:
         _write_manifest(run_dir, manifest)
 
     for n in order:
         try:
-            result = run_step(n, run_dir, carried, pairs=pairs,
+            result = run_step(n, run_dir, pairs=pairs,
                               ref_index=ref_index, dry_run=dry_run,
                               verify_n=verify_n)
         except Exception as exc:
@@ -360,11 +334,8 @@ def run_sequence(*, run_dir: Path, step3: Path, start_at: int = 6,
             print(f"Resume with:  python {_rel(Path(__file__))} "
                   f"--start-at {n} --run-dir {_rel(run_dir)}")
             return 1
-        if dry_run and STEPS[n]["result_glob"]:
-            carried = f"<step {n} output: {STEPS[n]['result_glob']}>"
         if result is not None:
-            carried = result
-            manifest["inputs"][f"step{n}_result"] = _rel(result)
+            manifest[f"step{n}"] = _rel(result)
         if not dry_run:
             _write_manifest(run_dir, manifest)
 
@@ -383,8 +354,6 @@ def run_sequence(*, run_dir: Path, step3: Path, start_at: int = 6,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Run calibration steps 6 -> 7 -> 8 into one run folder.")
-    ap.add_argument("--step3", metavar="PATH", default=None,
-                    help="step-3b JSON for step 6 (default: newest in calib_data)")
     ap.add_argument("--run-dir", metavar="PATH", default=None,
                     help="reuse this folder instead of creating a new one "
                          "(required with --start-at 7/8)")
@@ -421,13 +390,11 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"--ref {ref_index} is not in --pairs {pairs}: step 7 fits every "
                  f"target against the reference and needs its step-6 eta")
 
-    step3 = resolve_step3(args.step3)
     run_dir = make_run_dir(args.run_dir, create=not args.dry_run)
 
     if args.dry_run:
         print(f"Run folder : {_rel(run_dir)}")
-        print(f"Step 3 in  : {_rel(step3)}")
-        return run_sequence(run_dir=run_dir, step3=step3, start_at=args.start_at,
+        return run_sequence(run_dir=run_dir, start_at=args.start_at,
                             stop_at=args.stop_at,
                             pairs=pairs, ref_index=ref_index, dry_run=True,
                             verify_n=verify_n)
@@ -441,9 +408,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr = _Tee(stderr, fh)
         try:
             print(f"Run folder : {_rel(run_dir)}")
-            print(f"Step 3 in  : {_rel(step3)}")
             print(f"Log        : {_rel(log_path)}")
-            return run_sequence(run_dir=run_dir, step3=step3,
+            return run_sequence(run_dir=run_dir,
                                 start_at=args.start_at, stop_at=args.stop_at,
                                 pairs=pairs,
                                 ref_index=ref_index, verify_n=verify_n)

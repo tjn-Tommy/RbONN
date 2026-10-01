@@ -40,21 +40,23 @@ running. Nothing marked **legacy** or **dead** should be imported from new code.
 |------|------|
 | `src/calibration_module/fit/` | calibration physics — models, fits, file formats. Imports no driver, so it can be run against saved CSVs with the bench powered down. |
 | `src/calibration_module/measure/` | acquisition — drives the SLM, DAQ and OSA and returns rows. Does no fitting. |
-| `src/calibration_module/fit/slm_response.py` | steps 1–3 data — `CalibrationResult` and its JSON/CSV (the file every later step and the encoder read), the step-3 channel grid, peak centroids, the usable-band clip. Driver-free. Beside it, `fit/transfer.py` is the per-channel sin² curve the encoder inverts and `fit/outliers.py` the post-sweep re-measure flags. |
-| `src/calibration_module/measure/slm_response.py` | steps 1–3 acquisition — the OSA/DAQ sweeps, plus one `run_step1/2/3b/3c` per step. The GUI's Step 1/2/3b/3c tabs and the step scripts both call the runner, so a step's sequence (e.g. 3b: refine centre → tile grid → grouped sweep) is written once. |
-| `src/calibration_module/steps/calib_step{1,2,3b,3c}.py` | the step 1–3 runners — constants (the GUI tabs' defaults), then `measure.slm_response.run_step*` → JSON (+ CSV for 3b/3c). `calib_step2.py` needs `--step1` or `--min-max`; 3b/3c need `--step2`, and take `--width`/`--gap`. |
+| `src/calibration_module/calib_file.py` | **the one calibration file per run directory** — `load_calib` / `write_section`, the step sections, their `ran` stamps and relative CSV pointers, and the rule that writing a section drops the ones below it. Holds the container only; each section's payload belongs to the fit that defines it. See [Calibration file](#calibration-file). |
+| `src/calibration_module/fit/slm_response.py` | steps 1–3 data — `CalibrationResult`, the `step1/2/3_section` builders that put it in `calib.json`, the step-3 channel grid, peak centroids, the usable-band clip. Driver-free. Beside it, `fit/transfer.py` is the per-channel sin² curve the encoder inverts and `fit/outliers.py` the post-sweep re-measure flags. |
+| `src/calibration_module/measure/slm_response.py` | steps 1–3 acquisition — the OSA/DAQ sweeps, plus one `run_step1/2/3b/3c` per step. The GUI's Step 1/2/3 tabs and the step scripts both call the runner, so a step's sequence is written once. (`run_step3b` is legacy — see below.) |
+| `src/calibration_module/steps/calib_step{1,2,3}.py` | the step 1–3 runners — constants (the GUI tabs' defaults), then `measure.slm_response.run_step*` → a section of `calib.json` (+ a CSV for 2 and 3). All three take `--run DIR`; step 3 also takes `--width`/`--gap`. `calib_step3.py` was `calib_step3c.py`. |
 | `src/calibration_module/fit/pair_v2.py` | **current** step 6 estimator — the difference fit (`D(w) = Y(1,w) − Ŷ(0,w) = η²w + a_x + q_x`) over 31 acquisitions on 10 repeated levels, plus 6 verification levels. Driver-free: `tests/test_pair_v2.py` runs the whole estimator off a committed CSV with no fake instrument. `PairV2Config` carries what a fit was specified with, so two configurations can coexist in one process. |
 | `src/calibration_module/measure/pair_v2.py` | step 6 acquisition — one pair's interleaved schedule, the near-rail ±0.1 → ±0.2 V escalation and the TIA sign convention. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
-| `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner (287 lines) — constants, then load layout → `measure.pair_v2` → `fit.pair_v2` → CSV/JSON/PNG. Holds no physics. |
+| `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner — constants, then load the layout out of the run's step-3 section → `measure.pair_v2` → `fit.pair_v2` → the CSV, the `step6` section and the PNGs. Holds no physics. `--run` and `--pairs` are required and have no default. |
 | `src/calibration_module/fit/phase.py` | **current** step 7 fit — the fringe `Y = a² + b²g² + 2abg·cos(ΔΦ_SLM + ΔΦ_comb)` with `a`, `b`, the single-beam background and the dark ALL pinned to step 6, so `ΔΦ_comb` is the one free parameter. That cosine argument is the project's ONE sign convention, so a stored `dphi_comb_rad` IS Φₖ in the forward model — nothing negates it. Also owns the phase CSV/JSON formats. Driver-free. |
 | `src/calibration_module/measure/phase_v2.py` | step 7 acquisition — one target pair swept against the held reference, the all-off dark, and step 6's near-rail escalation reused rather than retyped. `PhaseV2Config` is the drive (reference, ramp, levels); `PhaseV2Acq` the timing and input range. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
-| `src/calibration_module/steps/calib_step7_v2.py` | the step 7 runner (423 lines) — constants, then load the step-6 JSON → `measure.phase_v2` → `fit.phase` → CSV/JSON/PNG. Holds no physics. `--step6` is required and has no default. |
+| `src/calibration_module/steps/calib_step7_v2.py` | the step 7 runner — constants, then load the run's step-3 + step-6 sections → `measure.phase_v2` → `fit.phase` → the CSV, the `step7` section and the PNGs. Holds no physics. `--run`, `--targets` and `--ref` are required and have no default. |
+| `src/calibration_module/steps/calib_step8.py` | step 8 — the capped ladder that fits `Y_sat` and anchors `g = 1`. `--run` is required. Writes `step8_patterns_*.csv` (the plan, before the hardware is touched), the reads CSV, the `step8` section and the report PNG. |
 | `src/calibration_module/fit/verify.py` | the n-pair check — predicts `Y = |Σ η√(xw)·e^{i(φ½(x)+φ½(w)+Φ)}|² + background` for any drive with nothing free, and quotes the error against each block's full scale `FS = Y_max − Y_min = Y_max` — the ceiling the pairs can actually be driven to, found by a 1-D support scan over the projection axis ψ. The free-phase `S² = (Σ_k η_k)²` is *not* it: a pair only reaches `|z_k| = η_k` with its phase pinned to `Φ_k`, so `S²` over-predicts by 54–67 % on the 0908–0911 runs. Also the verify CSV, which reads old step-8 CSVs too. Driver-free. |
-| `src/calibration_module/steps/calib_npair_verify.py` | step 8 — `--n` pairs at a time: every C(N, n) block of the calibrated pairs, 8 random `(x, w)` patterns each, error as `rms(meas − pred) / FS`. `--step7` is required. Replaces `calib_step8_v2.py`'s `x = w = v` sweep. |
+| `src/calibration_module/steps/calib_npair_verify.py` | the n-pair accuracy check — `--n` pairs at a time: every C(N, n) block of the calibrated pairs, 8 random `(x, w)` patterns each, error as `rms(meas − pred) / FS`. Its `--step7` now takes a run directory (or its `calib.json`) like everything else, though the flag still carries the old name; slated for deprecation in favour of `calib_step8.py`. |
 | `src/calibration_module/fit/pair.py` | step 6 **v1** — the joint 6-parameter grid fit `pair_v2` replaced. GUI Step 6 moved off it; only `calib_step6_v1.py` and `calib_synth_v1.py` still reach it, kept so a historical CSV can be re-fit both ways. |
 | `src/calibration_module/steps/calib_step{6,7,8}_v1.py` | the v1 chain — dispatch to SLM + DAQ, collect, fit, plot. Kept for the estimator comparison and to re-fit historical CSVs. |
 | `src/calibration_module/measure/bench.py` | SLM/DAQ connection helpers shared by the step scripts |
-| `src/onn_module/` | the ONN as a trainable torch module, and the bench handover. `params.py` turns a step-7/step-8 calibration into the layer's (eta, Phi, Y_sat) -- through `fit/verify.py`, never by parsing the JSON itself, so the phase-sign convention has one definition; `layer.py` is the same forward model in torch, held to `verify.predict` at 1e-12 by `tests/test_onn_layer.py`; `finetune.py` carries a trained head onto a fresh calibration (and can still train from scratch); `bench_reference.py` writes the `.npz` the bench consumes; `onn_infer.py` is the bench run itself -- replays those drives, measures the gain against step 8's `g = 1` anchor, and reports whether the optics picked the right digit. Two envs: everything but `onn_infer` runs in **`rbonn-ml`** (`src/onn_module/requirements.txt`, torch, no drivers); `onn_infer` runs in **`rbonn`** (drivers, no torch). The `.npz` is the seam -- see `docs/onn_bench_protocol.md`. |
+| `src/onn_module/` | the ONN as a trainable torch module, and the bench handover. `params.py` turns a run directory into the layer's (eta, Phi, Y_sat) with `ONNParams.from_run` -- through `fit/verify.py`, never by parsing the JSON itself, so the phase-sign convention has one definition; `layer.py` is the same forward model in torch, held to `verify.predict` at 1e-12 by `tests/test_onn_layer.py`; `finetune.py` carries a trained head onto a fresh calibration (and can still train from scratch); `bench_reference.py` writes the `.npz` the bench consumes; `onn_infer.py` is the bench run itself -- replays those drives, measures the gain against step 8's `g = 1` anchor, and reports whether the optics picked the right digit. Two envs: everything but `onn_infer` runs in **`rbonn-ml`** (`src/onn_module/requirements.txt`, torch, no drivers); `onn_infer` runs in **`rbonn`** (drivers, no torch). The `.npz` is the seam -- see `docs/onn_bench_protocol.md`. |
 | `src/{daq,osa,scope,heater}_module/`, `src/slm_module/{controller,driver,encoding,generator}` | instrument drivers and pattern encoding |
 | `src/gui/` | the PyQt5 control suite (entry point `src/main.py`). It drives every instrument, not just the SLM, which is why it sits beside them rather than inside `slm_module/`. |
 | `src/drafts/monitor_lib.py` + `daq_osa_monitor.py` / `daq_pmt_monitor.py` | overnight drift monitors |
@@ -69,6 +71,8 @@ once its GUI page is rebuilt.
 | Path | Kept alive by |
 |------|---------------|
 | `src/calibration_module/measure/center.py` | TPA centre scan — [app.py:6471](src/gui/app.py#L6471) only |
+| `src/calibration_module/steps/calib_step3b.py`, `measure.slm_response.run_step3b` | the OSA grouped-channel sweep. Step 3 on this bench is the DAQ scan (`calib_step3.py`), and 3b's GUI tab is built but no longer added to the tab bar, so nothing routine reaches it. It still writes the pre-v3 standalone JSON, which `load_calib` will not read. |
+| `src/calibration_module/steps/calib_step{6,7}_v1.py` | the v1 predecessors. They write the pre-v3 nested result and have not been moved onto `--run`; keep them for reading history, not for running. |
 | `src/calibration_module/fit/legacy_intensity.py` | the old sin² transfer-curve fit (was `slm_module/calibration/calibration.py`). Step 3 is `fit/slm_response.py` + `measure/slm_response.py`; only `intensity_model` (used by `fit/outliers.py`) and one GUI "load a calibration CSV" path at [app.py:8119](src/gui/app.py#L8119) still reach it. `phase_for_level` and `predict_intensity` are exported and called nowhere at all — not in `src/`, not in the tests. |
 
 ### Dead — nothing imports these
@@ -101,14 +105,15 @@ sole copy of that logic.
 
 ### Hidden GUI pages — built, but not shown as tabs
 
-Three pages are constructed by `_build_calibration_page` and never added to the
+Four pages are constructed by `_build_calibration_page` and never added to the
 tab bar. They stay built because other pages read their widgets, or because
 re-tabbing them should be a one-line change rather than a rebuild.
 
 | Page | Why it is hidden | What still needs it |
 |------|------------------|---------------------|
 | **Step 4b · Stage3 Reopt** | its result is wired to nothing. The shape actually in use is the frozen `OPTIMIZED_ENCODING_SHAPE` constant in [optimization.py:123](src/slm_module/optimization.py#L123), hand-transcribed from `encoding/2026-07-03_run162902/best_so_far.json`. A 4b run writes a new `best_so_far.json` under its own output root and nothing reads it. | `_set_calibration_running` gates `stage3_reopt_stop_button`; `calibration_run_buttons` holds `stage3_reopt_run_button` |
-| **Step 6b · TPA Center** | its Apply button does not apply. The encoding layout is read verbatim from the Step 3c calibration, so a valid centre fit only prints *"re-run Step 3c with this target centre"* — it looks like it re-centres the channels and does not. | nothing; self-contained |
+| **Step 3b · Fast Channels** | the OSA grouped sweep. Step 3 here is the DAQ scan, and two tabs for one step is how a sweep gets done through the wrong one. Its writer also predates `calib.json`. | nothing; self-contained |
+| **Step 6b · TPA Center** | its Apply button does not apply. The encoding layout is read verbatim from the step-3 section, so a valid centre fit only prints *"re-run step 3 with this target centre"* — it looks like it re-centres the channels and does not. | nothing; self-contained |
 | **Mod Error** | never had a tab | the Encoding Gain (TPA Encoding page) and Quick Test sweeps read its `ana_*` OSA sweep-settings widgets |
 
 To bring 4b or 6b back, swap the `self._..._page = self._build_...()` line for an
@@ -130,6 +135,66 @@ Kept for provenance; they answered their question and are not maintained.
 | Path | Problem |
 |------|---------|
 | `docs/calib_0715_steps_6_7_8.md` | names `calib_step{6,7,8}_test.py` (now `_v1.py`) and `slm_module.tpa_{pair,phase}` (now `calibration_module.{pair,phase}`). Every uncertainty in it is an SEM with Birge-scaled errors and χ²/dof — all three were removed in favour of the trace std, so the numbers are not reproducible from today's code. |
+
+## Calibration file
+
+**One run directory, one JSON.** Every step reads `<run>/calib.json`, replaces
+its own section and writes it back; no step copies another step's payload, so the
+step-3 channel layout exists once instead of once per downstream result. The raw
+readings stay in the sibling CSVs — several per directory is normal, one per
+acquisition — and the JSON keeps only what was fitted from them plus a relative
+pointer back.
+
+```
+run_0930/
+  calib.json              step2 + step3 + step6 + step7 + step8
+  step2_0928_1744.csv     px -> nm
+  step3_0929_1802.csv     per-channel transfer sweep
+  step6_meas_*.csv        per-pair TPA sweep
+  step7_meas_*.csv        comb-phase sweep
+  step8_patterns_*.csv    the ladder plan, written before the hardware
+  step8_*.csv             the ladder reads
+  *.png
+```
+
+Each section carries `ran` (a full local ISO timestamp of when that step
+executed) and `csv` (relative to the JSON, so the directory can be copied or
+moved whole). Before v3 the chain was cumulative: a step-7 result embedded a copy
+of step 3 and step 6, a step-8 result pointed at its step 7 by absolute path, and
+`run_0929` held 615 KB across seven JSONs where it now holds 110 KB in one.
+
+**Inheriting an older calibration is a filesystem operation.** Copy the directory
+— or just its `calib.json` and the CSVs worth keeping — to a new name and run the
+step you want to redo. There is no `--inherit` flag and no provenance field:
+what you copied is what the file says, and you did it with your own hands.
+
+**Writing a section drops the sections below it.** A fresh step 3 means a new
+channel grid, so the step-6 etas and step-7 phases in that file were measured
+through an aperture that no longer exists; keeping them would leave the file
+reading as valid when it is not. They are dropped, named as they go, and the
+directory they were copied from still has them. The step order is 1 < 2 < 3 < 6 <
+7 < 8.
+
+Nothing enforces the stamps. A hand-assembled file can hold a step 6 older than
+its step 3, and `Calib.stale()` finds it while `Calib.chain_lines()` says so —
+printed by every runner before it touches the bench and shown on the GUI's run
+folder pill. A note, not a refusal: whether it matters is the operator's call,
+but it will not be a surprise.
+
+```
+$ python src/calibration_module/steps/calib_step7_v2.py --run src/calib_data/run_0930 --targets 1,3,4 --ref 2
+src/calib_data/run_0930/calib.json
+  step2  2026-09-28 17:44
+  step3  2026-09-29 18:02
+  step6  2026-09-30 13:25
+```
+
+Everything downstream — steps 6, 7 and 8, `fit/verify.load_forward_model`,
+`ONNParams.from_run` — takes the run directory (or the `calib.json` inside it)
+and reads what it needs out of that one file. `tools/migrate_calib_v3.py`
+converted the twelve directories that predate the schema; the frozen runs under
+`src/calib_data/archive/` were deliberately left in the old shape, so
+`load_calib` refuses them by name.
 
 ## Alignment
 
@@ -206,21 +271,24 @@ Two acquisition backends produce the same `CalibrationResult`:
   reading (clamped at 0). No all-bright reference is taken — the downstream
   $I_0\,\sin^2(\theta/2)$ model fits $I_0$ as a free amplitude, so absolute scale
   is irrelevant, and a full-bright panel could saturate the photodiode. This
-  is what Step 3c runs.
+  is what step 3 runs.
 
-The old **Channels only** toggle on the Step-3a page — scan only where an
-encoding channel lands, rather than walking every calibrated coordinate — is now
-the whole of Step 3c, which takes its scan coordinates from 3b's channel
-structuring instead of from a window/pad guess. Each row of the result is a channel,
-so the sweep is roughly `n_coordinates / n_channels` times shorter (≈20× on a
-typical map) while producing a `CalibrationResult` the encoder reads unchanged.
+Step 3 scans only where an encoding channel lands, rather than walking every
+calibrated coordinate: mirror-symmetric channel pairs are tiled around a
+configurable **target center** wavelength (default 778 nm), and any channel whose
+window overlaps a **guard band** (default 780 / 776 ± 0.06 nm) is skipped, with
+the next pitch outward tried instead. Guard bands must be symmetric about the
+target so the x/w pairs keep equal wavelength offsets. Each row of the result is
+a channel, so the sweep is roughly `n_coordinates / n_channels` times shorter
+(≈20× on a typical map).
 
-**Step 3c — channel grid + DAQ**: the same DAQ sweep, but the scan coordinates
-come from Step 3b's channel structuring: mirror-symmetric channel pairs are
-tiled around a configurable **target center** wavelength (default 778 nm), and
-any channel whose window overlaps a **guard band** (default 780 / 776 ± 0.06 nm)
-is skipped, with the next pitch outward tried instead. Guard bands must be
-symmetric about the target so the x/w pairs keep equal wavelength offsets.
+The sweep goes to `step3_*.csv` and the FITTED curves to the `step3` section of
+`calib.json`; the raw `intensity_levels` / `raw_intensity_levels` arrays are not
+duplicated into the JSON, which is why that section is 9 KB where the old
+standalone step-3 file was 38 KB. A channel whose curve will not fit is fatal at
+write time — there is no interpolation fallback left, so a channel with no fit
+cannot be encoded at all, and the right moment to say so is while the sweep is
+still fresh in the CSV.
 
 At encode time the transfer curve is **inverted**: `EncodingChannel.level_for(val)`
 maps a target normalized value $val \in [0, 1]$ to a grayscale level. The returned
@@ -398,7 +466,7 @@ then reports itself as not measured rather than silently passing.
 
 ### Channel layout
 
-The channel geometry is decided **once**, when the Step-3b/3c measurement grid
+The channel geometry is decided **once**, when the step-3 measurement grid
 is designed (`build_channel_calibration_grid`), tiling the panel into
 symmetric channel **pairs** around the 778 nm centre:
 
@@ -421,7 +489,7 @@ Defaults: `channel_width_px = 15`, `gap_px = 5`, `n_channels = 20` per side.
 Padding, guard-band, and centre columns render at their local off level, so
 they stay dark with no extra masking.
 
-Every consumer of a Step-3b/3c result — the TPA Encoding tab and the draft
+Every consumer of a step-3 section — the TPA Encoding tab and the draft
 step scripts — loads it **verbatim**
 (`channel_layout_from_calibration`): the calibration already *is* the channel
 structure (one row per channel centre, with the target centre, pitch and guard
@@ -431,7 +499,7 @@ nearest-coordinate snapping — the encoder always drives exactly the channels
 that were measured, and pair indices mean the same thing everywhere. The one
 number the file does not record is the window/gap split; the window width is
 taken as `pitch − gap_px` (default gap 5 px). To move the channels, re-run
-Step 3c with a new target centre.
+step 3 with a new target centre.
 
 The legacy re-tiling consumer (`build_channel_layout`) is deprecated for
 Step-3 results; it remains only where no measured channel grid exists yet —

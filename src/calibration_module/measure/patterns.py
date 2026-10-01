@@ -20,7 +20,6 @@ dark rather than hand back a run nothing can be compared against.
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,14 +27,12 @@ from typing import Callable
 
 import numpy as np
 
-from calibration_module.fit.slm_response import calibration_result_from_dict
 from calibration_module.fit.verify import pairs_tag, predict
 from calibration_module.measure.pair_v2 import (
     DEFAULT_ACQ as BENCH_ACQ,
     PairV2Acq,
     read_point,
 )
-from slm_module.encoding import channel_layout_from_calibration
 
 #: Pairs are numbered 1..N on the bench; keep in step with steps 6 and 7.
 PAIR_INDEX_BASE = 1
@@ -138,19 +135,16 @@ def slot(pair: int) -> int:
     return int(pair) - PAIR_INDEX_BASE
 
 
-def load_layout(step7: Path, pairs):
-    """Channel layout from the Step-3 calibration embedded in the step-7 JSON.
+def load_layout(run: Path, pairs):
+    """Channel layout from the run's step-3 section.
 
-    The embedded payload and the ``encoding`` marker were carried forward from
-    step 6, so this drives the same aperture and the same level mapping the etas
-    and phases were measured under.
+    The etas and phases this drives against live in the same calib.json, so the
+    aperture and the level mapping are necessarily the ones they were measured
+    under -- which is what carrying an embedded copy forward used to buy.
     """
-    payload = json.loads(Path(step7).read_text(encoding="utf-8"))
-    step3 = payload.get("step3")
-    if step3 is None:
-        raise ValueError(f"{Path(step7).name} has no embedded 'step3' calibration; "
-                         f"point --step7 at a combined step-7 result")
-    layout = channel_layout_from_calibration(calibration_result_from_dict(step3))
+    from calibration_module.calib_file import load_calib
+
+    layout = load_calib(run).layout()
     bad = [k for k in pairs if not 0 <= slot(k) < layout.n_channels]
     if bad:
         raise ValueError(f"pair(s) {bad} out of range: the layout has "

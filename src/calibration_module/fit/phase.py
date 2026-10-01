@@ -69,7 +69,7 @@ half (drive builders + the SLM/monitor sweep) lives in
 trial x point) are persisted as a CSV (:func:`write_phase_csv`) so a run can be
 reloaded and re-fit offline (:func:`load_phase_csv`); the fitted spectrum is
 persisted as a combined ``{step3, step6, step7}`` JSON
-(:func:`save_comb_phase_json` / :func:`load_comb_phase_json`) that downstream
+(:func:`save_step7_section` / :func:`load_comb_phase_json`) that downstream
 consumers read as their single input.
 """
 from __future__ import annotations
@@ -1454,28 +1454,27 @@ def save_phase_json(result: PhaseResult, path: str | Path) -> str:
     return str(out)
 
 
-def save_comb_phase_json(
+def save_step7_section(
     fits: dict[tuple[int, str], PhaseFit],
-    step6_path: str | Path,
-    path: str | Path,
+    run: str | Path,
     *,
     ref_index: int,
-    csv_path: str | None = None,
+    csv: str | Path | Sequence[str | Path] | None = None,
     single_beam_bg: bool | None = None,
     chains: Mapping[int, object] | None = None,
     extra: dict | None = None,
-) -> str:
-    """Combined step-7 result JSON: ``{"step3": ..., "step6": ..., "step7": ...}``.
+    log=print,
+):
+    """Write the comb-phase spectrum as the ``step7`` section of the run's calib.json.
 
     ``fits`` maps ``(tgt_index, method)`` to a fitted :class:`PhaseFit` --
     ``method`` is the free-form amplitude-handling label the driver used
     (e.g. ``"bounded"`` / ``"fix"``); a target may carry one entry per method.
-    The ``step3``, ``step6`` and ``encoding`` payloads are carried over VERBATIM
-    from the combined step-6 JSON at ``step6_path``, so this one file is a
-    superset:
-    channel layout (step3) + per-pair eta / single-beam / dark models (step6)
-    + the comb-phase spectrum ``{Phi_k}`` vs ``ref_index`` (step7).  Downstream
-    consumers (e.g. a multi-pair forward-model check) need nothing else.
+
+    The step-3 and step-6 payloads are no longer copied forward.  They are the
+    ``step3`` and ``step6`` sections of the same file, which is what made the
+    old combined result a superset, and a new step 6 drops this section rather
+    than leaving it describing phases measured against etas that have moved.
 
     ``extra`` keys are merged into the ``step7`` section (step-7 v2 stores its
     cascade plan there under ``"cascade"``).
@@ -1491,34 +1490,24 @@ def save_comb_phase_json(
     apart.  Without ``chains`` the fits are stored exactly as fitted, which is
     the single-reference case and byte-identical to what it always wrote.
     """
-    payload6 = json.loads(Path(step6_path).read_text(encoding="utf-8"))
-    if "step6" not in payload6:                        # bare save_tpa_pair_json summary
-        payload6 = {"step3": payload6.get("step3"), "step6": payload6}
-    out = Path(path).resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "step3": payload6.get("step3"),
-        "step6": payload6.get("step6"),
-        # which encoder drove the measurement; step 8 reads it back so the whole
-        # chain predicts against the levels that were actually written
-        "encoding": payload6.get("encoding"),
-        "step7": {
-            "ref_index": int(ref_index),
-            "csv": csv_path,
-            "single_beam_bg": single_beam_bg,
-            "step6_json": str(Path(step6_path).resolve()),
-            "channels": [
-                {"tgt_index": int(k), "method": str(m),
-                 "fit": _chained_fit_payload(f, (chains or {}).get(k),
-                                             int(ref_index))}
-                for (k, m), f in sorted(fits.items())
-            ],
-        },
+    from calibration_module.calib_file import load_calib, write_section
+
+    # Phases are measured against step 6's etas; without them the section is not
+    # interpretable, so say so before the file is touched.
+    load_calib(run, missing_ok=True).require(3, 6)
+    section = {
+        "ref_index": int(ref_index),
+        "single_beam_bg": single_beam_bg,
+        "channels": [
+            {"tgt_index": int(k), "method": str(m),
+             "fit": _chained_fit_payload(f, (chains or {}).get(k),
+                                         int(ref_index))}
+            for (k, m), f in sorted(fits.items())
+        ],
     }
     if extra:
-        payload["step7"].update(extra)
-    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return str(out)
+        section.update(extra)
+    return write_section(run, 7, section, csv=csv, log=log)
 
 
 def load_comb_phase_json(
@@ -1686,6 +1675,6 @@ __all__ = [
     "load_phase_csv",
     "phase_fit_payload",
     "save_phase_json",
-    "save_comb_phase_json",
+    "save_step7_section",
     "load_comb_phase_json",
 ]

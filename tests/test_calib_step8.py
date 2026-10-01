@@ -9,6 +9,7 @@ columns coming back misaligned -- shows up there as a non-zero residual.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from calibration_module import calib_file as CF  # noqa: E402
 from calibration_module.fit import levels, levels_report as R, verify as V  # noqa: E402
 from calibration_module.measure import patterns as S8  # noqa: E402
 from calibration_module.steps import calib_step8 as SA  # noqa: E402
@@ -475,22 +477,27 @@ class YSatFitTests(unittest.TestCase):
             row["mean_v"] = row["dark_v"] + V.saturate(c, truth) + (row["pred_v"] - c)
 
         with tempfile.TemporaryDirectory() as tmp:
+            # The run the Y_sat is written into: a copy of the fixture run, so
+            # its step-3/6/7 sections are the forward model being fitted against.
+            run = Path(tmp) / "run_s8"
+            run.mkdir()
+            shutil.copy2(STEP7, run / "calib.json")
             path = V.write_verify_csv(
-                Path(tmp) / "calib_step8_0000_0000.csv", self.pairs, rows,
-                meta={"step7_json": STEP7, "y_max_v": self.scale.fs,
-                      "status": "complete"},
+                run / "calib_step8_0000_0000.csv", self.pairs, rows,
+                meta={"step7_ran": CF.load_calib(run).ran(7),
+                      "y_max_v": self.scale.fs, "status": "complete"},
                 extra=["kind", "label", "seq", "target_alpha", "alpha",
                        "coherent_v", "sb_pred_v"])
-            result = SA.fit_and_write(path, STEP7, out_dir=tmp, log=lambda *_: None)
-            written = json.loads(
-                (Path(tmp) / "calib_step8_result_0000_0000.json").read_text())
-            self.assertTrue((Path(tmp) / "calib_step8_0000_0000_ysat.png").exists())
-            # the caller that chose out_dir should not have to re-derive either
-            # name from the CSV: the fit reports where it put both files
-            self.assertEqual(Path(result["result_json"]),
-                             Path(tmp) / "calib_step8_result_0000_0000.json")
+            result = SA.fit_and_write(path, run, log=lambda *_: None)
+            written = CF.load_calib(run).section(8)
+            self.assertTrue((run / "calib_step8_0000_0000_ysat.png").exists())
+            self.assertEqual([q.name for q in run.glob("*.json")],
+                             ["calib.json"])
+            # the caller should not have to re-derive either name from the CSV:
+            # the fit reports where it put the file and the plot
+            self.assertEqual(Path(result["result_json"]), run / "calib.json")
             self.assertEqual(Path(result["png"]),
-                             Path(tmp) / "calib_step8_0000_0000_ysat.png")
+                             run / "calib_step8_0000_0000_ysat.png")
 
         self.assertAlmostEqual(result["y_sat_v"], truth, places=2)
         fs = result["full_scale"]
@@ -500,10 +507,10 @@ class YSatFitTests(unittest.TestCase):
         self.assertAlmostEqual(fs["y_max_pred_v"], self.scale.fs, places=9)
         # a perfect bench does not drift between the two ends
         self.assertAlmostEqual(fs["drift_frac"], 0.0, places=9)
-        # and the JSON downstream reads carries the anchor it was defined by
+        # and the section downstream reads carries the sweep that anchored it
         self.assertAlmostEqual(written["y_sat_v"], result["y_sat_v"])
-        self.assertEqual(Path(written["gain_reference"]["csv"]).name,
-                         "calib_step8_0000_0000.csv")
+        self.assertEqual(written["csv"], "calib_step8_0000_0000.csv")
+        self.assertIn("g = 1", written["gain_reference"]["convention"])
 
 
 class CsvCompatibilityTests(unittest.TestCase):

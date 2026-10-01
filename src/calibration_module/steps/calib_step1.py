@@ -24,7 +24,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from calibration_module.fit.slm_response import save_calibration_result  # noqa: E402
+from calibration_module.calib_file import write_section  # noqa: E402
+from calibration_module.fit.slm_response import step1_section  # noqa: E402
 from calibration_module.measure.bench import (  # noqa: E402
     connect_osa,
     connect_slm,
@@ -54,10 +55,11 @@ USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode swit
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=CALIB_PATH,
-                        help=f"output directory (default {CALIB_PATH})")
+    parser.add_argument("--run", type=Path, default=CALIB_PATH, metavar="DIR",
+                        help=f"run directory; the off/on levels become its "
+                             f"calib.json step1 section (default {CALIB_PATH})")
     args = parser.parse_args(argv)
-    args.out.mkdir(parents=True, exist_ok=True)
+    args.run.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%m%d_%H%M")
 
     print(f"Step 1: {len(LEVELS)} levels, {LEVELS[0]}..{LEVELS[-1]}")
@@ -72,9 +74,9 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         osa.disconnect()
 
-    path = save_calibration_result(result, args.out / f"calib_step1_{stamp}.json")
+    calib = write_section(args.run, 1, step1_section(result))
     print(f"\nmin level {result.min_level}, max level {result.max_level}")
-    print(f"Saved -> {path}")
+    print(f"Saved -> {calib.path}")
 
 
 if __name__ == "__main__":

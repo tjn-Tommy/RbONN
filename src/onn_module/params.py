@@ -24,15 +24,13 @@ should set it.
 
 ``y_sat``
 ---------
-Step 8 fits the saturation level and writes ``y_sat_v`` beside the
-``step7_json`` it resolved its forward model from, so
-:meth:`ONNParams.from_step8` takes ``y_sat`` from the step-8 result and
-``eta``/``phi_rad`` from the step-7 file it names -- one calibration, reached
-through the artifact that measured the saturation against it.  (A step-8 result
-that carries ``eta``/``phi_rad`` inline is read directly; none has ever been
-written that way.)  There is no default saturation level in this module on
-purpose: a hardcoded 5 V that silently disagrees with the run it is quoted
-against is worse than an explicit ``y_sat=None`` (no saturation).
+Step 8 fits the saturation level into the ``step8`` section of the same
+``calib.json`` that holds the etas and the phases it was measured against, so
+:meth:`ONNParams.from_run` reads all three out of one file and there is no
+pointer to follow and no chance of pairing a ``Y_sat`` with the wrong forward
+model.  There is no default saturation level in this module on purpose: a
+hardcoded 5 V that silently disagrees with the run it is quoted against is worse
+than an explicit ``y_sat=None`` (no saturation).
 """
 from __future__ import annotations
 
@@ -105,114 +103,74 @@ class ONNParams:
         )
 
     @staticmethod
-    def from_step7(path: str | Path, *, pairs: Sequence[int] | None = None,
-                   y_sat: float | None = None,
-                   method: str | None = None) -> "ONNParams":
-        """Load a combined step-7 JSON through ``verify.load_forward_model``.
+    def from_run(run: str | Path, *, pairs: Sequence[int] | None = None,
+                 y_sat: float | None = None,
+                 method: str | None = None) -> "ONNParams":
+        """Load a run directory's calib.json -- eta, Phi and Y_sat in one file.
 
-        ``pairs=None`` takes every pair the file calibrates end to end (a step-6
-        eta and, unless it is the reference, a step-7 phase).  A step-7 file
-        carries no saturation level, so ``y_sat`` has to be passed or the layer
-        runs linear -- use :meth:`from_step8` to get it from a measurement.
+        ``run`` is the run directory or the ``calib.json`` inside it.  The etas
+        come from its step-6 section, the phases from step 7 and the saturation
+        level from step 8; an explicit ``y_sat`` overrides the file's, and a run
+        with no step 8 runs linear unless one is passed.
+
+        ``pairs=None`` takes every pair the run calibrates end to end: a step-6
+        eta and, unless it is the reference, a step-7 phase.
+
+        There is no shape sniffing left.  The four variants this used to dispatch
+        between -- a step-8 result with eta/phi inlined, one with only y_sat and
+        a path to follow, a combined step-7 file, a hand-written template -- were
+        four ways of saying "the forward model", and the run directory is now the
+        one way.  Only the hand-written template survives, in
+        :meth:`from_template`, because nothing measured it.
         """
-        models, phases, ref = load_forward_model(path, pairs=pairs, method=method)
+        from calibration_module.calib_file import load_calib
+
+        calib = load_calib(run)
+        models, phases, ref = load_forward_model(
+            calib.path, pairs=pairs, method=method)
         idx = sorted(models)
+        if y_sat is None and 8 in calib:
+            y_sat = calib.section(8).get("y_sat_v")
         return ONNParams(
             eta=torch.tensor([float(models[k].eta) for k in idx]),
             phi=torch.tensor([float(phases[k]) for k in idx]),
             eta_err=torch.tensor([float(models[k].eta_err) for k in idx]),
             y_sat=_y_sat(y_sat), phase_sign=1.0,
-            channels=idx, reference=int(ref), source=str(path),
+            channels=idx, reference=int(ref), source=str(calib.path),
         )
 
     @staticmethod
-    def from_step8(path: str | Path, *, pairs: Sequence[int] | None = None,
-                   y_sat: float | None = None) -> "ONNParams":
-        """Load a step-8 / system-accuracy JSON: eta, Phi and Y_sat in one file.
+    def from_template(path: str | Path, channels: Sequence[int] | None = None,
+                      y_sat: float | None = None) -> "ONNParams":
+        """Load the hand-written ``onn_layer_v1`` schema -- see :func:`write_template`.
 
-        This is the preferred loader.  Step 8 resolves the forward model once
-        and stores what it ran with -- ``eta``, ``phi_rad``, ``y_sat_v`` and the
-        ``step7_json`` it came from -- so the layer is guaranteed to be the model
-        the bench was last measured against.  An explicit ``y_sat`` overrides the
-        file's.
+        For a model somebody typed, not one the bench measured; a measured one
+        comes from :meth:`from_run`.
         """
         path = Path(path)
         with open(path, encoding="utf-8") as fh:
             d = json.load(fh)
-        if "eta" not in d or "phi_rad" not in d:
-            return ONNParams._step8_via_step7(path, d, pairs=pairs, y_sat=y_sat)
-        eta_d = {int(k): float(v) for k, v in d["eta"].items()}
-        phi_d = {int(k): float(v) for k, v in d["phi_rad"].items()}
-        idx = sorted(eta_d) if pairs is None else sorted(int(p) for p in pairs)
-        missing = [k for k in idx if k not in eta_d or k not in phi_d]
-        if missing:
-            raise KeyError(f"pair(s) {missing} are not in {path.name} "
-                           f"(it covers {sorted(eta_d)})")
-        return ONNParams(
-            eta=torch.tensor([eta_d[k] for k in idx]),
-            phi=torch.tensor([phi_d[k] for k in idx]),
-            y_sat=_y_sat(d.get("y_sat_v") if y_sat is None else y_sat),
-            phase_sign=1.0, channels=idx,
-            reference=None if d.get("reference") is None else int(d["reference"]),
-            source=str(path),
-        )
-
-    @staticmethod
-    def _step8_via_step7(path: Path, d: dict, *, pairs, y_sat) -> "ONNParams":
-        """A step-8 result that stores only ``y_sat_v`` and a path to its step 7.
-
-        Step 8 has never written ``eta``/``phi_rad`` of its own -- it records
-        ``step7_json``, the file it resolved its forward model from.  Following
-        that path is better than copying the numbers in: one source, and a
-        step-8 result cannot drift from the calibration it was measured under.
-
-        The recorded path is absolute, so a moved calib_data directory breaks
-        it; the step-7 file is then looked for beside the step-8 file, which is
-        where a run directory keeps them both.
-        """
-        if "y_sat_v" not in d:
-            raise KeyError(f"{path.name} has neither 'eta'/'phi_rad' nor 'y_sat_v': "
-                           f"not a step-8 result (keys: {sorted(d)})")
-        recorded = d.get("step7_json")
-        if not recorded:
-            raise KeyError(f"{path.name} has no 'eta'/'phi_rad' and no 'step7_json' "
-                           f"to resolve them from")
-        for cand in (Path(recorded), path.parent / Path(recorded).name):
-            if cand.is_file():
-                break
-        else:
-            raise FileNotFoundError(
-                f"{path.name} points at {recorded}, which is not there, and no "
-                f"{Path(recorded).name} sits beside it -- pass the step-7 file "
-                f"directly with an explicit y_sat")
-        p = ONNParams.from_step7(
-            cand, pairs=pairs,
-            y_sat=d["y_sat_v"] if y_sat is None else y_sat)
-        p.source = f"{path} (y_sat) + {cand} (eta, phi)"
-        return p
-
-    @staticmethod
-    def from_json(path: str | Path, channels: Sequence[int] | None = None,
-                  y_sat: float | None = None) -> "ONNParams":
-        """Dispatch on what the file is: step-8 result, step-7 result, or template.
-
-        ``y_sat`` overrides whatever the file says, and sets the units of ``Y``:
-        pass the saturation level in detector volts and ``Y`` comes out in volts.
-        """
-        path = Path(path)
-        with open(path, encoding="utf-8") as fh:
-            d = json.load(fh)
-        if "phi_rad" in d and "eta" in d and isinstance(d["eta"], dict):
-            return ONNParams.from_step8(path, pairs=channels, y_sat=y_sat)
-        if "y_sat_v" in d and "step7_json" in d:      # a step-8 result, lean form
-            return ONNParams.from_step8(path, pairs=channels, y_sat=y_sat)
-        if "step7" in d or "step6" in d:
-            return ONNParams.from_step7(path, pairs=channels, y_sat=y_sat)
         p = ONNParams._from_flat(d, channels)
         if y_sat is not None:
             p.y_sat = _y_sat(y_sat)
         p.source = str(path)
         return p
+
+    @staticmethod
+    def from_json(path: str | Path, channels: Sequence[int] | None = None,
+                  y_sat: float | None = None) -> "ONNParams":
+        """A run directory's calib.json, or a hand-written template.
+
+        Kept as the one entry point that does not make the caller know which it
+        has.  The test is the ``schema`` key, not the shape of the payload: a v3
+        calib.json says what it is.
+        """
+        from calibration_module.calib_file import CalibFileError
+
+        try:
+            return ONNParams.from_run(path, pairs=channels, y_sat=y_sat)
+        except CalibFileError:
+            return ONNParams.from_template(path, channels, y_sat)
 
     @staticmethod
     def _from_flat(d: dict, channels: Sequence[int] | None) -> "ONNParams":
