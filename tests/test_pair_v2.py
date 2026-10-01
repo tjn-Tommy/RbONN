@@ -28,6 +28,7 @@ from calibration_module.fit.pair_v2 import (  # noqa: E402
     DEFAULT_CONFIG,
     PairV2Config,
     average_levels,
+    burst_rows,
     fit_pair,
     load_meas_csv,
 )
@@ -200,6 +201,64 @@ class NoDriverTests(unittest.TestCase):
         )
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), "", f"fit imported a driver: {out.stdout}")
+
+
+class BurstRowTests(unittest.TestCase):
+    """average_levels drops burst acquisitions before they reach Level.mean."""
+
+    #: run_0929 pair 10 x=1 w=0.9: one burst repeat among six.
+    BURST_CSV = REPO / "src/calib_data/run_0929/calib_step6v2_meas_0930_0215.csv"
+
+    def _rows(self):
+        self.assertTrue(self.BURST_CSV.is_file(), f"missing: {self.BURST_CSV}")
+        return load_meas_csv(self.BURST_CSV)[10]
+
+    def test_finds_the_one_known_burst(self) -> None:
+        mask = burst_rows(self._rows())
+        self.assertEqual(int(mask.sum()), 1)
+        row = [r for r, bad in zip(self._rows(), mask) if bad][0]
+        self.assertAlmostEqual(row[1], 1.0)      # x
+        self.assertAlmostEqual(row[2], 0.9)      # w
+        self.assertGreater(row[4], 0.1)          # a 111 mV trace std
+
+    def test_the_clean_0907_run_loses_nothing(self) -> None:
+        for pair, rows in load_meas_csv(MEAS_CSV).items():
+            self.assertFalse(burst_rows(rows).any(), f"false positive on pair {pair}")
+
+    def test_dropping_restores_the_cell_mean(self) -> None:
+        # Level.mean is a PLAIN mean over repeats, so the burst dragged the cell
+        # from its five honest repeats at ~1.70 mV up to 4.09 mV.
+        cell = (1.0, 0.9)
+        keep = [L for L in average_levels(self._rows()) if (L.x, L.w) == cell][0]
+        raw = [L for L in average_levels(self._rows(), drop_bursts=False)
+               if (L.x, L.w) == cell][0]
+        self.assertEqual(keep.n, 5)
+        self.assertEqual(raw.n, 6)
+        self.assertAlmostEqual(keep.mean * 1e3, 1.70, places=1)
+        self.assertAlmostEqual(raw.mean * 1e3, 4.09, places=1)
+
+    def test_dropping_tightens_eta(self) -> None:
+        clean = fit_pair(10, average_levels(self._rows()))
+        raw = fit_pair(10, average_levels(self._rows(), drop_bursts=False))
+        self.assertLess(clean.eta_err, raw.eta_err)
+        self.assertGreater(clean.r2, raw.r2)
+        # the burst inflated the quoted error by ~a third without moving eta
+        # more than a twelfth of a sigma -- it was noise, not signal
+        self.assertLess(abs(clean.eta - raw.eta), 0.2 * clean.eta_err)
+
+    def test_never_empties_a_cell(self) -> None:
+        # every repeat of one cell flagged -> all kept, so the level survives and
+        # the design matrix still describes the model that was fitted
+        rows = [(0, 1.0, 0.9, 0.05, 1.0), (1, 1.0, 0.9, 0.05, 1.0),
+                (0, 0.0, 0.0, 0.0, 0.001), (1, 0.0, 0.0, 0.0, 0.001),
+                (2, 0.0, 0.0, 0.0, 0.001)]
+        self.assertFalse(burst_rows(rows).any())
+        cells = {(L.x, L.w) for L in average_levels(rows)}
+        self.assertIn((1.0, 0.9), cells)
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(burst_rows([]).size, 0)
+        self.assertEqual(average_levels([]), [])
 
 
 if __name__ == "__main__":

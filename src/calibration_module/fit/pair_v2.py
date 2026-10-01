@@ -138,6 +138,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .outliers import BURST_K_REPEAT, flag_burst_repeats
 from .sigma import STD_FLOOR_V, floor_std
 
 __all__ = [
@@ -146,6 +147,7 @@ __all__ = [
     "Level",
     "PairV2Fit",
     "average_levels",
+    "burst_rows",
     "block_of",
     "design_bg",
     "grad_bg_w",
@@ -262,16 +264,6 @@ class PairV2Config:
     #: records; the Step-3 layout arrays are always 0-based, so :meth:`slot`
     #: converts.  0 restores the old 0-based convention.
     pair_index_base: int = 1
-    #: How the encoder turns a commanded x/w into a grayscale level.  ``"fit"``
-    #: inverts the fitted sin^2 transfer model, so full scale is the fitted
-    #: retardance = pi and ``v`` means ``sin^2(Delta/2)`` exactly -- the relation
-    #: ``phase.phi_half`` already assumes downstream.  ``"interp"`` interpolates
-    #: the measured step-3b curve instead.  Step 6 SETS the chain's convention:
-    #: it writes the choice into its combined result and steps 7 and 8 read it
-    #: back from there, so one chain cannot mix the two.  Results measured under
-    #: different methods are not comparable -- eta, the single-beam background
-    #: and the comb phases are all defined at the levels actually written.
-    encoding_method: str = "fit"
 
     @classmethod
     def from_ramp(cls, sweep_min: float, sweep_max: float, points: int,
@@ -459,12 +451,55 @@ class Level:
         return self.on_cross_line(cfg) and lo - 1e-9 <= self.w <= hi + 1e-9
 
 
-def average_levels(rows) -> list[Level]:
+def burst_rows(rows, *, k: float = BURST_K_REPEAT) -> np.ndarray:
+    """Boolean mask of ``rows`` that are bursts, not measurements.
+
+    Every step-6 level is measured several times, so each row is judged against
+    the other repeats of its OWN ``(x, w)`` cell
+    (:func:`~calibration_module.fit.outliers.flag_burst_repeats`) rather than
+    against the sweep.  The sweep would be a much blunter ruler: it spans dark
+    to full scale, so its trace stds legitimately vary ~100x -- enough that it
+    reads an honest full-scale point as a burst.  Repeats of one cell agree to
+    1.6x at the 99th percentile across every run on disk, and never past 1.81x.
+
+    Never empties a cell: if every repeat of one ``(x, w)`` is flagged, all of
+    them are kept.  A level with no acquisitions would silently drop out of the
+    design matrix and change which model is being fitted, which is a worse
+    failure than a known-bad level that the caller has been warned about.
+    """
+    rows = list(rows)
+    if not rows:
+        return np.zeros(0, dtype=bool)
+    cell_of = [(round(float(r[1]), 6), round(float(r[2]), 6)) for r in rows]
+    mask = flag_burst_repeats(
+        np.array([float(r[4]) for r in rows], dtype=float), cell_of, k=k)
+    cells: dict[tuple[float, float], list[int]] = {}
+    for i, c in enumerate(cell_of):
+        cells.setdefault(c, []).append(i)
+    for idx in cells.values():
+        if all(mask[i] for i in idx):
+            for i in idx:
+                mask[i] = False
+    return mask
+
+
+def average_levels(rows, *, drop_bursts: bool = True) -> list[Level]:
     """Group raw ``(rep, x, w, mean_v, std_v)`` rows into repeat-averaged levels.
 
     Rows may carry the two PMT-thermistor cells after ``std_v``; the fit has no
     use for them, so only the first five fields are read.
+
+    Burst acquisitions (:func:`burst_rows`) are dropped first, because
+    :attr:`Level.mean` is a PLAIN mean over repeats: on run_0929 pair 10 one
+    burst repeat read 15.97 mV against five honest ones at 1.70-1.72 mV, which
+    put the cell at 4.09 mV instead of 1.71 mV and -- through the blown-up
+    :attr:`Level.rep_std` -- took eta_err from 13.4% to 17.8%.  Pass
+    ``drop_bursts=False`` for the unfiltered historical behaviour.
     """
+    rows = list(rows)
+    if drop_bursts and rows:
+        mask = burst_rows(rows)
+        rows = [r for r, bad in zip(rows, mask) if not bad]
     grouped: dict[tuple[float, float], list[tuple[float, float]]] = {}
     for _rep, x, w, mean_v, std_v in (r[:5] for r in rows):
         grouped.setdefault((round(float(x), 6), round(float(w), 6)), []).append(
@@ -1344,7 +1379,8 @@ def _background_dict(fit: PairV2Fit) -> dict:
 
 
 def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
-                       *, step3: dict | str | Path, center_wl: float = 0.0) -> Path:
+                       *, step3: dict | str | Path, center_wl: float = 0.0,
+                       dropped_bursts: dict[int, list[dict]] | None = None) -> Path:
     """Step-3 calibration + every v2 pair fit, in the schema step 7 reads.
 
     ``channels[].fit.{eta, eta_err, params.{a_x,q_x,a_w,q_w,d}.value}`` is the
@@ -1357,6 +1393,11 @@ def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
     the GUI already holds the calibration it built its layout from, and
     re-reading a path would let the file on disk drift from the layout the
     sweep actually ran with.
+
+    ``dropped_bursts`` maps a pair index to the burst acquisitions
+    (:func:`burst_rows`) left out of its fit.  Recorded per pair so a result can
+    always be traced back to the rows that made it, and so a run whose bench was
+    glitching cannot be mistaken later for a clean one.
     """
     out_path = Path(out_path)
     cfg = fits[0].cfg
@@ -1403,6 +1444,7 @@ def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
                         if cfg.verify_enabled else []),
         "product_checks": [[list(pt) for pt in group] for group in cfg.product_checks],
         "center_wl": center_wl,
+        "dropped_bursts": {str(k): v for k, v in (dropped_bursts or {}).items()},
         "channels": [
             {
                 "index": fit.index,
@@ -1416,9 +1458,7 @@ def save_combined_json(fits: list[PairV2Fit], out_path: str | Path,
     }
     if not isinstance(step3, dict):
         step3 = json.loads(Path(step3).read_text(encoding="utf-8"))
-    out_path.write_text(json.dumps({"step3": step3, "step6": step6,
-                                    "encoding": {"method": cfg.encoding_method}},
-                                   indent=2),
+    out_path.write_text(json.dumps({"step3": step3, "step6": step6}, indent=2),
                         encoding="utf-8")
     return out_path
 

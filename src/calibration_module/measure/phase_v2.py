@@ -21,12 +21,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..fit.phase import PhaseResult
-from .pair_v2 import PairV2Acq, PairV2Aborted, read_point_autorange
+from .pair_v2 import DEFAULT_ACQ as BENCH_ACQ, PairV2Acq, PairV2Aborted, read_point
 
 __all__ = [
     "PhaseV2Config",
     "DEFAULT_CONFIG",
-    "PhaseV2Acq",
     "DEFAULT_ACQ",
     "PhaseV2Aborted",
     "PhaseV2Progress",
@@ -100,31 +99,18 @@ class PhaseV2Config:
 DEFAULT_CONFIG = PhaseV2Config()
 
 
-@dataclass(frozen=True)
-class PhaseV2Acq(PairV2Acq):
-    """Step 7's acquisition settings -- step 6's, with step-7 defaults.
-
-    A subclass rather than a twin so the shared
-    :func:`~calibration_module.measure.pair_v2.read_point_autorange` takes it as
-    the type it documents.  Only the defaults differ, and they differ for one
-    reason: step 7 is the brightest of the calibration steps.  The reference
-    stays on for every point while a second pair ramps up on top of it, so the
-    bright end runs past the +/-0.1 V step 6 lives at -- where the board clips
-    and returns a wrong mean rather than an error.
-    """
-
-    #: All-off dark only; at zero signal it needs the averaging.
-    t_single_s: float = 10.0
-    #: Every sweep point: the reference is on, so they are all bright.
-    t_both_s: float = 10.0
-    settle_s: float = 0.25
-    #: One quantized step above step 6's, costing one bit of resolution.
-    range_v: float = 0.2
-    range_wide_v: float = 0.5
-
-
-#: The acquisition every validated v2 run to date used.
-DEFAULT_ACQ = PhaseV2Acq()
+#: The bench acquisition -- step 6's and step 8's object, not a copy.
+#:
+#: Step 7 used to subclass ``PairV2Acq`` as ``PhaseV2Acq`` to hold its own
+#: defaults: a 10 s window against step 6's 8, and +/-0.2 V against step 6's
+#: +/-0.1, because step 7 is the brightest calibration step and the reference
+#: stays on for every point.  Both arguments are gone -- the range is fixed at
+#: the amplifier's own 1 V for every step, and one window is what makes a
+#: step-7 point comparable to the step-6 eta it is pinned against -- so the
+#: subclass held nothing.  Worse, it made ``step7.ACQ == step6.ACQ`` FALSE on
+#: the type while every field matched, which is exactly the claim this module
+#: now wants to be able to make.
+DEFAULT_ACQ = BENCH_ACQ
 
 
 @dataclass
@@ -181,10 +167,10 @@ def build_xw_sweep(cfg: PhaseV2Config = DEFAULT_CONFIG) -> list[Drive]:
     return [(float(v), float(v), r, r) for v in cfg.ramp()]
 
 
-def run_seconds(drive: Sequence[Drive], acq: PhaseV2Acq = DEFAULT_ACQ) -> float:
+def run_seconds(drive: Sequence[Drive], acq: PairV2Acq = DEFAULT_ACQ) -> float:
     """How long one target's sweep will take, so a caller can say so first."""
     n = len(drive)
-    return acq.t_single_s + n * acq.t_both_s + (n + 1) * acq.settle_s
+    return (n + 1) * (acq.t_meas_s + acq.settle_s)
 
 
 def measure_target(
@@ -195,7 +181,7 @@ def measure_target(
     drive: Sequence[Drive],
     *,
     cfg: PhaseV2Config = DEFAULT_CONFIG,
-    acq: PhaseV2Acq = DEFAULT_ACQ,
+    acq: PairV2Acq = DEFAULT_ACQ,
     col_ratio: np.ndarray | None = None,
     read_timeout: float = 30.0,
     step0: int = 0,
@@ -259,12 +245,12 @@ def measure_target(
             tgt_index=tgt_index, ref_index=cfg.ref_index,
             x_t=d[0], w_t=d[1], x_r=d[2], w_r=d[3],
             mean_v=mean_v, std_v=std_v, range_v=range_v, single=single,
-            duration_s=acq.t_single_s if single else acq.t_both_s,
+            duration_s=acq.t_meas_s,
         ))
 
     check_stop()
     display(0.0, 0.0, 0.0, 0.0)                      # all-off dark, once
-    dark_v, dark_std, dark_range = read_point_autorange(
+    dark_v, dark_std, dark_range = read_point(
         monitor, single=True, acq=acq, timeout=read_timeout, log=log
     )
     emit(0, (0.0, 0.0, 0.0, 0.0), dark_v, dark_std, dark_range, True)
@@ -274,7 +260,7 @@ def measure_target(
     for offset, (x_t, w_t, x_r, w_r) in enumerate(drive, start=1):
         check_stop()
         display(x_t, w_t, x_r, w_r)
-        mean_v, std_v, range_v = read_point_autorange(
+        mean_v, std_v, range_v = read_point(
             monitor, single=False, acq=acq, timeout=read_timeout, log=log
         )
         rows.append((x_t, w_t, x_r, w_r, mean_v, std_v))

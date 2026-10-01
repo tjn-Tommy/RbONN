@@ -64,8 +64,8 @@ Everything tunable is the block of constants below -- the drive's half in
 too, so the two front ends run the same fit over the same sweep.
 
 Each point is one fixed-duration ``daq_module`` acquisition like step 6:
-``t_single_s`` for the all-off dark (near-zero signal needs the averaging) and
-``t_both_s`` for the sweep points (the reference is on, so they are bright),
+``t_meas_s`` for every read, the all-off dark included (one window is what
+makes a sweep point comparable to the step-6 eta it is pinned against),
 low-passed at the ``DAQMonitorSettings`` bandwidth.  Every CSV row records the
 mean, its trace std and the std ratio (std/|mean|).
 
@@ -113,10 +113,11 @@ from calibration_module.fit.cascade import (  # noqa: E402
     plan_lines,
 )
 from calibration_module.fit.report import plot_fringe  # noqa: E402
+from calibration_module.fit.outliers import BURST_K  # noqa: E402
 from calibration_module.fit.sigma import STD_FLOOR_V  # noqa: E402
 from calibration_module.measure.bench import connect_daq, connect_slm  # noqa: E402
 from calibration_module.measure.phase_v2 import (  # noqa: E402
-    PhaseV2Acq,
+    DEFAULT_ACQ,
     PhaseV2Config,
     build_xw_sweep,
     measure_target,
@@ -153,16 +154,12 @@ CONFIG = PhaseV2Config(
     n_points=10,
 )
 
-# Acquisition timing and input range.  See PhaseV2Acq for what each one costs.
-ACQ = PhaseV2Acq(
-    t_single_s=10.0,
-    t_both_s=10.0,
-    settle_s=0.25,
-    range_v=0.2,
-    range_wide_v=0.5,
-    autorange=True,
-    invert=True,
-)
+# Acquisition timing and input range: the bench's, shared with steps 6 and 8
+# and the ONN loop.  This step used to run its own 10 s / +/-0.2 V because it
+# is the brightest of the three; the range is now the amplifier's own 1 V for
+# everyone, and one window is what makes a step-7 point comparable to the
+# step-6 eta it is pinned against.
+ACQ = DEFAULT_ACQ
 
 # Fold in the step-6 single-beam response as a FIXED background.  The reference
 # is held at a constant level -> its single-beam is a constant; only the swept
@@ -191,10 +188,8 @@ def _load_layout(step6: Path):
 
     ``save_combined_json`` stores the raw step-3 payload under ``"step3"``, so
     the layout this run drives is guaranteed to be the one the step-6 etas were
-    calibrated under.  The encoding convention is read back the same way: step 6
-    recorded which mapping it drove with, and reading it back is what keeps a
-    chain internally consistent.  A file written before the fitted encoding
-    existed carries no marker and was measured under ``"interp"``.
+    calibrated under.  There is one encoding convention -- the fitted sin^2
+    inversion -- so there is nothing left to read back and disagree about.
     """
     step6 = Path(step6)
     if not step6.is_file():
@@ -208,10 +203,7 @@ def _load_layout(step6: Path):
             f"{step6} has no embedded 'step3' calibration; point --step6 at a "
             f"combined step-6 result (calib_step6_v2 save_combined_json)"
         )
-    enc_method = (payload.get("encoding") or {}).get("method", "interp")
-    layout = channel_layout_from_calibration(
-        calibration_result_from_dict(step3), method=enc_method
-    )
+    layout = channel_layout_from_calibration(calibration_result_from_dict(step3))
     for name, idx in ([("ref_index", CONFIG.ref_index)]
                       + [("TGT_INDICES", k) for k in TGT_INDICES]):
         if not (0 <= CONFIG.slot(idx) < layout.n_channels):
@@ -355,7 +347,7 @@ def _run_sweep(step6: Path, fit_after: bool, *,
 
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
-                      t_both=ACQ.t_both_s, t_single=ACQ.t_single_s,
+                      t_both=ACQ.t_meas_s, t_single=ACQ.t_meas_s,
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
     results: list[PhaseResult] = []
     per_target = len(drive) + 1
@@ -447,6 +439,7 @@ def fit_csv(path: str | Path, step6: Path) -> None:
 
     stamp = time.strftime("%m%d_%H%M")
     fits: dict[int, PhaseFit] = {}
+    bursts: dict[int, list[dict]] = {}
     for k in fittable:
         print(f"\n=== pair {k} vs reference {ref_of[k]} ===")
         result = load_phase_csv(path, models[k], models[ref_of[k]],
@@ -456,6 +449,19 @@ def fit_csv(path: str | Path, step6: Path) -> None:
         drift = f" +/- {dts.std(ddof=1)*1e3:.4f} drift" if dts.size > 1 else ""
         print(f"Loaded {result.trial.size} rows, "
               f"dark = {result.dark*1e3:.4f}{drift} mV")
+        # Loud, because a burst is a BENCH fault, not a statistical nuisance: the
+        # trace jumped mid-acquisition.  The 1/std^2 weighting means dropping it
+        # barely moves dPhi_comb, so the ONLY way this reaches a human is here --
+        # stay quiet and a glitching bench reads as a clean run.
+        if result.dropped_bursts:
+            bursts[k] = result.dropped_bursts
+            print(f"!! {len(result.dropped_bursts)} BURST acquisition(s) dropped "
+                  f"(trace std >{BURST_K:g}x the sweep median) -- "
+                  f"the bench glitched, investigate:")
+            for b in result.dropped_bursts:
+                print(f"     x_t=w_t={b['x_t']:g}: "
+                      f"{b['voltage_mean_v']*1e3:+.4f} mV with a "
+                      f"{b['voltage_std_v']*1e3:.4f} mV trace std")
         report(result.fit, result.tgt_index, result.ref_index)
         plot_path = CALIB_PATH / f"calib_step7v2_pair{k}_{stamp}.png"
         save_plot(result.fit, result.tgt_index, plot_path)
@@ -482,16 +488,24 @@ def fit_csv(path: str | Path, step6: Path) -> None:
     # E = sum_k eta_k sqrt(x_k w_k) exp(i[u_k + v_k + Phi_k]); nothing negates
     # it on the way out or on the way back in.
     out_json = CALIB_PATH / f"calib_step7_result_{stamp}.json"
+    # Recorded per target so a result can always be traced back to the rows that
+    # made it, and so a run whose bench was glitching cannot later be mistaken
+    # for a clean one.  Written whether or not the run cascaded.
+    extra: dict = {}
+    if chained:
+        extra["cascade"] = {
+            "min_sep": MIN_PAIR_SEP,
+            "stages": [{"ref": s.ref, "targets": list(s.targets),
+                        "depth": s.depth} for s in stages],
+        }
+    if bursts:
+        extra["dropped_bursts"] = {str(k): v for k, v in bursts.items()}
     save_comb_phase_json({(k, METHOD): f for k, f in fits.items()},
                          step6, out_json, ref_index=ref,
                          csv_path=str(Path(path).resolve()),
                          single_beam_bg=SINGLE_BEAM_BG,
                          chains=chains,
-                         extra={"cascade": {
-                             "min_sep": MIN_PAIR_SEP,
-                             "stages": [{"ref": s.ref, "targets": list(s.targets),
-                                         "depth": s.depth} for s in stages],
-                         }} if chained else None)
+                         extra=extra or None)
     print(f"\nCombined step-7 result (step3 + step6 + step7) saved to {out_json}")
 
 

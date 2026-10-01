@@ -13,8 +13,10 @@ def _make_calibration():
 
     coords = np.array([0.0, 50.0, 100.0, 150.0, 200.0], dtype=float)
     wavelengths = np.array([779.0, 778.5, 778.0, 777.5, 777.0], dtype=float)
-    levels = np.array([0, 512, 1023], dtype=int)
-    curve = np.array([0.0, 0.5, 1.0], dtype=float)
+    # The layout builder fits every row, so the sweep has to be a sin^2 the
+    # 4-parameter model can take; the scan itself is what these tests check.
+    levels = np.linspace(0, 1023, 9).round().astype(int)
+    curve = np.sin(0.5 * np.pi * levels / 1023.0) ** 2
     intensity = np.tile(curve, (coords.size, 1))
     return CalibrationResult(
         wavelength=wavelengths,

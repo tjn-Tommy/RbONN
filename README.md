@@ -54,6 +54,7 @@ running. Nothing marked **legacy** or **dead** should be imported from new code.
 | `src/calibration_module/fit/pair.py` | step 6 **v1** — the joint 6-parameter grid fit `pair_v2` replaced. GUI Step 6 moved off it; only `calib_step6_v1.py` and `calib_synth_v1.py` still reach it, kept so a historical CSV can be re-fit both ways. |
 | `src/calibration_module/steps/calib_step{6,7,8}_v1.py` | the v1 chain — dispatch to SLM + DAQ, collect, fit, plot. Kept for the estimator comparison and to re-fit historical CSVs. |
 | `src/calibration_module/measure/bench.py` | SLM/DAQ connection helpers shared by the step scripts |
+| `src/onn_module/` | the ONN as a trainable torch module, and the bench handover. `params.py` turns a step-7/step-8 calibration into the layer's (eta, Phi, Y_sat) -- through `fit/verify.py`, never by parsing the JSON itself, so the phase-sign convention has one definition; `layer.py` is the same forward model in torch, held to `verify.predict` at 1e-12 by `tests/test_onn_layer.py`; `finetune.py` carries a trained head onto a fresh calibration (and can still train from scratch); `bench_reference.py` writes the `.npz` the bench consumes; `onn_infer.py` is the bench run itself -- replays those drives, measures the gain against step 8's `g = 1` anchor, and reports whether the optics picked the right digit. Two envs: everything but `onn_infer` runs in **`rbonn-ml`** (`src/onn_module/requirements.txt`, torch, no drivers); `onn_infer` runs in **`rbonn`** (drivers, no torch). The `.npz` is the seam -- see `docs/onn_bench_protocol.md`. |
 | `src/{daq,osa,scope,heater}_module/`, `src/slm_module/{controller,driver,encoding,generator}` | instrument drivers and pattern encoding |
 | `src/gui/` | the PyQt5 control suite (entry point `src/main.py`). It drives every instrument, not just the SLM, which is why it sits beside them rather than inside `slm_module/`. |
 | `src/drafts/monitor_lib.py` + `daq_osa_monitor.py` / `daq_pmt_monitor.py` | overnight drift monitors |
@@ -222,26 +223,27 @@ is skipped, with the next pitch outward tried instead. Guard bands must be
 symmetric about the target so the x/w pairs keep equal wavelength offsets.
 
 At encode time the transfer curve is **inverted**: `EncodingChannel.level_for(val)`
-maps a target normalized value $val \in [0, 1]$ to a grayscale level. Two methods,
-picked by `method=`; the returned level is rounded to the nearest integer
-grayscale either way, so even a coarse sweep can command levels between the
-swept points.
+maps a target normalized value $val \in [0, 1]$ to a grayscale level. The returned
+level is rounded to the nearest integer grayscale, so even a coarse sweep can
+command levels between the swept points.
 
-- **`"fit"`** — the default from `channel_layout_from_calibration`, i.e. what the
-  calibration chain and the GUI actually use. Inverts the fitted model in
-  [`fit/transfer.py`](src/calibration_module/fit/transfer.py):
+There is one inversion — the fitted model in
+[`fit/transfer.py`](src/calibration_module/fit/transfer.py):
 
-  $$I(L) = \mathrm{floor} + \mathrm{contrast}\cdot\sin^2\!\big(\Delta(L)/2\big),
-  \qquad \Delta(L) = c_2 L^2 + c_1 L + c_0$$
+$$I(L) = \mathrm{floor} + \mathrm{contrast}\cdot\sin^2\!\big(\Delta(L)/2\big),
+\qquad \Delta(L) = c_2 L^2 + c_1 L + c_0$$
 
-  `level_for` solves $\sin^2(\Delta/2) = val$ for $\Delta = 2\arcsin\sqrt{val}$ —
-  exactly the retardance `calibration_module.fit.phase.phi_half` assumes downstream —
-  then inverts $\Delta(L)$ on its rising branch. Full scale is the model's
-  $\Delta = \pi$, not the swept `argmax`, so one noisy sample cannot redefine it.
-- **`"interp"`** — linear interpolation between the two swept points bracketing
-  the target, over the off→on rising segment (made monotonic with a cumulative-max
-  envelope so noise near the flat top can't invert the mapping). Kept for
-  comparison; `val = 0` → swept `argmin`, `val = 1` → swept `argmax`.
+`level_for` solves $\sin^2(\Delta/2) = val$ for $\Delta = 2\arcsin\sqrt{val}$ —
+exactly the retardance `calibration_module.fit.phase.phi_half` assumes downstream —
+then inverts $\Delta(L)$ on its rising branch. Full scale is the model's
+$\Delta = \pi$, not the swept `argmax`, so one noisy sample cannot redefine it.
+
+The older `"interp"` mapping — linear interpolation between the two swept points
+bracketing the target — is **gone** as of 0930, along with the `method=` argument
+and the `encoding` marker step 6 used to write into its result. It was kept for
+comparison, the comparison was made, and the fit won: `val` now means
+$\sin^2(\Delta/2)$ exactly, which is the relation `phi_half` already assumed
+downstream, and full scale stops moving when one sample is noisy.
 
 The quadratic term $c_2$ (`phase_curv`) is the panel's own level→phase
 nonlinearity, added after the 0907 Step-3c sweep resolved it: the linear model's

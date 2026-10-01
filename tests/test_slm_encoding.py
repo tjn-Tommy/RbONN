@@ -40,14 +40,16 @@ from osa_module.controller import MeasurementSettings, TraceData
 
 
 def _make_layout(width: int = 10) -> ChannelLayout:
-    """Two-channel layout (one x, one w) with a simple linear transfer curve.
+    """Two-channel layout (one x, one w) over a textbook sin^2 transfer curve.
 
-    levels 0..1023 map linearly to normalised power 0..1, so level_for(v) picks
-    the swept level nearest ``v`` * 1023: level_for(0) -> 0 (measured off),
-    level_for(0.5) -> 512, level_for(1.0) -> 1023.
+    Extinction at level 0 and full scale at 1023, i.e. ``Delta(L) = pi L/1023``,
+    so inverting the fit gives round numbers: ``level_for(0) -> 0``,
+    ``level_for(0.5) -> 512`` (the fitted ``Delta = pi/2``) and
+    ``level_for(1) -> 1023``.  A sin^2 shape rather than a ramp because that is
+    what the encoder's model is, and a straight line is not a curve it can fit.
     """
-    levels = np.array([0, 256, 512, 768, 1023], dtype=int)
-    curve = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=float)
+    levels = np.linspace(0, 1023, 12).round().astype(int)
+    curve = np.sin(0.5 * np.pi * levels / 1023.0) ** 2
 
     def _ch(index: int, x_start: int) -> EncodingChannel:
         return EncodingChannel(
@@ -64,55 +66,6 @@ def _make_layout(width: int = 10) -> ChannelLayout:
         calib_coords=np.array([0, 50, 150, 200], dtype=float),
         calib_off_levels=np.zeros(4, dtype=int),
     )
-
-
-class LevelForInterpolationTests(unittest.TestCase):
-    """level_for interpolates between the two swept points bracketing the target."""
-
-    @staticmethod
-    def _channel(levels, curve) -> EncodingChannel:
-        return EncodingChannel(
-            index=0, side="x", x_center=50, x_start=45, x_end=55,
-            wavelength_nm=780.0,
-            levels=np.asarray(levels, dtype=int),
-            intensity_curve=np.asarray(curve, dtype=float),
-        )
-
-    def test_returns_levels_between_swept_points(self) -> None:
-        # coarse 10-point sweep, linear curve: val = 0.1166 lands between the
-        # swept points at 100 and 200 -> interpolated grayscale 105
-        ch = self._channel(np.linspace(0, 900, 10), np.linspace(0.0, 1.0, 10))
-        level = ch.level_for(0.1166)
-        self.assertEqual(level, 105)
-        self.assertNotIn(level, ch.levels)
-
-    def test_bracketing_pair_on_nonlinear_curve(self) -> None:
-        ch = self._channel([0, 100, 200], [0.0, 0.2, 1.0])
-        self.assertEqual(ch.level_for(0.1), 50)    # within [0.0, 0.2] segment
-        self.assertEqual(ch.level_for(0.6), 150)   # within [0.2, 1.0] segment
-
-    def test_endpoints_hit_off_and_on_levels(self) -> None:
-        ch = self._channel([10, 300, 700, 1000], [0.05, 0.3, 0.8, 0.97])
-        self.assertEqual(ch.level_for(0.0), ch.off_level)
-        self.assertEqual(ch.level_for(1.0), ch.on_level)
-        self.assertEqual(ch.level_for(-0.5), ch.off_level)   # clipped
-        self.assertEqual(ch.level_for(1.5), ch.on_level)
-
-    def test_flat_run_from_envelope_uses_lowest_level(self) -> None:
-        # noise dip at level 200 is clamped by the cumulative-max envelope to a
-        # flat run; a target on the flat takes the lowest level reaching it and
-        # targets above interpolate from the end of the run
-        ch = self._channel([0, 100, 200, 300], [0.0, 0.5, 0.4, 1.0])
-        self.assertEqual(ch.level_for(0.5), 100)
-        self.assertEqual(ch.level_for(0.75), 200)  # between 0.5@100 and 1.0@300
-
-    def test_mapping_is_non_decreasing(self) -> None:
-        rng = np.random.default_rng(7)
-        curve = np.clip(np.sin(np.linspace(0, np.pi / 2, 12)) ** 2
-                        + rng.normal(0, 0.01, 12), 0.0, None)
-        ch = self._channel(np.linspace(0, 1023, 12), curve)
-        out = [ch.level_for(v) for v in np.linspace(0.0, 1.0, 101)]
-        self.assertTrue(all(b >= a for a, b in zip(out, out[1:])))
 
 
 class EncodeToPatternTests(unittest.TestCase):
@@ -456,15 +409,17 @@ class CenterGapGeometryTests(unittest.TestCase):
 
     def test_build_channel_layout_carries_center_gap(self) -> None:
         coords = np.arange(0.0, 1001.0, 20.0)
+        # Geometry is what this test is about, but the builder fits every row on
+        # the way, so the sweep has to be one a sin^2 can describe.
+        levels = np.linspace(100, 900, 9).round().astype(int)
+        row = np.sin(0.5 * np.pi * (levels - 100) / 800.0) ** 2
         calib = CalibrationResult(
             wavelength=783.0 - 0.01 * coords,
             coordinates=coords,
             max_level=900,
             min_level=100,
-            level_range=np.asarray([100, 500, 900]),
-            intensity_levels=np.tile(
-                np.asarray([0.0, 0.5, 1.0]), (coords.size, 1)
-            ),
+            level_range=levels,
+            intensity_levels=np.tile(row, (coords.size, 1)),
         )
         layout = build_channel_layout(
             calib, n_channels=2, channel_width_px=15, gap_px=5,
@@ -681,12 +636,12 @@ class ChannelLayoutFromCalibrationTests(unittest.TestCase):
                 self.assertEqual(before.level_for(float(value)),
                                  after.level_for(float(value)))
 
-    def test_interpolating_a_fits_only_channel_says_why_it_cannot(self) -> None:
+    def test_fits_only_channels_carry_no_curve(self) -> None:
+        """The sweep is in step3_*.csv; the layout does not pretend otherwise."""
         layout = channel_layout_from_calibration(self._fits_only(), warn=False)
-        channel = layout.all_channels[0]
-        self.assertEqual(channel.intensity_curve.size, 0)
-        with self.assertRaisesRegex(TransferFitError, "no measured curve"):
-            channel.level_for_interp(0.5)
+        for channel in layout.all_channels:
+            self.assertEqual(channel.intensity_curve.size, 0)
+            self.assertIsNotNone(channel.transfer_fit)
 
     def test_fits_only_needs_one_fit_per_channel(self) -> None:
         calib = self._fits_only()
@@ -722,7 +677,7 @@ class MeasurePairColRatioTests(unittest.TestCase):
             return real(*args, **kwargs)
 
         cfg = PairV2Config(pair_index_base=1)
-        acq = PairV2Acq(settle_s=0.0, autorange=False)
+        acq = PairV2Acq(settle_s=0.0)
         schedule = build_schedule(cfg)
         # measure_pair does `from slm_module.encoding import encode_to_pattern`
         # at call time, so patch the module attribute it will re-import.

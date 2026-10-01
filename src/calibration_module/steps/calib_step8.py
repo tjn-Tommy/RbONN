@@ -16,31 +16,80 @@ This step measures that one constant, and nothing else.
 
 The sweep
 ---------
-One family: the ladder.  ``LADDER`` patterns, one per stratum of ``[0, Y_max]``,
-each a fresh random drive found by least-move projection onto its level set
-(:mod:`calibration_module.fit.levels`), plus the closed-form full-scale drive
-at exactly ``alpha = 1`` displayed at the start and again at the end.
+One family, the ladder, in two bands.  ``LADDER`` rungs stratify the BRIGHT
+band, :data:`LADDER_FLOOR_V` to :data:`LADDER_CEILING_V`; ``LADDER_LOW`` rungs
+stratify everything below it, down to :data:`LADDER_LOW_V`.  Each is a fresh
+random drive found by least-move projection onto its level set
+(:mod:`calibration_module.fit.levels`), and one more rung solved at the very top
+brackets the run, displayed first and last.
 
-There used to be two more families -- repeats at fixed drive, and a psi scan
-for measured full scale -- and they are gone on purpose.  The repeats measured
-readout reproducibility, which is a question about the machine rather than
-about ``Y_sat``; the psi scan measured the ceiling, which the ladder now
-reaches by itself because ``LADDER_ALPHA_MAX`` is 1 and the ``alpha = 1`` drive
-has a closed form.  What is left runs in about a quarter of an hour instead of
-half of one, and every read in it constrains the fit.
+Those three ends are per-run settings, not fixed constants -- ``--ceiling-mv``,
+``--floor-mv`` and ``--low-mv``, and three boxes on the GUI's Step 8 page
+(Sweep max, Band floor, Sweep min).  The module constants are their defaults,
+and one of them is a guess the bench has not checked yet: see below.  They are
+MILLIVOLTS at both boundaries, because :func:`ladder_levels` is what turns them
+into alphas -- an alpha typed by hand would silently follow the PMT gain, which
+is the one thing the volts exist to prevent.
+
+38 reads, about five minutes.  There used to be 92 over a quarter of an hour,
+spread uniformly from zero to full scale, and two more families besides -- see
+"Where the reads go" for why almost all of that was spent on nothing.
 
 The ladder is shuffled before it is driven, because running it in level order
 would alias slow drift straight onto the level axis -- the axis being measured.
 
-Why the top of the sweep is the whole measurement
--------------------------------------------------
-The curvature a saturation fit sees grows with ``|E|^2``: at 10 % of full scale
-the saturated and linear models differ by under 1 %, and no amount of averaging
-down there will separate them.  That is why the ladder now runs to 1 rather
-than stopping at 0.995, and why the closed-form ceiling drive is read twice.  A
-sweep that never reaches the top returns a ``Y_sat`` whose error bar has run
-into the search grid, and :func:`~calibration_module.fit.verify.fit_y_sat` says
-so rather than quoting a number.
+Where the reads go, and why so few
+----------------------------------
+The curvature a saturation fit sees grows with ``|E|^2``, and the information a
+rung carries about ``1/Y_sat`` goes as ``(Y^2/sigma)^2``.  That is a very steep
+weighting: with ``sigma`` set by the ~1 % per-pattern model error it is ``Y^2``,
+and with the 0.2 mV systematic floor it is ``Y^4``.  Either way the bottom of
+the scale carries essentially none of it -- the old 90-rung uniform ladder spent
+40 % of its reads below ``alpha = 0.4``, which between them held about 1 % of the
+leverage.
+
+So the bright band gets 30 rungs and everything below it gets 6.  Simulated
+through :func:`~calibration_module.fit.verify.fit_y_sat` at the present gain,
+that returns ``Y_sat`` to ~4 %, against the ~11 % it would have to be wrong by
+before it cost as much as the model error it sits next to.  The old 90 reads
+bought 2 % -- five times the precision that is usable, for two and a half times
+the run and two and a half times the drift exposure.
+
+The 6 low rungs are not leverage and are not pretending to be.  They are there
+because an inference run's MEDIAN read is ~40 mV: without them nothing in this
+sweep would touch the decade the machine spends most of its time in, and a
+step-6/7 error down there would leave no trace in any file.
+
+Why the ladder stops short of full scale
+----------------------------------------
+``LADDER_CEILING_V`` is 450 mV and ``Y_max`` is presently ~1534 mV, so the top
+of the ladder is ``alpha ~ 0.29``, not 1.  Two separate reasons, neither of them
+about the atoms:
+
+* The amplifier rails at :data:`AMP_LIMIT_V`, and its transimpedance stage
+  begins to COMPRESS somewhere below that -- where, exactly, is not known.  Both
+  bend the top of the ladder down in the same way saturation does, and
+  :func:`~calibration_module.fit.verify.fit_y_sat` would absorb either into
+  ``Y_sat`` and report a confident wrong number.  The raw trace peak runs ~1.2x
+  the mean, so 450 mV keeps the peak near 59 % of the rail.
+* Nothing downstream ever goes there.  An inference run's brightest read is
+  ~400 mV, ``alpha ~ 0.26``.  Driving the ladder to full scale would measure the
+  saturation of a regime the computation never enters, at the price of running
+  the amplifier where it is least trustworthy.
+
+The model being fitted is ``1/y = 1/Y + 1/Y_sat`` -- a fixed functional form, not
+a local expansion -- so a ``Y_sat`` measured with its leverage at 450 mV is
+exactly as valid at 260 mV.  What matters is that the ladder BRACKETS the range
+the machine uses, and 450 mV clears 400 mV.  That also makes 450 mV close to a
+floor rather than a safe default: much lower and the ladder stops covering the
+computation at all.
+
+Use the probe (see below) to find out where the electronics actually stop being
+linear; that measurement is what ``LADDER_CEILING_V`` is supposed to encode.
+When it is made, it goes in the Sweep max box (or ``--ceiling-mv``) -- the
+constant is only the default. Past ~770 mV the GUI asks first, since 1.31x is
+the measured p90 peak/mean and that is where the raw PEAK starts touching the
+rail -- on every bright rung, not on one probe read.
 
 The run assumes no Y_sat
 ------------------------
@@ -82,11 +131,13 @@ wanders ~1 %/h bidirectionally, worth ~1.4 mV per 1 %.  Refreshing ``g`` every
 
 Input range
 -----------
-Every read gets the range its prediction calls for -- the smallest board range
-holding it under ``RANGE_FILL`` of full -- so a dim pattern keeps the sensitive
-range and a bright one does not clip.  If a trace comes back near the rail
-anyway, step 6's escalation remeasures it once, wider, and keeps the wide
-reading; ``range_v`` in the CSV is the range the kept read was taken at.
+One range, :data:`~calibration_module.measure.pair_v2.RANGE_V`, for every read
+including the darks -- the same one steps 6 and 7 use.  Reads used to get the
+range their prediction called for, which put the board's per-range offset
+difference into every dark subtraction that crossed a boundary, and a near-rail
+trace used to trigger a re-read one range wider.  Both are gone; ``range_v`` in
+the CSV records the one range, and ``peak_v`` still records the raw trace peak
+so a flat-top is visible after the fact.
 
 Alpha is coherent, and single_beam is subtracted
 ------------------------------------------------
@@ -96,14 +147,51 @@ It is small but it RAMPS -- 0.39 -> 1.13 mV bottom to top on the 0911 run -- and
 a ramp coherent with level is exactly what a saturation fit is looking for, so
 leaving it in would bias ``Y_sat``.  The raw ``voltage_mean_v`` and ``dark_v``
 are never touched; ``sb_pred_v`` is a column and the subtraction happens in the
-fit.  Input range still comes from the FULL prediction, background included:
-the ADC sees the total.
+fit.
+
+The probe
+---------
+:func:`probe_verdict` and :func:`print_probe` report ONE displayed level read
+once -- nothing written -- against the linear model and against
+:data:`AMP_LIMIT_V`.  The GUI's Step 8 page drives it: pick an alpha, see the
+predicted millivolts before committing, display and read.
+
+That is the tool for the question ``LADDER_CEILING_V`` answers: walk alpha up
+and watch when the read starts falling behind the linear prediction faster than
+one constant can explain, or when the raw peak approaches the rail.  Run it
+after any change in optical power or PMT gain, because ``Y_max`` scales with
+both and the amplifier does not.
+
+It replaces a check that could only drive ``alpha = 1``.  That was safe while
+``Y_max`` fitted under the amplifier, and it no longer does: at the present gain
+the check would have clipped by construction, then inverted the clipped read to
+report a confident ceiling.  A caller-chosen alpha cannot do that.
+
+Timing matters more than the cap
+--------------------------------
+``pred_v`` here is step 6/7's ``eta`` IN STEP 6/7's VOLTS, and
+:func:`~calibration_module.fit.verify.fit_y_sat` pins ``g = 1`` with no free
+scale.  So any gain difference between when ``eta`` was measured and when this
+sweep reads is absorbed entirely into ``Y_sat``, levered by ``Y_sat / top read``
+-- about 15x at the present ceiling.  A 1 % gain drift between step 7 and step 8
+moves ``Y_sat`` by 28 %, a 2 % drift by 72 %, and the rmse barely moves in
+either case, so the fit looks clean while it is wrong.  Only past ~5 % does
+``unbounded`` fire.
+
+The gain wanders ~1 %/h, so every hour between step 7 and step 8 costs ~15 % of
+``Y_sat``.  RUN THIS IMMEDIATELY AFTER STEP 7, in the same sitting.  The 0917
+observation quoted below -- a ``g = 1`` ``Y_sat`` swinging 4.39..5.44 V overnight
+while tracking gain at r = 0.98 -- is this effect, measuring how stale step 7 had
+become, and not a property of the atoms.
 
 Read window
 -----------
-A dim read has the worst signal to noise, so it gets the longest window:
-``T_both`` runs linearly from ``T_BOTH_DIM_S`` at the run's dimmest prediction
-to ``T_BOTH_BRIGHT_S`` at its brightest.  The dark keeps ``T_single``.
+One window, :data:`~calibration_module.measure.pair_v2.T_MEAS_S`, for every read
+including the darks -- the same one steps 6 and 7 use.  This step used to ramp
+it from 10 s at the dimmest prediction down to 5 s at the brightest, on the
+argument that a dim read needs the averaging.  It does, but a LADDER is read
+point against point: a window that varies along the level axis puts a
+window-dependent systematic on exactly the axis :func:`fit_y_sat` reads.
 
 PMT temperature
 ---------------
@@ -123,6 +211,12 @@ hardware is touched, so an interrupted run is still reproducible.
 ``calib_step8_result_<MMDD_HHMM>.json``    the fitted ``Y_sat`` -- what steps
                                            downstream read.
 ``calib_step8_<MMDD_HHMM>_ysat.png``       the three-panel report.
+
+All four go to ``--out`` (default :data:`OUT_DIR`) as soon as they exist: a
+script run is a run somebody asked for.  The GUI is the other way round -- it
+stages a sweep in a temp directory and writes into ``OUT_DIR`` only when Save
+is pressed, so an abandoned run does not have to be recognised and deleted
+later.
 
 Not a unittest (it needs real hardware) -- run it directly.
 """
@@ -181,17 +275,68 @@ USB_SLM_NO = 1              # SLM_Ctrl_* device index for the DVI-mode switch
 DAQ_DEVICE = "Dev1"
 DAQ_CHANNEL = "ai0"
 
-#: Windows come from T_BOTH_DIM_S / T_BOTH_BRIGHT_S per read, not from ``t_both_s``.
+#: The bench acquisition, unchanged -- same window, range and settle as steps 6
+#: and 7.  This step declares no acquisition of its own.
 ACQ = DEFAULT_ACQ
 
 # ---- The run ----
-LADDER = 90                     # patterns across the scale, one per stratum
-LADDER_ALPHA_MAX = 1.0          # the ladder owns the ceiling; nothing else measures it
+LADDER = 30                     # rungs in the bright band, one per stratum
+LADDER_LOW = 6                  # rungs below it -- forward-model checks, not leverage
 SEED = None                     # None -> a fresh seed, printed and written to the JSON
 
-# ---- The read ----
-T_BOTH_DIM_S = 10.0             # window at the run's dimmest prediction
-T_BOTH_BRIGHT_S = 5.0           # ... linear down to this at its brightest
+# ---- Where the ladder starts and stops ----
+#
+# All three are VOLTS, not fractions of Y_max, because every argument that set
+# them is about volts: the amplifier, the noise floor, and how bright an
+# inference run actually reads.  :func:`ladder_levels` turns them into the alphas
+# a given forward model needs, so the geometry survives a change of PMT gain.
+#
+#: The brightest read the ladder is allowed to take, and the only thing that
+#: decides where the sweep stops -- :func:`ladder_levels` divides it by ``Y_max``
+#: and :func:`build` uses the result as ``alpha_hi``.
+#:
+#: 450 mV IS AN UNVERIFIED WORKING FIGURE, not a measurement.  Nobody has
+#: measured where this transimpedance amplifier starts to COMPRESS; only its hard
+#: rail is known, :data:`AMP_LIMIT_V` = 1 V.  That matters because compression
+#: bends the top of the ladder down in exactly the way saturation does, the fit
+#: has one free parameter, and it cannot tell them apart -- so it would absorb
+#: the amplifier into ``Y_sat`` and quote a confident wrong number.  Use the
+#: probe (:func:`probe_verdict`) to replace the guess: walk alpha up and watch
+#: for the read falling behind the linear model faster than one constant can
+#: explain, and for the raw peak approaching the rail.
+#:
+#: Two reasons 450 is the right guess to make MEANWHILE.  The errors are
+#: asymmetric: too low costs precision only -- 700 -> 450 mV moved sigma(Y_sat)
+#: from 3.0 % to 3.9 %, against the ~11 % where it would start to matter at all
+#: -- while too high is silent, for the reason above.  And it is near a hard
+#: floor: an inference run's brightest read is ~400 mV, and a ladder stopping
+#: below that stops covering the range the machine computes in.  So the usable
+#: range is roughly 400..700 mV and this is the bottom of it.
+#:
+#: For scale, 450 mV keeps the raw trace peak near 590 mV (the 0929 sweep's p90
+#: peak/mean is 1.31) = 59 % of the rail.
+LADDER_CEILING_V = 0.450
+#: The bright band's floor.  A rung's information about ``1/Y_sat`` goes as
+#: ``(Y^2/sigma)^2``, so the bottom of the scale carries almost none of it: the
+#: 90-rung ladder this replaces spent 40 % of its reads on 1 % of its leverage.
+LADDER_FLOOR_V = 0.230
+#: Below :data:`LADDER_FLOOR_V` the rungs are FORWARD-MODEL CHECKS rather than
+#: ``Y_sat`` leverage -- they carry no curvature worth fitting, and they are here
+#: because an inference run's MEDIAN read is ~40 mV.  Without them nothing in
+#: this sweep would touch the decade the machine spends most of its time in, and
+#: a step-6/7 error down there would leave no trace.
+LADDER_LOW_V = 0.031
+
+# ---- The amplifier ceiling ----
+#: The transimpedance amplifier saturates here, at EVERY PMT gain and on every
+#: board range.  It is a property of the electronics, not of the atoms, and it is
+#: the one hard limit in the chain: a read flat-topped at this value measures
+#: nothing.  It matters most to this step, because step 8 is the only step that
+#: deliberately drives the top of the scale -- and because a clipped ceiling read
+#: bends the top of the ladder down in exactly the way real saturation does, so
+#: :func:`~calibration_module.fit.verify.fit_y_sat` would absorb it into
+#: ``Y_sat`` and report a confident wrong number.
+AMP_LIMIT_V = 1.0
 
 OUT_DIR = CALIB_PATH
 
@@ -200,20 +345,60 @@ OUT_DIR = CALIB_PATH
 # building the run
 # ======================================================================
 
-def read_window(preds: Sequence[float]):
-    """``t(pred)`` -- linear from T_BOTH_DIM_S at ``min(preds)`` to T_BOTH_BRIGHT_S at ``max``."""
-    lo, hi = float(min(preds)), float(max(preds))
-
-    def t_both(pred: float) -> float:
-        f = 0.0 if hi <= lo else min(max((float(pred) - lo) / (hi - lo), 0.0), 1.0)
-        return T_BOTH_DIM_S + f * (T_BOTH_BRIGHT_S - T_BOTH_DIM_S)
-    return t_both
-
-
-def run_seconds(preds: Sequence[float], t_both) -> float:
+def run_seconds(n_reads: int) -> float:
     """Estimated wall time: every window and settle, plus the periodic darks."""
-    secs = sum(t_both(q) + ACQ.settle_s for q in preds)
-    return secs + ACQ.t_single_s * (1 + secs // DARK_EVERY_S)
+    secs = n_reads * (ACQ.t_meas_s + ACQ.settle_s)
+    return secs + ACQ.t_meas_s * (1 + secs // DARK_EVERY_S)
+
+
+def ladder_levels(y_max_v: float, *, ceiling_v: float = LADDER_CEILING_V,
+                  floor_v: float = LADDER_FLOOR_V,
+                  low_v: float = LADDER_LOW_V) -> dict:
+    """The ladder's three voltages, as alphas for this particular forward model.
+
+    ``alpha`` is a fraction of ``Y_max``, which moves with the PMT gain and with
+    the optical power; the voltages do not.  Converting here rather than storing
+    alphas is what lets one set of constants describe the run at any gain: turn
+    the PMT down and the alphas rise to keep the ladder on the same volts.
+
+    The three are ARGUMENTS, defaulting to the module constants, because the
+    ceiling is a guess about the amplifier that the probe is meant to replace
+    (see :data:`LADDER_CEILING_V`) -- so the GUI and the CLI can move the band
+    without editing the module, and the run records what it actually swept.
+    They stay VOLTS at the boundary for the same reason they are volts here: an
+    alpha typed by hand would silently follow the PMT gain.
+
+    Clamped so the bands stay ordered and non-empty even for a forward model
+    dimmer than ``ceiling_v``, where the cap saturates at 1.
+    """
+    fs = float(y_max_v)
+    ceiling, band, check = float(ceiling_v), float(floor_v), float(low_v)
+    if not fs > 0:
+        return {"cap": 1.0, "floor": 0.5, "low": 0.1, "capped": False}
+    cap = min(1.0, ceiling / fs)
+    floor = min(band / fs, 0.9 * cap)
+    low = min(check / fs, 0.9 * floor)
+    return {"cap": cap, "floor": floor, "low": low,
+            # True -> the amplifier, not the atoms, decides where this run stops
+            "capped": bool(ceiling < fs)}
+
+
+def ceiling_pattern(models, phases, pairs, cap: float, *, seed: int) -> Pattern:
+    """The single rung the run is bracketed with, at the top of the ladder.
+
+    ONE pattern, displayed at both ends: the bracket measures drift, and two
+    different drives at the same level would measure model error instead.
+
+    At ``cap == 1`` the level set is a single point and :func:`full_scale_pattern`
+    has it in closed form.  Below that the set has diversity, so the bracket is an
+    ordinary solved rung -- it keeps ``kind="F"`` so the CSV still says which read
+    is the bracket, and so the ONN's anchor picker still recognises it.
+    """
+    if cap >= 1.0 - 1e-9:
+        return full_scale_pattern(models, phases, pairs, label="ceiling")
+    rung, = level_patterns(models, phases, pairs, 1, seed=seed,
+                           alpha_lo=cap, alpha_hi=cap)
+    return replace(rung, kind="F", label="ceiling")
 
 
 def interleave(ladder: Sequence[Pattern], ceiling: Pattern, *, seed: int) -> list[Pattern]:
@@ -231,16 +416,33 @@ def interleave(ladder: Sequence[Pattern], ceiling: Pattern, *, seed: int) -> lis
             + [replace(ceiling, label=ceiling.label + "@end")])
 
 
-def build(models, phases, pairs, *, seed: int, ladder: int = LADDER):
+def build(models, phases, pairs, *, seed: int, ladder: int = LADDER,
+          low: int = LADDER_LOW, ceiling_v: float = LADDER_CEILING_V,
+          floor_v: float = LADDER_FLOOR_V, low_v: float = LADDER_LOW_V):
     """``(scale, patterns, preds)`` -- the whole run, solved, in read order.
+
+    Two bands, one ladder.  ``ladder`` rungs stratify the bright band, which is
+    where all of the ``Y_sat`` leverage is, and ``low`` rungs stratify everything
+    below it, where there is none -- those exist to catch a step-6/7 error in the
+    decade an inference run actually computes in.  Both are shuffled together by
+    :func:`interleave`, so neither band is a block in time.
+
+    ``ceiling_v``, ``floor_v`` and ``low_v`` are where the two bands end, in
+    VOLTS -- :func:`ladder_levels` turns them into this model's alphas.
 
     ``preds`` are LINEAR: this run fits ``Y_sat``, so it must not assume one.
     """
     scale = full_scale(models, phases, pairs)
-    rungs = level_patterns(models, phases, pairs, ladder, seed=seed,
-                           alpha_hi=LADDER_ALPHA_MAX)
-    patterns = interleave(rungs, full_scale_pattern(models, phases, pairs),
-                          seed=seed + 2)
+    lv = ladder_levels(scale.fs, ceiling_v=ceiling_v, floor_v=floor_v,
+                       low_v=low_v)
+    rungs = list(level_patterns(models, phases, pairs, ladder, seed=seed,
+                                alpha_lo=lv["floor"], alpha_hi=lv["cap"]))
+    if low:
+        rungs += list(level_patterns(models, phases, pairs, low, seed=seed + 1,
+                                     alpha_lo=lv["low"], alpha_hi=lv["floor"]))
+    patterns = interleave(
+        rungs, ceiling_pattern(models, phases, pairs, lv["cap"], seed=seed + 3),
+        seed=seed + 2)
     return scale, patterns, [float(predict(models, phases, pairs, p.x, p.w))
                              for p in patterns]
 
@@ -250,7 +452,10 @@ def build(models, phases, pairs, *, seed: int, ladder: int = LADDER):
 # ======================================================================
 
 def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
-            ladder: int = LADDER, seed: int | None = None,
+            ladder: int = LADDER, low: int = LADDER_LOW,
+            ceiling_v: float = LADDER_CEILING_V,
+            floor_v: float = LADDER_FLOOR_V, low_v: float = LADDER_LOW_V,
+            seed: int | None = None,
             dry_run: bool = False, pmt: "PmtTemperature | None" = None) -> str | None:
     """Solve the sweep, write its JSON, drive it, write the CSV."""
     out = Path(OUT_DIR if out_dir is None else out_dir)
@@ -261,11 +466,14 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
     if seed is None:
         seed = SEED if SEED is not None else int(np.random.SeedSequence().entropy % 2**32)
 
-    scale, patterns, preds = build(models, phases, pairs, seed=seed, ladder=ladder)
+    scale, patterns, preds = build(models, phases, pairs, seed=seed,
+                                   ladder=ladder, low=low, ceiling_v=ceiling_v,
+                                   floor_v=floor_v, low_v=low_v)
+    lv = ladder_levels(scale.fs, ceiling_v=ceiling_v, floor_v=floor_v,
+                       low_v=low_v)
     coh = [float(predict(models, phases, pairs, p.x, p.w, coherent=True))
            for p in patterns]
-    t_both = read_window(preds)
-    secs = run_seconds(preds, t_both)
+    secs = run_seconds(len(patterns))
 
     print(f"Step 7 in : {step7}")
     print(f"Pairs     : {pairs}  (N = {len(pairs)}, reference {ref})")
@@ -273,10 +481,16 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
           f"({100 * scale.headroom:.1f} %)   psi* {np.degrees(scale.psi):.2f} deg")
     print(f"            4-bit level step = {scale.fs / 15 * 1e3:.3f} mV (linear)")
     print(f"Model     : LINEAR -- this run fits Y_sat, so it assumes none")
-    print(f"Read      : T_both {T_BOTH_DIM_S:g} s (dimmest, {min(preds) * 1e3:.2f} mV) "
-          f"-> {T_BOTH_BRIGHT_S:g} s (brightest, {max(preds) * 1e3:.2f} mV)")
-    print(f"Patterns  : {len(patterns)} reads  (ladder {ladder}, ceiling 2), "
-          f"~{secs / 60:.0f} min")
+    print(f"Read      : {ACQ.t_meas_s:g} s every read, dark included, at "
+          f"+/-{ACQ.range_v:g} V  (dimmest {min(preds) * 1e3:.2f} mV, "
+          f"brightest {max(preds) * 1e3:.2f} mV)")
+    print(f"Ladder    : {ladder} rungs over "
+          f"{lv['floor'] * scale.fs * 1e3:.0f}..{lv['cap'] * scale.fs * 1e3:.0f} mV "
+          f"(alpha {lv['floor']:.3f}..{lv['cap']:.3f}), plus {low} model checks "
+          f"down to {lv['low'] * scale.fs * 1e3:.0f} mV"
+          + ("" if lv["capped"] else "   [Y_max is under the ceiling: no cap]"))
+    print(f"Patterns  : {len(patterns)} reads  (ladder {ladder + low}, "
+          f"ceiling 2), ~{secs / 60:.0f} min")
     print(f"Seed      : {seed}")
     fell_back = [p.label for p in patterns if not p.exact]
     if fell_back:
@@ -293,12 +507,14 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
         "level_step_v": scale.fs / 15.0,
         "eta": dict(zip(map(str, pairs), scale.amplitudes)),
         "phi_rad": dict(zip(map(str, pairs), scale.phases)),
-        "config": {"ladder": ladder, "ladder_alpha_max": LADDER_ALPHA_MAX,
-                   "t_both_dim_s": T_BOTH_DIM_S, "t_both_bright_s": T_BOTH_BRIGHT_S},
+        "config": {"ladder": ladder, "ladder_low": low,
+                   "ceiling_v": ceiling_v, "floor_v": floor_v,
+                   "low_v": low_v, "alpha": lv,
+                   "t_meas_s": ACQ.t_meas_s, "range_v": ACQ.range_v},
         "patterns": [
             {"seq": i, "kind": p.kind, "label": p.label,
              "target_alpha": p.target_alpha, "alpha": p.alpha,
-             "coherent_v": c, "pred_v": q, "t_both_s": t_both(q), "exact": p.exact,
+             "coherent_v": c, "pred_v": q, "t_meas_s": ACQ.t_meas_s, "exact": p.exact,
              "x": dict(zip(map(str, pairs), map(float, p.x))),
              "w": dict(zip(map(str, pairs), map(float, p.w)))}
             for i, (p, c, q) in enumerate(zip(patterns, coh, preds))
@@ -307,7 +523,8 @@ def collect(step7: Path, *, pairs=None, method=None, out_dir=None,
     print(f"\nPatterns written to {json_path}")
 
     if dry_run:
-        report_plan(patterns, preds, coh, scale.fs, t_both)
+        report_plan(patterns, preds, coh, scale.fs, ceiling_v=ceiling_v,
+                    floor_v=floor_v, low_v=low_v)
         return None
 
     return _drive(step7, pairs, patterns, preds, coh, models, phases,
@@ -323,20 +540,18 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
     """Display every pattern in read order and write the CSV, partial or not.
 
     ``extra_of(i, pattern)`` adds per-read columns beyond the standard ones;
-    ``columns`` names them, in CSV order.  Each read's window comes from
-    :func:`read_window` over ``preds``.
+    ``columns`` names them, in CSV order.  Every read takes ``ACQ.t_meas_s``.
 
     ``pmt``, if given, adds its two columns to every read and brackets the run
     with a reading in the meta.
     """
     x = np.stack([p.x for p in patterns])[None]      # (1 block, P, n)
     w = np.stack([p.w for p in patterns])[None]
-    t_both = read_window(preds)
     extra = [[{"kind": p.kind, "label": p.label, "seq": i,
                "target_alpha": f"{p.target_alpha:.6f}",
                "alpha": f"{p.alpha:.6f}",
                "coherent_v": f"{c:.9g}", "sb_pred_v": f"{q - c:.9g}",
-               "t_both_s": f"{t_both(q):.3f}",
+               "t_meas_s": f"{ACQ.t_meas_s:.3f}",
                **(extra_of(i, p) if extra_of else {})}
               for i, (p, c, q) in enumerate(zip(patterns, coh, preds))]]
 
@@ -354,7 +569,7 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
 
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
-                      t_both=ACQ.t_both_s, t_single=ACQ.t_single_s,
+                      t_both=ACQ.t_meas_s, t_single=ACQ.t_meas_s,
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
     layout = load_layout(step7, pairs)
     rows: list[dict] = []
@@ -362,7 +577,7 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
     csv_path = None
     try:
         run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
-                     rows=rows, extra=extra, y_sat=None, t_both_of=t_both,
+                     rows=rows, extra=extra, y_sat=None,
                      row_hook=pmt)
     except BaseException as exc:
         status = (f"partial ({type(exc).__name__} after {len(rows)} of "
@@ -380,12 +595,132 @@ def _drive(step7, pairs, patterns, preds, coh, models, phases, *,
                     meta={"step7_json": Path(step7).resolve(),
                           "patterns_json": json_path, "status": status, **meta},
                     extra=["kind", "label", "seq", "target_alpha", "alpha",
-                           "coherent_v", "sb_pred_v", "t_both_s", *columns])
+                           "coherent_v", "sb_pred_v", "t_meas_s", "peak_v",
+                           *columns])
                 print(f"\nCSV ({len(rows)} reads, {status}) written to {csv_path}")
         finally:
             slm.close_slm()
             daq.disconnect()
     return csv_path
+
+
+# ======================================================================
+# the probe -- display one level, read it once
+# ======================================================================
+#
+# One drive, one read, nothing written.  This is how the bench finds out where
+# the readout stops being linear, which is a question about the ELECTRONICS and
+# not about the atoms.  Raise the optical power or the PMT gain and the brightest
+# reads clip -- or merely COMPRESS, well before the rail -- and either bends the
+# top of the ladder down in exactly the way saturation does.  The fit has one
+# free parameter and no way to tell them apart, so what comes out is a ``Y_sat``
+# that looks clean and is wrong.
+#
+# This replaces a check that could only ever drive ``alpha = 1``.  That was fine
+# while ``Y_max`` fitted under the amplifier, and it does not: at the present
+# gain ``Y_max`` is ~1534 mV against a 1 V rail, so the old check clipped by
+# construction and then reported a confident ceiling computed FROM the clipped
+# read.  An alpha the caller picks cannot do that, and it does strictly more --
+# walking alpha up until the read falls behind the linear model is the
+# measurement that decides :data:`LADDER_CEILING_V` in the first place.
+
+def probe_verdict(*, alpha: float, y_max_v: float, coherent_v: float,
+                  sb_pred_v: float, mean_v: float, dark_v: float, std_v: float,
+                  peak_v: float = float("nan"), range_v: float = float("nan"),
+                  limit_v: float = AMP_LIMIT_V,
+                  ceiling_v: float = LADDER_CEILING_V) -> dict:
+    """One displayed level and one read: what the bench did with it.
+
+    ``coherent_v`` and ``sb_pred_v`` are the LINEAR predictions for the drive
+    that was displayed -- :func:`~calibration_module.fit.verify.predict` with
+    ``coherent=True``, and the single-beam background it leaves out.  Saturation
+    acts on the coherent part alone (the background is detector response to each
+    beam separately, not TPA field), so inverting the one read gives an
+    indicative ``Y_sat``::
+
+        Y_sat = coh * m / (coh - m),    m = (mean - dark) - sb
+
+    ONE read, so that is a preview of what the sweep will fit rather than a
+    replacement for it -- and it means nothing at all if the read was clipped.
+
+    Clipping is called on the RAW trace peak, never on the mean: the 20 Hz
+    low-pass pulls a flat-top back under the rail, so a clipped read still
+    reports a perfectly reasonable mean.  ``peak_v`` is the only number here that
+    sees it, which is why it is a column in every step-8 CSV.
+    """
+    coh = float(coherent_v)
+    meas = float(mean_v) - float(dark_v)
+    m = meas - float(sb_pred_v)
+
+    if 0.0 < m < coh:
+        y_sat = coh * m / (coh - m)
+    elif m >= coh:
+        y_sat = float("inf")            # read met or beat the linear model
+    else:
+        y_sat = float("nan")            # nothing was there
+
+    limit = float(limit_v)
+    ceiling = float(ceiling_v)
+    peak = float(peak_v)
+    near = max(peak if np.isfinite(peak) else 0.0, meas)
+    pred = coh + float(sb_pred_v)
+    lv = ladder_levels(y_max_v, ceiling_v=ceiling)
+    return {
+        "alpha": float(alpha),
+        "y_max_v": float(y_max_v),
+        "limit_v": limit,
+        "ceiling_v": ceiling,
+        "alpha_cap": lv["cap"],
+        "coherent_pred_v": coh,
+        "sb_pred_v": float(sb_pred_v),
+        "pred_v": pred,
+        "mean_v": float(mean_v), "dark_v": float(dark_v), "std_v": float(std_v),
+        "measured_v": meas,
+        "measured_coherent_v": m,
+        "peak_v": peak,
+        "peak_fraction": (peak / limit) if limit else float("nan"),
+        "read_range_v": float(range_v),
+        "shortfall": (1.0 - meas / pred) if pred else float("nan"),
+        "y_sat_implied_v": y_sat,
+        "over_ceiling": bool(meas > ceiling),
+        "clipped": bool(near >= 0.98 * limit),
+        # TIGHT is about the raw peak, not the mean: compression starts before
+        # the rail does, and the peak is what reaches it first.
+        "verdict": ("CLIPPED" if near >= 0.98 * limit
+                    else "TIGHT" if near >= 0.85 * limit
+                    else "OK"),
+    }
+
+
+def print_probe(d: dict, log=print) -> None:
+    """The probe block: what was asked for, what came back, and what it implies."""
+    fs = d["y_max_v"]
+    log(f"alpha {d['alpha']:.4f} of Y_max {fs * 1e3:.1f} mV   "
+        f"(ladder cap {d['alpha_cap']:.3f} = {d['ceiling_v'] * 1e3:.0f} mV)")
+    log(f"predicted         {d['pred_v'] * 1e3:9.3f} mV  (LINEAR, of which "
+        f"{d['sb_pred_v'] * 1e3:.3f} mV is single beam)")
+    log(f"measured          {d['measured_v'] * 1e3:9.3f} mV  "
+        f"+/-{d['std_v'] * 1e3:.3f}  (dark {d['dark_v'] * 1e3:+.4f} mV, "
+        f"range {d['read_range_v']:g} V)")
+    log(f"vs prediction     {100 * d['shortfall']:+9.2f} %")
+    log(f"raw trace peak    {d['peak_v'] * 1e3:9.3f} mV  = "
+        f"{100 * d['peak_fraction']:.1f} % of the {d['limit_v']:g} V amplifier "
+        f"limit")
+    y = d["y_sat_implied_v"]
+    if np.isfinite(y):
+        log(f"implied Y_sat     {y:9.3f} V   (ONE read -- a preview of the fit, "
+            f"and meaningless if clipped)")
+    else:
+        log("implied Y_sat         none   (the read met or beat the linear model)")
+    log(f"verdict           {d['verdict']:>9}"
+        + ("   the raw trace reached the rail: this read is a flat-top"
+           if d["clipped"] else
+           "   the raw peak is close to the rail" if d["verdict"] == "TIGHT"
+           else ""))
+    if d["over_ceiling"]:
+        log(f"                            this read is above the ladder's "
+            f"ceiling ({d['ceiling_v'] * 1e3:.0f} mV) -- brighter than the "
+            f"sweep goes")
 
 
 # ======================================================================
@@ -427,42 +762,66 @@ def fit_and_write(csv_path, step7, *, pairs=None, method=None, out_dir=None,
         "gain_reference": {"convention": "g = 1 at this sweep",
                            "csv": str(csv_path.resolve())},
     }, indent=2), encoding="utf-8")
+    # Same reason the PNG path is in here: the caller that asked for a
+    # different out_dir should not have to re-derive the name from the CSV.
+    result["result_json"] = str(result_path)
     log(f"Result written to {result_path}")
     return result
 
 
-def report_plan(patterns, preds, coh, fs: float, t_both) -> None:
-    """The dry-run table: what will be driven, in read order, on which range, how long."""
+def report_plan(patterns, preds, coh, fs: float, *,
+                ceiling_v: float = LADDER_CEILING_V,
+                floor_v: float = LADDER_FLOOR_V,
+                low_v: float = LADDER_LOW_V) -> None:
+    """The dry-run table: what will be driven, in read order, and how bright.
+
+    ``wants`` is the range :func:`range_for` WOULD pick per read.  Every read is
+    actually taken at the fixed ``ACQ.range_v``, so a row wanting more than that
+    is a row the amplifier cannot hold either -- they are the same 1 V.
+    """
     step = fs / 15.0
     print(f"\n  {'seq':>4} {'kind':>4} {'label':<22} {'alpha':>7} "
-          f"{'coh (mV)':>10} {'pred (mV)':>10} {'sb (mV)':>8} {'range':>7} {'T (s)':>6}")
+          f"{'coh (mV)':>10} {'pred (mV)':>10} {'sb (mV)':>8} {'wants':>7}"
+          f"   (every read +/-{ACQ.range_v:g} V, {ACQ.t_meas_s:g} s)")
     for i, (p, c, q) in enumerate(zip(patterns, coh, preds)):
         rng = range_for(q)[0]
         print(f"  {i:4d} {p.kind:>4} {p.label:<22} {p.alpha:7.4f} "
               f"{c * 1e3:10.4f} {q * 1e3:10.4f} {(q - c) * 1e3:8.4f} "
-              f"{rng:6.1f}V {t_both(q):6.2f}" + ("" if p.exact else "  [fallback]"))
+              f"{rng:6.1f}V" + ("" if p.exact else "  [fallback]"))
 
     a = np.array([p.alpha for p in patterns if p.kind == "A"])
     used = np.array([range_for(q)[0] for p, q in zip(patterns, preds)
                      if p.kind == "A"])
     sb = np.array([q - c for p, q, c in zip(patterns, preds, coh) if p.kind == "A"])
-    # every read, not just the ladder: the ceiling is what occupies level 15
+    lv = ladder_levels(fs, ceiling_v=ceiling_v, floor_v=floor_v, low_v=low_v)
+    bright = a[a >= lv["floor"] - 1e-9]
+    # Binned over the LADDER's own span, not over [0, Y_max].  The sweep stops at
+    # LADDER_CEILING_V on purpose, so a histogram against full scale would report
+    # eleven empty levels as if they were a gap rather than the design.
+    cap = max(lv["cap"], 1e-9)
     every = np.array([p.alpha for p in patterns])
-    # +eps so the ceiling's alpha, 1 to within rounding, lands in level 15
-    hist = np.bincount(np.clip((every * 15 + 1e-9).astype(int), 0, 15), minlength=16)
+    hist = np.bincount(np.clip((every / cap * 15 + 1e-9).astype(int), 0, 15),
+                       minlength=16)
     print(f"\n  ladder alpha : min {a.min():.4f}  median {np.median(a):.4f}  "
-          f"max {a.max():.4f}   (the ceiling reads sit at exactly 1)")
-    print(f"  4-bit levels : {' '.join(str(c) for c in hist)}   "
-          f"({int((hist > 0).sum())} of 16 occupied)")
+          f"max {a.max():.4f}   (the two ceiling reads sit at the cap, "
+          f"{lv['cap']:.4f})")
+    print(f"  bright band  : {len(bright)} rungs >= {lv['floor']:.4f} "
+          f"({lv['floor'] * fs * 1e3:.0f} mV) -- the leverage;  "
+          f"{len(a) - len(bright)} below it are model checks")
+    print(f"  coverage     : {' '.join(str(c) for c in hist)}   "
+          f"({int((hist > 0).sum())} of 16 bins of [0, cap] occupied)")
     print(f"  single_beam  : {sb.min() * 1e3:.3f} .. {sb.max() * 1e3:.3f} mV  "
           f"({100 * (sb.max() - sb.min()) / step:.1f} % of a level step)")
     print("  DAQ ranges   : " + ", ".join(
         f"{r:g}V x{n}" for r, n in zip(*np.unique(used, return_counts=True))))
-    top = max(preds)
-    print(f"\n  the fit lives at the top: at alpha = 1 ({top * 1e3:.1f} mV) a "
+    top, bot = max(preds), lv["floor"] * fs
+    print(f"\n  the fit lives at the top: at the cap ({top * 1e3:.1f} mV) a "
           f"Y_sat of 5 V bends\n  the reading down by "
-          f"{100 * top / (5.0 + top):.1f} %, at alpha = 0.1 by only "
-          f"{100 * 0.1 * top / (5.0 + 0.1 * top):.1f} %")
+          f"{100 * top / (5.0 + top):.1f} %, at the band floor "
+          f"({bot * 1e3:.1f} mV) by {100 * bot / (5.0 + bot):.1f} %, and at the "
+          f"dimmest\n  model check ({min(preds) * 1e3:.1f} mV) by "
+          f"{100 * min(preds) / (5.0 + min(preds)):.2f} % -- which is why those "
+          f"are checks and not leverage")
 
 
 # ======================================================================
@@ -487,7 +846,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--p", nargs="+", type=int, default=None, metavar="PAIR",
                         help="only drive these pairs (default: every calibrated pair)")
     parser.add_argument("--ladder", type=int, default=LADDER, metavar="N",
-                        help=f"patterns across the scale (default {LADDER})")
+                        help=f"rungs in the bright band, where the Y_sat "
+                             f"leverage is (default {LADDER})")
+    parser.add_argument("--low", type=int, default=LADDER_LOW, metavar="N",
+                        help=f"rungs BELOW the bright band (default "
+                             f"{LADDER_LOW}).  They carry no usable curvature; "
+                             f"they are there so a step-6/7 error in the decade "
+                             f"an inference run computes in cannot pass "
+                             f"unnoticed.  0 drops them")
+    parser.add_argument("--ceiling-mv", type=float, metavar="MV",
+                        default=1e3 * LADDER_CEILING_V,
+                        help=f"brightest read the ladder may take, in "
+                             f"MILLIVOLTS (default "
+                             f"{1e3 * LADDER_CEILING_V:g}).  This is an "
+                             f"unverified figure for where the amplifier starts "
+                             f"to compress, not a measurement -- see "
+                             f"LADDER_CEILING_V.  Volts, not alpha, so it stays "
+                             f"put when the PMT gain moves")
+    parser.add_argument("--floor-mv", type=float, metavar="MV",
+                        default=1e3 * LADDER_FLOOR_V,
+                        help=f"bottom of the bright band, in MILLIVOLTS "
+                             f"(default {1e3 * LADDER_FLOOR_V:g}).  --ladder "
+                             f"rungs stratify from here to --ceiling-mv")
+    parser.add_argument("--low-mv", type=float, metavar="MV",
+                        default=1e3 * LADDER_LOW_V,
+                        help=f"dimmest read of all, in MILLIVOLTS (default "
+                             f"{1e3 * LADDER_LOW_V:g}).  --low model checks "
+                             f"stratify from here to --floor-mv")
     parser.add_argument("--method", default=PHASE_METHOD,
                         help="stored step-7 fit to predict from")
     parser.add_argument("--seed", type=int, default=None,
@@ -528,8 +913,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"--pmt ignored ({type(exc).__name__}: {exc})")
 
     csv_path = collect(args.step7, pairs=wanted, method=args.method,
-                       ladder=args.ladder, out_dir=args.out, seed=args.seed,
-                       dry_run=args.dry_run, pmt=pmt)
+                       ladder=args.ladder, low=args.low,
+                       ceiling_v=args.ceiling_mv / 1e3,
+                       floor_v=args.floor_mv / 1e3, low_v=args.low_mv / 1e3,
+                       out_dir=args.out,
+                       seed=args.seed, dry_run=args.dry_run, pmt=pmt)
     if csv_path is not None:
         fit_and_write(csv_path, args.step7, method=args.method, out_dir=args.out)
         print(f"\nRe-fit with:  python {Path(__file__).name} "

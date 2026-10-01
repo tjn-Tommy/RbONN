@@ -93,7 +93,18 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
             "Sweep point",
             "Signal (V)",
         ),
+        "ladder": (
+            "Step 8 · Saturation ladder",
+            "Predicted signal, linear model (mV)",
+            "Measured signal (mV)",
+        ),
     }
+
+    #: Phases whose points are drawn unjoined.  The default line follows
+    #: acquisition order, which is the run's own axis for a sweep -- but step
+    #: 8's ladder is driven SHUFFLED on purpose, so joining its reads draws
+    #: nothing but the shuffle.
+    _SCATTER_PHASES = frozenset({"ladder"})
 
     def __init__(
         self,
@@ -235,7 +246,7 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
                 color="#47b8e0",
                 marker="o",
                 markersize=3,
-                linewidth=1.0,
+                linewidth=0.0 if phase in self._SCATTER_PHASES else 1.0,
             )
         self.canvas.draw_idle()
 

@@ -22,7 +22,7 @@ from calibration_module.fit.phase import PairModel  # noqa: E402
 from calibration_module.fit.verify import full_scale, predict  # noqa: E402
 
 RUN = ROOT / "src" / "calib_data" / "run_0911_10pairs_w20g30"
-STEP7 = RUN / "calib_step7_result_0911_2037.json"
+STEP7 = RUN / "calib.json"
 
 
 def toy(etas, phases, *, single_beam: float = 0.0):

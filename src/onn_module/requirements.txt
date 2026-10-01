@@ -1,0 +1,21 @@
+# The rbonn-ml env: training only, no instrument drivers.
+#
+#   conda create -n rbonn-ml python=3.12 -y
+#   conda activate rbonn-ml
+#   pip install -r src/onn_module/requirements.txt
+#
+# Deliberately NOT installed into rbonn (see src/requirements.txt), which drives
+# the bench: torch and torchvision resolve numpy and scipy themselves, and a
+# broken training env costs nothing while a broken bench env costs bench time.
+# The two meet through files only -- a calibration JSON in, a bench_reference.npz
+# out -- so the bench side never needs torch.
+#
+# numpy and scipy are here because onn_module.params imports
+# calibration_module.fit.verify, which is numpy/scipy and driver-free by design.
+torch
+torchvision
+numpy
+scipy
+matplotlib
+scikit-learn   # one confusion-matrix plot; imported lazily, so it is optional
+trackio        # optional run tracking; runs/ is written either way

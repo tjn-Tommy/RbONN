@@ -162,34 +162,43 @@ class AcquisitionSettingsTests(_WindowCase):
         self.assertTrue(self.win.tpa_phase_invert.isChecked())
         self.assertTrue(self.win._tpa_phase_acq().invert)
 
-    def test_checkboxes_reach_the_acq_config(self) -> None:
+    def test_the_invert_checkbox_reaches_the_acq_config(self) -> None:
         w = self.win
-        for box, field in ((w.tpa_phase_invert, "invert"),
-                           (w.tpa_phase_autorange, "autorange")):
-            box.setChecked(False)
-            self.assertFalse(getattr(w._tpa_phase_acq(), field))
-            box.setChecked(True)
-            self.assertTrue(getattr(w._tpa_phase_acq(), field))
+        w.tpa_phase_invert.setChecked(False)
+        self.assertFalse(w._tpa_phase_acq().invert)
+        w.tpa_phase_invert.setChecked(True)
+        self.assertTrue(w._tpa_phase_acq().invert)
 
-    def test_default_windows_are_the_v2_validated_ones(self) -> None:
+    def test_default_window_is_the_bench_s(self) -> None:
         acq = self.win._tpa_phase_acq()
-        self.assertEqual(acq.t_both_s, DEFAULT_ACQ.t_both_s)
-        self.assertEqual(acq.t_single_s, DEFAULT_ACQ.t_single_s)
+        self.assertEqual(acq.t_meas_s, DEFAULT_ACQ.t_meas_s)
         self.assertEqual(acq.settle_s, DEFAULT_ACQ.settle_s)
 
-    def test_range_starts_a_step_above_step_6(self) -> None:
-        """Step 7 is the brightest step: the reference is on for every point."""
-        self.assertEqual(self.win._tpa_phase_acq().range_v, DEFAULT_ACQ.range_v)
-        self.assertGreater(self.win._tpa_phase_acq().range_v,
-                           self.win._tpa_acq().range_v)
+    def test_range_is_step_6_s(self) -> None:
+        """One range for both steps -- and for step 8, and for the dark.
 
-    def test_windows_are_not_shared_with_step_6(self) -> None:
-        """Step 7 runs its own acquisition windows, not step 6's."""
+        Step 7 used to start a range above step 6 because it is the brightest
+        step: the reference is on for every point.  Brightness no longer picks
+        the range.  It is fixed at the transimpedance amplifier's own 1 V limit,
+        so a read too big for it is a flat-top rather than a range problem, and
+        step 7's numbers are pinned to step 6's etas -- which means the two have
+        to have been read the same way.
+        """
+        self.assertEqual(self.win._tpa_phase_acq().range_v, DEFAULT_ACQ.range_v)
+        self.assertEqual(self.win._tpa_phase_acq().range_v,
+                         self.win._tpa_acq().range_v)
+
+    def test_the_two_pages_still_have_their_own_boxes(self) -> None:
+        """Same DEFAULT, separate widgets: step 7 is overridable on its own.
+
+        The two agree by default, which is the point -- but a bench needs to be
+        able to depart from it on one page without silently moving the other.
+        """
         w = self.win
-        before = w.tpa_tboth.value()
-        w.tpa_phase_tboth.setValue(3.5)
-        self.assertEqual(w.tpa_tboth.value(), before)
-        w.tpa_phase_tboth.setValue(DEFAULT_ACQ.t_both_s)
+        before = w.tpa_tmeas.value()
+        w.tpa_phase_tmeas.setValue(3.5)
+        self.assertEqual(w.tpa_tmeas.value(), before)
+        w.tpa_phase_tmeas.setValue(DEFAULT_ACQ.t_meas_s)
 
 
 class StepSixInputTests(_WindowCase):
@@ -533,8 +542,11 @@ class RunPlanTests(_WindowCase):
     def test_the_run_length_is_the_runner_s(self) -> None:
         w = self.win
         drive = build_xw_sweep(w._tpa_phase_config())
-        secs = run_seconds(drive, w._tpa_phase_acq())
-        self.assertAlmostEqual(secs, 10.0 + 10 * 10.0 + 11 * 0.25, places=6)
+        acq = w._tpa_phase_acq()
+        secs = run_seconds(drive, acq)
+        self.assertAlmostEqual(
+            secs, acq.t_meas_s + 10 * acq.t_meas_s + 11 * acq.settle_s,
+            places=6)
 
 
 class CascadeTests(_WindowCase):
@@ -548,8 +560,8 @@ class CascadeTests(_WindowCase):
     """
 
     RUN10 = REPO / "src/calib_data/run_0916_10pairs_w15g35"
-    STEP6_10 = RUN10 / "calib_step6v2_result_0916_1958.json"
-    MERGED = RUN10 / "calib_step7_result_0916_merged_ref2.json"
+    STEP6_10 = RUN10 / "calib.json"
+    MERGED = RUN10 / "calib.json"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -793,6 +805,73 @@ class PmtCheckboxTests(_WindowCase):
         w.tpa_phase_pmt.setChecked(False)
         self.assertTrue(w.tpa_pmt.isChecked())
         w.tpa_phase_pmt.setChecked(True)
+
+
+class LiveSweepBurstTests(_WindowCase):
+    """A live sweep must drop bursts too, not only a loaded CSV.
+
+    _tpa_phase_fit_results is the path a finished sweep takes: it fits the
+    in-memory PhaseResult from measure_target and never sees load_phase_csv.
+    Without the guard there, the same sweep would fit one way on the bench and
+    another way when refit from the CSV it had just written.
+    """
+
+    BURST_RUN = REPO / "src/calib_data/run_0929"
+    BURST_CSV = BURST_RUN / "calib_step7_meas_0930_0236.csv"
+    BURST_S6 = BURST_RUN / "calib.json"
+
+    def _swept(self, tgt: int, ref: int):
+        """The sweep as measure_target hands it over: bursts still in."""
+        from calibration_module.fit.phase import load_pair_models, load_phase_csv
+        if not (self.BURST_CSV.is_file() and self.BURST_S6.is_file()):
+            self.skipTest(f"missing run_0929 fixture: {self.BURST_CSV}")
+        models = load_pair_models(self.BURST_S6)
+        raw = load_phase_csv(self.BURST_CSV, models[tgt], models[ref],
+                             comb_only=True, single_beam_bg=True,
+                             only_tgt=tgt, drop_bursts=False)
+        return raw, models
+
+    def test_the_finished_sweep_path_drops_them(self) -> None:
+        w = self.win
+        raw, models = self._swept(10, 2)
+        n = raw.trial.size
+        failed = w._tpa_phase_fit_results({10: raw}, models, 2)
+        self.assertEqual(failed, [])
+        kept = w.tpa_phase_results[10]
+        self.assertEqual(len(kept.dropped_bursts), 2)
+        self.assertEqual(kept.trial.size, n - 2)
+        # the point of the whole exercise: the fit now reads as the good fit it is
+        self.assertGreater(kept.fit.r2, 0.95)
+
+    def test_it_agrees_with_the_same_sweep_refit_from_its_csv(self) -> None:
+        from calibration_module.fit.phase import load_phase_csv
+        w = self.win
+        raw, models = self._swept(6, 2)
+        w._tpa_phase_fit_results({6: raw}, models, 2)
+        live = w.tpa_phase_results[6]
+        viacsv = load_phase_csv(self.BURST_CSV, models[6], models[2],
+                                comb_only=True, single_beam_bg=True, only_tgt=6)
+        self.assertAlmostEqual(live.fit.dphi_comb, viacsv.fit.dphi_comb, places=9)
+        self.assertAlmostEqual(live.fit.r2, viacsv.fit.r2, places=9)
+
+    def test_a_clean_sweep_is_untouched(self) -> None:
+        w = self.win
+        raw, models = self._swept(4, 2)
+        n = raw.trial.size
+        w._tpa_phase_fit_results({4: raw}, models, 2)
+        self.assertEqual(w.tpa_phase_results[4].dropped_bursts, [])
+        self.assertEqual(w.tpa_phase_results[4].trial.size, n)
+
+    def test_the_table_and_fringe_still_fill(self) -> None:
+        """The panel must repopulate after a sweep that dropped rows."""
+        w = self.win
+        raw, models = self._swept(10, 2)
+        w._tpa_phase_fit_results({10: raw}, models, 2)
+        w._tpa_phase_fill_table()
+        w._tpa_phase_redraw()
+        self.assertEqual(w.tpa_phase_table.rowCount(), 1)
+        self.assertEqual(w.tpa_phase_table.item(0, 0).text(), "10")
+        self.assertEqual(len(w.tpa_phase_fig.axes), 2)
 
 
 if __name__ == "__main__":

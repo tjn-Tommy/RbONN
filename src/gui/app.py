@@ -19,7 +19,12 @@ from matplotlib.ticker import MaxNLocator
 import matplotlib
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from daq_module.controller import DAQController, DAQMonitorSettings, lowpass
+from daq_module.controller import (
+    DAQController,
+    DAQMonitorSettings,
+    settle_samples,
+    waveform_stats,
+)
 from heater_module.controller import (
     HeaterCycle,
     PID_DEFAULTS as HEATER_PID_DEFAULTS,
@@ -28,12 +33,13 @@ from heater_module.controller import (
 )
 from osa_module.controller import MeasurementSettings, OSAController
 from osa_module.driver import OSAError
-from scope_module.controller import (
-    ScopeController,
-    ScopeSettings,
-    Waveform,
+from psu_module.controller import (
+    PMT_CONTROL_I_MAX,
+    PMT_CONTROL_V_MAX,
+    PSUController,
+    PSUState,
+    SET_TOL_V,
 )
-
 from calibration_module.fit.legacy_intensity import CalibrationFit, fit_calibration, load_calibration_csv
 from calibration_module.fit.slm_response import (
     CalibrationResult,
@@ -100,6 +106,7 @@ from calibration_module.fit.pair_v2 import (
     PairV2Config,
     PairV2Fit,
     average_levels,
+    burst_rows,
     fit_pair,
     load_meas_csv,
     save_combined_json,
@@ -107,6 +114,7 @@ from calibration_module.fit.pair_v2 import (
     write_meas_csv,
 )
 from calibration_module.measure.pair_v2 import (
+    DEFAULT_ACQ as BENCH_ACQ,
     PairV2Aborted,
     PairV2Acq,
     PairV2Progress,
@@ -125,6 +133,7 @@ from calibration_module.fit.phase import (
     PhaseResult,
     fit_result,
     load_pair_models,
+    drop_bursts,
     load_phase_csv,
     save_comb_phase_json,
     references_in_csv,
@@ -139,7 +148,6 @@ from calibration_module.fit.cascade import (
     plan_lines,
 )
 from calibration_module.measure.phase_v2 import (
-    PhaseV2Acq,
     PhaseV2Aborted,
     PhaseV2Config,
     PhaseV2Progress,
@@ -150,7 +158,12 @@ from calibration_module.measure.phase_v2 import (
 from calibration_module.fit.pair_v2 import meas_csv_meta
 from calibration_module.measure.pmt_temp import open_pmt
 from calibration_module.fit.report import plot_fringe
-from calibration_module.measure.patterns import PatternsAborted, run_patterns
+from calibration_module.measure.patterns import (
+    PatternsAborted,
+    PatternsProgress,
+    range_for,
+    run_patterns,
+)
 from calibration_module.fit.step8_report import print_result as step8_print_result
 from calibration_module.fit.verify import (
     load_forward_model as verify_load_forward_model,
@@ -485,6 +498,29 @@ class SLMMonitorView(QtWidgets.QWidget):
         super().closeEvent(event)
 
 
+#: Every acquisition control on the step 6/7/8 pages starts from BENCH_ACQ, so
+#: "the three steps ran the same way" is the default rather than a thing to
+#: remember.  The boxes stay editable -- a bench needs an escape hatch -- but a
+#: changed one is a deliberate departure from what the CLI will do.
+BENCH_WINDOW_TIP = (
+    "T_meas: the averaging window for EVERY read, the all-off dark included.\n"
+    "Steps 6, 7 and 8 and the ONN loop all read at this one window, so a "
+    "step-7 point and the step-6 \N{GREEK SMALL LETTER ETA} it is pinned "
+    "against averaged the same noise \N{EM DASH} and a dark subtracted from a "
+    "whole sweep does not carry its own, differently-averaged noise into every "
+    "point of it."
+)
+BENCH_RANGE_TIP = (
+    "Input range, for every read including the dark.\n"
+    "Fixed at the amplifier's own limit: the TIA saturates at 1 V, so a read "
+    "the board could only hold wider is already a flat-top and measuring it "
+    "more precisely measures nothing. Board rail and amplifier rail coincide.\n"
+    "Going narrower buys nothing \N{EM DASH} the board is dither-dominated even at "
+    "\N{PLUS-MINUS SIGN}0.1 V, and quantization on the reported mean sits 2000x "
+    "under the fit's own sigma floor."
+)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     scan_progress = QtCore.pyqtSignal(int, int, str)
     scan_started = QtCore.pyqtSignal(int, int, int, int)
@@ -495,11 +531,13 @@ class MainWindow(QtWidgets.QMainWindow):
     tpa_progress = QtCore.pyqtSignal(object)
     tpa_phase_progress = QtCore.pyqtSignal(object)
     tpa_center_progress = QtCore.pyqtSignal(object)
+    step8_progress = QtCore.pyqtSignal(object)
     edge_gain_progress = QtCore.pyqtSignal(int, int, str)
     edge_optimization_progress = QtCore.pyqtSignal(object)
     qt_test_progress = QtCore.pyqtSignal(int, int, str)
-    hold_progress = QtCore.pyqtSignal(int, int)
     heater_sample = QtCore.pyqtSignal(object)
+    daq_reading = QtCore.pyqtSignal(object)
+    psu_sample = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -567,10 +605,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_phase_stop_event: threading.Event | None = None
         self.tpa_center_result: TPACenterResult | None = None
         self.tpa_center_stop_event: threading.Event | None = None
-        self.scope_controller: ScopeController | None = None
-        self.scope_stop_event: threading.Event | None = None
         self.daq_controller: DAQController | None = None
-        self.hold_stop_event: threading.Event | None = None
+        # DAQ Monitor continuous mode: one worker loop of back-to-back
+        # finite reads owns the card while it runs (see _daq_stream_toggled)
+        self.daq_stream_stop_event: threading.Event | None = None
         # Heater (Thorlabs TC300B): one serial link, so at most one background
         # loop (ramp or read-only monitor) owns it at a time.
         self.heater_controller: TC300Controller | None = None
@@ -579,6 +617,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._heater_times: dict[int, list[float]] = {1: [], 2: []}
         self._heater_temps: dict[int, list[float]] = {1: [], 2: []}
         self._heater_volts: dict[int, list[float]] = {1: [], 2: []}
+        # PSU (Korad KWR103) driving the PMT gain-control input. Unlike the
+        # heater, a live monitor does NOT own the link: the driver locks the
+        # port per exchange, so setpoints can be applied while it polls.
+        self.psu_controller: PSUController | None = None
+        self.psu_stop_event: threading.Event | None = None
+        self._psu_disconnect_pending = False
+        self._psu_busy = False        # a one-shot command (apply/output) in flight
+        self.psu_state: PSUState | None = None   # last full snapshot from the supply
 
         self.setWindowTitle("Santec SLM Control")
         self.resize(1280, 840)
@@ -593,11 +639,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_progress.connect(self._on_tpa_progress)
         self.tpa_phase_progress.connect(self._on_tpa_phase_progress)
         self.tpa_center_progress.connect(self._on_tpa_center_progress)
+        self.step8_progress.connect(self._on_step8_progress)
         self.edge_gain_progress.connect(self._edge_gain_progress)
         self.edge_optimization_progress.connect(self._edge_optimization_progress)
         self.qt_test_progress.connect(self._qt_test_progress)
-        self.hold_progress.connect(self._on_hold_progress)
         self.heater_sample.connect(self._on_heater_sample)
+        self.daq_reading.connect(self._on_daq_reading)
+        self.psu_sample.connect(self._on_psu_sample)
 
         # Live OSA monitor: measure() notifies the bridge from the worker
         # thread; the queued signal repaints the viewer page and the dock for
@@ -640,7 +688,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setObjectName("Navigation")
         self.nav.setFrameShape(QtWidgets.QFrame.NoFrame)
         nav_items = (
-            ("\N{ELECTRIC PLUG}  Connections", "Connect SLM, OSA, scope and DAQ"),
+            ("\N{ELECTRIC PLUG}  Connections",
+             "Connect SLM, OSA, DAQ, heater and PSU"),
             ("\N{LINK SYMBOL}  SLM Control", "Grayscale and CSV display"),
             # instrument pages sit next to SLM Control: they are the read-side
             # counterpart to driving the panel, and are reached far more often
@@ -651,6 +700,9 @@ class MainWindow(QtWidgets.QMainWindow):
              "One-shot DAQ waveform diagnostic: trace, spectrum, filtered stats"),
             ("\N{THERMOMETER}  Heater",
              "Thorlabs TC300B: staircase ramp/hold + live temperature monitor"),
+            ("\N{BATTERY}  PMT Gain",
+             "Korad KWR103 in constant voltage: PMT gain-control setpoint, "
+             "output and live V/I"),
             ("\N{CHART WITH UPWARDS TREND}  Calibration", "Min/max, wavelength, intensity, TPA"),
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
@@ -676,6 +728,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_osa_viewer_page())
         self.stack.addWidget(self._build_daq_monitor_page())
         self.stack.addWidget(self._build_heater_page())
+        self.stack.addWidget(self._build_psu_page())
         self.stack.addWidget(self._build_calibration_page())
         self.stack.addWidget(self._build_scan_page())
         self.stack.addWidget(self._build_segments_page())
@@ -690,7 +743,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setCurrentRow(0)
 
     def _build_connection_page(self) -> QtWidgets.QWidget:
-        """First page: connect the SLM, OSA and scope, with a shared status log."""
+        """First page: connect the SLM, OSA and DAQ, with a shared status log."""
         page = self._page_shell("Connections")
 
         # ---- SLM ----
@@ -783,31 +836,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ol.setColumnStretch(1, 1)
         page.layout().addWidget(osa)
 
-        # ---- Scope ----
-        scope = self._panel("Oscilloscope (R&S RTO6)")
-        scl = QtWidgets.QGridLayout(scope)
-        self.scope_host_edit = QtWidgets.QLineEdit("192.168.1.2")
-        self.scope_host_edit.setPlaceholderText("RTO6 host / IP")
-        self.scope_connect_button = QtWidgets.QPushButton("Connect Scope")
-        self.scope_connect_button.clicked.connect(self._connect_scope)
-        self.scope_disconnect_button = QtWidgets.QPushButton("Disconnect")
-        self.scope_disconnect_button.setProperty("variant", "ghost")
-        self.scope_disconnect_button.setEnabled(False)
-        self.scope_disconnect_button.clicked.connect(self._disconnect_scope)
-        self.scope_status_label = QtWidgets.QLabel("Scope: closed")
-        self._set_status(self.scope_status_label, "Scope: closed", "off")
-        scl.addWidget(QtWidgets.QLabel("Scope Host"), 0, 0)
-        scl.addWidget(self.scope_host_edit, 0, 1)
-        scl.addWidget(self.scope_connect_button, 0, 2)
-        scl.addWidget(self.scope_disconnect_button, 0, 3)
-        scl.addWidget(self.scope_status_label, 0, 4)
-        scl.setColumnStretch(1, 1)
-        page.layout().addWidget(scope)
-
         # ---- DAQ ----
-        # Scope and DAQ both read the same PMT signal on the TPA encoder page,
-        # so only one may be connected at a time (see _on_scope_connected /
-        # _on_daq_connected).
+        # The only reader of the PMT signal: nothing else contends for it.
         daq = self._panel("DAQ (NI-DAQmx)")
         dql = QtWidgets.QGridLayout(daq)
         self.daq_device_edit = QtWidgets.QLineEdit("Dev1")
@@ -848,6 +878,27 @@ class MainWindow(QtWidgets.QMainWindow):
         htl.addWidget(self.heater_status_label, 0, 4)
         htl.setColumnStretch(1, 1)
         page.layout().addWidget(heater)
+
+        # ---- PSU (Korad KWR103 -> PMT gain control) ----
+        psu = self._panel("Power supply (Korad KWR103 \N{RIGHTWARDS ARROW} PMT gain)")
+        pul = QtWidgets.QGridLayout(psu)
+        self.psu_port_edit = QtWidgets.QLineEdit("COM4")
+        self.psu_port_edit.setPlaceholderText("KWR103 serial port (e.g. COM4)")
+        self.psu_connect_button = QtWidgets.QPushButton("Connect PSU")
+        self.psu_connect_button.clicked.connect(self._connect_psu)
+        self.psu_disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self.psu_disconnect_button.setProperty("variant", "ghost")
+        self.psu_disconnect_button.setEnabled(False)
+        self.psu_disconnect_button.clicked.connect(self._disconnect_psu)
+        self.psu_status_label = QtWidgets.QLabel("PSU: closed")
+        self._set_status(self.psu_status_label, "PSU: closed", "off")
+        pul.addWidget(QtWidgets.QLabel("Port"), 0, 0)
+        pul.addWidget(self.psu_port_edit, 0, 1)
+        pul.addWidget(self.psu_connect_button, 0, 2)
+        pul.addWidget(self.psu_disconnect_button, 0, 3)
+        pul.addWidget(self.psu_status_label, 0, 4)
+        pul.setColumnStretch(1, 1)
+        page.layout().addWidget(psu)
 
         # ---- shared status log ----
         self.log_box = QtWidgets.QPlainTextEdit()
@@ -1767,268 +1818,6 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setValue(value)
         spin.setSuffix(suffix)
         return spin
-
-    def _build_scope_holding_tab(self) -> QtWidgets.QWidget:
-        page = self._page_shell("Scope Holding Time")
-        subtitle = QtWidgets.QLabel(
-            "Measure the SLM settling (hold) time on a single PC-scripted timeline: "
-            "record → hold A (pre-switch) → switch A→B → hold B (post-switch) → stop. "
-            "Each repeat is aligned on the A→B edge detected in its own trace, so the "
-            "settle time is referenced to the real optical transition and is immune "
-            "to the scope-vs-PC clock offset (reported separately)."
-        )
-        subtitle.setObjectName("PageSubtitle")
-        subtitle.setWordWrap(True)
-        page.layout().addWidget(subtitle)
-        page.layout().addWidget(self._build_scope_holding_controls())
-        self.hold_fig = Figure(figsize=(7, 3.4), tight_layout=True)
-        self.hold_canvas = FigureCanvas(self.hold_fig)
-        page.layout().addWidget(self._panel_with_widget("Averaged transient", self.hold_canvas), 1)
-        self._hold_result = QtWidgets.QLabel("\N{EN DASH}")
-        page.layout().addWidget(self._hold_result)
-        return page
-
-    def _build_scope_holding_controls(self) -> QtWidgets.QGroupBox:
-        panel = self._panel("Settling measurement")
-        grid = QtWidgets.QGridLayout(panel)
-        self.hold_channel = QtWidgets.QComboBox(); self.hold_channel.addItems(["1", "2", "3", "4"])
-        self.hold_gray_a = self._spin(0, 1023, 880)
-        self.hold_gray_b = self._spin(0, 1023, 420)
-        self.hold_averages = self._spin(1, 1000, 60)
-        self.hold_window = self._double_spin(0.05, 5.0, 0.8, " s", 2)
-        self.hold_window.setToolTip("Time B is held/captured after the A→B switch")
-        self.hold_settle = self._double_spin(0.1, 5.0, 0.6, " s", 2)
-        self.hold_settle.setToolTip("Settle at A before recording starts (not measured)")
-        self.hold_baseline = self._double_spin(0.02, 2.0, 0.30, " s", 2)
-        self.hold_baseline.setToolTip("Time A is held after recording starts, before the switch")
-        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0); grid.addWidget(self.hold_channel, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Gray A (start)"), 0, 2); grid.addWidget(self.hold_gray_a, 0, 3)
-        grid.addWidget(QtWidgets.QLabel("Gray B (switch to)"), 0, 4); grid.addWidget(self.hold_gray_b, 0, 5)
-        grid.addWidget(QtWidgets.QLabel("Averages"), 1, 0); grid.addWidget(self.hold_averages, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Post-switch hold (B)"), 1, 2); grid.addWidget(self.hold_window, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Pre-settle"), 1, 4); grid.addWidget(self.hold_settle, 1, 5)
-        grid.addWidget(QtWidgets.QLabel("Pre-switch hold (A)"), 2, 0); grid.addWidget(self.hold_baseline, 2, 1)
-        self.hold_status = QtWidgets.QLabel("\N{EN DASH}")
-        self.hold_start_button = QtWidgets.QPushButton("Run")
-        self.hold_start_button.clicked.connect(self._hold_start)
-        self.hold_stop_button = QtWidgets.QPushButton("Stop")
-        self.hold_stop_button.setProperty("variant", "danger")
-        self.hold_stop_button.setEnabled(False)
-        self.hold_stop_button.clicked.connect(self._hold_stop)
-        grid.addWidget(self.hold_status, 3, 0, 1, 3)
-        grid.addWidget(self.hold_start_button, 3, 4)
-        grid.addWidget(self.hold_stop_button, 3, 5)
-        return panel
-
-    def _hold_set_running(self, running: bool) -> None:
-        self.hold_start_button.setEnabled(not running)
-        self.hold_stop_button.setEnabled(running)
-
-    def _hold_start(self) -> None:
-        scope = self.scope_controller
-        if scope is None or not scope.is_connected:
-            self.hold_status.setText("Connect the scope on the Connections page first.")
-            return
-        controller = self._controller()
-        if not getattr(controller, "is_open", False):
-            self.hold_status.setText("Open the SLM on the Connections page first.")
-            return
-        ch = int(self.hold_channel.currentText())
-        ga, gb = self.hold_gray_a.value(), self.hold_gray_b.value()
-        n = self.hold_averages.value()
-        pre_hold = self.hold_baseline.value()      # A held after record start, before switch
-        post_hold = self.hold_window.value()       # captured after the switch
-        settle = self.hold_settle.value()          # pre-settle at A before recording
-        total = pre_hold + post_hold + 0.1         # scope record span (+ margin)
-        rl = max(1000, int(total * 100_000))       # ~100 kSa/s
-        align_pre = min(0.1, pre_hold * 0.5)       # kept before the edge in the aligned avg
-        stop_event = threading.Event()
-        self.hold_stop_event = stop_event
-        self.hold_progress.emit(0, n)
-        self._hold_set_running(True)
-
-        def work() -> dict[str, Any]:
-            drv = scope.driver
-            drv.configure_channel(ch, state=True, scale="0.02", offset="0", coupling="DCLimit")
-            drv.set_decimation(ch, "HRESolution")
-            drv.set_time_range(str(total)); drv.set_record_length(rl)
-            drv.set_post_trigger_window(); drv.write("TRIGger1:MODE AUTO")
-
-            # center the vertical range on the gray-A level
-            controller.display_grayscale(ga, interval=0.0); time.sleep(settle)
-            drv.single_acquisition()
-            dl = time.monotonic() + total + 4
-            while time.monotonic() < dl and not drv.is_acquisition_complete():
-                time.sleep(0.02)
-            y0 = drv.read_waveform(ch)
-            mid = float(np.mean(y0)); pkpk = float(np.ptp(y0))
-            scale = min(max(pkpk * 1.5 / 8.0, 0.002), 0.5)
-            drv.configure_channel(ch, state=True, scale=f"{scale:.4f}",
-                                  offset=f"{mid:.4f}", coupling="DCLimit")
-
-            raws: list[np.ndarray] = []; onsets: list[int] = []
-            switch_rels: list[float] = []; t_axis = None; dt = None
-            for i in range(n):
-                if stop_event.is_set():
-                    return {"status": "aborted"}
-                # ---- one PC-scripted timeline (a single clock drives the sequence) ----
-                controller.display_grayscale(ga, interval=0.0); time.sleep(settle)
-                drv.single_acquisition(); t0 = time.monotonic()   # start recording
-                time.sleep(pre_hold)                              # hold A (pre-switch)
-                controller.display_grayscale(gb, interval=0.0)    # A -> B switch
-                switch_rels.append(time.monotonic() - t0)         # PC time of the switch
-                dl = time.monotonic() + total + 4
-                while time.monotonic() < dl and not drv.is_acquisition_complete():
-                    if stop_event.is_set():
-                        return {"status": "aborted"}
-                    time.sleep(0.02)
-                xs, xe, npts, vps = drv.read_waveform_header(ch)
-                y = np.asarray(drv.read_waveform(ch), dtype=float)
-                if t_axis is None:
-                    t_axis = np.linspace(xs, xe, y.size)
-                    dt = (xe - xs) / max(y.size - 1, 1)
-                raws.append(y)
-                onsets.append(self._hold_edge_onset(y, dt))
-                self.hold_progress.emit(i + 1, n)
-
-            return self._hold_reduce(raws, onsets, switch_rels, t_axis, dt,
-                                     align_pre, post_hold, pre_hold, n)
-
-        self._run_task("Scope holding", work, self._hold_finished, self._hold_error)
-
-    @staticmethod
-    def _hold_edge_onset(y: np.ndarray, dt: float) -> int:
-        """Index where the trace first leaves its initial baseline (A→B edge onset).
-
-        Referenced to the signal itself, so it is independent of the scope-vs-PC
-        clock offset. Returns -1 if no clear edge is found.
-        """
-        n5 = max(10, y.size // 20)
-        initial = float(np.median(y[:n5]))
-        final = float(np.median(y[-n5:]))
-        noise = float(np.std(y[:n5]))
-        step = final - initial
-        thr = max(0.1 * abs(step), 5.0 * noise, 1e-9)
-        guard = min(y.size - 1, int(0.03 / dt) if dt and dt > 0 else 0)
-        hit = np.where(np.abs(y[guard:] - initial) > thr)[0]
-        return int(hit[0] + guard) if hit.size else -1
-
-    @staticmethod
-    def _hold_reduce(raws, onsets, switch_rels, t_axis, dt, align_pre,
-                     post_hold, pre_hold, n_req) -> dict[str, Any]:
-        """Edge-align the per-repeat traces, average, and derive settle metrics.
-
-        Each repeat is cropped to a common [-align_pre, +post_hold] window around
-        its own detected edge, so averaging sharpens the transition instead of
-        smearing it with the trigger jitter. Time is returned with t=0 at the edge.
-        """
-        pre_n = max(1, int(align_pre / dt))
-        post_n = max(1, int(post_hold / dt))
-        subs: list[np.ndarray] = []; onset_times: list[float] = []
-        for y, on in zip(raws, onsets):
-            if on < 0 or on - pre_n < 0 or on + post_n > y.size:
-                continue
-            subs.append(y[on - pre_n: on + post_n])
-            onset_times.append(float(t_axis[on]))
-
-        used = len(subs)
-        if used:
-            avg = np.mean(np.vstack(subs), axis=0)
-            first = subs[0]
-            t_rel = (np.arange(avg.size) - pre_n) * dt
-            edge_scope = float(np.median(onset_times))
-        else:
-            # fallback: no detectable edge — average unaligned, reference to the mean
-            m = min(y.size for y in raws)
-            avg = np.mean(np.vstack([y[:m] for y in raws]), axis=0)
-            first = raws[0][:m]
-            on = MainWindow._hold_edge_onset(avg, dt)
-            ref = on if on >= 0 else 0
-            t_rel = (np.arange(avg.size) - ref) * dt
-            edge_scope = float(t_axis[on]) if on >= 0 else pre_hold
-
-        n5 = max(10, avg.size // 20)
-        pre_mask = t_rel < -0.01
-        initial = (float(np.median(avg[pre_mask])) if pre_mask.any()
-                   else float(np.median(avg[:n5])))
-        final = float(np.median(avg[t_rel > t_rel[-1] - 0.1]))
-        step = final - initial
-        resid = (float(np.std(avg[pre_mask])) if pre_mask.sum() > 1
-                 else float(np.std(avg[:n5])))
-        # settle-to-2% on a lightly smoothed trace so the metric is not limited by
-        # the averaged residual noise (2% of a small step can sit below the noise)
-        win = max(1, int(0.002 / dt))          # ~2 ms boxcar
-        if win > 1:
-            pad = win // 2
-            kern = np.ones(win) / win
-            sm = np.convolve(np.pad(avg, pad, mode="edge"), kern, mode="valid")[:avg.size]
-        else:
-            sm = avg
-        band = 0.02 * abs(step)
-        post_mask = t_rel >= 0.0
-        outside = np.where(post_mask & (np.abs(sm - final) > band))[0]
-        settle = float(t_rel[outside[-1]]) if outside.size else 0.0
-        # the clock offset the old command-referenced marker suffered from:
-        # scope-time of the real edge minus PC-time of the issued switch
-        pc_switch = float(np.median(switch_rels)) if switch_rels else pre_hold
-        offset = edge_scope - pc_switch
-        return {"status": "ok", "t": t_rel, "avg": avg, "first": first,
-                "initial": initial, "final": final, "step": step, "resid": resid,
-                "settle": settle, "cmd_rel": -offset, "offset": offset,
-                "n": used, "n_req": n_req}
-
-    def _hold_stop(self) -> None:
-        if self.hold_stop_event is not None:
-            self.hold_stop_event.set()
-            self.hold_status.setText("Stopping…")
-
-    def _on_hold_progress(self, done: int, total: int) -> None:
-        self.hold_status.setText(f"Averaging {done}/{total} transients…")
-
-    def _hold_finished(self, payload: dict[str, Any]) -> None:
-        self.hold_stop_event = None
-        self._hold_set_running(False)
-        if payload.get("status") == "aborted":
-            self.hold_status.setText("Stopped.")
-            return
-        self._hold_draw(payload)
-        sig = abs(payload["step"]) / max(payload["resid"], 1e-9)
-        self.hold_status.setText(
-            f"Done · {payload['n']}/{payload['n_req']} repeats edge-aligned"
-        )
-        self._hold_result.setText(
-            f"Settle to 2%: {payload['settle']*1000:.0f} ms after edge  ·  "
-            f"step {payload['step']*1000:.2f} mV  ·  residual noise "
-            f"{payload['resid']*1000:.2f} mV  ·  step/noise {sig:.1f}  ·  "
-            f"PC↔scope offset {payload['offset']*1000:+.0f} ms"
-            + ("  \N{WARNING SIGN} step not significant (use higher-contrast patterns)"
-               if sig < 3 else "")
-        )
-
-    def _hold_error(self, _error: str) -> None:
-        self.hold_stop_event = None
-        self._hold_set_running(False)
-        self.hold_status.setText("Measurement failed (see Status log)")
-
-    def _hold_draw(self, p: dict[str, Any]) -> None:
-        self.hold_fig.clear()
-        self.hold_fig.patch.set_facecolor("#101820")
-        ax = self.hold_fig.add_subplot(111)
-        self._style_dark_axes(ax)
-        ax.set_xlabel("time after A→B edge (ms)"); ax.set_ylabel("CH (mV)")
-        t = p["t"] * 1000.0
-        if p.get("first") is not None:
-            ax.plot(t, p["first"] * 1000.0, lw=0.5, color="#556", label="single raw")
-        ax.plot(t, p["avg"] * 1000.0, lw=1.4, color="#47b8e0", label=f"avg N={p['n']}")
-        ax.axvline(0.0, color="#8fd14f", ls="-", lw=1.0, label="A→B edge (detected)")
-        ax.axvline(p["cmd_rel"] * 1000.0, color="#f0a3a3", ls="--", lw=1.2,
-                   label="PC switch cmd")
-        if p.get("settle"):
-            ax.axvline(p["settle"] * 1000.0, color="#e0a447", ls=":", lw=1.0,
-                       label="settled (2%)")
-        ax.axhline(p["final"] * 1000.0, color="#8fd6a0", ls=":", lw=1.0)
-        ax.legend(loc="upper right", fontsize=8)
-        self.hold_canvas.draw_idle()
 
     def _build_scan_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("Center Scan")
@@ -4706,11 +4495,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_daq_range = QtWidgets.QComboBox()
         for lo, hi in self._DAQ_RANGES:
             self.tpa_daq_range.addItem(f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
-        self.tpa_daq_range.setCurrentIndex(0)   # most sensitive; autorange escalates
-        self.tpa_daq_range.setToolTip(
-            "Default input range. \N{PLUS-MINUS SIGN}0.1 V is the board's most "
-            "sensitive and right for almost every level."
-        )
+        self._select_daq_range(self.tpa_daq_range, BENCH_ACQ.range_v)
+        self.tpa_daq_range.setToolTip(BENCH_RANGE_TIP)
         self.tpa_daq_fcut = QtWidgets.QDoubleSpinBox()
         self.tpa_daq_fcut.setRange(0.1, 100_000.0)
         self.tpa_daq_fcut.setDecimals(1)
@@ -4724,16 +4510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_settle.setToolTip(
             "Wait after each SLM pattern change, before reading."
         )
-        self.tpa_tboth = self._double_spin(0.001, 30.0, 8.0, " s", 3)
-        self.tpa_tboth.setToolTip(
-            "T_both: averaging window when both beams of the pair are on."
-        )
-        self.tpa_tsingle = self._double_spin(0.001, 60.0, 10.0, " s", 3)
-        self.tpa_tsingle.setToolTip(
-            "T_single: averaging window when at most one beam is on (x=0 or "
-            "w=0, incl. the all-off dark) — a weak signal needs the longer "
-            "window."
-        )
+        self.tpa_tmeas = self._double_spin(0.001, 60.0, BENCH_ACQ.t_meas_s, " s", 3)
+        self.tpa_tmeas.setToolTip(BENCH_WINDOW_TIP)
         self.tpa_invert = QtWidgets.QCheckBox("Invert sign (TIA)")
         self.tpa_invert.setChecked(True)
         self.tpa_invert.setToolTip(
@@ -4743,14 +4521,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "root, so a sign-flipped run gives b < 0 and η = NaN rather than a "
             "plausible wrong answer."
         )
-        self.tpa_autorange = QtWidgets.QCheckBox("Widen to \N{PLUS-MINUS SIGN}0.2 V near rail")
-        self.tpa_autorange.setChecked(True)
-        self.tpa_autorange.setToolTip(
-            "Remeasure a near-rail read one range up. The clip test runs on the "
-            "raw trace peak, not the reported mean: the low-pass pulls a clipped "
-            "flat-top back under the rail, so a clipped read is a silently wrong "
-            "mean rather than an error."
-        )
         self.tpa_pmt = QtWidgets.QCheckBox("Log PMT temperature")
         self.tpa_pmt.setChecked(True)
         self.tpa_pmt.setToolTip(PMT_CHECKBOX_TIP)
@@ -4758,15 +4528,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = [
             ("Channel", self.tpa_daq_channel), ("Sample rate", self.tpa_daq_rate),
             ("Range", self.tpa_daq_range), ("Low-pass", self.tpa_daq_fcut),
-            ("Settle", self.tpa_settle), ("T_both", self.tpa_tboth),
-            ("T_single", self.tpa_tsingle),
+            ("Settle", self.tpa_settle), ("T_meas", self.tpa_tmeas),
         ]
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QtWidgets.QLabel(label), r, 0)
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_invert, len(rows), 0, 1, 2)
-        grid.addWidget(self.tpa_autorange, len(rows) + 1, 0, 1, 2)
-        grid.addWidget(self.tpa_pmt, len(rows) + 2, 0, 1, 2)
+        grid.addWidget(self.tpa_pmt, len(rows) + 1, 0, 1, 2)
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -4968,7 +4736,7 @@ class MainWindow(QtWidgets.QMainWindow):
             raise FileNotFoundError(f"Step-3 calibration not found: {path}")
         calib = load_calibration_result(path)
         layout = channel_layout_from_calibration(
-            calib, method=self._tpa_config().encoding_method
+            calib
         )
         return calib, layout
 
@@ -5008,16 +4776,21 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             return PairV2Config()
 
+    @staticmethod
+    def _select_daq_range(combo: QtWidgets.QComboBox, hi: float) -> None:
+        """Select the range whose upper bound is ``hi``; leave it alone if absent."""
+        for i in range(combo.count()):
+            if float(combo.itemData(i)[1]) == float(hi):
+                combo.setCurrentIndex(i)
+                return
+
     def _tpa_acq(self) -> PairV2Acq:
         """Acquisition timing and input range, straight off the DAQ group."""
         _lo, hi = self.tpa_daq_range.currentData()
         return PairV2Acq(
-            t_single_s=float(self.tpa_tsingle.value()),
-            t_both_s=float(self.tpa_tboth.value()),
+            t_meas_s=float(self.tpa_tmeas.value()),
             settle_s=float(self.tpa_settle.value()),
             range_v=float(hi),
-            range_wide_v=float(min(2.0 * hi, 10.0)),
-            autorange=self.tpa_autorange.isChecked(),
             invert=self.tpa_invert.isChecked(),
         )
 
@@ -5077,13 +4850,13 @@ class MainWindow(QtWidgets.QMainWindow):
         settings = DAQMonitorSettings(
             channel=self.tpa_daq_channel.text().strip() or "ai0",
             sample_rate=self.tpa_daq_rate.value(),
-            duration=acq.t_both_s,
-            single_duration=acq.t_single_s,
+            duration=acq.t_meas_s,
+            single_duration=acq.t_meas_s,
             hold=0.0,                 # measure_pair owns the settle
             min_val=lo, max_val=hi,
             f_cut=self.tpa_daq_fcut.value(),
         )
-        read_timeout = max(30.0, acq.t_single_s * 3.0 + 10.0)
+        read_timeout = max(30.0, acq.t_meas_s * 3.0 + 10.0)
 
         self.tpa_status.setText(
             f"Running\N{HORIZONTAL ELLIPSIS} {len(pairs)} pair(s), "
@@ -5168,8 +4941,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_fits = []
         failed: list[str] = []
         for index in sorted(rows_by_pair):
+            # average_levels drops these itself; logged here because a burst is a
+            # BENCH fault, and silent cleaning would let a glitching bench read
+            # as a clean run (the offline step-6 script prints the same thing).
+            rows = list(rows_by_pair[index])
+            for row in (r for r, bad in zip(rows, burst_rows(rows)) if bad):
+                self._log(
+                    f"[step 6] pair {index}: BURST acquisition dropped — "
+                    f"x={row[1]:g} w={row[2]:g} trial {int(row[0])} read "
+                    f"{row[3]*1e3:+.4f} mV with a {row[4]*1e3:.4f} mV trace std"
+                )
             try:
-                fit = fit_pair(index, average_levels(rows_by_pair[index]), cfg)
+                fit = fit_pair(index, average_levels(rows), cfg)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {index}: {exc}")
                 continue
@@ -5520,13 +5303,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_phase_daq_range = QtWidgets.QComboBox()
         for lo, hi in self._DAQ_RANGES:
             self.tpa_phase_daq_range.addItem(f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
-        self.tpa_phase_daq_range.setCurrentIndex(1)   # +/-0.2 V; autorange escalates
-        self.tpa_phase_daq_range.setToolTip(
-            "Default input range. Step 7 is the BRIGHTEST calibration step -- "
-            "the reference stays on for every point while a second pair ramps "
-            "up on top of it -- so it starts one step above step 6's "
-            "\N{PLUS-MINUS SIGN}0.1 V."
-        )
+        self._select_daq_range(self.tpa_phase_daq_range, BENCH_ACQ.range_v)
+        self.tpa_phase_daq_range.setToolTip(BENCH_RANGE_TIP)
         self.tpa_phase_daq_fcut = QtWidgets.QDoubleSpinBox()
         self.tpa_phase_daq_fcut.setRange(0.1, 100_000.0)
         self.tpa_phase_daq_fcut.setDecimals(1)
@@ -5540,18 +5318,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_phase_settle.setToolTip(
             "Wait after each SLM pattern change, before reading."
         )
-        # Its own windows, not step 6's: step 7 reads a different signal (both
-        # pairs on, every point) and validated at 10 s where step 6 runs 8.
-        self.tpa_phase_tboth = self._double_spin(0.001, 30.0, 10.0, " s", 3)
-        self.tpa_phase_tboth.setToolTip(
-            "T_both: averaging window for every sweep point. The reference is "
-            "on throughout, so they are all bright."
-        )
-        self.tpa_phase_tsingle = self._double_spin(0.001, 60.0, 10.0, " s", 3)
-        self.tpa_phase_tsingle.setToolTip(
-            "T_single: averaging window for the all-off dark read at the start "
-            "of each target — at zero signal it needs the averaging."
-        )
+        # Step 6's windows, not its own: step 7 pins its amplitudes to step 6's
+        # etas, so the two have to have averaged the same noise.
+        self.tpa_phase_tmeas = self._double_spin(
+            0.001, 60.0, BENCH_ACQ.t_meas_s, " s", 3)
+        self.tpa_phase_tmeas.setToolTip(BENCH_WINDOW_TIP)
         self.tpa_phase_invert = QtWidgets.QCheckBox("Invert sign (TIA)")
         self.tpa_phase_invert.setChecked(True)
         self.tpa_phase_invert.setToolTip(
@@ -5560,16 +5331,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "Leave this on. A sign-flipped run does not fail here — it fits a "
             "fringe upside down against pinned step-6 amplitudes and reports a "
             "phase, so check the residual, not just that a number came out."
-        )
-        self.tpa_phase_autorange = QtWidgets.QCheckBox(
-            "Widen one range near rail"
-        )
-        self.tpa_phase_autorange.setChecked(True)
-        self.tpa_phase_autorange.setToolTip(
-            "Remeasure a near-rail read one range up. The clip test runs on the "
-            "raw trace peak, not the reported mean: the low-pass pulls a clipped "
-            "flat-top back under the rail, so a clipped read is a silently wrong "
-            "mean rather than an error."
         )
         self.tpa_phase_pmt = QtWidgets.QCheckBox("Log PMT temperature")
         self.tpa_phase_pmt.setChecked(True)
@@ -5581,15 +5342,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Range", self.tpa_phase_daq_range),
             ("Low-pass", self.tpa_phase_daq_fcut),
             ("Settle", self.tpa_phase_settle),
-            ("T_both", self.tpa_phase_tboth),
-            ("T_single", self.tpa_phase_tsingle),
+            ("T_meas", self.tpa_phase_tmeas),
         ]
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QtWidgets.QLabel(label), r, 0)
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_phase_invert, len(rows), 0, 1, 2)
-        grid.addWidget(self.tpa_phase_autorange, len(rows) + 1, 0, 1, 2)
-        grid.addWidget(self.tpa_phase_pmt, len(rows) + 2, 0, 1, 2)
+        grid.addWidget(self.tpa_phase_pmt, len(rows) + 1, 0, 1, 2)
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -5821,11 +5580,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "no embedded 'step3' calibration — this is not a combined "
                 "step-6 result"
             )
-        # Which encoder drove step 6; a file written before the fitted encoding
-        # existed carries no marker and was measured under "interp".
-        method = (payload.get("encoding") or {}).get("method", "interp")
         layout = channel_layout_from_calibration(
-            calibration_result_from_dict(step3), method=method
+            calibration_result_from_dict(step3)
         )
         models = load_pair_models([path])
         if not models:
@@ -5886,16 +5642,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             return PhaseV2Config()
 
-    def _tpa_phase_acq(self) -> PhaseV2Acq:
+    def _tpa_phase_acq(self) -> PairV2Acq:
         """Acquisition timing and input range, straight off the DAQ group."""
         _lo, hi = self.tpa_phase_daq_range.currentData()
-        return PhaseV2Acq(
-            t_single_s=float(self.tpa_phase_tsingle.value()),
-            t_both_s=float(self.tpa_phase_tboth.value()),
+        return PairV2Acq(
+            t_meas_s=float(self.tpa_phase_tmeas.value()),
             settle_s=float(self.tpa_phase_settle.value()),
             range_v=float(hi),
-            range_wide_v=float(min(2.5 * hi, 10.0)),
-            autorange=self.tpa_phase_autorange.isChecked(),
             invert=self.tpa_phase_invert.isChecked(),
         )
 
@@ -5992,13 +5745,13 @@ class MainWindow(QtWidgets.QMainWindow):
         settings = DAQMonitorSettings(
             channel=self.tpa_phase_daq_channel.text().strip() or "ai0",
             sample_rate=self.tpa_phase_daq_rate.value(),
-            duration=acq.t_both_s,
-            single_duration=acq.t_single_s,
+            duration=acq.t_meas_s,
+            single_duration=acq.t_meas_s,
             hold=0.0,                 # measure_target owns the settle
             min_val=lo, max_val=hi,
             f_cut=self.tpa_phase_daq_fcut.value(),
         )
-        read_timeout = max(30.0, acq.t_single_s * 3.0 + 10.0)
+        read_timeout = max(30.0, acq.t_meas_s * 3.0 + 10.0)
 
         plan_text = self._tpa_phase_plan_lines(stages)
         hops = [s for s in stages if s.depth]
@@ -6125,6 +5878,15 @@ class MainWindow(QtWidgets.QMainWindow):
         failed: list[str] = []
         for k in sorted(results):
             result = results[k]
+            # A live sweep never goes through load_phase_csv, so the guard has to
+            # be applied here too -- otherwise the same sweep would fit one way
+            # now and another way when it is refit from the CSV it just wrote.
+            for b in drop_bursts(result):
+                self._log(
+                    f"[step 7] pair {k}: BURST acquisition dropped — "
+                    f"x_t=w_t={b['x_t']:g} read {b['voltage_mean_v']*1e3:+.4f} mV "
+                    f"with a {b['voltage_std_v']*1e3:.4f} mV trace std"
+                )
             ref = ref_of.get(k, ref_index)
             if k not in models or ref not in models:
                 failed.append(f"pair {k}: no step-6 η")
@@ -6252,18 +6014,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # its own and must not be called from here.
 
     def _build_step8_tab(self) -> QtWidgets.QWidget:
+        # No prose on this page.  The only text it shows is measured or
+        # predicted numbers; what the step is for lives in this module's
+        # comments and in calib_step8's docstring, where it does not take up
+        # half the panel every time the tab is opened.
         page = self._page_shell("Two-Photon Saturation (Y_sat)")
-        page.layout().addWidget(self._caption(
-            "Steps 6 and 7 never read above ~66 mV, where the atoms are linear "
-            "to ~1 %, so neither can see saturation. This sweeps the whole "
-            "output scale and fits the one constant that matters once a real "
-            "computation drives full scale: Y_sat, in "
-            "Y_pred = Y / (1 + Y / Y_sat). The gain is pinned to g = 1, which "
-            "DEFINES this run as the gain anchor -- a later run measures its "
-            "own gain as the ratio of its reads to this run's reads on the same "
-            "drives."
-        ))
-
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(self._build_step8_controls())
         split.addWidget(self._build_step8_results())
@@ -6290,46 +6045,133 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(QtWidgets.QLabel("Step 7 JSON"), 0, 0)
         grid.addWidget(self.step8_step7_edit, 0, 1)
         grid.addWidget(browse, 0, 2)
-        self.step8_step7_note = self._caption(
-            "That one file is the whole forward model: its embedded step 3 is "
-            "the layout, step 6 the etas, step 7 the phases.")
-        grid.addWidget(self.step8_step7_note, 1, 0, 1, 3)
+        # Numbers only, and empty until there is a forward model to quote:
+        # this step-7's Y_max, and where the ladder's two bands land on it.
+        # Anything that is not a number -- "pick a file", "that file could not be
+        # read" -- belongs in step8_status with the rest of the feedback.
+        self.step8_levels_note = QtWidgets.QLabel("")
+        self.step8_levels_note.setObjectName("PageSubtitle")
+        self.step8_levels_note.setWordWrap(True)
+        self.step8_levels_note.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse)
+        grid.addWidget(self.step8_levels_note, 1, 0, 1, 3)
+        self.step8_step7_edit.textChanged.connect(self._step8_step7_changed)
         box.addWidget(src)
 
         sweep = self._panel("Sweep")
         grid = QtWidgets.QGridLayout(sweep)
-        self.step8_ladder = self._spin(16, 400, STEP8.LADDER)
+        self.step8_ladder = self._spin(4, 400, STEP8.LADDER)
         self.step8_ladder.setToolTip(
-            "Patterns across the scale, one per stratum of [0, Y_max], each a "
-            "fresh random drive. The closed-form full-scale drive is added at "
-            "both ends on top of these, and is where the fit gets its leverage."
+            f"Rungs in the BRIGHT band \N{EM DASH} Band floor to Sweep max "
+            f"\N{EM DASH} one per stratum, each a fresh random drive. This is "
+            f"where all of the Y_sat leverage is: a rung's information about "
+            f"1/Y_sat goes as "
+            f"(Y\N{SUPERSCRIPT TWO}/\N{GREEK SMALL LETTER SIGMA})"
+            f"\N{SUPERSCRIPT TWO}, so the top of the band is worth orders more "
+            f"than the bottom."
         )
         self.step8_ladder.valueChanged.connect(self._step8_update_estimate)
+        self.step8_ladder.valueChanged.connect(self._step8_refresh_levels)
         grid.addWidget(QtWidgets.QLabel("Ladder rungs"), 0, 0)
         grid.addWidget(self.step8_ladder, 0, 1)
 
+        self.step8_low = self._spin(0, 100, STEP8.LADDER_LOW)
+        self.step8_low.setToolTip(
+            f"Rungs BELOW the bright band, Sweep min to Band floor. These carry "
+            f"no curvature worth fitting \N{EM DASH} they are forward-model "
+            f"checks.\n"
+            f"They are here because an inference run's MEDIAN read is ~40 mV: "
+            f"without them nothing in this sweep touches the decade the machine "
+            f"spends most of its time in, and a step-6/7 error down there would "
+            f"leave no trace. 0 drops them, and takes Sweep min with them."
+        )
+        self.step8_low.valueChanged.connect(self._step8_update_estimate)
+        self.step8_low.valueChanged.connect(self._step8_refresh_levels)
+        self.step8_low.valueChanged.connect(self._step8_refresh_buttons)
+        grid.addWidget(QtWidgets.QLabel("Model checks"), 0, 2)
+        grid.addWidget(self.step8_low, 0, 3)
+
+        # The band, in MILLIVOLTS, which is the unit every argument that set it
+        # was about: the amplifier, the noise floor, and how bright an inference
+        # run reads.  alpha is the DERIVED column beside them -- it is
+        # mV / Y_max, so it moves with the PMT gain, and typing it by hand would
+        # hand the geometry back to the gain.  Blank until a step-7 names a
+        # Y_max, because before that there is no alpha to show.
+        self.step8_sweep_max = self._double_spin(50.0, 1e3 * STEP8.AMP_LIMIT_V,
+                                                 1e3 * STEP8.LADDER_CEILING_V,
+                                                 " mV", 1)
+        self.step8_sweep_max.setSingleStep(10.0)
+        self.step8_sweep_max.setToolTip(
+            f"The brightest read of the whole sweep, and the only thing that "
+            f"decides where it stops.\n"
+            f"{1e3 * STEP8.LADDER_CEILING_V:.0f} mV is an UNVERIFIED figure for "
+            f"where the amplifier starts to compress, not a measurement: only "
+            f"its {STEP8.AMP_LIMIT_V:g} V hard rail is known. Compression bends "
+            f"the top of the ladder down exactly the way saturation does, and "
+            f"the fit has one free parameter and cannot tell them apart \N{EM DASH} "
+            f"so too high is SILENT, while too low only costs precision. Use "
+            f"the probe below to replace the guess."
+        )
+        self.step8_band_floor = self._double_spin(20.0, 1e3 * STEP8.AMP_LIMIT_V,
+                                                  1e3 * STEP8.LADDER_FLOOR_V,
+                                                  " mV", 1)
+        self.step8_band_floor.setSingleStep(10.0)
+        self.step8_band_floor.setToolTip(
+            "Where the bright band stops and the model checks start: the one "
+            "number here that is not an end of the sweep.\n"
+            "Everything above it is Y_sat leverage, everything below it is a "
+            "forward-model check. Push it up and the same rungs crowd into a "
+            "shorter, brighter band."
+        )
+        self.step8_sweep_min = self._double_spin(1.0, 1e3 * STEP8.AMP_LIMIT_V,
+                                                 1e3 * STEP8.LADDER_LOW_V,
+                                                 " mV", 1)
+        self.step8_sweep_min.setSingleStep(1.0)
+        self.step8_sweep_min.setToolTip(
+            "The dimmest read of the whole sweep, and the floor of the model "
+            "checks.\n"
+            "It is down at an inference run's MEDIAN read (~40 mV) on purpose. "
+            "Only meaningful with Model checks above 0."
+        )
+        self.step8_sweep_max_alpha = self._caption("")
+        self.step8_band_floor_alpha = self._caption("")
+        self.step8_sweep_min_alpha = self._caption("")
+        rows = (("Sweep max", self.step8_sweep_max, self.step8_sweep_max_alpha),
+                ("Band floor", self.step8_band_floor, self.step8_band_floor_alpha),
+                ("Sweep min", self.step8_sweep_min, self.step8_sweep_min_alpha))
+        for r, (label, spin, alpha) in enumerate(rows, start=1):
+            spin.valueChanged.connect(self._step8_refresh_levels)
+            grid.addWidget(QtWidgets.QLabel(label), r, 0)
+            grid.addWidget(spin, r, 1)
+            grid.addWidget(alpha, r, 2, 1, 2)
+        self.step8_sweep_max.valueChanged.connect(self._step8_probe_predict)
+        grid.setColumnStretch(2, 1)
+
         self.step8_daq_channel = QtWidgets.QLineEdit("ai0")
-        grid.addWidget(QtWidgets.QLabel("DAQ channel"), 1, 0)
-        grid.addWidget(self.step8_daq_channel, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("DAQ channel"), 4, 0)
+        grid.addWidget(self.step8_daq_channel, 4, 1)
 
         self.step8_daq_rate = QtWidgets.QDoubleSpinBox()
         self.step8_daq_rate.setRange(1.0, 2_000_000.0)
         self.step8_daq_rate.setDecimals(0)
         self.step8_daq_rate.setValue(1000.0)
         self.step8_daq_rate.setSuffix(" S/s")
-        grid.addWidget(QtWidgets.QLabel("Sample rate"), 2, 0)
-        grid.addWidget(self.step8_daq_rate, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("Sample rate"), 5, 0)
+        grid.addWidget(self.step8_daq_rate, 5, 1)
 
         self.step8_daq_fcut = self._double_spin(0.1, 100_000.0, 20.0, " Hz", 1)
-        grid.addWidget(QtWidgets.QLabel("Detector BW"), 3, 0)
-        grid.addWidget(self.step8_daq_fcut, 3, 1)
+        self.step8_daq_fcut.setToolTip(
+            "Detector 3 dB bandwidth: the low-pass behind the reported mean and "
+            "std. Shared with steps 6 and 7.")
+        grid.addWidget(QtWidgets.QLabel("Detector BW"), 6, 0)
+        grid.addWidget(self.step8_daq_fcut, 6, 1)
 
         self.step8_pmt = QtWidgets.QCheckBox("Log PMT thermistor (Keithley 2400)")
         self.step8_pmt.setToolTip(
             "Adds pmt_ohm_Ohm and pmt_c beside every read. Do not enable this "
             "while anything else is talking to the 2400 -- one GPIB bus, one "
             "instrument.")
-        grid.addWidget(self.step8_pmt, 4, 0, 1, 2)
+        grid.addWidget(self.step8_pmt, 7, 0, 1, 2)
         box.addWidget(sweep)
 
         run = self._panel("Run")
@@ -6339,11 +6181,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step8_stop_button = QtWidgets.QPushButton("Stop")
         self.step8_stop_button.setEnabled(False)
         self.step8_stop_button.clicked.connect(self._step8_stop)
-        self.step8_refit_button = QtWidgets.QPushButton("Re-fit a CSV\N{HORIZONTAL ELLIPSIS}")
-        self.step8_refit_button.clicked.connect(self._step8_refit)
+        # Load and Save, the pair steps 6 and 7 carry, for the same reason:
+        # a sweep is shown from wherever it was read, and nothing reaches
+        # calib_data until somebody says where it goes.
+        self.step8_load_button = QtWidgets.QPushButton(
+            "Load\N{HORIZONTAL ELLIPSIS}")
+        self.step8_load_button.setProperty("variant", "ghost")
+        self.step8_load_button.setToolTip(
+            "Fit a step-8 CSV that is already on disk and show it \N{EM DASH} "
+            "no hardware, no sweep.\n"
+            "The fit and its plot go to the staging directory, not next to the "
+            "file that was loaded: opening a CSV is not permission to write "
+            "beside it.")
+        self.step8_load_button.clicked.connect(self._step8_load)
+        self.step8_save_button = QtWidgets.QPushButton(
+            "Save\N{HORIZONTAL ELLIPSIS}")
+        self.step8_save_button.setProperty("variant", "ghost")
+        self.step8_save_button.setEnabled(False)
+        self.step8_save_button.setToolTip(
+            "Write the sweep on screen where you choose: the CSV, the result "
+            "JSON everything downstream reads, and the plot.\n"
+            "A run stages itself in a temp directory and goes nowhere else "
+            "until this is pressed.")
+        self.step8_save_button.clicked.connect(self._step8_save)
         grid.addWidget(self.step8_run_button, 0, 0)
         grid.addWidget(self.step8_stop_button, 0, 1)
-        grid.addWidget(self.step8_refit_button, 1, 0, 1, 2)
+        grid.addWidget(self.step8_load_button, 1, 0)
+        grid.addWidget(self.step8_save_button, 1, 1)
         self.step8_estimate = self._caption("")
         grid.addWidget(self.step8_estimate, 2, 0, 1, 2)
         self.step8_status = QtWidgets.QLabel("Idle")
@@ -6351,8 +6215,44 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.step8_status, 3, 0, 1, 2)
         box.addWidget(run)
 
+        probe = self._panel("Probe one level")
+        grid = QtWidgets.QGridLayout(probe)
+        self.step8_probe_alpha = self._double_spin(0.0, 1.0, 0.3, "", 4)
+        self.step8_probe_alpha.setSingleStep(0.01)
+        self.step8_probe_alpha.setToolTip(
+            f"Fraction of Y_max to display and read once. Defaults to the "
+            f"ladder's own cap.\n"
+            f"This is how the bench finds out where the READOUT stops being "
+            f"linear, which is a question about the electronics and not about "
+            f"the atoms: the amplifier rails at "
+            f"{1e3 * STEP8.AMP_LIMIT_V:.0f} mV and begins to compress somewhere "
+            f"below that, and either bends the top of a ladder down exactly the "
+            f"way saturation does \N{EM DASH} the fit has one free parameter and "
+            f"cannot tell them apart.\n"
+            f"Walk alpha up and watch the read fall behind the linear "
+            f"prediction, and the raw peak approach the rail. That measurement "
+            f"is what LADDER_CEILING_V "
+            f"({1e3 * STEP8.LADDER_CEILING_V:.0f} mV) encodes.")
+        self.step8_probe_alpha.valueChanged.connect(self._step8_probe_predict)
+        self.step8_probe_pred = self._caption("")
+        self.step8_probe_button = QtWidgets.QPushButton("Display && Read")
+        self.step8_probe_button.setEnabled(False)
+        self.step8_probe_button.setToolTip(
+            "One all-off dark, the frame, one reading. Nothing is written. It "
+            "goes through the same run_patterns loop and the same instruments "
+            "the sweep uses, so what it reports is literally a sweep read.")
+        self.step8_probe_button.clicked.connect(self._step8_probe)
+        grid.addWidget(QtWidgets.QLabel("alpha"), 0, 0)
+        grid.addWidget(self.step8_probe_alpha, 0, 1)
+        grid.addWidget(self.step8_probe_pred, 0, 2)
+        grid.addWidget(self.step8_probe_button, 1, 0, 1, 3)
+        grid.setColumnStretch(2, 1)
+        box.addWidget(probe)
+
         box.addStretch(1)
         self._step8_update_estimate()
+        self._step8_refresh_levels()
+        self._step8_refresh_buttons()
         return col
 
     def _build_step8_results(self) -> QtWidgets.QWidget:
@@ -6364,13 +6264,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step8_result_text = QtWidgets.QPlainTextEdit()
         self.step8_result_text.setReadOnly(True)
         self.step8_result_text.setMaximumHeight(190)
-        self.step8_result_text.setPlaceholderText(
-            "The fitted Y_sat lands here, with the predicted-vs-measured full "
-            "scale and the gain lever.")
         box.addWidget(self._panel_with_widget("Fit", self.step8_result_text))
 
-        self.step8_plot_label = QtWidgets.QLabel(
-            "The report renders here once the sweep has been fitted.")
+        self.step8_plot_label = QtWidgets.QLabel("")
         self.step8_plot_label.setAlignment(QtCore.Qt.AlignCenter)
         self.step8_plot_label.setMinimumHeight(360)
         scroll = QtWidgets.QScrollArea()
@@ -6395,18 +6291,177 @@ class MainWindow(QtWidgets.QMainWindow):
         Only the count and the windows, not the solved plan: solving the ladder
         takes seconds and this runs on every spinbox tick.
         """
-        n = self.step8_ladder.value() + 2
-        mid = (STEP8.T_BOTH_DIM_S + STEP8.T_BOTH_BRIGHT_S) / 2 + STEP8.ACQ.settle_s
+        n = self.step8_ladder.value() + self.step8_low.value() + 2
         self.step8_estimate.setText(
-            f"{n} reads, roughly {n * mid / 60:.0f} min "
-            f"(windows run {STEP8.T_BOTH_DIM_S:g} s at the bottom of the scale "
-            f"to {STEP8.T_BOTH_BRIGHT_S:g} s at the top)")
+            f"{n} reads, roughly {STEP8.run_seconds(n) / 60:.0f} min "
+            f"({STEP8.ACQ.t_meas_s:g} s every read at "
+            f"\N{PLUS-MINUS SIGN}{STEP8.ACQ.range_v:g} V, dark included)")
+
+    def _step8_step7_changed(self) -> None:
+        """Show where this step-7's Y_max lands, and gate the probe.
+
+        Runs on every keystroke, so it does nothing until the text names a file
+        that exists -- which for a browsed path is once.  ``full_scale`` is a
+        prediction and touches no hardware.
+        """
+        text = self.step8_step7_edit.text().strip()
+        path = Path(text) if text else None
+        if path is None or not path.is_file():
+            self.step8_y_max = None
+            self._step8_plan_for = None
+            # Not just the note: dropping Y_max drops the alphas with it, and a
+            # stale alpha beside a live box is the one thing this column must
+            # never show.
+            self._step8_refresh_levels()
+            self._step8_probe_predict()
+            self._step8_refresh_buttons()
+            return
+        # The cache is only a guard against re-parsing the JSON on every
+        # keystroke of a path being typed; it must not survive Y_max being
+        # dropped, or clearing the box and retyping the same file would leave the
+        # panel blank and the button dead.
+        if (getattr(self, "_step8_plan_for", None) == str(path.resolve())
+                and getattr(self, "step8_y_max", None) is not None):
+            return
+        try:
+            models, phases, _ref = verify_load_forward_model(path)
+            fs = float(STEP8.full_scale(models, phases, sorted(models)).fs)
+        except Exception as exc:                      # noqa: BLE001
+            self.step8_y_max = None
+            self._step8_plan_for = None
+            # Not just the note: dropping Y_max drops the alphas with it, and a
+            # stale alpha beside a live box is the one thing this column must
+            # never show.
+            self._step8_refresh_levels()
+            self.step8_status.setText(f"Cannot read the forward model: {exc}")
+            self._step8_probe_predict()
+            self._step8_refresh_buttons()
+            return
+        self.step8_y_max = fs
+        self._step8_plan_for = str(path.resolve())
+        self._step8_refresh_levels()
+        # A fresh forward model means a fresh cap, and the cap is the alpha worth
+        # probing by default -- it is the brightest read the sweep will take.
+        self.step8_probe_alpha.setValue(
+            round(STEP8.ladder_levels(fs, **self._step8_levels_v())["cap"], 4))
+        self._step8_probe_predict()
+        self._step8_refresh_buttons()
+
+    def _step8_levels_v(self) -> dict[str, float]:
+        """The three boxes as ``ladder_levels`` keywords, in VOLTS.
+
+        One place turns millivolts into volts, and it spells the keywords, so a
+        box cannot end up wired to the wrong band.
+        """
+        return {"ceiling_v": self.step8_sweep_max.value() / 1e3,
+                "floor_v": self.step8_band_floor.value() / 1e3,
+                "low_v": self.step8_sweep_min.value() / 1e3}
+
+    def _step8_refresh_levels(self) -> None:
+        """The alpha beside each box, and the Y_max note above them.
+
+        Pure arithmetic on a cached ``Y_max`` -- no solve, no file read -- so it
+        runs on every spinbox tick.  The alphas are BLANK until a step-7 JSON is
+        loaded: alpha is mV / Y_max and there is no Y_max before that.
+
+        It also shows what :func:`~calibration_module.steps.calib_step8.ladder_levels`
+        CLAMPED.  A band floor above the ceiling is clamped rather than refused,
+        and a clamp that is not on screen is a box and a run that disagree.
+        """
+        if not hasattr(self, "step8_sweep_min_alpha"):
+            return
+        fs = getattr(self, "step8_y_max", None)
+        volts = self._step8_levels_v()
+        checks = self.step8_low.value()
+        if fs is None:
+            self.step8_levels_note.clear()
+            for cap in (self.step8_sweep_max_alpha, self.step8_band_floor_alpha,
+                        self.step8_sweep_min_alpha):
+                cap.clear()
+            return
+        lv = STEP8.ladder_levels(fs, **volts)
+        rungs = (f"{self.step8_ladder.value()} rungs above",
+                 f"{checks} rungs below" if checks else "no model checks")
+        def caption(alpha: float, asked_v: float, note: str = "",
+                    gap: str = "clamped") -> str:
+            # A clamp shows as the disagreement itself: alpha * Y_max is what
+            # will be driven, the box is what was asked for.  ``gap`` names why
+            # they differ, and it is not always a clamp -- at the ceiling of a
+            # forward model dimmer than the box, the atoms own the top.
+            got = alpha * fs
+            gap = (f"  = {got * 1e3:.1f} mV {gap}".rstrip()
+                   if abs(got - asked_v) > 1e-6 * max(asked_v, 1e-9) else "")
+            return (f"\N{GREEK SMALL LETTER ALPHA} {alpha:.4f}{gap}"
+                    + (f"   \N{MIDDLE DOT}  {note}" if note else ""))
+        self.step8_sweep_max_alpha.setText(caption(
+            lv["cap"], volts["ceiling_v"],
+            "" if lv["capped"] else "Y_max is below it: the atoms own the top",
+            gap=""))
+        self.step8_band_floor_alpha.setText(
+            caption(lv["floor"], volts["floor_v"], rungs[0]))
+        self.step8_sweep_min_alpha.setText(
+            caption(lv["low"], volts["low_v"], rungs[1]) if checks else "")
+        self.step8_levels_note.setText(
+            f"Y_max {fs * 1e3:.1f} mV (LINEAR)   \N{EM DASH}   4-bit step "
+            f"{fs / 15 * 1e3:.3f} mV\n"
+            + (f"capped at {volts['ceiling_v'] * 1e3:.0f} mV: Y_max is "
+               f"{fs / volts['ceiling_v']:.2f}\N{MULTIPLICATION SIGN} that, and "
+               f"{fs / STEP8.AMP_LIMIT_V:.2f}\N{MULTIPLICATION SIGN} the "
+               f"{STEP8.AMP_LIMIT_V:g} V amplifier limit"
+               if lv["capped"] else
+               "not capped: Y_max is under Sweep max, so the ladder reaches "
+               "alpha = 1"))
+
+    def _step8_probe_predict(self) -> None:
+        """The predicted millivolts for the alpha in the box, before committing.
+
+        Pure arithmetic -- ``alpha`` IS the fraction of ``Y_max`` -- so this can
+        run on every spinbox tick without solving anything.  It exists so the
+        number is visible BEFORE the frame goes up: at the present gain
+        ``alpha = 1`` is ~1534 mV into a 1 V amplifier, and that should not be
+        one keystroke away without warning.
+        """
+        if not hasattr(self, "step8_probe_pred"):
+            return
+        fs = getattr(self, "step8_y_max", None)
+        if fs is None:
+            self.step8_probe_pred.setText("")
+            return
+        a = float(self.step8_probe_alpha.value())
+        v = a * float(fs)
+        ceiling = self._step8_levels_v()["ceiling_v"]
+        note = ""
+        if v > STEP8.AMP_LIMIT_V:
+            note = (f"   \N{EM DASH}  OVER the {STEP8.AMP_LIMIT_V:g} V amplifier limit, "
+                    f"this read will clip")
+        elif v > ceiling:
+            note = (f"   \N{EM DASH}  above Sweep max "
+                    f"{ceiling * 1e3:.0f} mV")
+        self.step8_probe_pred.setText(f"predicts {v * 1e3:.1f} mV{note}")
+
+    def _step8_refresh_buttons(self) -> None:
+        """Everything whose live-ness depends on the run, or on another box."""
+        if not hasattr(self, "step8_probe_button"):
+            return
+        running = self.step8_stop_button.isEnabled()
+        ready = getattr(self, "step8_y_max", None) is not None
+        self.step8_probe_button.setEnabled(not running and ready)
+        self.step8_probe_alpha.setEnabled(not running)
+        for w in (self.step8_ladder, self.step8_low, self.step8_sweep_max,
+                  self.step8_band_floor):
+            w.setEnabled(not running)
+        # Sweep min is the model checks' floor; with no checks there is nothing
+        # below the band floor for it to bound.
+        self.step8_sweep_min.setEnabled(not running and self.step8_low.value() > 0)
+        # There is nothing to save until a sweep has been fitted.
+        self.step8_save_button.setEnabled(
+            not running and getattr(self, "step8_last", None) is not None)
 
     def _step8_set_running(self, running: bool) -> None:
         self.step8_run_button.setEnabled(not running)
-        self.step8_refit_button.setEnabled(not running)
+        self.step8_load_button.setEnabled(not running)
         self.step8_stop_button.setEnabled(running)
-        self.step8_ladder.setEnabled(not running)
+        self._step8_refresh_buttons()
 
     def _step8_stop(self) -> None:
         if getattr(self, "step8_stop_event", None) is not None:
@@ -6415,6 +6470,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- the run -----------------------------------------------------------
     def _step8_run(self) -> None:
+        volts = self._step8_levels_v()
+        # Asked BEFORE the solve, and only about the read the sweep will
+        # actually take: on a forward model dimmer than the ceiling the sweep
+        # never reaches it, and a dialog there would be a false alarm.  1.31 is
+        # the 0929 sweep's p90 raw peak/mean, so this is the ceiling at which the
+        # PEAK starts touching the rail -- and it is 30 rungs, not one probe
+        # read, every one of them bent the way saturation bends them.
+        top = min(volts["ceiling_v"], getattr(self, "step8_y_max", None)
+                  or volts["ceiling_v"])
+        if top * 1.31 > STEP8.AMP_LIMIT_V:
+            if QtWidgets.QMessageBox.question(
+                    self, "The ladder tops out near the rail",
+                    f"Sweep max {volts['ceiling_v'] * 1e3:.0f} mV puts the "
+                    f"brightest rungs at {top * 1e3:.0f} mV mean, whose raw "
+                    f"trace peak runs ~{top * 1.31 * 1e3:.0f} mV against the "
+                    f"{STEP8.AMP_LIMIT_V:g} V amplifier limit.\n\n"
+                    f"Clipping, and compression well below the rail, bend the "
+                    f"top of the ladder down in exactly the way saturation "
+                    f"does. The fit has one free parameter and cannot tell "
+                    f"them apart, so it will absorb the amplifier into Y_sat "
+                    f"and report a confident wrong number \N{EM DASH} across "
+                    f"every bright rung, not one read.\n\nRun it anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
+                return
         try:
             step7 = self._step8_step7_path()
             models, phases, _ref = verify_load_forward_model(step7)
@@ -6422,7 +6502,8 @@ class MainWindow(QtWidgets.QMainWindow):
             seed = int(np.random.SeedSequence().entropy % 2**32)
             scale, patterns, preds = STEP8.build(
                 models, phases, pairs, seed=seed,
-                ladder=self.step8_ladder.value())
+                ladder=self.step8_ladder.value(),
+                low=self.step8_low.value(), **volts)
             layout = STEP8.load_layout(step7, pairs)
         except (ValueError, FileNotFoundError) as exc:
             self.step8_status.setText(str(exc))
@@ -6441,19 +6522,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         acq = STEP8.ACQ
-        t_both = STEP8.read_window(preds)
-        secs = STEP8.run_seconds(preds, t_both)
+        secs = STEP8.run_seconds(len(patterns))
         settings = DAQMonitorSettings(
             channel=self.step8_daq_channel.text().strip() or "ai0",
             sample_rate=self.step8_daq_rate.value(),
-            duration=acq.t_both_s, single_duration=acq.t_single_s,
+            duration=acq.t_meas_s, single_duration=acq.t_meas_s,
             hold=0.0,                       # run_patterns owns the settle
             min_val=-acq.range_v, max_val=acq.range_v,
             f_cut=self.step8_daq_fcut.value(),
         )
 
-        out = Path(STEP8.OUT_DIR)
-        out.mkdir(parents=True, exist_ok=True)
+        # Staged, not saved: calib_data gets nothing until Save is pressed.
+        out = self._step8_staging()
         stamp = time.strftime("%m%d_%H%M")
         coh = [float(verify_predict(models, phases, pairs, p.x, p.w, coherent=True))
                for p in patterns]
@@ -6463,7 +6543,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "target_alpha": f"{p.target_alpha:.6f}",
                    "alpha": f"{p.alpha:.6f}",
                    "coherent_v": f"{c:.9g}", "sb_pred_v": f"{q - c:.9g}",
-                   "t_both_s": f"{t_both(q):.3f}"}
+                   "t_meas_s": f"{acq.t_meas_s:.3f}"}
                   for i, (p, c, q) in enumerate(zip(patterns, coh, preds))]]
 
         self.step8_status.setText(
@@ -6473,8 +6553,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_calibration_dialog(on_stop=self._step8_stop)
         if self.calibration_dialog is not None:
             self.calibration_dialog.note([
-                f"{len(patterns)} reads \N{MIDDLE DOT} ladder "
-                f"{self.step8_ladder.value()} + 2 at full scale",
+                f"{len(patterns)} reads \N{MIDDLE DOT} "
+                f"{self.step8_ladder.value()} bright + "
+                f"{self.step8_low.value()} checks + 2 at the cap "
+                f"\N{MIDDLE DOT} {acq.t_meas_s:g} s at "
+                f"\N{PLUS-MINUS SIGN}{acq.range_v:g} V",
+                # The band is tunable, so the dialog has to say which one ran.
+                f"band {volts['floor_v'] * 1e3:.0f}"
+                f"\N{EN DASH}{volts['ceiling_v'] * 1e3:.0f} mV, checks down to "
+                f"{volts['low_v'] * 1e3:.0f} mV \N{MIDDLE DOT} brightest read "
+                f"{max(preds) * 1e3:.1f} mV",
                 f"Y_max {scale.fs * 1e3:.3f} mV \N{MIDDLE DOT} 4-bit step "
                 f"{scale.fs / 15 * 1e3:.3f} mV",
                 "Predictions are LINEAR: this run fits Y_sat, so it assumes none.",
@@ -6482,13 +6570,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         stop_event = threading.Event()
         self.step8_stop_event = stop_event
+
+        def report(progress: PatternsProgress) -> None:
+            self.step8_progress.emit(progress)
+
         pmt = open_pmt(enabled=self.step8_pmt.isChecked(),
                        log=lambda m: self._log(f"[step 8] {m}"))
 
         def work() -> dict[str, Any]:
             daq.configure_monitor(settings)
             rows: list[dict] = []
-            meta = {"n_pairs": len(pairs), "y_max_v": scale.fs}
+            meta = {"n_pairs": len(pairs), "y_max_v": scale.fs,
+                    "ladder": self.step8_ladder.value(),
+                    "ladder_low": self.step8_low.value(),
+                    "ceiling_v": f"{volts['ceiling_v']:.6g}",
+                    "floor_v": f"{volts['floor_v']:.6g}",
+                    "low_v": f"{volts['low_v']:.6g}"}
             columns: list[str] = []
             status = "complete"
             if pmt is not None:
@@ -6497,8 +6594,8 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 run_patterns(daq, controller, layout, [tuple(pairs)], x, w,
                              models, phases, rows=rows, acq=acq, extra=extra,
-                             y_sat=None, t_both_of=t_both, row_hook=pmt,
-                             stop_event=stop_event,
+                             y_sat=None, row_hook=pmt,
+                             stop_event=stop_event, progress_callback=report,
                              log=lambda m: self._log(f"[step 8] {m}"))
             except PatternsAborted as exc:
                 status = f"partial ({exc})"
@@ -6512,42 +6609,301 @@ class MainWindow(QtWidgets.QMainWindow):
                 meta={"step7_json": Path(step7).resolve(), "seed": seed,
                       "status": status, **meta},
                 extra=["kind", "label", "seq", "target_alpha", "alpha",
-                       "coherent_v", "sb_pred_v", "t_both_s", *columns])
+                       "coherent_v", "sb_pred_v", "t_meas_s", "peak_v",
+                       *columns])
             result = STEP8.fit_and_write(
                 csv_path, step7, out_dir=out,
                 log=lambda m: self._log(f"[step 8] {m}"))
-            return {"status": status, "csv": csv_path, "result": result}
+            # The step-7 file travels with the fit, because Save re-writes
+            # the result JSON at the destination and must use the model this
+            # fit was made against, not whatever the box holds by then.
+            return {"status": status, "csv": csv_path, "step7": Path(step7),
+                    "result": result}
 
         self._run_slm_task("Step 8 saturation sweep", work,
                            self._step8_finished, self._step8_error)
 
-    def _step8_refit(self) -> None:
-        """Fit a CSV that is already on disk -- no hardware, no sweep."""
+    def _on_step8_progress(self, progress: PatternsProgress) -> None:
+        """Feed one ladder read to the shared progress dialog.
+
+        Adapted rather than reported natively, exactly as steps 6 and 7 do it.
+        Unlike them this fires TWICE per read -- once when the read starts, once
+        when it lands -- because a step-8 read is a five-to-ten second average
+        behind a ten second opening dark, and a window that only moved on
+        finished reads spent that first quarter minute indistinguishable from a
+        hang.  The darks move the message but not the bar: they are not part of
+        ``total``, and ``step`` already counts only finished pattern reads.
+
+        The plot is measured against PREDICTED, not against read number.  The
+        ladder is driven shuffled on purpose (see ``calib_step8.interleave``),
+        so read order carries no physics, while this is the saturation curve the
+        run exists to fit -- it leaves the diagonal exactly where Y_sat bites.
+        """
+        n, total = progress.step, progress.total
+        if progress.single:
+            message = (f"dark (all off, {progress.t_read_s:g} s)…"
+                       if progress.mean_v is None else
+                       f"dark (all off) → {progress.mean_v * 1e3:.4f} mV")
+        elif progress.mean_v is None:
+            message = (f"read {n + 1}/{total} · "
+                       f"{progress.t_read_s:.1f} s window · "
+                       f"pred {progress.pred_v * 1e3:.2f} mV"
+                       f"…")
+        else:
+            net = progress.net_v
+            # Every read picks its own range from its prediction, so "wide"
+            # can only mean the near-rail escalation fired on top of that.
+            wide = ("  [wide range]"
+                    if progress.range_v != range_for(progress.pred_v)[0] else "")
+            message = (f"[{n}/{total}] {net * 1e3:.4f} mV  "
+                       f"pred {progress.pred_v * 1e3:.4f}  "
+                       f"diff {(net - progress.pred_v) * 1e3:+.4f}  "
+                       f"std {progress.std_ratio * 100:.2f}%{wide}")
+        self.step8_status.setText(message)
+        if self.calibration_dialog is None:
+            return
+        plot = progress.mean_v is not None and not progress.single
+        self.calibration_dialog.update_progress(CalibrationProgress(
+            phase="ladder",
+            step=n - 1,                   # the dialog adds 1 back
+            total=total,
+            message=message,
+            x=progress.pred_v * 1e3 if plot else None,
+            y=progress.net_v * 1e3 if plot else None,
+        ))
+
+    def _step8_probe(self) -> None:
+        """Display one chosen level, read it once, report it.  Nothing written.
+
+        It goes through the same ``run_patterns`` loop and the same instruments
+        the sweep uses -- the same all-off dark, the same fixed range, the same
+        inversion -- so what comes back is literally a sweep read.
+
+        The alpha is the caller's.  This replaced a button that could only drive
+        ``alpha = 1``, which at the present gain is ~1534 mV into a 1 V
+        amplifier: it clipped by construction and then inverted the clipped read
+        to report a confident ceiling.  The predicted millivolts are on screen
+        before the press, and anything past :data:`AMP_LIMIT_V` asks first.
+        """
+        alpha = float(self.step8_probe_alpha.value())
+        ceiling_v = self._step8_levels_v()["ceiling_v"]
+        if alpha <= 0.0:
+            self.step8_status.setText(
+                "alpha has to be above 0 \N{EM DASH} a zero drive is the dark, "
+                "which every read already takes first.")
+            return
+        fs_hint = getattr(self, "step8_y_max", None)
+        if fs_hint is not None and alpha * float(fs_hint) > STEP8.AMP_LIMIT_V:
+            if QtWidgets.QMessageBox.question(
+                    self, "Past the amplifier limit",
+                    f"alpha = {alpha:.4f} predicts "
+                    f"{alpha * float(fs_hint) * 1e3:.0f} mV, past the "
+                    f"{STEP8.AMP_LIMIT_V:g} V amplifier limit.\n\n"
+                    f"The read will be a flat-top: the raw trace rails, the "
+                    f"20 Hz low-pass pulls the mean back under it, and the "
+                    f"reported mean looks reasonable while measuring nothing. "
+                    f"peak_v is what will show it.\n\nDisplay it anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
+                return
+        try:
+            step7 = self._step8_step7_path()
+            models, phases, _ref = verify_load_forward_model(step7)
+            pairs = sorted(models)
+            scale = STEP8.full_scale(models, phases, pairs)
+            # Same solver the ladder uses, so a probe at the cap IS a ceiling
+            # rung: closed form at alpha = 1, a least-move projection below it.
+            pattern = replace(
+                STEP8.ceiling_pattern(
+                    models, phases, pairs, alpha,
+                    seed=int(np.random.SeedSequence().entropy % 2**32)),
+                label="probe")
+            layout = STEP8.load_layout(step7, pairs)
+        except (ValueError, FileNotFoundError) as exc:
+            self.step8_status.setText(str(exc))
+            return
+        except Exception as exc:                      # noqa: BLE001
+            self.step8_status.setText(f"Step 7: {exc}")
+            return
+
+        daq = self.daq_controller
+        if daq is None or not daq.is_connected:
+            self.step8_status.setText("Connect the DAQ first (DAQ page).")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.step8_status.setText("Open the SLM on the SLM Control page first.")
+            return
+
+        acq = STEP8.ACQ
+        coh = float(verify_predict(models, phases, pairs, pattern.x, pattern.w,
+                                   coherent=True))
+        tot = float(verify_predict(models, phases, pairs, pattern.x, pattern.w))
+        settings = DAQMonitorSettings(
+            channel=self.step8_daq_channel.text().strip() or "ai0",
+            sample_rate=self.step8_daq_rate.value(),
+            duration=acq.t_meas_s, single_duration=acq.t_meas_s,
+            hold=0.0,                       # run_patterns owns the settle
+            min_val=-acq.range_v, max_val=acq.range_v,
+            f_cut=self.step8_daq_fcut.value(),
+        )
+        x = pattern.x[None, None]
+        w = pattern.w[None, None]
+
+        self._step8_set_running(True)
+        self.step8_status.setText(
+            f"Probe\N{HORIZONTAL ELLIPSIS} one {acq.t_meas_s:g} s read at alpha "
+            f"= {alpha:.4f} after a {acq.t_meas_s:g} s dark "
+            f"(predicted {tot * 1e3:.1f} mV of Y_max {scale.fs * 1e3:.1f} mV)")
+
+        def work() -> dict[str, Any]:
+            daq.configure_monitor(settings)
+            rows: list[dict] = []
+            run_patterns(daq, controller, layout, [tuple(pairs)], x, w,
+                         models, phases, rows=rows, acq=acq, y_sat=None,
+                         log=lambda m: self._log(f"[probe] {m}"))
+            if not rows:
+                raise RuntimeError("the probe read produced no row")
+            r = rows[0]
+            return STEP8.probe_verdict(
+                alpha=alpha, y_max_v=scale.fs,
+                coherent_v=coh, sb_pred_v=tot - coh,
+                mean_v=r["mean_v"], dark_v=r["dark_v"], std_v=r["std_v"],
+                peak_v=r.get("peak_v", float("nan")), range_v=r["range_v"],
+                ceiling_v=ceiling_v)
+
+        self._run_slm_task("Step 8 probe", work,
+                           self._step8_probe_finished, self._step8_probe_error)
+
+    def _step8_probe_finished(self, verdict: dict[str, Any]) -> None:
+        self._step8_set_running(False)
+        lines: list[str] = []
+        STEP8.print_probe(verdict, log=lines.append)
+        self.step8_result_text.setPlainText("\n".join(lines).strip())
+        for line in lines:
+            self._log(f"[probe] {line}")
+        y = verdict["y_sat_implied_v"]
+        self.step8_status.setText(
+            f"{verdict['verdict']}: alpha {verdict['alpha']:.4f} read "
+            f"{verdict['measured_v'] * 1e3:.1f} mV "
+            f"({100 * verdict['shortfall']:+.2f} % vs linear) "
+            f"\N{MIDDLE DOT} peak {verdict['peak_v'] * 1e3:.0f} mV = "
+            f"{100 * verdict['peak_fraction']:.0f} % of "
+            f"{verdict['limit_v']:g} V "
+            + (f"\N{MIDDLE DOT} implied Y_sat {y:.2f} V"
+               if np.isfinite(y) else
+               "\N{MIDDLE DOT} implied Y_sat none"))
+
+    def _step8_probe_error(self, _error: str) -> None:
+        self._step8_set_running(False)
+        self.step8_status.setText("Probe read failed (see Status log)")
+
+    def _step8_staging(self) -> Path:
+        """Where a sweep lands before anybody has said to keep it.
+
+        Outside the repo on purpose.  A run nobody saved is not a calibration,
+        and ``calib_data`` is where calibrations live -- a page that filled it
+        on every press left the keeping and the discarding indistinguishable
+        afterwards.
+
+        It is not a way of holding the reads in memory either, and must not
+        become one: the CSV is written the moment the sweep ends, because five
+        minutes of bench time cannot live only in RAM, and the fit renders a
+        PNG to a path before this page can display it.  A crash between the
+        last read and a Save leaves both here.
+        """
+        out = Path(tempfile.gettempdir()) / "rbonn_step8"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _step8_load(self) -> None:
+        """Fit a CSV that is already on disk and show it -- no hardware.
+
+        The fit goes to staging, not beside the CSV that was named: opening a
+        file is not permission to write next to it.  Save is what chooses.
+        """
         try:
             step7 = self._step8_step7_path()
         except (ValueError, FileNotFoundError) as exc:
             self.step8_status.setText(str(exc))
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select a step-8 CSV", str(STEP8.OUT_DIR), "CSV Files (*.csv)")
+            self, "Load a step-8 CSV", str(STEP8.OUT_DIR), "CSV Files (*.csv)")
         if not path:
             return
+        out = self._step8_staging()
         self._step8_set_running(True)
         self.step8_status.setText(f"Fitting {Path(path).name}\N{HORIZONTAL ELLIPSIS}")
 
         def work() -> dict[str, Any]:
             return {"status": "complete", "csv": Path(path),
+                    "step7": Path(step7),
                     "result": STEP8.fit_and_write(
-                        path, step7, out_dir=Path(path).parent,
+                        path, step7, out_dir=out,
                         log=lambda m: self._log(f"[step 8] {m}"))}
 
-        self._run_task("Step 8 re-fit", work,
+        self._run_task("Step 8 fit", work,
                        self._step8_finished, self._step8_error)
+
+    def _step8_save(self) -> None:
+        """Put the sweep on screen where it is wanted: CSV, result JSON, plot.
+
+        The CSV is copied and the fit is then RE-WRITTEN at the destination
+        rather than copied with it.  The result JSON records the CSV and the
+        PNG it came from by absolute path -- deliberately, since a ``Y_sat``
+        and the reads that define ``g = 1`` are one object -- so a copied JSON
+        would point back into staging, which is temporary by design.  Writing
+        it there makes those pointers right by construction, and the fit is one
+        free parameter over thirty-odd reads: deterministic, and cheaper than
+        the plot it draws.
+
+        The step-7 file is the one this fit was made against, carried in the
+        payload.  Editing the box between a run and its save must not change
+        what the save records.
+        """
+        last = getattr(self, "step8_last", None)
+        if last is None:
+            return
+        src = Path(last["csv"])
+        # A staged run has no home yet, so it is offered calib_data; anything
+        # else is already somewhere, and offers itself back there -- which is
+        # how a loaded CSV gets its fit re-written beside it.
+        home = (Path(STEP8.OUT_DIR) if src.parent == self._step8_staging()
+                else src.parent)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Step-8 Result", str(home / src.name), "CSV (*.csv)")
+        if not path:
+            return
+        dest = Path(path).with_suffix(".csv")
+        self.step8_save_button.setEnabled(False)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.resolve() != src.resolve():
+                shutil.copy2(src, dest)
+            result = STEP8.fit_and_write(
+                dest, last["step7"], out_dir=dest.parent,
+                log=lambda m: self._log(f"[step 8] {m}"))
+        except Exception as exc:                            # noqa: BLE001
+            self.step8_status.setText(f"Save failed: {exc}")
+            self._step8_refresh_buttons()
+            return
+        # Saved is where it lives now, so a second Save offers this name and
+        # copies nothing.
+        self.step8_last = {**last, "csv": dest}
+        self._step8_refresh_buttons()
+        written = [dest.name, Path(result["result_json"]).name,
+                   Path(result["png"]).name]
+        self.step8_status.setText(
+            "Saved " + "  +  ".join(written)
+            + f"  \N{MIDDLE DOT} {dest.parent}")
 
     def _step8_finished(self, payload: dict[str, Any]) -> None:
         self.step8_stop_event = None
-        self._step8_set_running(False)
         csv_path = payload.get("csv")
+        # What Save will write.  Set before the buttons are refreshed, since
+        # this is what decides whether Save is alive.
+        self.step8_last = payload if csv_path is not None else None
+        self._step8_set_running(False)
         if csv_path is None:
             self.step8_status.setText("Stopped before the first read; nothing written.")
             if self.calibration_dialog is not None:
@@ -6568,7 +6924,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Y_sat = {result['y_sat_v']:.4f} \N{PLUS-MINUS SIGN} "
             f"{result['sigma_v']:.4f} V"
             + ("  (LIMIT: the sweep could not bound it)" if result["unbounded"] else "")
-            + f"  \N{MIDDLE DOT} {Path(csv_path).name}")
+            + (f"  \N{MIDDLE DOT} staged as {Path(csv_path).name} "
+               f"\N{EM DASH} press Save\N{HORIZONTAL ELLIPSIS} to keep it"
+               if Path(csv_path).parent == self._step8_staging() else
+               f"  \N{MIDDLE DOT} {Path(csv_path).name}"))
         if self.calibration_dialog is not None:
             self.calibration_dialog.finish(
                 not partial and not result["unbounded"],
@@ -6801,6 +7160,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             except (ValueError, KeyError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {k}: {exc}")
+                continue
+            # See the step-6 note in _tpa_fit_rows: load_phase_csv drops these,
+            # and this is the only place a GUI user would ever hear about it.
+            for b in loaded[k].dropped_bursts:
+                self._log(
+                    f"[step 7] pair {k}: BURST acquisition dropped — "
+                    f"x_t=w_t={b['x_t']:g} read {b['voltage_mean_v']*1e3:+.4f} mV "
+                    f"with a {b['voltage_std_v']*1e3:.4f} mV trace std"
+                )
         # Already fitted by load_phase_csv; this only re-refers them to the root,
         # over stages rebuilt from what the file recorded rather than planned.
         self.tpa_phase_results = loaded
@@ -7067,7 +7435,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings = DAQMonitorSettings(
             channel=self.tpa_daq_channel.text().strip() or "ai0",
             sample_rate=self.tpa_daq_rate.value(),
-            duration=self.tpa_tboth.value(),
+            duration=self.tpa_tmeas.value(),
             hold=self.tpa_settle.value(),
             min_val=lo, max_val=hi,
             f_cut=self.tpa_daq_fcut.value(),
@@ -7295,45 +7663,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "this target centre to re-centre the channels."
         )
 
-    # ===================== Scope (RTO6) page =========================
-    def _connect_scope(self) -> None:
-        host = self.scope_host_edit.text().strip()
-        if not host:
-            self._log("Enter the scope host first")
-            return
-        self.scope_connect_button.setEnabled(False)
-
-        def connect() -> tuple[ScopeController, str]:
-            scope = ScopeController(host=host)
-            scope.connect()
-            return scope, scope.identify()
-
-        self._run_task("Connect scope", connect, self._on_scope_connected, self._on_scope_error)
-
-    def _on_scope_connected(self, payload: tuple[ScopeController, str]) -> None:
-        scope, identity = payload
-        if self.daq_controller is not None:
-            self._disconnect_daq()
-            self._log("DAQ disconnected automatically (scope connected)")
-        self.scope_controller = scope
-        self._set_status(self.scope_status_label, "Scope: open", "ok")
-        self.scope_connect_button.setEnabled(False)
-        self.scope_disconnect_button.setEnabled(True)
-        self._log(f"Scope connected: {identity.strip()}")
-
-    def _on_scope_error(self, _error: str) -> None:
-        self._set_status(self.scope_status_label, "Scope: error", "error")
-        self.scope_connect_button.setEnabled(True)
-
-    def _disconnect_scope(self) -> None:
-        scope = self.scope_controller
-        self.scope_controller = None
-        self._set_status(self.scope_status_label, "Scope: closed", "off")
-        self.scope_connect_button.setEnabled(True)
-        self.scope_disconnect_button.setEnabled(False)
-        if scope is not None:
-            self._run_task("Disconnect scope", scope.disconnect)
-
     # ===================== DAQ (NI-DAQmx) page ========================
     def _connect_daq(self) -> None:
         device = self.daq_device_edit.text().strip()
@@ -7351,9 +7680,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_daq_connected(self, payload: tuple[DAQController, str]) -> None:
         daq, identity = payload
-        if self.scope_controller is not None:
-            self._disconnect_scope()
-            self._log("Scope disconnected automatically (DAQ connected)")
         self.daq_controller = daq
         self._set_status(self.daq_status_label, "DAQ: open", "ok")
         self.daq_connect_button.setEnabled(False)
@@ -7367,6 +7693,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _disconnect_daq(self) -> None:
         daq = self.daq_controller
+        if self.daq_stream_stop_event is not None:
+            self.daq_stream_stop_event.set()   # the loop is holding this card
         self.daq_controller = None
         self._set_status(self.daq_status_label, "DAQ: closed", "off")
         self.daq_connect_button.setEnabled(True)
@@ -7754,8 +8082,416 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"Save failed: {exc}")
 
     # ===================== DAQ live monitor page ========================
+    # ------------------------------------------------------------------- PSU
+    def _connect_psu(self) -> None:
+        port = self.psu_port_edit.text().strip()
+        if not port:
+            self._log("Enter the PSU serial port first")
+            return
+        self.psu_connect_button.setEnabled(False)
+
+        def connect() -> tuple[PSUController, str, PSUState]:
+            # Caps are the PMT module's spec, not the supply's 60 V rating: the
+            # controller refuses any setpoint above them, and refuses to enable
+            # the output if the front panel left one there.
+            psu = PSUController(port=port, max_voltage=PMT_CONTROL_V_MAX,
+                                max_current=PMT_CONTROL_I_MAX)
+            psu.connect()
+            return psu, psu.identify(), psu.read_state()
+
+        self._run_task("Connect PSU", connect, self._on_psu_connected,
+                       self._on_psu_connect_error)
+
+    def _on_psu_connected(self, payload: tuple[PSUController, str, PSUState]) -> None:
+        psu, identity, state = payload
+        self.psu_controller = psu
+        self._set_status(self.psu_status_label, "PSU: open", "ok")
+        self.psu_connect_button.setEnabled(False)
+        self.psu_disconnect_button.setEnabled(True)
+        self._log(f"PSU connected: {identity.strip()}")
+        # Adopt the supply's live setpoints rather than imposing the spinbox
+        # defaults: the PMT may already be running at a gain someone chose.
+        self._psu_show_state(state, adopt=True)
+        self._psu_refresh_buttons()
+        self.psu_page_status.setText(
+            f"Connected. Output is {'ON' if state.output_on else 'off'}; "
+            f"setpoint {state.vset:.3f} V, limit {state.iset:.3f} A."
+        )
+
+    def _on_psu_connect_error(self, _error: str) -> None:
+        self._set_status(self.psu_status_label, "PSU: error", "error")
+        self.psu_connect_button.setEnabled(True)
+
+    def _disconnect_psu(self) -> None:
+        # A running monitor would raise when the port closes under it, so stop
+        # it first and finish the disconnect once the loop unwinds.
+        if self.psu_stop_event is not None:
+            self._psu_disconnect_pending = True
+            self.psu_stop_event.set()
+            self._set_status(self.psu_status_label, "PSU: stopping\N{HORIZONTAL ELLIPSIS}", "off")
+            self.psu_page_status.setText(
+                "Stopping the monitor, then disconnecting\N{HORIZONTAL ELLIPSIS}")
+            return
+        self._psu_do_disconnect()
+
+    def _psu_do_disconnect(self) -> None:
+        psu = self.psu_controller
+        self.psu_controller = None
+        self.psu_state = None
+        self._psu_disconnect_pending = False
+        self._set_status(self.psu_status_label, "PSU: closed", "off")
+        self.psu_connect_button.setEnabled(True)
+        self.psu_disconnect_button.setEnabled(False)
+        self._psu_refresh_buttons()
+        if psu is not None:
+            # Leaves the output exactly as it is: closing a port must not change
+            # the PMT gain in the middle of a measurement.
+            self._run_task("Disconnect PSU", psu.disconnect)
+            self.psu_page_status.setText(
+                "Disconnected. The output was left exactly as it was.")
+
+    def _psu_ready(self) -> PSUController | None:
+        psu = self.psu_controller
+        if psu is None or not psu.is_connected:
+            self.psu_page_status.setText(
+                "Connect the power supply on the Connections page first.")
+            return None
+        return psu
+
+    # ---------------------------------------------------------------- PSU page
+    def _build_psu_page(self) -> QtWidgets.QWidget:
+        """KWR103 as a constant-voltage source for the PMT gain-control input.
+
+        Constant voltage is the only mode this page offers. The control input is
+        high impedance, so the current limit is a fault detector rather than an
+        operating parameter: if the mode pill ever reads CC, something is
+        shorted or mis-wired, not merely drawing more. Gain rises steeply with
+        control voltage, hence mV steps and a spinbox that stops at the module
+        spec (1.1 V) -- with the controller refusing anything above it even if
+        the front panel was left higher.
+        """
+        page = self._page_shell("PMT Gain \N{EM DASH} Control Voltage")
+
+        # --- setpoints ---
+        self.psu_cfg = self._panel("Setpoints (constant voltage)")
+        grid = QtWidgets.QGridLayout(self.psu_cfg)
+        self.psu_vset = QtWidgets.QDoubleSpinBox()
+        self.psu_vset.setRange(0.0, PMT_CONTROL_V_MAX)
+        self.psu_vset.setDecimals(3)
+        self.psu_vset.setSingleStep(0.005)     # gain is steep in this voltage
+        self.psu_vset.setSuffix(" V")
+        self.psu_vset.setValue(0.5)
+        self.psu_iset = QtWidgets.QDoubleSpinBox()
+        self.psu_iset.setRange(0.0, PMT_CONTROL_I_MAX)
+        self.psu_iset.setDecimals(3)
+        self.psu_iset.setSingleStep(0.005)
+        self.psu_iset.setSuffix(" A")
+        self.psu_iset.setValue(PMT_CONTROL_I_MAX)
+        self.psu_apply_button = QtWidgets.QPushButton("Apply setpoints")
+        self.psu_apply_button.setToolTip(
+            "Write both setpoints and read them back; a value the supply does "
+            "not take is reported as an error instead of passing silently")
+        self.psu_apply_button.clicked.connect(self._psu_apply)
+        self.psu_read_button = QtWidgets.QPushButton("Read from supply")
+        self.psu_read_button.setProperty("variant", "ghost")
+        self.psu_read_button.clicked.connect(self._psu_read)
+        grid.addWidget(QtWidgets.QLabel("Control voltage"), 0, 0)
+        grid.addWidget(self.psu_vset, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Current limit"), 0, 2)
+        grid.addWidget(self.psu_iset, 0, 3)
+        grid.addWidget(self.psu_apply_button, 0, 4)
+        grid.addWidget(self.psu_read_button, 0, 5)
+        note = QtWidgets.QLabel(
+            f"PMT gain rises steeply with control voltage; the spinbox stops at "
+            f"the module spec of {PMT_CONTROL_V_MAX:g} V. The current limit is a "
+            f"fault detector \N{EM DASH} the control input should draw microamps."
+        )
+        note.setWordWrap(True)
+        grid.addWidget(note, 1, 0, 1, 6)
+        grid.setColumnStretch(6, 1)
+        page.layout().addWidget(self.psu_cfg)
+
+        # --- output ---
+        out = self._panel("Output")
+        outl = QtWidgets.QHBoxLayout(out)
+        self.psu_on_button = QtWidgets.QPushButton("Output On")
+        self.psu_on_button.clicked.connect(self._psu_output_on)
+        self.psu_off_button = QtWidgets.QPushButton("Output Off")
+        self.psu_off_button.setProperty("variant", "ghost")
+        self.psu_off_button.clicked.connect(self._psu_output_off)
+        self.psu_output_label = QtWidgets.QLabel("Output: unknown")
+        self._set_status(self.psu_output_label, "Output: unknown", "off")
+        self.psu_mode_label = QtWidgets.QLabel("Mode: \N{EN DASH}")
+        self._set_status(self.psu_mode_label, "Mode: \N{EN DASH}", "off")
+        self.psu_prot_label = QtWidgets.QLabel(
+            "OVP \N{EN DASH}  \N{BULLET}  OCP \N{EN DASH}")
+        outl.addWidget(self.psu_on_button)
+        outl.addWidget(self.psu_off_button)
+        outl.addWidget(self.psu_output_label)
+        outl.addWidget(self.psu_mode_label)
+        outl.addWidget(self.psu_prot_label)
+        outl.addStretch(1)
+        page.layout().addWidget(out)
+
+        # --- measured output (numbers only) ---
+        self.psu_readout = QtWidgets.QLabel("\N{EN DASH}")
+        self.psu_readout.setAlignment(QtCore.Qt.AlignCenter)
+        self.psu_readout.setStyleSheet(
+            "font-size: 30px; font-weight: 600; color: #88c0d0; padding: 6px;"
+        )
+        page.layout().addWidget(
+            self._panel_with_widget("Measured output", self.psu_readout))
+
+        ctrl = QtWidgets.QHBoxLayout()
+        self.psu_monitor_button = QtWidgets.QPushButton("Monitor")
+        self.psu_monitor_button.setCheckable(True)
+        self.psu_monitor_button.setToolTip(
+            "Poll the supply read-only until stopped. Setpoints and the output "
+            "stay usable while it runs: the driver locks the port per exchange")
+        self.psu_monitor_button.clicked.connect(self._psu_monitor_toggled)
+        self.psu_monitor_stop_button = QtWidgets.QPushButton("Stop")
+        self.psu_monitor_stop_button.setProperty("variant", "ghost")
+        self.psu_monitor_stop_button.clicked.connect(self._psu_monitor_stop)
+        self.psu_period = QtWidgets.QDoubleSpinBox()
+        self.psu_period.setRange(0.1, 10.0)
+        self.psu_period.setDecimals(1)
+        self.psu_period.setSingleStep(0.1)
+        self.psu_period.setValue(0.5)
+        self.psu_period.setSuffix(" s")
+        ctrl.addWidget(self.psu_monitor_button)
+        ctrl.addWidget(self.psu_monitor_stop_button)
+        ctrl.addWidget(QtWidgets.QLabel("Interval"))
+        ctrl.addWidget(self.psu_period)
+        ctrl.addStretch(1)
+        page.layout().addLayout(ctrl)
+
+        self.psu_page_status = QtWidgets.QLabel(
+            "Idle. Connect the power supply on the Connections page.")
+        self.psu_page_status.setWordWrap(True)
+        page.layout().addWidget(self.psu_page_status)
+        page.layout().addStretch(1)
+        self._psu_refresh_buttons()
+        return page
+
+    def _psu_refresh_buttons(self) -> None:
+        connected = self.psu_controller is not None
+        running = self.psu_stop_event is not None
+        # Apply and the output stay live during a monitor run: the port is
+        # locked per exchange, so a setpoint cannot land inside a poll.
+        free = connected and not self._psu_busy
+        self.psu_apply_button.setEnabled(free)
+        self.psu_read_button.setEnabled(free)
+        self.psu_on_button.setEnabled(free)
+        self.psu_off_button.setEnabled(free)
+        self.psu_monitor_button.setEnabled(free and not running)
+        self.psu_monitor_stop_button.setEnabled(running)
+        self.psu_period.setEnabled(not running)   # the loop takes it at start
+
+    # ------------------------------------------------------------ PSU commands
+    def _psu_apply(self) -> None:
+        psu = self._psu_ready()
+        if psu is None:
+            return
+        volts, amps = self.psu_vset.value(), self.psu_iset.value()
+        self._psu_busy = True
+        self._psu_refresh_buttons()
+        self.psu_page_status.setText(
+            f"Applying {volts:.3f} V / {amps:.3f} A\N{HORIZONTAL ELLIPSIS}")
+
+        def work() -> PSUState:
+            psu.set_current(amps)    # limit first, so the new voltage is always
+            psu.set_voltage(volts)   # governed by the new limit
+            return psu.read_state()
+
+        self._run_task("PSU apply setpoints", work, self._psu_command_done,
+                       self._psu_command_error)
+
+    def _psu_read(self) -> None:
+        psu = self._psu_ready()
+        if psu is None:
+            return
+        self._psu_busy = True
+        self._psu_refresh_buttons()
+        self._run_task("PSU read state", psu.read_state,
+                       self._psu_command_done, self._psu_command_error)
+
+    def _psu_output_on(self) -> None:
+        psu = self._psu_ready()
+        if psu is None:
+            return
+        state = self.psu_state
+        vset = state.vset if state is not None else self.psu_vset.value()
+        iset = state.iset if state is not None else self.psu_iset.value()
+        lines = [
+            f"Apply {vset:.3f} V (limit {iset:.3f} A) to the PMT gain-control "
+            f"input?",
+            "",
+            "PMT gain rises steeply with control voltage.",
+        ]
+        # The dialog quotes the supply, not the spinbox -- what it will actually
+        # put out is the setpoint the hardware holds.
+        if abs(self.psu_vset.value() - vset) > SET_TOL_V:
+            lines.append(
+                f"The spinbox shows {self.psu_vset.value():.3f} V, which is not "
+                f"applied \N{EM DASH} press Apply first if that is what you want."
+            )
+        if state is not None and state.ovp <= vset:
+            lines.append(
+                f"OVP is {state.ovp:.3f} V, at or below the setpoint: the supply "
+                f"may trip the moment the output goes live."
+            )
+        answer = QtWidgets.QMessageBox.question(
+            self, "Enable PSU output", "\n".join(lines),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            self.psu_page_status.setText("Output left off.")
+            return
+        self._psu_busy = True
+        self._psu_refresh_buttons()
+
+        def work() -> PSUState:
+            psu.enable()             # re-checks the live setpoints against the caps
+            return psu.read_state()
+
+        self._run_task("PSU output on", work, self._psu_command_done,
+                       self._psu_command_error)
+
+    def _psu_output_off(self) -> None:
+        psu = self._psu_ready()
+        if psu is None:
+            return
+        self._psu_busy = True
+        self._psu_refresh_buttons()
+
+        def work() -> PSUState:
+            psu.disable()            # no confirmation: off is the safe direction
+            return psu.read_state()
+
+        self._run_task("PSU output off", work, self._psu_command_done,
+                       self._psu_command_error)
+
+    def _psu_command_done(self, state: PSUState | None) -> None:
+        self._psu_busy = False
+        if state is not None:
+            self._psu_show_state(state, adopt=True)
+            self.psu_page_status.setText(self._psu_state_summary(state))
+        self._psu_refresh_buttons()
+
+    def _psu_command_error(self, _error: str) -> None:
+        self._psu_busy = False
+        self._psu_refresh_buttons()
+        self.psu_page_status.setText("PSU command failed (see the Status log).")
+
+    # -------------------------------------------------------------- PSU monitor
+    def _psu_monitor_toggled(self) -> None:
+        if not self.psu_monitor_button.isChecked():
+            self._psu_monitor_stop()          # toggled off -> treat as stop
+            return
+        psu = self._psu_ready()
+        if psu is None:
+            self.psu_monitor_button.setChecked(False)
+            return
+        period = self.psu_period.value()
+        stop_event = threading.Event()
+        self.psu_stop_event = stop_event
+        self._psu_refresh_buttons()
+        self.psu_page_status.setText(
+            f"Monitoring every {period:g} s (read-only)\N{HORIZONTAL ELLIPSIS}")
+
+        def work() -> dict[str, Any]:
+            psu.monitor(sample_cb=self.psu_sample.emit, stop_event=stop_event,
+                        period=period, full=True)
+            return {"mode": "monitor"}
+
+        self._run_task("PSU monitor", work, self._psu_monitor_done,
+                       self._psu_monitor_error)
+
+    def _psu_monitor_stop(self) -> None:
+        if self.psu_stop_event is not None:
+            self.psu_stop_event.set()
+            self.psu_page_status.setText(
+                "Stopping the monitor\N{HORIZONTAL ELLIPSIS}")
+
+    def _psu_monitor_done(self, _payload: Any = None) -> None:
+        self.psu_stop_event = None
+        self.psu_monitor_button.setChecked(False)
+        self._psu_refresh_buttons()
+        if self._psu_disconnect_pending:
+            self._psu_do_disconnect()
+            return
+        self.psu_page_status.setText("Monitor stopped.")
+
+    def _psu_monitor_error(self, _error: str) -> None:
+        self.psu_stop_event = None
+        self.psu_monitor_button.setChecked(False)
+        self._psu_refresh_buttons()
+        if self._psu_disconnect_pending:
+            self._psu_do_disconnect()
+            return
+        self.psu_page_status.setText("PSU monitor failed (see the Status log).")
+
+    def _on_psu_sample(self, sample: Any) -> None:
+        """One live snapshot from the monitor worker (GUI thread, queued)."""
+        if isinstance(sample, PSUState):
+            self._psu_show_state(sample)      # never adopt: the user may be typing
+        else:
+            self._psu_paint_reading(sample)
+
+    # --------------------------------------------------------------- PSU paint
+    def _psu_show_state(self, state: PSUState, *, adopt: bool = False) -> None:
+        """Paint a full snapshot. ``adopt`` also pulls the setpoints into the
+        spinboxes -- for connect / apply / an explicit read, never for a poll,
+        which must not move a box the user is editing."""
+        self.psu_state = state
+        if adopt:
+            for spin, value in ((self.psu_vset, state.vset),
+                                (self.psu_iset, state.iset)):
+                spin.blockSignals(True)
+                spin.setValue(min(value, spin.maximum()))
+                spin.blockSignals(False)
+        self._psu_paint_reading(state)
+        prot = f"OVP {state.ovp:.3f} V  \N{BULLET}  OCP {state.ocp:.3f} A"
+        if state.ovp <= state.vset:
+            # Would trip the instant the output went live; say so rather than
+            # leaving it as a mystery at the front panel.
+            prot += f"  \N{BULLET}  OVP \N{LESS-THAN OR EQUAL TO} setpoint, would trip"
+        self.psu_prot_label.setText(prot)
+
+    def _psu_paint_reading(self, sample: Any) -> None:
+        """Readout + pills from either a PSUReading or a full PSUState."""
+        self.psu_readout.setText(
+            f"{sample.volts:.3f} V      {sample.amps * 1e3:.1f} mA"
+            f"      {sample.watts * 1e3:.1f} mW"
+        )
+        self._set_status(self.psu_output_label,
+                         "Output: ON" if sample.output_on else "Output: off",
+                         "ok" if sample.output_on else "off")
+        limited = getattr(sample, "current_limited", None)
+        if not sample.output_on:
+            self._set_status(self.psu_mode_label,
+                             "Mode: \N{EN DASH} (output off)", "off")
+        elif limited is None:
+            pass                     # a fast reading carries no CV/CC verdict
+        elif limited:
+            self._set_status(self.psu_mode_label, "Mode: CC \N{EM DASH} check wiring",
+                             "error")
+        else:
+            self._set_status(self.psu_mode_label, "Mode: CV", "ok")
+
+    @staticmethod
+    def _psu_state_summary(state: PSUState) -> str:
+        mode = "output off" if not state.output_on else (
+            "CC \N{EM DASH} the limit is binding" if state.current_limited else "CV")
+        return (
+            f"Setpoint {state.vset:.3f} V, limit {state.iset:.3f} A \N{BULLET} "
+            f"measured {state.volts:.3f} V / {state.amps * 1e3:.1f} mA \N{BULLET} "
+            f"{mode}."
+        )
+
     def _build_daq_monitor_page(self) -> QtWidgets.QWidget:
-        """Dedicated page: one-shot DAQ waveform diagnostic (time + spectrum).
+        """Dedicated page: DAQ waveform diagnostic (time + spectrum) + live readout.
 
         Mirrors ``src/drafts/daq_read_waveform.py``: one untriggered finite
         acquisition, sign-inverted (the TIA outputs negative volts for
@@ -7763,13 +8499,21 @@ class MainWindow(QtWidgets.QMainWindow):
         settle-cycles/f_cut turn-on transient discarded before any
         statistics. Replaces the deprecated live strip-chart monitor -- the
         bring-up view is the raw trace and its amplitude spectrum, not a
-        scrolling voltmeter. Connect the DAQ on the Connections page first.
+        scrolling voltmeter.
+
+        Two modes over the same reduction (``waveform_stats``): *Read waveform*
+        takes one ``Duration`` acquisition and plots it, while *Continuous*
+        loops back-to-back ``History`` acquisitions and reports only the
+        reading, leaving the plot on the last one-shot trace. Connect the DAQ
+        on the Connections page first.
         """
         page = self._page_shell("DAQ Monitor")
         subtitle = QtWidgets.QLabel(
-            "One-shot waveform diagnostic of the NI-DAQ analog input (the "
+            "Waveform diagnostic of the NI-DAQ analog input (the "
             "daq_read_waveform draft view): one finite acquisition, "
             "sign-inverted and low-passed, warmup dropped before the stats. "
+            "Continuous repeats independent History-long acquisitions and "
+            "reports mean ± std for each. "
             "Connect the DAQ on the Connections page first."
         )
         subtitle.setObjectName("PageSubtitle")
@@ -7798,6 +8542,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daqmon_duration.setValue(10.0)
         self.daqmon_duration.setSuffix(" s")
         self.daqmon_duration.setToolTip("One finite acquisition of this length")
+        self.daqmon_history = QtWidgets.QDoubleSpinBox()
+        self.daqmon_history.setRange(0.05, 60.0)
+        self.daqmon_history.setDecimals(3)
+        self.daqmon_history.setSingleStep(0.5)
+        self.daqmon_history.setValue(1.0)
+        self.daqmon_history.setSuffix(" s")
+        self.daqmon_history.setToolTip(
+            "Continuous mode: averaging window per reported reading. Each "
+            "reading is an independent acquisition of this length (the warmup "
+            "guard is acquired on top, so the full window is averaged). Read "
+            "live every loop, so it can be retuned while running."
+        )
         self.daqmon_fcut_hw = QtWidgets.QDoubleSpinBox()
         self.daqmon_fcut_hw.setRange(0.1, 100_000.0)
         self.daqmon_fcut_hw.setDecimals(1)
@@ -7827,14 +8583,36 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         pairs = [("Channel", self.daqmon_channel), ("Sample rate", self.daqmon_sample_rate),
                  ("Range", self.daqmon_range), ("Duration", self.daqmon_duration),
-                 ("HW bandwidth", self.daqmon_fcut_hw), ("Digital low-pass", self.daqmon_fcut_dig)]
+                 ("HW bandwidth", self.daqmon_fcut_hw), ("Digital low-pass", self.daqmon_fcut_dig),
+                 ("History (continuous)", self.daqmon_history)]
         for i, (label, widget) in enumerate(pairs):
             r, c = i // 3, (i % 3) * 2
             grid.addWidget(QtWidgets.QLabel(label), r, c)
             grid.addWidget(widget, r, c + 1)
-        grid.addWidget(self.daqmon_invert, 2, 0, 1, 4)
+        grid.addWidget(self.daqmon_invert, 3, 0, 1, 4)   # row 2 now holds History
         grid.setColumnStretch(6, 1)   # absorb leftover width instead of stretching fields
         page.layout().addWidget(self.daqmon_cfg)
+
+        # Continuous mode takes its parameters from this snapshot, never from
+        # the widgets themselves: its loop runs on a worker thread, which must
+        # not touch Qt objects. Every control rebinds the snapshot on the GUI
+        # thread and the worker reads it once per acquisition, so a rebind is
+        # atomic and the loop always sees one consistent set of values. That is
+        # what lets the controls stay live while streaming -- retuning History
+        # or the range takes effect on the next reading.
+        self._daqmon_stream_cfg: dict[str, Any] = {}
+        for widget, signal in (
+            (self.daqmon_channel, "textChanged"),
+            (self.daqmon_sample_rate, "valueChanged"),
+            (self.daqmon_range, "currentIndexChanged"),
+            (self.daqmon_duration, "valueChanged"),
+            (self.daqmon_history, "valueChanged"),
+            (self.daqmon_fcut_hw, "valueChanged"),
+            (self.daqmon_fcut_dig, "valueChanged"),
+            (self.daqmon_invert, "toggled"),
+        ):
+            getattr(widget, signal).connect(self._daqmon_sync_cfg)
+        self._daqmon_sync_cfg()
 
         # --- big numeric readout of the last read ---
         self.daqmon_readout = QtWidgets.QLabel("\N{EN DASH}")
@@ -7850,7 +8628,20 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl = QtWidgets.QHBoxLayout()
         self.daqmon_read_button = QtWidgets.QPushButton("Read waveform")
         self.daqmon_read_button.clicked.connect(self._daq_waveform_read)
+        self.daqmon_cont_button = QtWidgets.QPushButton("Continuous")
+        self.daqmon_cont_button.setCheckable(True)
+        self.daqmon_cont_button.setToolTip(
+            "Report mean ± std every History seconds until "
+            "stopped (readout only; the plot keeps the last one-shot trace)"
+        )
+        self.daqmon_cont_button.clicked.connect(self._daq_stream_toggled)
+        self.daqmon_stop_button = QtWidgets.QPushButton("Stop")
+        self.daqmon_stop_button.setProperty("variant", "ghost")
+        self.daqmon_stop_button.setEnabled(False)
+        self.daqmon_stop_button.clicked.connect(self._daq_stream_stop)
         ctrl.addWidget(self.daqmon_read_button)
+        ctrl.addWidget(self.daqmon_cont_button)
+        ctrl.addWidget(self.daqmon_stop_button)
         ctrl.addStretch(1)
         page.layout().addLayout(ctrl)
 
@@ -7863,7 +8654,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.daqmon_fig = Figure(figsize=(10, 6.0), tight_layout=True)
         self.daqmon_canvas = FigureCanvas(self.daqmon_fig)
         self.daqmon_canvas.setMinimumHeight(360)
-        plot_panel = self._panel("Waveform + amplitude spectrum")
+        plot_panel = self._panel(
+            "Last one-shot acquisition — waveform + amplitude spectrum")
         plot_layout = QtWidgets.QVBoxLayout(plot_panel)
         plot_layout.addWidget(self.daqmon_canvas, 1)
         page.layout().addWidget(plot_panel, 1)
@@ -7871,12 +8663,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._daq_waveform_draw(None)
         return page
 
-    # Leading settle guard dropped after filtering: the acquisition settles
-    # and the zero-phase low-pass anchors to the first sample, so the first
-    # cycles/f_cut seconds are a turn-on transient, not steady state. The
-    # narrowest cutoff in the chain (min(hw, digital)) is the slowest filter,
-    # so it sets the guard.
-    _DAQMON_SETTLE_CYCLES = 3.0
+    # The warmup guard (SETTLE_CYCLES / min(f_hw, f_dig)) and the
+    # invert -> low-pass -> drop-warmup -> mean/std reduction both live in
+    # daq_module.controller, shared by the one-shot read, the continuous loop
+    # and the unit tests.
 
     @staticmethod
     def _daqmon_spectrum(v: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
@@ -7890,81 +8680,206 @@ class MainWindow(QtWidgets.QMainWindow):
         freqs = np.fft.rfftfreq(n, d=1.0 / fs)
         return freqs[1:], spec[1:]  # drop DC bin
 
+    def _daqmon_cfg_snapshot(self) -> dict[str, Any]:
+        """Plain-value copy of the acquisition controls (GUI thread only)."""
+        min_val, max_val = self.daqmon_range.currentData()
+        return {
+            "channel": self.daqmon_channel.text().strip() or "ai0",
+            "fs": float(self.daqmon_sample_rate.value()),
+            "min_val": min_val,
+            "max_val": max_val,
+            "duration": float(self.daqmon_duration.value()),
+            "history": float(self.daqmon_history.value()),
+            "f_hw": float(self.daqmon_fcut_hw.value()),
+            "f_dig": float(self.daqmon_fcut_dig.value()),
+            "invert": self.daqmon_invert.isChecked(),
+            "order": DAQMonitorSettings().filter_order,
+        }
+
+    def _daqmon_sync_cfg(self, *_args: Any) -> None:
+        """Republish the snapshot the continuous loop reads (see the builder)."""
+        self._daqmon_stream_cfg = self._daqmon_cfg_snapshot()
+
+    def _daqmon_streaming(self) -> bool:
+        return self.daq_stream_stop_event is not None
+
+    def _daqmon_set_running(self, *, continuous: bool = False) -> None:
+        """Gate the buttons on the card's one owner (read, loop or calibration)."""
+        busy = self._calibration_busy()
+        streaming = self._daqmon_streaming()
+        idle = not busy and not self._daqmon_reading and not streaming
+        self.daqmon_read_button.setEnabled(idle)
+        self.daqmon_cont_button.setChecked(streaming and continuous)
+        self.daqmon_cont_button.setEnabled(idle or (streaming and continuous))
+        self.daqmon_stop_button.setEnabled(streaming)
+        # A one-shot read freezes its parameters; the continuous loop re-reads
+        # them per acquisition, so they stay editable while it runs.
+        self.daqmon_cfg.setEnabled(not self._daqmon_reading)
+
     def _daq_waveform_read(self) -> None:
         if self._calibration_busy():
             self.daqmon_status.setText("A calibration is running; DAQ reads are locked.")
+            return
+        if self._daqmon_streaming():
+            self.daqmon_status.setText("Continuous mode is running; press Stop first.")
             return
         daq = self._daq_ready()
         if daq is None:
             self.daqmon_status.setText("Connect the DAQ on the Connections page first.")
             return
-        min_val, max_val = self.daqmon_range.currentData()
-        channel = self.daqmon_channel.text().strip() or "ai0"
-        fs = float(self.daqmon_sample_rate.value())
-        duration = float(self.daqmon_duration.value())
-        f_hw = float(self.daqmon_fcut_hw.value())
-        f_dig = float(self.daqmon_fcut_dig.value())
-        invert = self.daqmon_invert.isChecked()
-        order = DAQMonitorSettings().filter_order
-        settle_cycles = self._DAQMON_SETTLE_CYCLES
+        cfg = self._daqmon_cfg_snapshot()
+        duration = cfg["duration"]
         self._daqmon_reading = True
-        self.daqmon_read_button.setEnabled(False)
-        self.daqmon_cfg.setEnabled(False)
+        self._daqmon_set_running()
         self.daqmon_status.setText(
-            f"Reading {duration:g} s @ {fs:g} S/s\N{HORIZONTAL ELLIPSIS}")
+            f"Reading {duration:g} s @ {cfg['fs']:g} S/s\N{HORIZONTAL ELLIPSIS}")
 
         def work() -> dict[str, Any]:
-            voltages = np.asarray(daq.driver.read_waveform(
-                channel=channel, sample_rate=fs, duration=duration,
-                min_val=min_val, max_val=max_val, timeout=duration + 10.0,
-            ), dtype=float)
-            if invert:
-                voltages = -voltages          # TIA: -volts -> +light
-            filtered = lowpass(voltages, fs, f_dig, order)
-            f_eff = min(f_hw, f_dig)          # narrowest cutoff governs settling
-            n_settle = int(round(settle_cycles / f_eff * fs)) if f_eff > 0 else 0
-            if n_settle >= voltages.size:
-                n_settle = 0                  # window too short to guard: keep everything
-            return {
-                "times": np.arange(voltages.size) / fs, "raw": voltages,
-                "filtered": filtered, "n_settle": n_settle, "fs": fs,
-                "f_hw": f_hw, "f_dig": f_dig, "duration": duration,
-                "channel": channel,
-            }
+            return self._daqmon_acquire(daq, cfg, duration)
 
         self._run_task("DAQ waveform", work,
                        self._daq_waveform_done, self._daq_waveform_error)
 
+    @staticmethod
+    def _daqmon_acquire(daq: DAQController, cfg: dict[str, Any],
+                        duration: float) -> dict[str, Any]:
+        """One acquisition reduced to a reading (worker thread; no Qt access).
+
+        ``duration`` is the span that must survive the warmup guard, so the
+        request is lengthened by the guard: a 1 s History really averages 1 s.
+        """
+        fs = cfg["fs"]
+        n_guard = settle_samples(fs, cfg["f_hw"], cfg["f_dig"])
+        request = duration + n_guard / fs if fs > 0 else duration
+        voltages = daq.driver.read_waveform(
+            channel=cfg["channel"], sample_rate=fs, duration=request,
+            min_val=cfg["min_val"], max_val=cfg["max_val"],
+            timeout=request + 10.0,
+        )
+        stats = waveform_stats(
+            voltages, sample_rate=fs, f_hw=cfg["f_hw"], f_dig=cfg["f_dig"],
+            invert=cfg["invert"], order=cfg["order"],
+        )
+        n = stats.raw.size
+        return {
+            "times": np.arange(n) / fs if fs > 0 else np.zeros(n),
+            "raw": stats.raw, "filtered": stats.filtered, "n_samples": n,
+            "n_settle": stats.n_settle, "fs": fs,
+            "mean": stats.mean, "std": stats.std,
+            "raw_mean": stats.raw_mean, "raw_std": stats.raw_std,
+            "rel": stats.rel_percent,
+            "f_hw": cfg["f_hw"], "f_dig": cfg["f_dig"],
+            "duration": request, "kept": duration,
+            "channel": cfg["channel"],
+        }
+
+    def _daqmon_show_reading(self, payload: dict[str, Any]) -> None:
+        """Paint the big mean +/- std readout (shared by both modes)."""
+        self.daqmon_readout.setText(
+            f"{payload['mean']*1000:+.4f} \N{PLUS-MINUS SIGN} "
+            f"{payload['std']*1000:.4f} mV   ({payload['rel']:.2f}%)"
+        )
+
+    @staticmethod
+    def _daqmon_reading_summary(payload: dict[str, Any]) -> str:
+        """The raw-vs-filtered one-liner both modes put in the status label."""
+        n0 = int(payload["n_settle"])
+        fs = payload["fs"]
+        f_eff = min(payload["f_hw"], payload["f_dig"])
+        return (
+            f"{payload['n_samples']} samples ({payload['duration']:g} s "
+            f"@ {fs:g} S/s); dropped {n0} warmup samples "
+            f"({n0 / fs * 1000.0:.0f} ms); "
+            f"raw {payload['raw_mean']*1000:+.4f} \N{PLUS-MINUS SIGN} "
+            f"{payload['raw_std']*1000:.4f} mV, "
+            f"filtered ({f_eff:g} Hz) {payload['mean']*1000:+.4f} "
+            f"\N{PLUS-MINUS SIGN} {payload['std']*1000:.4f} mV"
+        )
+
     def _daq_waveform_done(self, payload: dict[str, Any]) -> None:
         self._daqmon_reading = False
         self._refresh_manual_reads()
-        self.daqmon_cfg.setEnabled(True)
-        n0 = int(payload["n_settle"])
-        fs = payload["fs"]
-        raw_kept = payload["raw"][n0:]
-        filt_kept = payload["filtered"][n0:]
-        mean, std = float(filt_kept.mean()), float(filt_kept.std())
-        rel = (std / abs(mean) * 100.0) if mean else float("nan")
-        self.daqmon_readout.setText(
-            f"{mean*1000:+.4f} \N{PLUS-MINUS SIGN} {std*1000:.4f} mV   ({rel:.2f}%)"
-        )
-        raw_mean, raw_std = float(raw_kept.mean()), float(raw_kept.std())
-        f_eff = min(payload["f_hw"], payload["f_dig"])
-        self.daqmon_status.setText(
-            f"Read {payload['raw'].size} samples ({payload['duration']:g} s "
-            f"@ {fs:g} S/s); dropped {n0} warmup samples "
-            f"({n0 / fs * 1000.0:.0f} ms); "
-            f"raw {raw_mean*1000:+.4f} \N{PLUS-MINUS SIGN} {raw_std*1000:.4f} mV, "
-            f"filtered ({f_eff:g} Hz) {mean*1000:+.4f} \N{PLUS-MINUS SIGN} "
-            f"{std*1000:.4f} mV."
-        )
+        self._daqmon_show_reading(payload)
+        self.daqmon_status.setText(f"Read {self._daqmon_reading_summary(payload)}.")
         self._daq_waveform_draw(payload)
 
     def _daq_waveform_error(self, _error: str) -> None:
         self._daqmon_reading = False
         self._refresh_manual_reads()
-        self.daqmon_cfg.setEnabled(True)
         self.daqmon_status.setText("DAQ read failed (see Status log).")
+
+    # --- continuous mode: back-to-back independent readings ----------------
+
+    def _daq_stream_toggled(self) -> None:
+        if not self.daqmon_cont_button.isChecked():
+            # toggled off by the user's click -> treat as stop
+            self._daq_stream_stop()
+            return
+        if self._calibration_busy():
+            self.daqmon_cont_button.setChecked(False)
+            self.daqmon_status.setText("A calibration is running; DAQ reads are locked.")
+            return
+        if self._daqmon_reading:
+            self.daqmon_cont_button.setChecked(False)
+            self.daqmon_status.setText("A one-shot read is in flight; try again.")
+            return
+        daq = self._daq_ready()
+        if daq is None:
+            self.daqmon_cont_button.setChecked(False)
+            self.daqmon_status.setText("Connect the DAQ on the Connections page first.")
+            return
+        self._daqmon_sync_cfg()
+        stop_event = threading.Event()
+        self.daq_stream_stop_event = stop_event
+        self._daqmon_set_running(continuous=True)
+        self.daqmon_status.setText(
+            "Continuous\N{HORIZONTAL ELLIPSIS} press Stop to end.")
+
+        def work() -> dict[str, Any]:
+            n = 0
+            while not stop_event.is_set():
+                # Re-read the snapshot every pass: the controls stay live, so a
+                # retuned History (or range, or cutoff) applies from here on.
+                cfg = self._daqmon_stream_cfg
+                payload = self._daqmon_acquire(daq, cfg, cfg["history"])
+                if stop_event.is_set():
+                    break            # drop a reading the user already stopped
+                n += 1
+                payload["count"] = n
+                for trace in ("times", "raw", "filtered"):
+                    payload.pop(trace)     # readout only; see _daqmon_acquire
+                self.daq_reading.emit(payload)
+            return {"readings": n}
+
+        self._run_task("DAQ continuous", work,
+                       self._daq_stream_done, self._daq_stream_error)
+
+    def _on_daq_reading(self, payload: dict[str, Any]) -> None:
+        """One continuous reading arriving from the worker (GUI thread)."""
+        self._daqmon_show_reading(payload)
+        self.daqmon_status.setText(
+            f"Continuous \N{BULLET} reading {int(payload.get('count', 0))} over "
+            f"{payload['kept']:g} s \N{BULLET} "
+            f"{self._daqmon_reading_summary(payload)}."
+        )
+
+    def _daq_stream_stop(self) -> None:
+        if self.daq_stream_stop_event is not None:
+            self.daq_stream_stop_event.set()
+            self.daqmon_status.setText(
+                "Stopping\N{HORIZONTAL ELLIPSIS} "
+                "(after the acquisition in flight)")
+
+    def _daq_stream_done(self, payload: dict[str, Any]) -> None:
+        self.daq_stream_stop_event = None
+        self._daqmon_set_running()
+        n = int((payload or {}).get("readings", 0))
+        self.daqmon_status.setText(f"Continuous stopped after {n} readings.")
+
+    def _daq_stream_error(self, _error: str) -> None:
+        self.daq_stream_stop_event = None
+        self._daqmon_set_running()
+        self.daqmon_status.setText("DAQ continuous read failed (see Status log).")
 
     def _daq_waveform_draw(self, payload: dict[str, Any] | None) -> None:
         """Time-domain trace (top) + amplitude spectrum (bottom), draft-style."""
@@ -8532,10 +9447,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_manual_reads()
 
     def _refresh_manual_reads(self) -> None:
-        """Lock the OSA Viewer sweeps and the DAQ Monitor read during a calibration.
+        """Lock the OSA Viewer sweeps and the DAQ Monitor reads during a calibration.
 
         A manual read would share the instrument with the calibration's own
-        acquisitions, so a continuous OSA sweep already running is stopped too.
+        acquisitions, so a continuous OSA sweep or DAQ reading loop already
+        running is stopped too.
         """
         busy = self._calibration_busy()
         if busy and self.osa_view_stop_event is not None:
@@ -8546,8 +9462,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.osa_view_stop_event is not None,
                 continuous=self.osv_cont_button.isChecked(),
             )
+        if busy and self.daq_stream_stop_event is not None:
+            self.daq_stream_stop_event.set()
+            self._log("DAQ continuous reading stopped: a calibration started")
         if hasattr(self, "daqmon_read_button"):
-            self.daqmon_read_button.setEnabled(not busy and not self._daqmon_reading)
+            self._daqmon_set_running(
+                continuous=self.daqmon_cont_button.isChecked())
 
     def _set_calibration_running(self, running: bool) -> None:
         self._calibration_is_running = running
@@ -9975,6 +10895,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scan_pause_event.clear()
         if self.calibration_stop_event is not None:
             self.calibration_stop_event.set()
+        if self.daq_stream_stop_event is not None:
+            self.daq_stream_stop_event.set()
+        if self.psu_stop_event is not None:
+            self.psu_stop_event.set()
         self.thread_pool.waitForDone(3000)
         if self.controller is not None and getattr(self.controller, "is_open", False):
             try:
@@ -9987,16 +10911,8 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.osa_controller = None
-        if self.scope_stop_event is not None:
-            self.scope_stop_event.set()
         if self.heater_stop_event is not None:
             self.heater_stop_event.set()
-        if self.scope_controller is not None:
-            try:
-                self.scope_controller.disconnect()
-            except Exception:
-                pass
-            self.scope_controller = None
         if self.daq_controller is not None:
             try:
                 self.daq_controller.disconnect()
@@ -10009,6 +10925,14 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self.heater_controller = None
+        if self.psu_controller is not None:
+            # Closes the port only: the PMT keeps whatever gain voltage it has,
+            # so quitting the GUI never changes a running measurement.
+            try:
+                self.psu_controller.disconnect()
+            except Exception:
+                pass
+            self.psu_controller = None
         super().closeEvent(event)
 
     def _apply_style(self) -> None:

@@ -83,6 +83,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .outliers import flag_burst_traces
 from .sigma import floor_std
 
 # ======================================================================
@@ -507,6 +508,10 @@ class PhaseResult:
     # touches them -- they are here so the CSV round trip keeps them.
     pmt_ohm: np.ndarray | None = field(default=None, repr=False)
     pmt_c: np.ndarray | None = field(default=None, repr=False)
+    # Burst acquisitions dropped on load, one dict per dropped row (see
+    # :func:`load_phase_csv`).  Empty on a clean sweep.  Kept so the step can
+    # warn and record them: a silently cleaned sweep hides a bench fault.
+    dropped_bursts: list[dict] = field(default_factory=list, repr=False)
 
     @property
     def dark(self) -> float:
@@ -523,6 +528,65 @@ class PhaseResult:
             if np.any(mask):
                 out.append(float(dark_v[mask][0]))
         return np.asarray(out, dtype=float)
+
+
+def burst_mask(trace_stds, groups=None) -> np.ndarray:
+    """Which acquisitions are bursts, grouped by target.
+
+    Per TARGET, not over a whole file: a collected CSV holds every target against
+    the shared reference, and a dim pair's honest points look like nothing beside
+    a bright pair's.  ``groups`` is the per-row target (None = all one sweep).
+
+    A group that is ALL bursts is left alone: there is no honest scale left to
+    judge it against, and emptying it would hide the problem instead of showing
+    the caller a sweep worth throwing out.
+    """
+    s = np.asarray(trace_stds, dtype=float)
+    mask = np.zeros(s.size, dtype=bool)
+    if groups is None:
+        groups = [0] * s.size
+    groups = list(groups)
+    for g in set(groups):
+        idx = [i for i, t in enumerate(groups) if t == g]
+        sub = flag_burst_traces(s[idx])
+        if sub.all():
+            continue
+        for i, bad in zip(idx, sub):
+            mask[i] = bad
+    return mask
+
+
+def drop_bursts(result: PhaseResult) -> list[dict]:
+    """Strip burst acquisitions from a PhaseResult in place; return what went.
+
+    For the path that never touches a CSV: a live GUI sweep fits the
+    :class:`PhaseResult` that :func:`~calibration_module.measure.phase_v2.measure_target`
+    built, so without this it would keep its bursts while the same sweep refit
+    from its own CSV would not.  :func:`load_phase_csv` shares
+    :func:`burst_mask` with it rather than calling this, because there the rows
+    are still tuples and several targets may be in flight at once.
+
+    Appends to :attr:`PhaseResult.dropped_bursts` rather than replacing it, so
+    calling it twice on one result cannot lose the first round's record.  Bursts
+    are gone after the first call, so the second is a no-op.
+    """
+    keep = ~burst_mask(result.voltage_std_v)
+    if keep.all():
+        return []
+    gone = [
+        {"trial": int(result.trial[i]), "x_t": float(result.x_t[i]),
+         "w_t": float(result.w_t[i]),
+         "voltage_mean_v": float(result.voltage_mean_v[i]),
+         "voltage_std_v": float(result.voltage_std_v[i])}
+        for i in np.flatnonzero(~keep)
+    ]
+    for name in ("trial", "x_t", "w_t", "x_r", "w_r", "voltage_mean_v",
+                 "voltage_std_v", "dark_v", "pmt_ohm", "pmt_c"):
+        arr = getattr(result, name)
+        if arr is not None:                    # pmt_* are None when unlogged
+            setattr(result, name, np.asarray(arr)[keep])
+    result.dropped_bursts = list(result.dropped_bursts) + gone
+    return gone
 
 
 def _average_points(result: PhaseResult, dark_override: float | None = None):
@@ -1193,6 +1257,7 @@ def load_phase_csv(
     single_beam_bg: bool = False,
     comb_only: bool = False,
     only_tgt: int | None = None,
+    drop_bursts: bool = True,
 ) -> PhaseResult:
     """Load a raw phase-sweep CSV and re-fit dPhi_comb with the given step-6 models.
 
@@ -1212,6 +1277,11 @@ def load_phase_csv(
     response as a fixed background.  ``comb_only=True`` overrides ``frac`` and
     runs the step-7-v2 fit (:func:`fit_phase_fixed`): amplitudes and background
     all pinned to step 6, ``dPhi_comb`` the only free parameter.
+
+    ``drop_bursts`` (default on) discards burst acquisitions before fitting and
+    lists them in :attr:`PhaseResult.dropped_bursts`; pass False for the
+    unfiltered historical behaviour.  A sweep that is ALL bursts is left alone
+    -- there is nothing to calibrate against, and the caller should see it.
     """
     file_dark: float | None = None
     with open(Path(path), newline="", encoding="utf-8") as f:
@@ -1222,6 +1292,7 @@ def load_phase_csv(
                     file_dark = float(parts[1])
 
     rows: list[tuple] = []
+    row_tgts: list[int] = []
     tgt_index, ref_index = tgt_model.index, ref_model.index
     with open(Path(path), newline="", encoding="utf-8") as f:
         for row in csv.DictReader(line for line in f if not line.startswith("#")):
@@ -1230,6 +1301,7 @@ def load_phase_csv(
                 continue  # skip the other targets in a multi-pair CSV
             dv = row.get("dark_v")
             std_v = float(row["voltage_std_v"])  # the fit weight; every CSV records it
+            row_tgts.append(row_tgt)
             rows.append((
                 int(float(row.get("trial", 0))),
                 float(row["x_t"]), float(row["w_t"]),
@@ -1241,6 +1313,18 @@ def load_phase_csv(
             ))
             tgt_index = row_tgt
             ref_index = int(float(row.get("ref_index", ref_index)))
+
+    dropped_bursts: list[dict] = []
+    if drop_bursts and rows:
+        mask = burst_mask([r[6] for r in rows], row_tgts)
+        for r, bad in zip(rows, mask):
+            if bad:
+                dropped_bursts.append({
+                    "trial": r[0], "x_t": r[1], "w_t": r[2],
+                    "voltage_mean_v": r[5], "voltage_std_v": r[6],
+                })
+        if mask.any():
+            rows = [r for r, bad in zip(rows, mask) if not bad]
 
     trials = np.array([r[0] for r in rows], dtype=int)
     scalar_dark = (
@@ -1272,6 +1356,7 @@ def load_phase_csv(
                  if any(r[8] for r in rows) else None),
         pmt_c=(np.array([r[9] for r in rows], dtype=object)
                if any(r[9] for r in rows) else None),
+        dropped_bursts=dropped_bursts,
     )
     fit_result(result, tgt_model, ref_model, frac=frac,
                single_beam_bg=single_beam_bg, comb_only=comb_only)
@@ -1579,6 +1664,8 @@ __all__ = [
     "PairModel",
     "PhaseFit",
     "PhaseResult",
+    "burst_mask",
+    "drop_bursts",
     "load_pair_models",
     "build_phase_sweep",
     "build_symmetry_grid",

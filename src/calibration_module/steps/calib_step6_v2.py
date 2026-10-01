@@ -86,6 +86,7 @@ from calibration_module.fit.pair_v2 import (  # noqa: E402
     PairV2Config,
     PairV2Fit,
     average_levels,
+    burst_rows,
     fit_pair,
     load_meas_csv,
     report,
@@ -96,7 +97,7 @@ from calibration_module.fit.pair_v2 import (  # noqa: E402
 from calibration_module.fit.sigma import STD_FLOOR_V, floor_std  # noqa: E402,F401
 from calibration_module.measure.bench import connect_daq, connect_slm  # noqa: E402
 from calibration_module.measure.pair_v2 import (  # noqa: E402
-    PairV2Acq,
+    DEFAULT_ACQ,
     build_schedule,
     measure_pair,
     run_seconds,
@@ -106,6 +107,7 @@ from calibration_module.measure.pmt_temp import (  # noqa: E402
     PmtTemperature,
     open_pmt,
 )
+from calibration_module.fit.outliers import BURST_K_REPEAT  # noqa: E402
 from calibration_module.fit.slm_response import load_calibration_result  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 
@@ -124,21 +126,14 @@ PAIR_INDICES: list[int] = []
 # straight out of the step-6 JSON.
 CONFIG = PairV2Config(
     pair_index_base=1,                      # pairs are numbered 1..N
-    encoding_method="fit",
     fit_q=False,
     verify_enabled=True,
 )
 
-# Acquisition timing and input range.  See PairV2Acq for what each one costs.
-ACQ = PairV2Acq(
-    t_single_s=10.0,
-    t_both_s=8.0,
-    settle_s=0.25,
-    range_v=0.1,
-    range_wide_v=0.2,
-    autorange=True,
-    invert=True,
-)
+# Acquisition timing and input range: the bench's, shared with steps 7 and 8
+# and the ONN loop, so their numbers are comparable without a caveat.  See
+# PairV2Acq / T_MEAS_S / RANGE_V for why each value is what it is.
+ACQ = DEFAULT_ACQ
 
 SLM_DISPLAY_NO = None            # None -> auto-detect the LCOS-SLM display
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch
@@ -167,7 +162,7 @@ def _load_layout(step3: Path):
     if not step3.is_file():
         raise FileNotFoundError(f"Step-3 calibration not found: {step3}")
     layout = channel_layout_from_calibration(
-        load_calibration_result(step3), method=CONFIG.encoding_method
+        load_calibration_result(step3)
     )
     for pi in PAIR_INDICES:
         if not (0 <= CONFIG.slot(pi) < layout.n_channels):
@@ -222,7 +217,7 @@ def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False,
     # a result can be read back knowing what was lit.
     print(f"Layout: {layout.channel_width_px} px window + "
           f"{layout.pitch_px - layout.channel_width_px} px pad "
-          f"(pitch {layout.pitch_px} px), encoding {CONFIG.encoding_method!r}")
+          f"(pitch {layout.pitch_px} px)")
 
     meta: dict[str, object] = {}
     if pmt is not None:
@@ -237,7 +232,7 @@ def _run_sweep(step3: Path, fit_after: bool, *, include_anchor: bool = False,
 
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
-                      t_both=ACQ.t_both_s, t_single=ACQ.t_single_s,
+                      t_both=ACQ.t_meas_s, t_single=ACQ.t_meas_s,
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
     rows_by_pair: dict[int, list] = {}
     total = len(schedule) * len(PAIR_INDICES)
@@ -274,8 +269,32 @@ def _fit_and_save(rows_by_pair: dict[int, list], stamp: str, step3: Path, *,
                   layout=None, include_anchor: bool = False) -> None:
     """Fit every pair, print the report, write the combined JSON and the plots."""
     fits: list[PairV2Fit] = []
+    bursts: dict[int, list[dict]] = {}
     for index in sorted(rows_by_pair):
-        levels = average_levels(rows_by_pair[index])
+        rows = list(rows_by_pair[index])
+        # Loud, because a burst is a BENCH fault, not a statistical nuisance: the
+        # trace jumped mid-acquisition.  Dropping it quietly would turn a run
+        # that should be investigated into one that merely looks clean.
+        mask = burst_rows(rows)
+        if mask.any():
+            bursts[index] = [
+                {"x": float(r[1]), "w": float(r[2]), "trial": int(r[0]),
+                 "voltage_mean_v": float(r[3]), "voltage_std_v": float(r[4])}
+                for r, bad in zip(rows, mask) if bad
+            ]
+            print(f"\n!! pair {index}: {int(mask.sum())} BURST acquisition(s) "
+                  f"dropped (trace std >{BURST_K_REPEAT:g}x the quietest repeat "
+                  f"of the same level) -- the bench glitched, investigate:")
+            for b in bursts[index]:
+                sib = [float(r[4]) for r in rows
+                       if (round(float(r[1]), 6), round(float(r[2]), 6))
+                       == (round(b["x"], 6), round(b["w"], 6))]
+                quiet = min(sib) if sib else float("nan")
+                print(f"     x={b['x']:g} w={b['w']:g} trial {b['trial']}: "
+                      f"{b['voltage_mean_v']*1e3:+.4f} mV with a "
+                      f"{b['voltage_std_v']*1e3:.4f} mV trace std "
+                      f"({b['voltage_std_v']/quiet:.0f}x the quietest repeat)")
+        levels = average_levels(rows)
         try:
             fit = fit_pair(index, levels, CONFIG, include_anchor=include_anchor)
         except (ValueError, np.linalg.LinAlgError) as exc:
@@ -293,7 +312,8 @@ def _fit_and_save(rows_by_pair: dict[int, list], stamp: str, step3: Path, *,
 
     center_wl = float(getattr(layout, "center_wl", 0.0)) if layout is not None else 0.0
     json_path = CALIB_PATH / f"calib_step6v2_result_{stamp}.json"
-    save_combined_json(fits, json_path, step3=step3, center_wl=center_wl)
+    save_combined_json(fits, json_path, step3=step3, center_wl=center_wl,
+                       dropped_bursts=bursts)
     print(f"\nSaved Step-3 calib + Step-6 v2 fits -> {json_path}")
     for fit in fits:
         plot_path = json_path.with_name(f"calib_step6v2_pair{fit.index}_{stamp}.png")

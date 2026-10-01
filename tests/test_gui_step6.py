@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from calibration_module.fit.pair_v2 import load_meas_csv  # noqa: E402
 from calibration_module.fit.phase import PairModel, load_pair_models  # noqa: E402
+from calibration_module.measure.pair_v2 import DEFAULT_ACQ  # noqa: E402
 
 MEAS_CSV = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
 STEP3 = REPO / "src/calib_data/archive/2026-09/run_0908_1444/calib_step3c_0907_1358_pad10.json"
@@ -153,19 +154,24 @@ class AcquisitionSettingsTests(_WindowCase):
         self.assertTrue(self.win.tpa_invert.isChecked())
         self.assertTrue(self.win._tpa_acq().invert)
 
-    def test_checkboxes_reach_the_acq_config(self) -> None:
+    def test_the_invert_checkbox_reaches_the_acq_config(self) -> None:
         w = self.win
         w.tpa_invert.setChecked(False)
-        w.tpa_autorange.setChecked(False)
-        acq = w._tpa_acq()
-        self.assertFalse(acq.invert)
-        self.assertFalse(acq.autorange)
+        self.assertFalse(w._tpa_acq().invert)
         w.tpa_invert.setChecked(True)
-        w.tpa_autorange.setChecked(True)
+        self.assertTrue(w._tpa_acq().invert)
 
-    def test_default_windows_are_the_v2_validated_ones(self) -> None:
-        self.assertAlmostEqual(self.win.tpa_tboth.value(), 8.0)
-        self.assertAlmostEqual(self.win.tpa_tsingle.value(), 10.0)
+    def test_there_is_one_window_box_and_it_is_the_bench_s(self) -> None:
+        """One window, dark included, and it is not this page's to choose.
+
+        The dark used to run 10 s against the sweep's 8 on the argument that a
+        near-zero read needs the averaging.  It does, but the dark is subtracted
+        from every point of the sweep, so a dark averaged differently puts its
+        own noise into all of them.
+        """
+        self.assertAlmostEqual(self.win.tpa_tmeas.value(), DEFAULT_ACQ.t_meas_s)
+        self.assertAlmostEqual(self.win._tpa_acq().t_meas_s, DEFAULT_ACQ.t_meas_s)
+        self.assertFalse(hasattr(self.win, "tpa_tsingle"))
 
 
 class StepThreeInputTests(_WindowCase):
@@ -216,9 +222,7 @@ class StepThreeInputTests(_WindowCase):
         w = self.win
         w.tpa_step3_edit.setText(str(STEP3))
         _calib, gui_layout = w._tpa_load_step3()
-        offline = channel_layout_from_calibration(
-            load_calibration_result(STEP3), method=w._tpa_config().encoding_method
-        )
+        offline = channel_layout_from_calibration(load_calibration_result(STEP3))
         self.assertEqual(gui_layout.n_channels, offline.n_channels)
         self.assertEqual(gui_layout.channel_width_px, offline.channel_width_px)
         self.assertEqual(gui_layout.pitch_px, offline.pitch_px)
@@ -302,7 +306,7 @@ class SaveRoundTripTests(_WindowCase):
                              "the JSON is named like the script's, not the CSV")
 
             payload = json.loads(js_path.read_text(encoding="utf-8"))
-            self.assertEqual(sorted(payload), ["encoding", "step3", "step6"])
+            self.assertEqual(sorted(payload), ["step3", "step6"])
             self.assertIn("transfer_fits", payload["step3"])
 
             models = load_pair_models(str(js_path))

@@ -1,0 +1,77 @@
+{
+  "step7": {
+    "ref_index": 5,
+    "csv": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\run_0916_10pairs_w15g35\\calib_step7_meas_0916_2028.csv",
+    "single_beam_bg": true,
+    "step6_json": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\run_0916_10pairs_w15g35\\calib_step6v2_result_0916_1958.json",
+    "channels": [
+      {
+        "tgt_index": 1,
+        "method": "fixed_comb_only",
+        "fit": {
+          "dphi_comb_rad": -2.7606259800436472,
+          "dphi_comb_deg": -158.17221747066762,
+          "dphi_comb_err_rad": 0.02711790256990207,
+          "dphi_comb_err_deg": 1.5537413665023574,
+          "dphi_comb_err_eta_rad": 0.023981028451425114,
+          "dphi_comb_err_eta_deg": 1.3740117186498073,
+          "dphi_comb_err_total_rad": 0.036200419408879254,
+          "dphi_comb_err_total_deg": 2.0741312487322516,
+          "dphi_deta_ref": -9.541289792814936,
+          "dphi_deta_tgt": -0.4522366675726306,
+          "eta_ref_err": 0.002509866559037757,
+          "eta_tgt_err": 0.002808764082422063,
+          "a": 0.10027064505727848,
+          "a_err": 0.0,
+          "a_at_bound": false,
+          "b": 0.09345671567712166,
+          "b_err": 0.0,
+          "b_at_bound": false,
+          "eta_ref": 0.11141182784142054,
+          "eta_tgt": 0.09345671567712166,
+          "bound_frac": 0.0,
+          "amp_2ab": 0.01874193033175932,
+          "amp_2ab_err": 0.0,
+          "convention": "comb-slm",
+          "dark_resid_v": 0.0,
+          "dark_resid_err_v": 0.0,
+          "r2": 0.9982037171674895
+        }
+      },
+      {
+        "tgt_index": 3,
+        "method": "fixed_comb_only",
+        "fit": {
+          "dphi_comb_rad": -1.9140660003688448,
+          "dphi_comb_deg": -109.66790353062068,
+          "dphi_comb_err_rad": 0.028851171360191708,
+          "dphi_comb_err_deg": 1.6530503529476994,
+          "dphi_comb_err_eta_rad": 0.03287346831048455,
+          "dphi_comb_err_eta_deg": 1.8835109921478217,
+          "dphi_comb_err_total_rad": 0.0437384842857589,
+          "dphi_comb_err_total_deg": 2.5060305518732577,
+          "dphi_deta_ref": -11.148182820318802,
+          "dphi_deta_tgt": -6.304146673792508,
+          "eta_ref_err": 0.002509866559037757,
+          "eta_tgt_err": 0.0027371987554451467,
+          "a": 0.10027064505727848,
+          "a_err": 0.0,
+          "a_at_bound": false,
+          "b": 0.09523387462061976,
+          "b_err": 0.0,
+          "b_at_bound": false,
+          "eta_ref": 0.11141182784142054,
+          "eta_tgt": 0.09523387462061976,
+          "bound_frac": 0.0,
+          "amp_2ab": 0.01909832407902705,
+          "amp_2ab_err": 0.0,
+          "convention": "comb-slm",
+          "dark_resid_v": 0.0,
+          "dark_resid_err_v": 0.0,
+          "r2": 0.99568228223629
+        }
+      }
+    ]
+  },
+  "_from": "calib_step7_result_0916_2028.json"
+}

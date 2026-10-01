@@ -182,8 +182,131 @@ def transfer_fit_residuals(levels: np.ndarray, values: np.ndarray) -> np.ndarray
     return residuals
 
 
+# ----------------------------------------------------------------------
+# burst traces (steps 6/7)
+# ----------------------------------------------------------------------
+
+#: Trace-std multiple above the SWEEP median that counts as a burst, for a sweep
+#: measured once per point (step 7).  Measured over every step-7 sweep on disk:
+#: clean sweeps peak at 1.1-3.7x their own median, real bursts at 80-228x.  10
+#: sits in that gap with 2.7x margin over the noisiest honest sweep.
+BURST_K = 10.0
+
+#: Trace-std multiple above the MINIMUM of a cell's own repeats (step 6).
+#: Repeats are the same commanded (x, w) measured again, so this comparison is
+#: free of the sweep's dark-to-full-scale dynamic range and is far tighter: over
+#: the 1482 cells on disk the clean population sits at p99 = 1.6x and tops out
+#: at 1.81x, while every real anomaly is >= 5.1x.  3 splits that gap.
+BURST_K_REPEAT = 3.0
+
+
+def flag_burst_traces(
+    trace_stds,
+    *,
+    k: float = BURST_K,
+    min_points: int = 4,
+) -> np.ndarray:
+    """Boolean mask of acquisitions whose trace std is a burst, not noise.
+
+    A burst is a transient that lands part-way through one acquisition window:
+    the mean comes out multiples too high AND the within-trace spread explodes
+    with it.  On run_0929 step 7 one point read 0.910 V against a step-6 full
+    scale of 0.122 V, with a 0.354 V trace std.
+
+    Thresholds the **absolute** trace std against ``k * median(trace_stds)``.
+    Deliberately NOT the std/|mean| ratio: at a near-zero background level that
+    ratio is meaningless and reaches 44 on perfectly good data, whereas the
+    absolute spread of a clean acquisition tracks the signal smoothly.
+
+    The median (not the MAD) sets the scale here because trace std is bounded
+    below by detector noise and only ever spikes upward -- the distribution has
+    no left tail for a robust sigma to measure, and a couple of bursts cannot
+    drag a median.  Non-finite entries are always flagged.
+
+    Below ``min_points`` acquisitions the median is too soft to threshold
+    against, so nothing is flagged.
+    """
+    s = np.asarray(trace_stds, dtype=float)
+    if s.ndim != 1:
+        raise ValueError("trace_stds must be 1-D")
+    if not np.isfinite(k) or k <= 1.0:
+        raise ValueError("k must be > 1")
+    bad = ~np.isfinite(s)
+    finite = s[~bad]
+    if finite.size < min_points:
+        return bad
+    scale = float(np.median(finite))
+    if not (scale > 0.0):
+        return bad
+    return bad | (s > float(k) * scale)
+
+
+def flag_burst_repeats(
+    trace_stds,
+    group_ids,
+    *,
+    k: float = BURST_K_REPEAT,
+) -> np.ndarray:
+    """Boolean mask of burst acquisitions, judged against their own repeats.
+
+    ``group_ids`` is any sequence of hashable labels marking which acquisitions
+    are repeats of one another (for step 6, the commanded ``(x, w)`` cell).
+    Within a group every entry measures the identical setting, so the group is a
+    reference with no dynamic range in it at all -- unlike
+    :func:`flag_burst_traces`, whose sweep median has to straddle everything from
+    dark to full scale and therefore reads the honest full-scale point as 10x
+    the typical one.
+
+    Flags any entry above ``k`` times its group's MINIMUM trace std.  The minimum
+    is the right reference because trace std only ever spikes upward: it is
+    bounded below by detector noise, so the smallest repeat is the one least
+    disturbed.  Measured over the 1482 cells on disk the clean population tops
+    out at 1.81x while every real anomaly is >= 5.1x, so k = 3 sits in the gap
+    with 1.7x margin.
+
+    This catches the mild kind of burst the sweep test cannot: on run_0906 one
+    repeat of ``x=1, w=0.7`` carried a 3.976 mV trace std against siblings at
+    0.72-0.81 mV while its MEAN, 25.46 mV, sat right on the cell's 25.33 mV.
+    Only the trace was disturbed, so nothing reading the mean could have seen it.
+
+    Degrades gracefully with no special case: a single-acquisition group is its
+    own minimum, giving a ratio of 1, and is never flagged -- correctly, since
+    nothing in the data can say whether it was disturbed.  Note the minimum is a
+    downward-biased scale estimate, so the ratio creeps up with group size; that
+    is measured out to the 6 repeats the step-6 grids actually use.
+    """
+    s_arr = np.asarray(trace_stds, dtype=float)
+    # kept as a plain sequence, not an array: the ids are typically (x, w)
+    # tuples, which numpy would helpfully turn into a 2-D array of floats
+    ids = list(group_ids)
+    if s_arr.ndim != 1 or len(ids) != s_arr.size:
+        raise ValueError("trace_stds and group_ids must be matching 1-D sequences")
+    if not np.isfinite(k) or k <= 1.0:
+        raise ValueError("k must be > 1")
+    out = ~np.isfinite(s_arr)
+    groups: dict[object, list[int]] = {}
+    for i, g in enumerate(ids):
+        groups.setdefault(g, []).append(i)
+    for idx in groups.values():
+        vals = s_arr[idx]
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            continue
+        scale = float(np.min(finite))
+        if not (scale > 0.0):
+            continue
+        for i in idx:
+            if np.isfinite(s_arr[i]) and s_arr[i] > float(k) * scale:
+                out[i] = True
+    return out
+
+
 __all__ = [
+    "BURST_K",
+    "BURST_K_REPEAT",
     "OutlierRemeasurePolicy",
+    "flag_burst_repeats",
+    "flag_burst_traces",
     "flag_by_residual",
     "linear_fit_residuals",
     "mad_sigma",

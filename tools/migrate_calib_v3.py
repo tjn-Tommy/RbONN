@@ -244,24 +244,30 @@ class DirPlan:
     passed_over: list[Candidate] = field(default_factory=list)
     untouched: list[Path] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    converted: bool = False        # calib.json already here; only tidying left
 
     @property
     def empty(self) -> bool:
-        return not self.chosen
+        return not self.chosen and not self.untouched
 
 
 def plan_dir(run: Path) -> DirPlan:
-    plan = DirPlan(run=run)
+    """What to do with one directory: sections to write, JSONs to stash.
+
+    A directory that already has a ``calib.json`` is not re-converted, but any
+    other JSON beside it is still stashed -- one directory, one JSON, and a
+    superseded report sitting next to the real thing is what this exists to end.
+    """
+    plan = DirPlan(run=run, converted=(run / CALIB_NAME).is_file())
     by_step: dict[int, list[Candidate]] = {}
     for path in sorted(run.glob("*.json")):
         if path.name == CALIB_NAME:
-            plan.notes.append(f"{CALIB_NAME} already here -- skipping this directory")
-            return plan
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             plan.untouched.append(path)
-            plan.notes.append(f"{path.name}: not valid JSON, left alone")
+            plan.notes.append(f"{path.name}: not valid JSON, stashed unread")
             continue
         step = classify(payload)
         if step is None:
@@ -270,6 +276,19 @@ def plan_dir(run: Path) -> DirPlan:
         ran, note = stamp_of(path)
         by_step.setdefault(step, []).append(
             Candidate(path=path, step=step, ran=ran, note=note, payload=payload))
+
+    if plan.converted:
+        # Sections are already written; do not touch them, and do not re-stash
+        # the originals sitting in legacy_v2/.  Only the leftovers here matter.
+        plan.passed_over = []
+        plan.chosen = {}
+        for candidate in [c for group in by_step.values() for c in group]:
+            plan.untouched.append(candidate.path)
+        if plan.untouched:
+            plan.notes.append(
+                f"{CALIB_NAME} already here -- stashing "
+                f"{len(plan.untouched)} leftover JSON(s) only")
+        return plan
 
     for step, candidates in by_step.items():
         candidates.sort(key=lambda c: c.ran)
@@ -300,7 +319,7 @@ def describe(plan: DirPlan) -> list[str]:
     for note in plan.notes:
         lines.append(f"    ! {note}")
     if plan.untouched:
-        lines.append("    left as-is: "
+        lines.append("    stashing (not a section): "
                      + ", ".join(sorted(p.name for p in plan.untouched)))
     return lines
 
@@ -350,10 +369,18 @@ def apply_dir(plan: DirPlan, log) -> None:
 
     stash = plan.run / LEGACY_DIR
     stash.mkdir(exist_ok=True)
-    for chosen in list(plan.chosen.values()) + plan.passed_over:
-        shutil.move(str(chosen.path), str(stash / chosen.path.name))
-    log(f"    stashed {len(plan.chosen) + len(plan.passed_over)} legacy JSON(s) "
-        f"in {LEGACY_DIR}/")
+    moved = ([c.path for c in plan.chosen.values()]
+             + [c.path for c in plan.passed_over]
+             # Not a section and nothing reads them: the pre-step-8 full-scale
+             # and system-accuracy reports.  Stashed, not converted -- their
+             # payload is a driven ladder, not calibration state, and forcing it
+             # into a step8 section would blur what that section means.
+             + plan.untouched)
+    for path in moved:
+        shutil.move(str(path), str(stash / path.name))
+    log(f"    stashed {len(moved)} legacy JSON(s) in {LEGACY_DIR}/")
+    if plan.converted:
+        return
     calib = load_calib(plan.run)
     for line in calib.chain_lines()[1:]:
         log(f"    {line.strip()}")

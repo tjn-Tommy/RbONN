@@ -28,9 +28,10 @@ from calibration_module.steps import calib_step8 as SA  # noqa: E402
 from calibration_module.fit import pair_v2 as P6, phase as PH  # noqa: E402
 from calibration_module.fit.pair import load_tpa_pair_csv  # noqa: E402
 from calibration_module.measure.pmt_temp import open_pmt  # noqa: E402
+from daq_module import DAQMonitorSettings  # noqa: E402
 
 RUN = ROOT / "src" / "calib_data" / "run_0911_10pairs_w20g30"
-STEP7 = RUN / "calib_step7_result_0911_2037.json"
+STEP7 = RUN / "calib.json"
 
 
 def model():
@@ -38,6 +39,21 @@ def model():
         raise unittest.SkipTest(f"{STEP7} not in the tree")
     models, phases, _ = V.load_forward_model(STEP7)
     return models, phases, sorted(models)
+
+
+def hot_model(y_max_v=1.534):
+    """The same model scaled to a given Y_max -- a brighter bench than the file.
+
+    The file on disk tops out near 317 mV, which is UNDER
+    :data:`LADDER_CEILING_V`, so it exercises the uncapped branch and cannot say
+    anything about the capped one.  ``Y_max = |sum eta|^2``, so scaling every
+    ``eta`` by ``sqrt(k)`` scales ``Y_max`` by ``k``: this is the present bench,
+    where the amplifier and not the atoms decides where the ladder stops.
+    """
+    models, phases, pairs = model()
+    k = (float(y_max_v) / V.full_scale(models, phases, pairs).fs) ** 0.5
+    hot = {i: replace(m, eta=m.eta * k) for i, m in models.items()}
+    return hot, phases, pairs
 
 
 class _FakeSLM:
@@ -85,9 +101,9 @@ class BuildTests(unittest.TestCase):
     def counts(self):
         return {k: sum(1 for p in self.patterns if p.kind == k) for k in "ABCF"}
 
-    def test_the_sweep_is_the_ladder_and_the_ceiling_and_nothing_else(self):
+    def test_the_sweep_is_the_two_bands_and_the_bracket_and_nothing_else(self):
         c = self.counts()
-        self.assertEqual(c["A"], SA.LADDER)
+        self.assertEqual(c["A"], SA.LADDER + SA.LADDER_LOW)
         self.assertEqual(c["F"], 2)
         self.assertEqual(c["B"], 0)
         self.assertEqual(c["C"], 0)
@@ -99,35 +115,136 @@ class BuildTests(unittest.TestCase):
         self.assertTrue(self.patterns[-1].label.endswith("@end"))
         self.assertFalse(any(p.kind == "F" for p in self.patterns[1:-1]))
 
-    def test_the_ceiling_is_exactly_full_scale(self):
-        """The fit lives at the top, so the top has to BE the top."""
+    def test_the_bracket_is_the_top_of_the_ladder(self):
+        """The fit lives at the top, so the bracket has to BE the top."""
+        cap = SA.ladder_levels(self.scale.fs)["cap"]
+        alpha = max(p.alpha for p in self.patterns if p.kind == "A")
         for p in (self.patterns[0], self.patterns[-1]):
-            self.assertAlmostEqual(p.alpha, 1.0, places=6)
-            self.assertTrue(p.exact)
+            self.assertAlmostEqual(p.alpha, cap, places=6)
+            self.assertGreaterEqual(p.alpha + 1e-9, alpha)
         # and both ends drive the identical frame, or the drift bracket is not one
         np.testing.assert_array_equal(self.patterns[0].x, self.patterns[-1].x)
         np.testing.assert_array_equal(self.patterns[0].w, self.patterns[-1].w)
-
-    def test_the_ladder_reaches_the_ceiling(self):
-        """alpha_hi is 1 now: the psi scan used to own the top and is gone."""
-        self.assertEqual(SA.LADDER_ALPHA_MAX, 1.0)
-        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
-        self.assertGreater(alpha.max(), 0.97)
 
     def test_the_ladder_is_not_in_level_order(self):
         """Ascending order would alias drift onto the level axis."""
         alpha = [p.alpha for p in self.patterns if p.kind == "A"]
         self.assertFalse(alpha == sorted(alpha))
-        # and not merely reversed either
-        self.assertGreater(np.mean(np.abs(np.diff(alpha))), 0.2)
+        # Scale-free, because the band's width is a bench number now: a sorted
+        # ladder steps by span/(n-1) between neighbours, a shuffled one by
+        # O(span).  Anything past a few times the sorted step is not an order.
+        span = max(alpha) - min(alpha)
+        self.assertGreater(np.mean(np.abs(np.diff(alpha))),
+                           5 * span / (len(alpha) - 1))
 
-    def test_the_ladder_covers_the_scale(self):
+    def test_the_bright_band_holds_the_leverage(self):
+        """LADDER rungs above the floor, LADDER_LOW below, and no strays."""
+        lv = SA.ladder_levels(self.scale.fs)
         alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
-        self.assertLess(alpha.min(), 0.05)
-        self.assertGreater(alpha.max(), 0.95)
-        self.assertGreater(np.median(alpha), 0.4)
-        occupied = len(set(np.clip((alpha * 15).astype(int), 0, 15).tolist()))
-        self.assertGreaterEqual(occupied, 15)
+        self.assertEqual(int((alpha >= lv["floor"] - 1e-9).sum()), SA.LADDER)
+        self.assertEqual(int((alpha < lv["floor"] - 1e-9).sum()), SA.LADDER_LOW)
+
+    def test_the_bright_band_is_covered_evenly(self):
+        """Stratified, so 30 rungs cannot leave a tenth of the band empty."""
+        lv = SA.ladder_levels(self.scale.fs)
+        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
+        bright = alpha[alpha >= lv["floor"] - 1e-9]
+        bins = np.clip(((bright - lv["floor"]) / (lv["cap"] - lv["floor"])
+                        * 10).astype(int), 0, 9)
+        self.assertEqual(len(set(bins.tolist())), 10)
+
+    def test_the_low_rungs_reach_down_to_the_check_floor(self):
+        """They are not leverage; they are the only reads near the ONN median."""
+        lv = SA.ladder_levels(self.scale.fs)
+        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
+        low = alpha[alpha < lv["floor"] - 1e-9]
+        self.assertGreaterEqual(low.min(), lv["low"] - 1e-9)
+        # inside the first stratum of the low band, so genuinely near the floor
+        width = (lv["floor"] - lv["low"]) / SA.LADDER_LOW
+        self.assertLess(low.min(), lv["low"] + width)
+
+    def test_a_bright_bench_stops_at_the_ceiling_in_VOLTS(self):
+        """The whole point of the cap: 450 mV, whatever Y_max happens to be.
+
+        The file on disk is dimmer than the ceiling, so this uses a scaled model
+        -- the present bench, where Y_max is 1534 mV against a 1 V amplifier.
+        """
+        hot, phases, pairs = hot_model(1.534)
+        scale, patterns, preds = SA.build(hot, phases, pairs, seed=5)
+        self.assertAlmostEqual(scale.fs, 1.534, places=6)
+        lv = SA.ladder_levels(scale.fs)
+        self.assertTrue(lv["capped"])
+        coh = [float(V.predict(hot, phases, pairs, p.x, p.w, coherent=True))
+               for p in patterns]
+        self.assertAlmostEqual(max(coh), SA.LADDER_CEILING_V, places=4)
+        # and nothing anywhere near the amplifier: that is what buys the margin
+        self.assertLess(max(preds), 0.55 * SA.AMP_LIMIT_V)
+
+    def test_a_dim_bench_is_not_capped_at_all(self):
+        """Under the ceiling the atoms own the top, and alpha reaches 1."""
+        lv = SA.ladder_levels(0.300)
+        self.assertFalse(lv["capped"])
+        self.assertEqual(lv["cap"], 1.0)
+
+    def test_the_levels_are_the_constants_divided_by_y_max(self):
+        lv = SA.ladder_levels(1.534)
+        self.assertAlmostEqual(lv["cap"] * 1.534, SA.LADDER_CEILING_V, places=9)
+        self.assertAlmostEqual(lv["floor"] * 1.534, SA.LADDER_FLOOR_V, places=9)
+        self.assertAlmostEqual(lv["low"] * 1.534, SA.LADDER_LOW_V, places=9)
+
+    def test_the_three_voltages_are_arguments_and_still_volts(self):
+        """The GUI and the CLI can move the band without editing the module.
+
+        In VOLTS at the boundary too, for the same reason they are volts in the
+        module: the same three numbers have to mean the same three reads after
+        the PMT gain moves.
+        """
+        for fs in (1.534, 0.900):
+            with self.subTest(y_max_v=fs):
+                lv = SA.ladder_levels(fs, ceiling_v=0.700, floor_v=0.350,
+                                      low_v=0.040)
+                self.assertAlmostEqual(lv["cap"] * fs, 0.700, places=9)
+                self.assertAlmostEqual(lv["floor"] * fs, 0.350, places=9)
+                self.assertAlmostEqual(lv["low"] * fs, 0.040, places=9)
+
+    def test_a_moved_ceiling_moves_the_brightest_read_of_the_sweep(self):
+        """Not just the arithmetic: the solved drives land on the new volts.
+
+        This is the measurement the probe exists to enable -- find where the
+        amplifier really compresses, then put it in this box.
+        """
+        hot, phases, pairs = hot_model(1.534)
+        scale, patterns, _preds = SA.build(hot, phases, pairs, seed=7,
+                                           ceiling_v=0.700, floor_v=0.350,
+                                           low_v=0.040)
+        coh = np.array([float(V.predict(hot, phases, pairs, p.x, p.w,
+                                        coherent=True)) for p in patterns])
+        self.assertAlmostEqual(coh.max(), 0.700, places=4)
+        bright = coh[coh >= 0.350 - 1e-9]
+        self.assertEqual(len(bright), SA.LADDER + 2)      # the bracket is up here
+        self.assertAlmostEqual(coh.min(), 0.040, delta=0.055)
+
+    def test_a_raised_band_floor_crowds_the_rungs_without_moving_the_top(self):
+        hot, phases, pairs = hot_model(1.534)
+        _scale, patterns, _preds = SA.build(hot, phases, pairs, seed=7,
+                                            floor_v=0.350)
+        coh = np.array([float(V.predict(hot, phases, pairs, p.x, p.w,
+                                        coherent=True)) for p in patterns])
+        self.assertAlmostEqual(coh.max(), SA.LADDER_CEILING_V, places=4)
+        bright = np.sort(coh)[-(SA.LADDER + 2):]
+        self.assertGreaterEqual(bright.min(), 0.350 - 1e-6)
+        # and the checks still reach down to their own floor, unmoved
+        self.assertLess(coh.min(), 0.06)
+
+    def test_the_bands_stay_ordered_for_an_absurdly_dim_model(self):
+        """Clamped, so a bad step 7 cannot produce an empty or inverted band."""
+        for fs in (1e-4, 1e-3, 0.01, 0.05, 0.3, 1.0, 5.0):
+            with self.subTest(y_max_v=fs):
+                lv = SA.ladder_levels(fs)
+                self.assertLess(lv["low"], lv["floor"])
+                self.assertLess(lv["floor"], lv["cap"])
+                self.assertLessEqual(lv["cap"], 1.0)
+                self.assertGreater(lv["low"], 0.0)
 
     def test_seed_reproduces_the_whole_plan(self):
         _, again, _ = SA.build(self.models, self.phases, self.pairs, seed=101)
@@ -158,7 +275,7 @@ class CollectTests(unittest.TestCase):
 
     def setUp(self):
         self.layout = SimpleNamespace(n_channels=len(self.pairs))
-        self.acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0)
+        self.acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0)
 
     def _collect(self, noise=0.0, pats=None):
         slm = _FakeSLM()
@@ -218,18 +335,21 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(list(reads.kind), [p.kind for p in self.patterns])
         self.assertEqual(list(reads.label), [p.label for p in self.patterns])
 
-    def test_each_read_takes_the_range_its_prediction_calls_for(self):
-        """The range follows the level: dim reads stay sensitive, bright ones do
-        not clip.  Nothing clips on a perfect bench, so no read escalates and
-        every one keeps the range ``range_for`` picked."""
+    def test_every_read_takes_the_one_fixed_range(self):
+        """One range for the whole ladder, whatever each read is predicted at.
+
+        This is the opposite of what the step used to do -- it picked each
+        read's range from its prediction, so a 90-rung ladder spanned three or
+        four of them and the dark sat on a fifth.  A ladder is read rung against
+        rung, and the board's offset and gain error are per-range, so that put a
+        range-shaped step into the exact axis ``fit_y_sat`` reads.
+        """
         rows = self._collect()
-        for row in rows:
-            want, _ = S8.range_for(row["pred_v"])
-            self.assertEqual(row["range_v"], want)
-            self.assertLessEqual(abs(row["pred_v"]),
-                                 S8.RANGE_FILL * row["range_v"])
-        spanned = {row["range_v"] for row in rows}
-        self.assertGreater(len(spanned), 1, "the ladder should span several ranges")
+        self.assertEqual({row["range_v"] for row in rows}, {self.acq.range_v})
+        # and the range the old policy would have chosen really does vary, so
+        # this is a fact about the run rather than about a flat ladder
+        wanted = {S8.range_for(row["pred_v"])[0] for row in rows}
+        self.assertGreater(len(wanted), 1)
 
     def test_repeats_of_one_drive_are_one_group(self):
         rows = self._collect(noise=1e-4, pats=self.legacy)
@@ -337,7 +457,7 @@ class YSatFitTests(unittest.TestCase):
         slm = _FakeSLM()
         daq = _FakeDAQ(slm, self.models, self.phases, noise=0.0)
         layout = SimpleNamespace(n_channels=len(self.pairs))
-        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0)
+        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0)
         x = np.stack([p.x for p in self.patterns])[None]
         w = np.stack([p.w for p in self.patterns])[None]
         full = [float(V.predict(self.models, self.phases, self.pairs, p.x, p.w))
@@ -365,6 +485,12 @@ class YSatFitTests(unittest.TestCase):
             written = json.loads(
                 (Path(tmp) / "calib_step8_result_0000_0000.json").read_text())
             self.assertTrue((Path(tmp) / "calib_step8_0000_0000_ysat.png").exists())
+            # the caller that chose out_dir should not have to re-derive either
+            # name from the CSV: the fit reports where it put both files
+            self.assertEqual(Path(result["result_json"]),
+                             Path(tmp) / "calib_step8_result_0000_0000.json")
+            self.assertEqual(Path(result["png"]),
+                             Path(tmp) / "calib_step8_0000_0000_ysat.png")
 
         self.assertAlmostEqual(result["y_sat_v"], truth, places=2)
         fs = result["full_scale"]
@@ -517,8 +643,7 @@ class PmtTemperatureTests(unittest.TestCase):
 
         rows: list[dict] = []
         S8.run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
-                        rows=rows, acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0,
-                                               t_single_s=0.0),
+                        rows=rows, acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0),
                         encode=_encode, log=lambda _: None, row_hook=pmt)
 
         self.assertEqual(len(rows), len(patterns))
@@ -541,9 +666,141 @@ class PmtTemperatureTests(unittest.TestCase):
         rows: list[dict] = []
         S8.run_patterns(_FakeDAQ(slm, models, phases), slm, layout, [tuple(pairs)],
                         x, w, models, phases, rows=rows,
-                        acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_both_s=0.0, t_single_s=0.0),
+                        acq=replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0),
                         encode=_encode, log=lambda _: None)
         self.assertTrue(all("pmt_c" not in r for r in rows))
+
+class _RangeSpyDAQ(_FakeDAQ):
+    """A ``_FakeDAQ`` that ``can_autorange`` accepts, and that records set_range.
+
+    ``can_autorange`` looks for ``_settings`` and ``last_values``; the plain
+    fake has neither, so it could never exercise the range path either way.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        from daq_module import DAQMonitorSettings
+        self._settings = DAQMonitorSettings()
+        self.last_values = np.zeros(4)
+        self.ranges: list[float] = []
+
+    def configure_monitor(self, settings):
+        self._settings = settings
+        self.ranges.append(float(settings.max_val))
+
+
+class FixedRangeTests(unittest.TestCase):
+    """Nothing in a run touches the board's input range.
+
+    There used to be two mechanisms here, both gone.  ``range_for(pred)`` picked
+    each read's range and ``set_range`` applied it, so a 90-rung ladder spanned
+    three or four ranges and took its dark on a fifth -- putting the board's
+    per-range offset straight into the dark subtraction.  On top of that a
+    near-rail raw peak triggered a re-read one range up, which in the 0928 gain
+    sweep fired on a spike 1700x the trace's own spread and latched the wider
+    range for the rest of the run.
+
+    A ``_RangeSpyDAQ`` that records every ``configure_monitor`` is the test: the
+    list has to stay empty.
+    """
+
+    def _run(self, acq):
+        models, phases, pairs = model()
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=6)
+        slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
+        daq = _RangeSpyDAQ(slm, models, phases)
+        x = np.stack([p.x for p in patterns])[None]
+        w = np.stack([p.w for p in patterns])[None]
+        rows: list[dict] = []
+        S8.run_patterns(daq, slm, layout, [tuple(pairs)], x, w, models, phases,
+                        rows=rows, acq=acq, encode=_encode, log=lambda _: None)
+        return daq, rows
+
+    def test_the_range_is_never_reconfigured(self):
+        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0)
+        daq, rows = self._run(acq)
+        self.assertEqual(daq.ranges, [])
+        self.assertEqual({r["range_v"] for r in rows}, {acq.range_v})
+
+    def test_the_old_policy_really_would_have_moved_it(self):
+        """So the test above is about the code, not about a flat ladder."""
+        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0, range_v=0.1)
+        _, rows = self._run(acq)
+        self.assertGreater(len({S8.range_for(r["pred_v"])[0] for r in rows}), 1)
+
+
+class ProgressCallbackTests(unittest.TestCase):
+    """``run_patterns`` announces every read before it takes it.
+
+    The point is not the numbers -- the row already carries those -- but the
+    ANNOUNCEMENT: a step-8 read is a whole averaging window behind a ten second
+    opening dark, and the GUI used to show nothing at all until the first one
+    landed.  So the contract under test is that an event arrives BEFORE each
+    read, that ``step`` counts finished pattern reads (never the darks), and
+    that a caller passing nothing still gets the old behaviour.
+    """
+
+    ACQ = property(lambda self: replace(S8.DEFAULT_ACQ, settle_s=0.0,
+                                        t_meas_s=0.0))
+
+    def _run(self, n=4, acq=None, **kw):
+        models, phases, pairs = model()
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        patterns = patterns[:n]
+        slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
+        x = np.stack([p.x for p in patterns])[None]
+        w = np.stack([p.w for p in patterns])[None]
+        rows: list[dict] = []
+        S8.run_patterns(_FakeDAQ(slm, models, phases), slm, layout, [tuple(pairs)],
+                        x, w, models, phases, rows=rows,
+                        acq=self.ACQ if acq is None else acq,
+                        encode=_encode, log=lambda _: None, **kw)
+        return rows, len(patterns)
+
+    def test_every_read_is_announced_before_it_lands(self):
+        seen: list = []
+        rows, n = self._run(progress_callback=seen.append)
+
+        self.assertEqual(len(rows), n)
+        # one dark (announced + landed) plus two per pattern
+        self.assertEqual(len(seen), 2 + 2 * n)
+        darks = [p for p in seen if p.single]
+        self.assertEqual([p.mean_v is None for p in darks], [True, False])
+        self.assertTrue(all(p.total == n for p in seen))
+
+        reads = [p for p in seen if not p.single]
+        # announcement, landing, announcement, landing, ...
+        self.assertEqual([p.mean_v is None for p in reads],
+                         [True, False] * n)
+        # step counts FINISHED pattern reads, so it is 0 through the dark and
+        # through the first announcement, and n once the last read lands.
+        self.assertEqual([p.step for p in darks], [0, 0])
+        self.assertEqual([p.step for p in reads],
+                         [k for i in range(n) for k in (i, i + 1)])
+
+    def test_a_landed_read_carries_its_row_and_its_net_signal(self):
+        seen: list = []
+        rows, _ = self._run(progress_callback=seen.append)
+        landed = [p for p in seen if not p.single and p.mean_v is not None]
+
+        self.assertEqual([p.row for p in landed], rows)
+        for p, row in zip(landed, rows):
+            self.assertAlmostEqual(p.net_v, row["mean_v"] - row["dark_v"])
+            self.assertAlmostEqual(p.pred_v, row["pred_v"])
+            self.assertEqual(p.range_v, row["range_v"])
+        self.assertTrue(all(p.net_v is None for p in seen if p.mean_v is None))
+
+    def test_the_announcement_carries_the_window_it_is_about_to_average(self):
+        acq = replace(self.ACQ, t_meas_s=4.0)
+        seen: list = []
+        self._run(acq=acq, progress_callback=seen.append)
+        for p in seen:
+            self.assertEqual(p.t_read_s,
+                             acq.t_meas_s)
+
+    def test_without_a_callback_nothing_changes(self):
+        rows, n = self._run()
+        self.assertEqual(len(rows), n)
 
 
 class PmtInStepsSixAndSevenTests(unittest.TestCase):
@@ -557,7 +814,7 @@ class PmtInStepsSixAndSevenTests(unittest.TestCase):
 
     S6_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step6v2_meas_0917_1811.csv"
     S7_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step7_meas_0917_1831.csv"
-    S6_JSON = ROOT / "src/calib_data/calib_0917_1617/calib_step6v2_result_0917_1811.json"
+    S6_JSON = ROOT / "src/calib_data/calib_0917_1617/calib.json"
     META = {"pmt_resource": "GPIB0::21::INSTR", "pmt_period_s": "60",
             "pmt_c_start": "27.2379", "pmt_c_end": "27.2146"}
 
@@ -649,6 +906,203 @@ class PmtInStepsSixAndSevenTests(unittest.TestCase):
         with mock.patch("calibration_module.measure.pmt_temp.PmtTemperature",
                         side_effect=AssertionError("must not be constructed")):
             self.assertIsNone(open_pmt(enabled=False))
+
+class ProbeTests(unittest.TestCase):
+    """One displayed level, one read: does the readout still look linear?
+
+    The load-bearing tests are the two peak ones.  Clipping, amplifier
+    compression and atomic saturation all bend the top of a ladder down the same
+    way, and ``fit_y_sat`` has one free parameter, so any of them returns a
+    clean-looking wrong ``Y_sat``.  The RAW TRACE PEAK is the only thing in the
+    chain that sees the first two: the 20 Hz low-pass pulls a flat-top back under
+    the rail, so the reported mean stays perfectly reasonable.
+    """
+
+    FS_HOT = 1.010509        # the 0928 ten-pair ceiling, past the 1 V limit
+    FS_COLD = 0.454          # the 0917 ceiling, comfortably under it
+
+    def _verdict(self, y_sat, *, fs=None, alpha=1.0, sb=1.2e-3, dark=-1.2e-4,
+                 peak_extra=6e-2, mean_override=None, peak_override=None,
+                 ceiling_v=SA.LADDER_CEILING_V):
+        fs = self.FS_HOT if fs is None else fs
+        coh = alpha * fs
+        meas = V.saturate(coh, y_sat) + sb
+        if mean_override is not None:
+            meas = mean_override
+        peak = meas + peak_extra if peak_override is None else peak_override
+        return SA.probe_verdict(
+            alpha=alpha, y_max_v=fs, coherent_v=coh, sb_pred_v=sb,
+            mean_v=meas + dark, dark_v=dark, std_v=2.2e-4,
+            peak_v=peak, range_v=1.0, ceiling_v=ceiling_v)
+
+    def test_one_read_recovers_the_y_sat_it_was_taken_under(self):
+        for truth in (3.0, 4.82, 12.0):
+            with self.subTest(y_sat=truth):
+                d = self._verdict(truth)
+                self.assertAlmostEqual(d["y_sat_implied_v"], truth, places=6)
+
+    def test_it_recovers_y_sat_from_a_level_that_is_not_the_top(self):
+        """The probe's whole point is that alpha is the caller's."""
+        for alpha in (0.1, 0.293, 0.55, 1.0):
+            with self.subTest(alpha=alpha):
+                d = self._verdict(4.82, alpha=alpha)
+                self.assertAlmostEqual(d["y_sat_implied_v"], 4.82, places=5)
+                self.assertAlmostEqual(d["alpha"], alpha)
+
+    def test_a_flat_top_the_mean_hides_is_caught_by_the_peak(self):
+        # A mean at 780 mV is 22 % clear of the limit, and the trace is railed.
+        d = self._verdict(4.82, mean_override=0.780, peak_override=0.9995)
+        self.assertLess(d["measured_v"], 0.8 * d["limit_v"])
+        self.assertTrue(d["clipped"])
+        self.assertEqual(d["verdict"], "CLIPPED")
+
+    def test_a_peak_approaching_the_rail_is_tight_though_the_mean_is_not(self):
+        """Compression starts before the rail, and the peak gets there first.
+
+        This is why LADDER_CEILING_V is 450 mV and not 700: the raw trace runs
+        ~1.2x the mean on this bench, so a mean with 16 % of margin has a peak
+        with 10 %.
+        """
+        d = self._verdict(4.82)                       # 835 mV mean, 895 mV peak
+        self.assertLess(d["measured_v"], 0.85 * d["limit_v"])
+        self.assertGreater(d["peak_fraction"], 0.85)
+        self.assertFalse(d["clipped"])
+        self.assertEqual(d["verdict"], "TIGHT")
+
+    def test_a_comfortable_read_is_ok(self):
+        d = self._verdict(4.82, fs=self.FS_COLD)
+        self.assertFalse(d["clipped"])
+        self.assertEqual(d["verdict"], "OK")
+        self.assertLess(d["peak_fraction"], 0.85)
+
+    def test_a_read_that_beats_the_linear_model_reports_no_saturation(self):
+        d = self._verdict(None, fs=self.FS_COLD, peak_extra=0.0)
+        self.assertFalse(np.isfinite(d["y_sat_implied_v"]))
+
+    def test_a_moved_ceiling_is_what_the_probe_judges_against(self):
+        """Raise the box and a read that WAS over the ceiling stops being over it.
+
+        The probe is how the ceiling gets measured, so it has to answer about
+        the ceiling being tried, not about the module's default.
+        """
+        d = self._verdict(4.82, alpha=0.550, ceiling_v=0.700)
+        self.assertAlmostEqual(d["ceiling_v"], 0.700)
+        self.assertAlmostEqual(d["alpha_cap"] * self.FS_HOT, 0.700, places=9)
+        self.assertGreater(d["measured_v"], SA.LADDER_CEILING_V)
+        self.assertFalse(d["over_ceiling"])
+        # and the default still calls that same read over the ceiling
+        self.assertTrue(self._verdict(4.82, alpha=0.550)["over_ceiling"])
+
+    def test_it_reports_where_the_ladder_would_stop(self):
+        """So the panel can say "you are above the sweep" without guessing."""
+        d = self._verdict(4.82)
+        self.assertAlmostEqual(d["alpha_cap"],
+                               SA.ladder_levels(self.FS_HOT)["cap"])
+        self.assertAlmostEqual(d["ceiling_v"], SA.LADDER_CEILING_V)
+        # 835 mV against a 450 mV ceiling
+        self.assertTrue(d["over_ceiling"])
+
+    def test_a_read_inside_the_ladder_is_not_flagged_over_the_ceiling(self):
+        d = self._verdict(4.82, alpha=SA.ladder_levels(self.FS_HOT)["cap"])
+        self.assertFalse(d["over_ceiling"])
+        self.assertEqual(d["verdict"], "OK")
+
+
+class _SaturatingDAQ(_FakeDAQ):
+    """A bench whose atoms saturate, and which exposes a raw trace."""
+
+    def __init__(self, *args, y_sat, rail=None, **kw):
+        super().__init__(*args, **kw)
+        self.y_sat, self.rail = y_sat, rail
+        # Both attributes together are what can_autorange() looks for, so this
+        # fake goes down the same range-and-window path the real board does --
+        # which is the point: range_for() sends a ~1 V ceiling to +/-2 V, where
+        # the near-rail escalation can no longer see a 1 V flat top.
+        self.last_values = np.zeros(4)
+        self._settings = DAQMonitorSettings()
+
+    def monitor_cycle(self, timeout=None, single=False):
+        x_vals, w_vals = self.slm.shown
+        pairs = sorted(self.models)
+        slots = [k - S8.PAIR_INDEX_BASE for k in pairs]
+        y = float(V.predict(self.models, self.phases, pairs,
+                            x_vals[slots], w_vals[slots], y_sat=self.y_sat))
+        v = y + self.dark
+        if self.rail is not None:
+            v = min(v, self.rail)
+        # The TIA is negative for light; the raw trace is what the board sampled.
+        self.last_values = np.full(4, -v)
+        return SimpleNamespace(value=-v, std=1e-5)
+
+    def configure_monitor(self, settings):
+        self._settings = settings
+
+
+class ProbeReadTests(unittest.TestCase):
+    """One probe read through the real drive loop, against a fake bench."""
+
+    ALPHA = 1.0
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models, cls.phases, cls.pairs = model()
+        cls.scale = V.full_scale(cls.models, cls.phases, cls.pairs)
+        # The GUI solves the probe pattern with ceiling_pattern, so the test
+        # drives what the bench drives.
+        cls.pattern = SA.ceiling_pattern(cls.models, cls.phases, cls.pairs,
+                                         cls.ALPHA, seed=3)
+
+    def _read(self, y_sat, rail=None, limit_v=None):
+        # The 0911 file on disk tops out at ~317 mV, well under the real 1 V
+        # amplifier limit, so a test that wants to see a railed read has to say
+        # where the rail is -- and the plan must be told the same number, or the
+        # verdict would be judging the read against a limit it never met.
+        limit_v = SA.AMP_LIMIT_V if limit_v is None else limit_v
+        slm = _FakeSLM()
+        daq = _SaturatingDAQ(slm, self.models, self.phases, y_sat=y_sat, rail=rail)
+        layout = SimpleNamespace(n_channels=len(self.pairs))
+        acq = replace(S8.DEFAULT_ACQ, settle_s=0.0, t_meas_s=0.0)
+        rows: list[dict] = []
+        S8.run_patterns(daq, slm, layout, [tuple(self.pairs)],
+                        self.pattern.x[None, None], self.pattern.w[None, None],
+                        self.models, self.phases, rows=rows, acq=acq,
+                        encode=_encode, log=lambda _: None, y_sat=None)
+        coh = float(V.predict(self.models, self.phases, self.pairs,
+                              self.pattern.x, self.pattern.w, coherent=True))
+        tot = float(V.predict(self.models, self.phases, self.pairs,
+                              self.pattern.x, self.pattern.w))
+        r = rows[0]
+        return r, SA.probe_verdict(
+            alpha=self.ALPHA, y_max_v=self.scale.fs, limit_v=limit_v,
+            coherent_v=coh, sb_pred_v=tot - coh,
+            mean_v=r["mean_v"], dark_v=r["dark_v"], std_v=r["std_v"],
+            peak_v=r["peak_v"], range_v=r["range_v"])
+
+    def test_the_loop_stamps_the_raw_peak_on_the_row(self):
+        row, _ = self._read(6.0)
+        self.assertTrue(np.isfinite(row["peak_v"]))
+        # The peak is the |trace| max, so the TIA's sign must not reach it.
+        self.assertGreater(row["peak_v"], 0.0)
+
+    def test_the_read_recovers_the_benchs_own_y_sat(self):
+        _, d = self._read(6.0)
+        self.assertAlmostEqual(d["y_sat_implied_v"], 6.0, places=4)
+        self.assertFalse(d["clipped"])
+
+    def test_a_railed_bench_is_reported_clipped(self):
+        _, d = self._read(30.0, rail=0.300, limit_v=0.300)
+        self.assertTrue(d["clipped"])
+        self.assertEqual(d["verdict"], "CLIPPED")
+
+    def test_the_peak_column_survives_the_csv(self):
+        row, _ = self._read(6.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = V.write_verify_csv(
+                Path(tmp) / "calib_step8_probe.csv", self.pairs, [row],
+                meta={"status": "complete"}, extra=["peak_v"])
+            _, blocks, _ = V.load_verify_csv(path)
+        self.assertAlmostEqual(float(blocks[0].extra["peak_v"][0]),
+                               row["peak_v"], places=9)
 
 
 if __name__ == "__main__":

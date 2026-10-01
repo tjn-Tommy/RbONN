@@ -163,7 +163,6 @@ CALIB_PATH = REPO_ROOT / "src" / "calib_data"
 # catch: a check run against the wrong step-3 file looks like a check that
 # passed.  Naming it per run is the only version that cannot go wrong silently.
 
-ENCODING_METHOD = "fit"          # must match the run being investigated
 PAIR_INDEX_BASE = 1
 PAIR_INDICES = [1, 2, 3, 4, 5, 6]
 
@@ -184,8 +183,6 @@ T_BOTH_S = 8.0
 SETTLE_S = 0.25
 
 DAQ_RANGE_V = 0.1
-DAQ_RANGE_WIDE_V = 0.2
-DAQ_NEAR_RAIL_FRAC = 0.95
 
 # ---- The grid ----
 # The background block, verbatim from step 6's GRID including its repeat counts,
@@ -314,7 +311,6 @@ def _config():
     """
     return replace(
         s6.CONFIG,
-        encoding_method=ENCODING_METHOD,
         pair_index_base=PAIR_INDEX_BASE,
         product_checks=PRODUCT_CHECKS,
         verify_enabled=True,
@@ -326,9 +322,8 @@ def _acq():
     """Acquisition timing: step 6's, with this draft's windows and range."""
     return replace(
         s6.ACQ,
-        t_single_s=T_SINGLE_S, t_both_s=T_BOTH_S, settle_s=SETTLE_S,
-        range_v=DAQ_RANGE_V, range_wide_v=DAQ_RANGE_WIDE_V,
-        near_rail_frac=DAQ_NEAR_RAIL_FRAC,
+        t_meas_s=T_BOTH_S, settle_s=SETTLE_S,
+        range_v=DAQ_RANGE_V,
     )
 
 
@@ -753,7 +748,6 @@ def save_json(fits: list, out_path: str | Path, step3: Path,
         "product_checks": [[list(pt) for pt in group] for group in PRODUCT_CHECKS],
         "pull_limit": PULL_LIMIT,
         "ref_step6": None if REF_STEP6 is None else str(REF_STEP6),
-        "encoding": {"method": ENCODING_METHOD},
         "step3_path": str(step3),
         "channels": [_channel_dict(fit, plots.get(fit.index)) for fit in fits],
     }
@@ -851,14 +845,10 @@ def _print_inputs(step3: Path) -> None:
     Printed before the layout is loaded, so a missing or misnamed file names
     itself on the way to the exception rather than after it; ``check_csv``
     swallows that exception and carries on with NaN wavelengths, which is what
-    the ``(MISSING)`` mark explains.  ``ENCODING_METHOD`` rides along because
-    it has to match the run being investigated and is just as silent when it
-    does not -- a "fit" check over levels driven under "interp" compares
-    against the wrong grayscale.
+    the ``(MISSING)`` mark explains.
     """
     mark = "" if Path(step3).is_file() else "   (MISSING)"
     print(f"Step 3 in : {_rel(step3)}{mark}")
-    print(f"Encoding  : {ENCODING_METHOD}")
 
 
 def _print_plan(grid: Grid, schedule) -> None:

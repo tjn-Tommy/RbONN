@@ -639,8 +639,7 @@ def save_calibration_result(
     different moments against the same JSON and must agree on what "x = 0.5"
     means; re-deriving the fit on every load would let an optimizer path or a
     scipy version quietly move it between them.  The raw ``intensity_levels``
-    stay in the file alongside the fits, so a curve can always be refitted or
-    encoded by interpolation instead.
+    stay in the file alongside the fits, so a curve can always be refitted.
 
     A channel whose curve will not fit is reported and ``transfer_fits`` is
     stored as null -- the measurement is never lost to a fit failure, and the

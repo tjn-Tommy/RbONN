@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     block = [tuple(pairs)]
     slm = S8.connect_slm(S8.SLM_DISPLAY_NO, S8.USB_SLM_NO)
     daq = S8.connect_daq(device=S8.DAQ_DEVICE, channel=S8.DAQ_CHANNEL,
-                         t_both=S8.ACQ.t_both_s, t_single=S8.ACQ.t_single_s,
+                         t_both=S8.ACQ.t_meas_s, t_single=S8.ACQ.t_meas_s,
                          min_val=-S8.ACQ.range_v, max_val=S8.ACQ.range_v)
     layout = S8.load_layout(step7, pairs)
     rows: list[dict] = []

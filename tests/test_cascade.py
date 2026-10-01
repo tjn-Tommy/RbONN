@@ -33,9 +33,12 @@ from calibration_module.fit.cascade import (  # noqa: E402
 )
 
 RUN = REPO_ROOT / "src/calib_data/run_0916_10pairs_w15g35"
-STAGE1 = RUN / "calib_step7_result_0916_2015.json"      # 4-10 vs ref 2
-STAGE2 = RUN / "calib_step7_result_0916_2028.json"      # 1,3  vs ref 5
-MERGED = RUN / "calib_step7_result_0916_merged_ref2.json"
+# The two stages of one cascaded run.  A run directory holds ONE
+# calib.json, whose step7 section is the merged spectrum, so the
+# per-stage fits live here as fixtures trimmed to what this test reads.
+STAGE1 = REPO_ROOT / "tests/fixtures/cascade_0916/stage1_ref2.json"   # 4-10 vs ref 2
+STAGE2 = REPO_ROOT / "tests/fixtures/cascade_0916/stage2_ref5.json"   # 1,3  vs ref 5
+MERGED = RUN / "calib.json"
 
 
 def _fits(path: Path) -> dict:
