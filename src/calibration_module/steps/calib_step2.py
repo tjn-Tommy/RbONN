@@ -1,21 +1,26 @@
 """Step 2 -- the SLM column -> wavelength map, from a bright-window OSA sweep.
 
-Needs the OSA and the SLM.  The off/on levels come from a step-1 file or are
-given by hand; one of the two is required::
+Needs the OSA and the SLM::
 
-    python src/calibration_module/steps/calib_step2.py --step1 calib_step1_0910_1724.json
-    python src/calibration_module/steps/calib_step2.py --min-max 400,900
-    python src/calibration_module/steps/calib_step2.py --step1 FILE --out DIR
+    python src/calibration_module/steps/calib_step2.py --calib DIR/calib.json
+    python src/calibration_module/steps/calib_step2.py --calib DIR/calib.json --min-max 400,900
 
-Walks a ``WINDOW_PX``-wide bright window across the panel, centroids the peak
-it puts on the OSA, and fits one line through every peak.  ``USABLE_BAND_NM``
-clips the finished map to the band steps 3-8 can use -- never the peak search
-(see :func:`calibration_module.measure.slm_response.run_step2`).  Writes
-``calib_step2_MMDD_HHMM.json``, the map ``calib_step3b.py`` / ``calib_step3c.py``
-take as ``--step2``.
+In:  ``--calib``, whose ``step1`` section gives the off/on levels, or
+     ``--min-max`` to give them by hand.
+Out: ``step2_MMDD_HHMM.csv`` beside that file, and the ``step2`` section
+     pointing at it -- the wavelength map step 3 reads.
 
-This is the runner only: the sweep is ``run_step2``, the same call the GUI's
-Step 2 tab makes.  The constants below are that tab's defaults.
+Walks a ``WINDOW_PX``-wide bright window across the panel, centroids the peak it
+puts on the OSA, and fits one line through every peak.  ``USABLE_BAND_NM`` clips
+the finished map to the band steps 3-8 can use, never the peak search (see
+:func:`calibration_module.measure.slm_response.run_step2`).
+
+``--min-max`` is not a fallback.  This is the only step that ever reads step 1,
+and the section written here carries the levels onward, so a calibration whose
+levels were given by hand needs no step 1 at all.
+
+The runner only: the sweep is ``run_step2``, the same call the GUI's Step 2 tab
+makes, and the constants below are that tab's defaults.
 """
 
 from __future__ import annotations
@@ -30,10 +35,13 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from calibration_module.calib_file import write_section  # noqa: E402
+from calibration_module.calib_file import (  # noqa: E402
+    calib_path,
+    load_calib,
+    write_section,
+)
 from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
-    load_calibration_result,
     step2_section,
     write_wavelength_map_csv,
 )
@@ -46,8 +54,6 @@ from calibration_module.measure.slm_response import run_step2  # noqa: E402
 from osa_module.controller import MeasurementSettings  # noqa: E402
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "src/calib_data"   # output directory; --out overrides it
-
 MEASURE = MeasurementSettings(
     center_wl="778nm",
     span="8nm",
@@ -69,15 +75,30 @@ SLM_DISPLAY_NO = None            # None -> auto-detect the LCOS-SLM display
 USB_SLM_NO = 1                   # SLM_Ctrl_* device index for the DVI-mode switch
 
 
-def _seed(args: argparse.Namespace) -> CalibrationResult:
-    if args.step1 is not None:
-        return load_calibration_result(args.step1)
-    try:
-        low, high = (int(part) for part in args.min_max.split(","))
-    except ValueError as exc:
-        raise SystemExit(f"--min-max wants LOW,HIGH levels, got {args.min_max!r}") from exc
-    if high < low:
-        raise SystemExit("--min-max: HIGH must be >= LOW")
+def _seed(calib_file: Path, min_max: str | None) -> CalibrationResult:
+    """The off/on levels to sweep with: ``--min-max`` if given, else step 1.
+
+    Only the two levels are taken; the sweep reads nothing else off the seed
+    (see :func:`~calibration_module.measure.slm_response.wavelength_calibration`),
+    which is why a hand-given pair is as good as a measured one.
+    """
+    if min_max is not None:
+        try:
+            low, high = (int(part) for part in min_max.split(","))
+        except ValueError as exc:
+            raise SystemExit(
+                f"--min-max wants LOW,HIGH levels, got {min_max!r}") from exc
+        if high < low:
+            raise SystemExit("--min-max: HIGH must be >= LOW")
+    else:
+        section = load_calib(calib_file, missing_ok=True).get(1)
+        if section is None:
+            raise SystemExit(
+                f"{calib_file} has no step1 section -- run step 1 against it, "
+                f"or give the levels here with --min-max LOW,HIGH"
+            )
+        low = int(section["min_level"])
+        high = int(section["max_level"])
     return CalibrationResult(
         wavelength=np.asarray([]),
         coordinates=np.asarray([]),
@@ -89,14 +110,18 @@ def _seed(args: argparse.Namespace) -> CalibrationResult:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    levels = parser.add_mutually_exclusive_group(required=True)
-    levels.add_argument("--step1", type=Path, help="step-1 JSON carrying min/max levels")
-    levels.add_argument("--min-max", help="off/on levels by hand, e.g. 400,900")
-    parser.add_argument("--out", type=Path, default=CALIB_PATH,
-                        help=f"output directory (default {CALIB_PATH})")
+    parser.add_argument("--calib", required=True, type=Path, metavar="FILE",
+                        help="calib.json to read the off/on levels from and to "
+                             "write the map into; a directory means its "
+                             "calib.json (required)")
+    parser.add_argument("--min-max", metavar="LOW,HIGH",
+                        help="off/on levels by hand, e.g. 400,900 -- instead of "
+                             "the file's step1 section, and the way a "
+                             "calibration without a step 1 gets its levels")
     args = parser.parse_args(argv)
-    seed = _seed(args)
-    args.out.mkdir(parents=True, exist_ok=True)
+    calib_file = calib_path(args.calib)
+    seed = _seed(calib_file, args.min_max)
+    calib_file.parent.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%m%d_%H%M")
 
     lo, hi = USABLE_BAND_NM
@@ -124,8 +149,9 @@ def main(argv: list[str] | None = None) -> None:
         osa.disconnect()
 
     # CSV first: the map is on disk before anything else can fail.
-    csv_path = write_wavelength_map_csv(clipped, args.out / f"step2_{stamp}.csv")
-    calib = write_section(args.out, 2, step2_section(clipped), csv=csv_path)
+    csv_path = write_wavelength_map_csv(
+        clipped, calib_file.parent / f"step2_{stamp}.csv")
+    calib = write_section(calib_file, 2, step2_section(clipped), csv=csv_path)
     print(f"\n{clipped.coordinates.size} of {swept.coordinates.size} swept coordinates "
           f"kept ({swept.wavelength.min():.3f}-{swept.wavelength.max():.3f} nm swept)")
     print(f"Saved -> {calib.path}\n         {csv_path}")

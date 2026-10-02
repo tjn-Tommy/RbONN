@@ -12,6 +12,7 @@ same committed measurement CSV the offline script refits.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -38,11 +39,12 @@ from calibration_module.measure.pair_v2 import DEFAULT_ACQ  # noqa: E402
 from calib_fixtures import seed_run  # noqa: E402
 
 MEAS_CSV = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_meas_0907_1757.csv"
+STEP6 = REPO / "src/calib_data/archive/2026-09/run_0907_1724/calib_step6v2_result_0907_1757.json"
 STEP3 = REPO / "src/calib_data/archive/2026-09/run_0908_1444/calib_step3c_0907_1358_pad10.json"
 
-#: What the 0907 run published, in the order the table lists them.
-RECORDED_ETA = [0.17760529803227112, 0.17954179839571333, 0.1920940148157429,
-                0.2142402286038278, 0.25500301123102215]
+#: What the 0907 CSV fits to (see test_pair_v2.RECORDED_ETA), table order.
+RECORDED_ETA = [0.17723508222881532, 0.17949741792999532, 0.19180164107087086,
+                0.21419773519244129, 0.2549718270732447]
 
 _app: QtWidgets.QApplication | None = None
 
@@ -50,6 +52,21 @@ _app: QtWidgets.QApplication | None = None
 def setUpModule() -> None:
     global _app
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+@contextlib.contextmanager
+def _picks(path):
+    """Answer the Load dialog with ``path``.
+
+    Load asks which calibration to re-fit rather than taking the page's field:
+    looking at another night is the usual reason to press it, and the field is
+    where a SWEEP writes.  So every Load here has to say what was picked.
+    """
+    with unittest.mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            staticmethod(lambda *a, **k: (str(path), ""))):
+        yield
+
 
 
 class _WindowCase(unittest.TestCase):
@@ -66,7 +83,7 @@ class _WindowCase(unittest.TestCase):
 
     def _load(self):
         w = self.win
-        failed = w._tpa_fit_rows(load_meas_csv(MEAS_CSV), w._tpa_config(), None)
+        failed = w._tpa_fit_rows(load_meas_csv(MEAS_CSV), None)
         self.assertEqual(failed, [])
         w._tpa_fill_table()
         w._tpa_redraw()
@@ -101,52 +118,47 @@ class SweepRampTests(_WindowCase):
     def _cross(cfg):
         return [(w, n) for x, w, n in cfg.grid if x and w]
 
-    def test_defaults_give_the_37_acquisition_grid(self) -> None:
+    def test_defaults_give_the_34_acquisition_grid(self) -> None:
         from calibration_module.measure.pair_v2 import build_schedule
 
-        cfg = self.win._tpa_config()
-        self.assertEqual(cfg.fit_w_range, (0.2, 0.9))
-        self.assertEqual(len(build_schedule(cfg)), 37)
+        self.assertEqual(len(build_schedule(self.win._tpa_config())), 34)
 
-    def test_the_ramp_reaches_the_grid_and_the_fit_window(self) -> None:
+    def test_the_ramp_reaches_the_grid(self) -> None:
         w = self.win
         w.tpa_sweep_min.setValue(0.30)
         w.tpa_sweep_max.setValue(0.90)
         w.tpa_points.setValue(3)
-        cfg = w._tpa_config()
-        self.assertEqual(cfg.fit_w_range, (0.3, 0.9))
-        self.assertEqual([lv[0] for lv in self._cross(cfg)][:3], [0.3, 0.6, 0.9])
+        self.assertEqual([lv[0] for lv in self._cross(w._tpa_config())], [0.3, 0.6, 0.9])
 
     def test_last_ramp_point_gets_the_extra_repeats(self) -> None:
-        """The top of the window carries the most leverage on the slope."""
+        """The top of the ramp carries the most leverage on the slope."""
         cross = self._cross(self.win._tpa_config())
-        in_window = [lv for lv in cross if lv[0] <= 0.9]
-        self.assertEqual(in_window[-1][1], 6)
-        self.assertTrue(all(n == 4 for _w, n in in_window[:-1]))
+        self.assertEqual(cross[-1][1], 6)
+        self.assertTrue(all(n == 4 for _w, n in cross[:-1]))
 
-    def test_max_below_one_keeps_the_top_drive_diagnostic(self) -> None:
+    def test_max_below_one_appends_nothing(self) -> None:
+        """No (1, 1.0) compression level: the sweep is the ramp and only the ramp."""
         cross = self._cross(self.win._tpa_config())
-        self.assertEqual(cross[-1], (1.0, 2))          # measured, excluded from the fit
+        self.assertEqual(cross[-1], (0.9, 6))
+        self.assertNotIn(1.0, [w for w, _n in cross])
 
-    def test_max_at_one_gives_up_that_diagnostic(self) -> None:
-        """Compression then sits inside the fit -- the cost of the wider window."""
+    def test_a_loaded_csv_is_fitted_over_its_own_cross_line(self) -> None:
+        """The ramp controls describe the NEXT sweep; a loaded file is fitted as
+        it was swept.  Spinboxes at 0.2-0.9, file swept to 1.0: window 0.2-1.0."""
         w = self.win
-        w.tpa_sweep_max.setValue(1.00)
-        cfg = w._tpa_config()
-        self.assertEqual(cfg.fit_w_range[1], 1.0)
-        self.assertEqual(self._cross(cfg)[-1], (1.0, 6))    # the ramp end, not excluded
-        # Refitting the recorded run under this window pulls w = 1.0 in, so
-        # nothing is left to report as the compression diagnostic.
-        w._tpa_fit_rows(load_meas_csv(MEAS_CSV), cfg, None)
-        self.assertEqual(w.tpa_fits[0].excluded, [])
+        w.tpa_sweep_min.setValue(0.20)
+        w.tpa_sweep_max.setValue(0.90)
+        w._tpa_fit_rows(load_meas_csv(MEAS_CSV), None)
+        self.assertEqual(w.tpa_fits[0].fit_w_range, (0.2, 1.0))
 
     def test_a_half_typed_ramp_falls_back_instead_of_raising(self) -> None:
         """A spinbox mid-edit must not stop the page redrawing."""
+        from calibration_module.fit.pair_v2 import PairV2Config
+
         w = self.win
         w.tpa_sweep_min.setValue(0.90)
         w.tpa_sweep_max.setValue(0.90)                 # min == max: not a ramp
-        cfg = w._tpa_config()
-        self.assertEqual(cfg.fit_w_range, (0.2, 0.9))  # the validated default
+        self.assertEqual(w._tpa_config(), PairV2Config())  # the validated default
         w._tpa_redraw()                                 # must not raise
 
 
@@ -198,29 +210,33 @@ class StepThreeInputTests(_WindowCase):
         w = self.win
         w.tpa_step3_edit.setText("")
         w._tpa_run()
-        self.assertIn("no run folder", w.tpa_status.text())
+        self.assertIn("no calibration file", w.tpa_status.text())
 
     def test_run_refuses_a_path_that_is_not_there(self) -> None:
         w = self.win
         w.tpa_step3_edit.setText(str(self.run.parent / "no_such_run"))
         w._tpa_run()
-        self.assertIn("no calib.json", w.tpa_status.text())
+        self.assertIn("is not there", w.tpa_status.text())
 
     def test_a_valid_run_is_described_before_the_run(self) -> None:
         """An hour of bench time deserves a look at the folder first."""
         w = self.win
         w.tpa_step3_edit.setText(str(self.run))
         text = w.tpa_step3_label.text()
-        self.assertIn(self.run.name, text)
+        self.assertIn(self.run.name, text)        # the folder, not just calib.json
         self.assertIn("step3", text)                 # the stamp chain
         self.assertRegex(text, r"\d+ pairs")
         self.assertRegex(text, r"\d+ px window")
-        self.assertEqual(w.tpa_step3_label.property("status"), "ok")
+        # It lands in the page's status line, beside the title, and plain: the
+        # green pill under the field said only that the field had a path in it.
+        self.assertIs(w.tpa_step3_label, w.tpa_status)
+        self.assertIsNone(w.tpa_step3_label.property("status"))
 
     def test_a_folder_without_a_calib_json_is_flagged(self) -> None:
         w = self.win
         w.tpa_step3_edit.setText(str(MEAS_CSV.parent))   # no calib.json in there
-        self.assertEqual(w.tpa_step3_label.property("status"), "error")
+        self.assertIn("calib.json", w.tpa_status.text())
+        self.assertFalse(w.tpa_run_button.isEnabled())
 
     def test_layout_matches_the_offline_loader(self) -> None:
         """Same run, same loader -> the same pixels get driven."""
@@ -238,14 +254,20 @@ class StepThreeInputTests(_WindowCase):
 
 class ResultsTableTests(_WindowCase):
     def test_table_shows_the_published_etas(self) -> None:
+        """Each row is its own pair's eta, to within what the weights can move it.
+
+        Not equality, so a reweighting cannot break it.  The point of this test
+        is that row ``i`` carries pair ``i + 2``'s eta -- a transposition or an
+        off-by-one would be wrong by percent, not by the 0.1% a reweighting
+        moves it.
+        """
         w = self._load()
         self.assertEqual(w.tpa_table.rowCount(), 5)
         for row, expected in enumerate(RECORDED_ETA):
             with self.subTest(row=row):
                 self.assertEqual(w.tpa_table.item(row, 0).text(), str(row + 2))
-                self.assertAlmostEqual(
-                    float(w.tpa_table.item(row, 1).text()), expected, places=5
-                )
+                got = float(w.tpa_table.item(row, 1).text())
+                self.assertAlmostEqual(got / expected, 1.0, places=2)
 
     def test_background_columns_are_in_millivolts(self) -> None:
         """a_x/a_w/d are volts on the fit and mV in the table -- easy to get wrong."""
@@ -306,12 +328,10 @@ class SaveRoundTripTests(_WindowCase):
         w = self._load()
         run = seed_run(self.tmp / "run_y", step3=STEP3)
         w.tpa_step3_edit.setText(str(run))
-        target = run / "calib_step6v2_meas_0910_1938.csv"
-        with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getSaveFileName",
-            staticmethod(lambda *a, **k: (str(target), "")),
-        ):
-            w._tpa_save()
+        w._tpa_autosave()
+        written = sorted(run.glob("calib_step6v2_meas_*.csv"))
+        self.assertEqual(len(written), 1, w.tpa_status.text())
+        target = written[0]
 
         self.assertTrue(target.is_file(), w.tpa_status.text())
         jsons = list(run.glob("*.json"))
@@ -326,27 +346,99 @@ class SaveRoundTripTests(_WindowCase):
 
         models = load_pair_models(str(jsons[0]))
         self.assertEqual(sorted(models), [2, 3, 4, 5, 6])
-        self.assertAlmostEqual(models[5].eta, RECORDED_ETA[3], places=12)
+        # What the page showed is exactly what it wrote; see
+        # test_table_shows_the_published_etas for why this is not RECORDED_ETA.
+        self.assertAlmostEqual(models[5].eta, w.tpa_fits[3].eta, places=12)
 
         self.assertEqual(
-            len(list(run.glob("calib_step6v2_pair*_0910_1938.png"))), 5,
-            "one diagnostic PNG per pair, same renderer as the offline script",
+            list(run.glob("*.png")), [],
+            "no PNGs: Load re-fits the CSV the section names and draws it",
         )
 
-    def test_save_without_a_run_still_writes_the_rows(self) -> None:
-        """The measurement must never be lost to a missing calibration."""
+    def test_save_without_a_run_parks_the_rows_rather_than_losing_them(self) -> None:
+        """The measurement must never be lost to a missing calibration.
+
+        With the dialog gone there is no path to type, so a sweep whose page
+        named no run goes to a dated folder under the calibration directory --
+        no section (nothing there to interpret it against), but the hour of
+        bench time survives.
+        """
         w = self._load()
-        target = self.tmp / "bare" / "rows_only.csv"
-        target.parent.mkdir()
+        parked = self.tmp / "unfiled_home"
+        parked.mkdir()
         w.tpa_step3_edit.setText("")
         with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getSaveFileName",
-            staticmethod(lambda *a, **k: (str(target), "")),
+            type(w), "_default_calib_dir", lambda _self: parked
         ):
-            w._tpa_save()
-        self.assertTrue(target.is_file())
-        self.assertFalse(list(target.parent.glob("*.json")))
-        self.assertIn("no usable run folder", w.tpa_status.text())
+            w._tpa_autosave()
+        rows = list(parked.glob("unfiled_*/calib_step6v2_meas_*.csv"))
+        self.assertEqual(len(rows), 1, w.tpa_status.text())
+        self.assertFalse(list(rows[0].parent.glob("*.json")))
+        self.assertIn("no usable calibration file", w.tpa_status.text())
+
+
+class LoadAsksTests(_WindowCase):
+    """Load asks which calibration to re-fit; the page's own file stays put.
+
+    The field is where a SWEEP writes.  Looking at another night is the usual
+    reason to press Load, and it must not quietly re-point that.
+    """
+
+    def test_it_fits_the_file_it_was_handed_not_the_one_on_the_page(self) -> None:
+        w = self.win
+        stale = str(Path("C:/nowhere/at/all/calib.json"))
+        w.tpa_step3_edit.setText(stale)
+        self.addCleanup(w.tpa_step3_edit.setText, "")
+        with tempfile.TemporaryDirectory() as tmp:
+            other = seed_run(Path(tmp) / "other_night", step3=STEP3,
+                             step6=STEP6, step6_csv=MEAS_CSV)
+            with _picks(other / "calib.json"):
+                w._tpa_load()
+            self.assertTrue(w.tpa_fits, w.tpa_status.text())
+            self.assertIn("other_night", w.tpa_status.text())
+        self.assertEqual(w.tpa_step3_edit.text(), stale,
+                         "a Load must not move where a sweep would write")
+
+    def test_a_cancelled_load_changes_nothing(self) -> None:
+        w = self.win
+        w.tpa_status.setText("–")
+        with _picks(""):
+            w._tpa_load()
+        self.assertEqual(w.tpa_status.text(), "–")
+
+
+class RailTests(_WindowCase):
+    """The rail ceiling is a page setting now, and it reaches the fit.
+
+    It was the constant ``outliers.BURST_MAX_V``, which is a property of this
+    bench at this gain: it has to clear the brightest honest read of the sweep,
+    and nobody but the operator knows what that will be.
+    """
+
+    def test_the_default_is_the_modules_constant(self) -> None:
+        from calibration_module.fit.outliers import BURST_MAX_V
+
+        self.assertAlmostEqual(self.win._tpa_rail_v(), BURST_MAX_V, places=9)
+
+    def test_lowering_it_rejects_reads_the_default_keeps(self) -> None:
+        """A rail under the sweep's own cross line takes the cross line out."""
+        w = self.win
+        self.addCleanup(w.tpa_rail.setValue, w.tpa_rail.value())
+        rows = load_meas_csv(MEAS_CSV)
+
+        w.tpa_rail.setValue(300.0)
+        self.assertEqual(w._tpa_fit_rows(rows, None), [])
+        self.assertEqual(len(w.tpa_fits), len(rows))
+        kept = {f.index: len(f.levels) for f in w.tpa_fits}
+
+        # 1 mV is under this sweep's drive levels (~8 mV) and over its dark
+        # (~0.09 mV), so the bright half of every pair is railed away.
+        w.tpa_rail.setValue(1.0)
+        failed = w._tpa_fit_rows(rows, None)
+        self.assertTrue(failed, "a rail under the drive must cost reads")
+        self.assertLess(len(w.tpa_fits), len(rows))
+        for fit in w.tpa_fits:
+            self.assertLess(len(fit.levels), kept[fit.index])
 
 
 class ProgressDialogTests(_WindowCase):
@@ -424,16 +516,13 @@ class Step7HandoffTests(_WindowCase):
         with tempfile.TemporaryDirectory() as tmp:
             run = seed_run(Path(tmp) / "run_h", step3=STEP3)
             w.tpa_step3_edit.setText(str(run))
-            target = run / "handoff.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_save()
+            w._tpa_autosave()
             w.tpa_phase_step6_edit.setText(str(run))
             layout, models = w._tpa_phase_load_step6()
             self.assertEqual(sorted(models), [2, 3, 4, 5, 6])
-            self.assertAlmostEqual(models[5].eta, RECORDED_ETA[3], places=12)
+            # The etas step 7 pins to are the ones step 6 just wrote, not a
+            # historical constant -- the floor is measured per sweep now.
+            self.assertAlmostEqual(models[5].eta, w.tpa_fits[3].eta, places=12)
             self.assertEqual(layout.n_channels, 6)
         w.tpa_phase_step6_edit.setText("")
 
@@ -485,14 +574,13 @@ class PmtCheckboxTests(_WindowCase):
 
     def test_a_load_takes_the_meta_from_the_file_not_the_session(self) -> None:
         """Otherwise Save would stamp loaded rows with this session's sweep."""
-        from unittest import mock
-
         w = self.win
-        w.tpa_meta = {"pmt_c_start": "99.9"}        # left over from a sweep here
-        with mock.patch.object(
-                QtWidgets.QFileDialog, "getOpenFileName",
-                return_value=(str(MEAS_CSV), "")):
-            w._tpa_load()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = seed_run(Path(tmp) / "run_meta", step3=STEP3, step6=STEP6,
+                           step6_csv=MEAS_CSV)
+            w.tpa_meta = {"pmt_c_start": "99.9"}    # left over from a sweep here
+            with _picks(run / "calib.json"):
+                w._tpa_load()
         self.assertNotIn("pmt_c_start", w.tpa_meta)
 
 

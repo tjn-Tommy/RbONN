@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -13,7 +14,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
-from calibration_module.fit.legacy_intensity import intensity_model, load_calibration_csv
+from calibration_module.fit.legacy_intensity import (
+    fit_calibration,
+    intensity_model,
+    load_calibration_csv,
+)
 from calibration_module.fit.outliers import OutlierRemeasurePolicy
 from calibration_module.fit.slm_response import (
     CalibrationResult,
@@ -1533,6 +1538,47 @@ class ClipToWavelengthRangeTests(unittest.TestCase):
         np.testing.assert_allclose(loaded.coordinates, clipped.coordinates)
         np.testing.assert_allclose(
             loaded.wavelength_fit_coefficients, clipped.wavelength_fit_coefficients
+        )
+
+
+class LegacyIntensityFitTests(unittest.TestCase):
+    """What is left of the old sin^2 fit.
+
+    ``legacy_intensity`` is still reachable: ``fit.outliers`` uses its model and
+    one GUI page loads a CSV through it. Its loader is already exercised by
+    ``test_write_intensity_calibration_csv_matches_legacy_loader`` above; these
+    two cover the rest of it, and are all that survived ``tests/test_calibration.py``.
+    """
+
+    def test_load_calibration_csv_rejects_missing_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bad.csv"
+            with open(path, "w", encoding="utf-8", newline="") as file:
+                csv.writer(file).writerows([["level", "intensity"], [0, 1]])
+
+            with self.assertRaisesRegex(ValueError, "missing required columns"):
+                load_calibration_csv(path)
+
+    def test_fit_calibration_recovers_synthetic_curve(self) -> None:
+        levels = np.linspace(0, 1023, 50)
+        true_i0 = 2.5
+        true_slope = 2.0 * math.pi / 1023.0
+        true_offset = 0.35
+        intensities = intensity_model(levels, true_i0, true_slope, true_offset)
+        points = [
+            type("Point", (), {"wavelength_nm": 800.0, "level": float(level),
+                               "intensity": float(intensity)})
+            for level, intensity in zip(levels, intensities)
+        ]
+
+        fit = fit_calibration(points)[800.0]
+
+        self.assertLess(fit.rmse, 1e-6)
+        self.assertGreater(fit.r_squared, 0.999999)
+        np.testing.assert_allclose(
+            intensity_model(levels, fit.i0, fit.phase_slope, fit.phase_offset),
+            intensities,
+            atol=1e-5,
         )
 
 

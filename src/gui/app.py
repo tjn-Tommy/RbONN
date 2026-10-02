@@ -1,3 +1,34 @@
+"""The SLM control suite: one PyQt5 window over every instrument on the bench.
+
+In:  the drivers -- ``slm_module``, ``osa_module``, ``daq_module``,
+     ``heater_module``, ``psu_module`` -- and ``calibration_module`` for the
+     sweeps and the fits.  This file drives them and defines no physics and no
+     file format of its own.
+Out: the window, and whatever CSV/JSON/PNG each calibration step writes through
+     ``calibration_module``.  No page parses a calibration by hand: they all go
+     through ``calibration_module.calib_file``, one run's ``calib.json``.
+
+A 220 px nav list switches a stack of pages.  Connections and SLM Control first,
+then the read-side instrument pages (OSA Viewer, DAQ Monitor, Heater, PMT Gain)
+beside them because they are reached far more often than the Calibration page
+under them, which carries the step chain as tabs: 1 Min/Max, 2 Wavelength,
+3 Channels (DAQ), 6 TPA Efficiency, 7 Comb Phase, 8 Saturation.  Several pages
+are BUILT BUT NOT TABBED -- the OSA step 3b, Mod Error, step 4b, step 6b -- each
+saying at its own construction why; they stay built because other pages read
+their widgets.
+
+Every instrument call goes through :meth:`MainWindow._run_task`, which runs it on
+a ``FunctionWorker`` thread and delivers the result on the GUI thread, so no page
+blocks the event loop.  The v2 sweep drivers in ``calibration_module.measure``
+take a ``progress_callback`` and a ``stop_event``, which is how one
+implementation serves both this GUI's progress bar and Stop button and the
+offline step scripts.
+
+The step pages share one contract, in the ``_STEP_*`` maps on
+:class:`MainWindow`: each names a ``calib.json``, declares what that file must
+already contain before its Run is enabled, and describes what it found.
+"""
+
 from __future__ import annotations
 
 import json
@@ -48,7 +79,11 @@ from calibration_module.fit.slm_response import (
     load_calibration_result,
     load_wavelength_map_csv,
     save_calibration_result,
+    step1_section,
+    step2_section,
+    step3_section,
     write_intensity_calibration_csv,
+    write_wavelength_map_csv,
 )
 from calibration_module.measure.slm_response import (
     CalibrationAborted,
@@ -108,18 +143,21 @@ from calibration_module.calib_file import (
     STEP_ORDER as CALIB_STEP_ORDER,
     calib_path as calib_file_path,
     load_calib,
+    write_section,
 )
 from calibration_module.fit.pair_v2 import (
     PairV2Config,
     PairV2Fit,
     average_levels,
+    sweep_floor,
+    step6_floor,
     burst_rows,
     fit_pair,
     load_meas_csv,
-    save_plot,
     save_step6_section,
     write_meas_csv,
 )
+from calibration_module.fit.outliers import BURST_MAX_V
 from calibration_module.measure.pair_v2 import (
     DEFAULT_ACQ as BENCH_ACQ,
     PairV2Aborted,
@@ -141,6 +179,7 @@ from calibration_module.fit.phase import (
     fit_result,
     load_pair_models,
     drop_bursts,
+    guard_darks,
     load_phase_csv,
     save_step7_section,
     references_in_csv,
@@ -265,24 +304,6 @@ def _pattern_to_qimage_color(data: np.ndarray) -> QtGui.QImage:
         rgb.data, width, height, 3 * width, QtGui.QImage.Format_RGB888
     )
     return image.copy()
-
-
-def _save_paths(path: str | Path) -> tuple[Path, Path, Callable[[int], Path]]:
-    """The CSV, JSON and per-pair PNG a step 6/7 save writes, named like the scripts.
-
-    ``calib_step7_meas_0910_2025.csv`` -> ``calib_step7_result_0910_2025.json``
-    and ``calib_step7_pair<k>_0910_2025.png``, so a GUI save and a script run
-    leave the same ``*_result_*.json`` behind.  A name without ``_meas_`` keeps
-    its stem and gains ``_result`` / ``_pair<k>``.
-    """
-    csv = Path(path).with_suffix(".csv")
-    head, meas, tail = csv.stem.partition("_meas_")
-    tail = f"_{tail}" if meas else ""
-    return (
-        csv,
-        csv.with_name(f"{head}_result{tail}.json"),
-        lambda k: csv.with_name(f"{head}_pair{k}{tail}.png"),
-    )
 
 
 class WheelSpinBox(QtWidgets.QDoubleSpinBox):
@@ -503,6 +524,51 @@ class SLMMonitorView(QtWidgets.QWidget):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._timer.stop()
         super().closeEvent(event)
+
+
+class StatusLine(QtWidgets.QLabel):
+    """A page's newest line of feedback, beside its title.  Never a history.
+
+    It does not wrap.  A wrapped status is a paragraph that grows and shrinks
+    under whatever it sits above, moving the rest of the page every time a
+    message lands -- and two of them stacked read as a log, which this is not.
+    So the text is kept whole and PAINTED elided, with all of it in the tooltip.
+
+    ``text()`` returns the whole string rather than the part that fit: what the
+    page said is not a function of how wide the window happens to be, and every
+    reader of it -- the tests included -- wants the sentence.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self.setObjectName("PageSubtitle")
+        self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        # Ignored: the label is as wide as the header row has left over, never
+        # as wide as its longest message.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                           QtWidgets.QSizePolicy.Preferred)
+        self._full = ""
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        shown = self.fontMetrics().elidedText(
+            self._full, QtCore.Qt.ElideRight, max(0, self.width()))
+        # Only on a real change: setText relayouts, a relayout can resize, and
+        # a resize comes back here.
+        if shown != QtWidgets.QLabel.text(self):
+            super().setText(shown)
 
 
 #: Every acquisition control on the step 6/7/8 pages starts from BENCH_ACQ, so
@@ -984,7 +1050,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # DAQ scan below is the step 3 this bench runs, and two tabs for one step
         # is how a sweep ends up done through the wrong one.  See the README's
         # Legacy section.
-        self._build_fast_channel_calibration_page()
+        self._fast_channel_page = self._build_fast_channel_calibration_page()
+        self._fast_channel_page.setVisible(False)
         tabs.addTab(self._build_step3c_page(), "Step 3 · Channels (DAQ)")
         # Mod Error page is built but not shown as a tab: the Encoding Gain
         # (TPA Encoding page) and Quick Test sweeps read its ana_* OSA
@@ -1020,6 +1087,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # earlier run's JSON -- see calib_data/archive/2026-09/run_0907_1724/sequence.json.
         self.calibration_tabs = tabs
         lay.addWidget(tabs)
+        # Every page's field exists now, so each can describe its file and gate
+        # its own buttons.  Done once here rather than from each page's
+        # constructor: a page's Run button is sometimes built after its field.
+        self._calib_describe_all()
 
         # every OSA-gated Run button, toggled together by
         # _set_calibration_running (the unified pipeline page gates its own
@@ -1031,6 +1102,247 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stage3_reopt_run_button,
         ]
         return page
+
+    # ---- the calib file every page names -----------------------------
+    #: What a step needs to find in its calib.json before it can run.
+    #:
+    #: Steps 1 and 2 need nothing.  Step 1 CREATES the file, and step 2's
+    #: off/on levels come either from step 1 or from the manual pair, so a
+    #: calibration whose levels were typed in is complete and never has a
+    #: step 1 at all -- the same rule as ``calib_step2.py --min-max``.
+    _STEP_NEEDS: dict[int | str, tuple[int, ...]] = {
+        "3c": (2,), 6: (3,), 7: (3, 6), 8: (3, 6, 7),
+    }
+
+    #: Pages with something better to say about their file than its chain --
+    #: step 6 counts the layout's pairs, step 7 the etas it will pin to, step 8
+    #: the Y_max it places its band on.  One line per page either way.
+    _STEP_DESCRIBE: dict[int | str, str] = {
+        6: "_tpa_describe_step3", 7: "_tpa_phase_describe_step6",
+        8: "_step8_step7_changed",
+    }
+
+    #: Pages whose file description goes in the page's STATUS LINE, beside the
+    #: title, rather than in a pill under the file row.
+    #:
+    #: A green pill under the field said the file was readable, which is the one
+    #: thing already obvious from the field having a path in it -- and it said so
+    #: in the loudest place on the page, every time, forever.  The status line is
+    #: where a page's newest line of feedback goes, and what a file holds is
+    #: feedback about loading it.  Only these three have one; steps 1-3 keep the
+    #: pill, which is also the only place they report a file that is missing.
+    _STEP_STATUS: dict[int | str, str] = {
+        6: "tpa_status", 7: "tpa_phase_status", 8: "step8_status",
+    }
+
+    #: The per-page Run buttons each step's file gates, by attribute name.
+    #:
+    #: Run only.  Load is not gated by this field and must not be: it ASKS
+    #: which calibration to re-fit, and looking at another night's is the usual
+    #: reason to press it -- so gating it on the field meant you could not open
+    #: a file until you had already named a different one.
+    #:
+    #: Step 3's Run is not here either: it is DAQ-gated as well, so
+    #: :meth:`_refresh_step3_run_button` owns it and reads the same requirement.
+    _STEP_BUTTONS: dict[int | str, tuple[str, ...]] = {
+        6: ("tpa_run_button",),
+        7: ("tpa_phase_run_button",),
+        8: ("step8_run_button",),
+    }
+
+    def _calib_file_row(self, step: int | str, *,
+                        create: bool = False) -> QtWidgets.QWidget:
+        """The one input a step page takes: the calib.json it appends to.
+
+        One field per page, because the file IS the argument -- the same
+        ``--calib`` every runner takes.  A single shared field sat in the
+        calibration tab's header until 2026-10-01; it kept six pages in step by
+        force, which also meant looking at last night's step 6 re-pointed
+        step 8.  One per page, and loading a file is loading a file.
+
+        ``create=True`` gives step 1 a SAVE dialog: it is the step that starts a
+        calibration, so it names a file that need not exist yet, and the OS asks
+        before replacing one that does -- which is the whole warning, since a
+        new step 1 drops every section under it anyway.
+
+        A typed directory is accepted and means its ``calib.json``, exactly as
+        the runners' :func:`~calibration_module.calib_file.calib_path` does.
+        """
+        if not hasattr(self, "_calib_edits"):
+            self._calib_edits: dict[int | str, QtWidgets.QLineEdit] = {}
+            self._calib_labels: dict[int | str, QtWidgets.QLabel] = {}
+
+        panel = self._panel("Calibration file")
+        grid = QtWidgets.QGridLayout(panel)
+        grid.setColumnStretch(1, 1)
+        edit = QtWidgets.QLineEdit()
+        edit.setPlaceholderText(
+            "required — the calib.json this step writes into"
+        )
+        edit.setToolTip(
+            "The one file this step reads and appends to, and whose folder its "
+            "CSV lands in.\n"
+            "Its step3 section IS the channel layout every level is encoded "
+            "through, its step6 section the etas step 7 pins to, its step7 "
+            "section the forward model step 8 drives."
+        )
+        browse = QtWidgets.QPushButton("Browse\N{HORIZONTAL ELLIPSIS}")
+        browse.setProperty("variant", "ghost")
+        browse.clicked.connect(
+            (lambda: self._browse_new_calib_into(edit)) if create
+            else (lambda: self._browse_calib_into(edit))
+        )
+        # The page's own status line if it has one (see _STEP_STATUS), so
+        # the description lands beside the title; otherwise a pill under the
+        # field.  Registered either way, so every writer stays one call.
+        label = getattr(self, self._STEP_STATUS.get(step, ""), None)
+        inline = label is None
+        if inline:
+            label = QtWidgets.QLabel("\N{EN DASH}")
+            label.setObjectName("PageSubtitle")
+            label.setWordWrap(True)
+        grid.addWidget(QtWidgets.QLabel("File"), 0, 0)
+        grid.addWidget(edit, 0, 1)
+        grid.addWidget(browse, 0, 2)
+        if inline:
+            grid.addWidget(label, 1, 0, 1, 3)
+
+        self._calib_edits[step] = edit
+        self._calib_labels[step] = label
+        edit.textChanged.connect(lambda _="": self._calib_file_changed(step))
+        return panel
+
+    def _open_calib(self, title: str, step: int | str) -> "Path | None":
+        """Ask which calib.json to look at, starting where this page's lives.
+
+        Load ASKS rather than taking the page's field, because looking at
+        another night is the usual reason to press it -- and the field is where
+        a SWEEP will write, which must not move because somebody opened a file.
+        Everything the fit then needs comes out of the file that was picked: its
+        own sweep CSV, its own step-3 layout, its own step-6 etas.  Nothing on
+        screen afterwards is a mixture of two calibrations.
+        """
+        here = self._calib_file_path(step)
+        start = (str(here.parent) if here is not None and here.parent.is_dir()
+                 else str(self._default_calib_dir()))
+        name, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, title, start,
+            f"Calibration ({CALIB_FILE_NAME});;JSON (*.json);;All files (*)")
+        return calib_file_path(name) if name else None
+
+    def _browse_calib_into(self, edit: QtWidgets.QLineEdit) -> None:
+        """Open an existing calib.json, starting in src/calib_data."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open a calibration file", str(self._default_calib_dir()),
+            f"Calibration ({CALIB_FILE_NAME});;JSON (*.json);;All files (*)")
+        if path:
+            edit.setText(path)
+
+    def _browse_new_calib_into(self, edit: QtWidgets.QLineEdit) -> None:
+        """Choose or create the calib.json step 1 starts.
+
+        A Save dialog, so the folder can be made here and the OS asks before
+        replacing a file that already exists.  Nothing is written until the
+        sweep finishes: an accepted name is a name, and an abandoned step 1
+        leaves no empty calibration behind.
+        """
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Choose or create a calibration file",
+            str(self._default_calib_dir() / CALIB_FILE_NAME),
+            f"Calibration ({CALIB_FILE_NAME});;JSON (*.json)")
+        if path:
+            edit.setText(path)
+
+    @staticmethod
+    def _calib_name(path: Path) -> str:
+        """``run_0930/calib.json`` -- the folder is half the identity of a file
+        that is called calib.json in every one of them."""
+        return f"{path.parent.name}/{path.name}"
+
+    def _calib_file_path(self, step: int | str) -> "Path | None":
+        """The calib.json this page names, or None when its field is empty."""
+        edit = getattr(self, "_calib_edits", {}).get(step)
+        text = "" if edit is None else edit.text().strip().strip('"')
+        return calib_file_path(text) if text else None
+
+    def _require_calib_file(self, step: int | str) -> Path:
+        """The page's calib file, or a ValueError the Run handlers reject on."""
+        path = self._calib_file_path(step)
+        if path is None:
+            raise ValueError("choose a calibration file for this step first")
+        return path
+
+    def _calib_sections(self, step: int | str) -> "set[int]":
+        """Which sections this page's file has; empty set if it cannot be read."""
+        path = self._calib_file_path(step)
+        if path is None:
+            return set()
+        try:
+            return set(load_calib(path).steps())
+        except Exception:                                   # noqa: BLE001
+            return set()
+
+    def _calib_missing(self, step: int | str) -> "list[int]":
+        """Sections ``step`` needs that its file has not got, in order."""
+        have = self._calib_sections(step)
+        return [n for n in self._STEP_NEEDS.get(step, ()) if n not in have]
+
+    def _calib_file_changed(self, step: int | str) -> None:
+        """Re-describe this page's file, then re-gate this page's buttons."""
+        hook = getattr(self, self._STEP_DESCRIBE.get(step, ""), None)
+        if hook is not None:
+            hook()
+            self._calib_gate_step(step)
+            return
+        label = getattr(self, "_calib_labels", {}).get(step)
+        path = self._calib_file_path(step)
+        if label is not None:
+            if path is None:
+                self._set_status(label, "No calibration file chosen.", "off")
+            elif not path.is_file():
+                self._set_status(
+                    label,
+                    f"{path.name} does not exist yet — "
+                    f"{'step 1 will create it' if step == 1 else 'nothing to read'}"
+                    f" ({path.parent})",
+                    "off" if step == 1 else "error")
+            else:
+                try:
+                    chain = self._run_chain(path)
+                except Exception as exc:                    # noqa: BLE001
+                    self._set_status(label, f"{path.name}: {exc}", "error")
+                else:
+                    self._set_status(
+                        label,
+                        f"{self._calib_name(path)} · {chain}", "ok")
+        self._calib_gate_step(step)
+
+    def _calib_gate_step(self, step: int | str) -> None:
+        """Enable this page's buttons only when its file has what it needs.
+
+        Said before the click, not after: a step 7 driven against a file with no
+        step 6 used to spend the sweep and then refuse to fit it.
+        """
+        if step == "3c":
+            self._refresh_step3_run_button()
+            return
+        missing = self._calib_missing(step)
+        why = ("" if not missing else
+               "that file has no " + ", ".join(f"step{n}" for n in missing))
+        for name in self._STEP_BUTTONS.get(step, ()):
+            button = getattr(self, name, None)
+            if button is None:
+                continue
+            # Remembered the first time, because gating overwrites the tooltip
+            # and the button's own explanation has to come back afterwards.
+            if button.property("_ready_tip") is None:
+                button.setProperty("_ready_tip", button.toolTip())
+            button.setEnabled(not missing)
+            button.setToolTip(why or button.property("_ready_tip") or "")
+
+    def _calib_describe_all(self) -> None:
+        for step in getattr(self, "_calib_edits", {}):
+            self._calib_file_changed(step)
 
     def _build_stage3_reopt_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -1502,49 +1814,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return Path(__file__).resolve().parents[1] / "calib_data"
 
-    def _output_row(self, step: int | str, key: str, label: str, is_csv: bool) -> QtWidgets.QWidget:
-        """An output path edit + Browse, stored under self.step_widgets[step][key].
-
-        A blank edit saves to src/calib_data/calib_step{step}_MMDD_HHMM (see
-        _resolve_output_path); Browse pre-fills that same default.
-        """
-        row = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        suffix = ".csv" if is_csv else ".json"
-        edit = QtWidgets.QLineEdit()
-        edit.setPlaceholderText(
-            f"{label} (blank = src/calib_data/calib_step{step}_MMDD_HHMM{suffix})"
-        )
-        button = QtWidgets.QPushButton("Browse")
-        filt = "CSV Files (*.csv)" if is_csv else "JSON Files (*.json)"
-        button.clicked.connect(
-            lambda: self._browse_save_into(
-                edit,
-                str(self._default_calib_dir() / self._default_calib_name(step, suffix)),
-                filt,
-            )
-        )
-        self.step_widgets[step][key] = edit
-        layout.addWidget(QtWidgets.QLabel(label))
-        layout.addWidget(edit, 1)
-        layout.addWidget(button)
-        return row
-
-    def _input_file_row(self, step: int | str, caption: str, filt: str) -> QtWidgets.QWidget:
-        """An input path edit + Browse for a step, stored under [step]['in_path']."""
-        row = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        edit = QtWidgets.QLineEdit()
-        button = QtWidgets.QPushButton("Browse")
-        button.clicked.connect(lambda: self._browse_open_into(edit, caption, filt))
-        self.step_widgets[step]["in_path"] = edit
-        layout.addWidget(QtWidgets.QLabel("Input file"))
-        layout.addWidget(edit, 1)
-        layout.addWidget(button)
-        return row
-
     def _min_max_row(self, step: int | str, label: str) -> QtWidgets.QWidget:
         """A manual min/max level pair stored under [step]['min'] / [step]['max']."""
         row = QtWidgets.QWidget()
@@ -1607,9 +1876,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_step1_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
+        # Step 1 names a file that need not exist: this is where a calibration
+        # starts.  Nothing is written until the sweep finishes.
+        layout.addWidget(self._calib_file_row(1, create=True))
         layout.addWidget(self._build_measurement_group(1, {}))
         layout.addWidget(self._level_sweep_row(1, stop=1023, stepv=64))
-        layout.addWidget(self._output_row(1, "out", "Output JSON", False))
         layout.addWidget(self._run_row(1, "Run Step 1", self._run_step1))
         layout.addStretch(1)
         return page
@@ -1617,6 +1888,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_step2_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
+        layout.addWidget(self._calib_file_row(2))
         layout.addWidget(self._build_measurement_group(2, {}))
 
         cfg = QtWidgets.QHBoxLayout()
@@ -1669,11 +1941,15 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(cfg)
         layout.addWidget(self._region_row(2))
 
-        # input source
+        # Where the off/on levels come from.  Two choices, not three: step 1
+        # writes into the very file named above, so reading them back out of it
+        # is both simpler and what the CLI does -- and typing them is a
+        # first-class path, not a fallback, because a calibration seeded by hand
+        # is complete and never has a step 1 (see calib_step2.py --min-max).
         src_row = QtWidgets.QHBoxLayout()
         widgets["source"] = QtWidgets.QComboBox()
         widgets["source"].addItems(
-            ["Step 1 result (memory)", "From file…", "Manual min/max"]
+            ["The file's step 1", "Manual min/max"]
         )
         widgets["source"].currentIndexChanged.connect(self._toggle_step2_source)
         src_row.addWidget(QtWidgets.QLabel("Min/max source"))
@@ -1681,14 +1957,9 @@ class MainWindow(QtWidgets.QMainWindow):
         src_row.addStretch(1)
         layout.addLayout(src_row)
 
-        widgets["in_row"] = self._input_file_row(
-            2, "Open Step 1/2 result", "JSON Files (*.json)"
-        )
-        layout.addWidget(widgets["in_row"])
         widgets["manual_row"] = self._min_max_row(2, "Manual levels")
         layout.addWidget(widgets["manual_row"])
 
-        layout.addWidget(self._output_row(2, "out", "Output JSON", False))
         layout.addWidget(self._run_row(2, "Run Step 2", self._run_step2))
         layout.addStretch(1)
         self._toggle_step2_source()
@@ -1750,6 +2021,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(18, 14, 18, 14)
         widgets = self.step_widgets["3c"]
 
+        layout.addWidget(self._calib_file_row("3c"))
         widgets["daq_group"] = self._build_step3_daq_group("3c")
         layout.addWidget(widgets["daq_group"])
 
@@ -1788,26 +2060,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(
             self._level_sweep_row("3c", start=350, stop=950, stepv=25))
 
-        # wavelength source (same choices as Step 3)
-        src_row = QtWidgets.QHBoxLayout()
-        widgets["source"] = QtWidgets.QComboBox()
-        widgets["source"].addItems(["Step 2 result (memory)", "From file…"])
-        widgets["source"].currentIndexChanged.connect(self._toggle_step3c_source)
-        src_row.addWidget(QtWidgets.QLabel("Wavelength source"))
-        src_row.addWidget(widgets["source"])
-        src_row.addStretch(1)
-        layout.addLayout(src_row)
-
-        widgets["in_row"] = self._input_file_row(
-            "3c", "Open Step 2 result or λ-map CSV", "Calibration (*.json *.csv)"
-        )
-        layout.addWidget(widgets["in_row"])
-        widgets["manual_row"] = self._min_max_row("3c", "min/max for CSV source")
-        layout.addWidget(widgets["manual_row"])
-
-        layout.addWidget(self._output_row("3c", "out", "Output JSON", False))
-        layout.addWidget(self._output_row("3c", "out_csv", "Output CSV", True))
-
+        # No wavelength-source choice: the map is the named file's step-2
+        # section, exactly as calib_step3.py reads it.  The off/on levels ride
+        # in that section too, so there is nothing left to pick.
         run_row = self._run_row("3c", "Run Step 3c", self._run_step3c)
         widgets["stop"] = QtWidgets.QPushButton("Stop")
         widgets["stop"].setProperty("variant", "danger")
@@ -1816,7 +2071,6 @@ class MainWindow(QtWidgets.QMainWindow):
         run_row.layout().addWidget(widgets["stop"])
         layout.addWidget(run_row)
         layout.addStretch(1)
-        self._toggle_step3c_source()
         return page
 
     def _caption(self, text: str) -> QtWidgets.QLabel:
@@ -2189,7 +2443,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if calib is None or not calib.encodable:
             self._enc_log(
                 "No calibration found. Run Step 3 on the Calibration page, or use "
-                "'Load other…' to pick a run folder's calib.json."
+                "'Load other…' to pick a calib.json."
             )
             return
         self._enc_build_layout()
@@ -4490,6 +4744,7 @@ class MainWindow(QtWidgets.QMainWindow):
         the width and the full height.
         """
         page = self._page_shell("Channel TPA Efficiency (η) Calibration")
+        self.tpa_status = self._page_status(page, "\N{EN DASH}")
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(self._build_tpa_controls())
         split.addWidget(self._build_tpa_results())
@@ -4502,11 +4757,29 @@ class MainWindow(QtWidgets.QMainWindow):
         return page
 
     def _build_tpa_controls(self) -> QtWidgets.QWidget:
-        """The left column: DAQ, sweep, plan, progress, buttons."""
+        """The left column: the calib file, DAQ, sweep, buttons -- in that order.
+
+        The file first, because it is the one thing that has to be right before
+        anything else on the page means anything: every level below is encoded
+        through its step-3 section, so a sweep against the wrong one does not
+        fail, it calibrates a different aperture and reports numbers that look
+        fine.  Naming it here is also what makes a GUI run and a terminal run
+        the same run -- ``--calib`` on calib_step6_v2.py is this field.
+
+        It does not scroll, and that is a constraint on what may go in it: the
+        acquisition settings that are not bench constants, the sweep, and the
+        buttons.  A column taller than the window either loses the height out of
+        its panels or grows a scrollbar, and a setting you have to scroll to
+        find is a setting you will not check.
+        """
         col = QtWidgets.QWidget()
         box = QtWidgets.QVBoxLayout(col)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(12)
+
+        box.addWidget(self._calib_file_row(6))
+        self.tpa_step3_edit = self._calib_edits[6]
+        self.tpa_step3_label = self._calib_labels[6]
 
         # --- DAQ acquisition --------------------------------------------
         daq = self._panel("DAQ · acquisition")
@@ -4554,15 +4827,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_pmt.setToolTip(PMT_CHECKBOX_TIP)
 
         rows = [
-            ("Channel", self.tpa_daq_channel), ("Sample rate", self.tpa_daq_rate),
-            ("Range", self.tpa_daq_range), ("Low-pass", self.tpa_daq_fcut),
-            ("Settle", self.tpa_settle), ("T_meas", self.tpa_tmeas),
+            ("Channel", self.tpa_daq_channel),
+            ("Range", self.tpa_daq_range),
+            ("T_meas", self.tpa_tmeas),
         ]
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QtWidgets.QLabel(label), r, 0)
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_invert, len(rows), 0, 1, 2)
-        grid.addWidget(self.tpa_pmt, len(rows) + 1, 0, 1, 2)
+        # Bench constants, and off the panel for it.  The sample rate, the
+        # low-pass and the settle have been the same on every run this bench
+        # has taken, and the PMT log is always on; what is left on the panel is
+        # what actually gets set.  They are still live widgets that _tpa_acq
+        # and the sweep read, so this hides a control, not a setting.
+        for widget in (self.tpa_daq_rate, self.tpa_daq_fcut,
+                       self.tpa_settle, self.tpa_pmt):
+            widget.setParent(daq)
+            widget.hide()
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -4571,38 +4852,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sgrid.setHorizontalSpacing(8)
         sgrid.setVerticalSpacing(6)
 
-        # The Step-3 calibration is named here rather than inherited from the
-        # Encoding page, and it is required.  Every level of this sweep is
-        # *encoded through* it, so a run against the wrong one does not fail --
-        # it calibrates a different aperture and reports numbers that look fine.
-        # Naming it per run is also what makes a GUI run and a terminal run the
-        # same run: --step3 on calib_step6_v2.py is this field.
-        self.tpa_step3_edit = QtWidgets.QLineEdit()
-        self.tpa_step3_edit.setPlaceholderText("required — Step-3b/3c calibration JSON")
-        self.tpa_step3_edit.setToolTip(
-            "The Step-3b/3c result the channel layout is built from.\n"
-            "Its rows ARE the channels: pair i is the i-th channel of this file, "
-            "and the encoded aperture is the one these transfer curves were "
-            "measured through."
-        )
-        self.tpa_step3_browse = QtWidgets.QPushButton("Browse\N{HORIZONTAL ELLIPSIS}")
-        self.tpa_step3_browse.setProperty("variant", "ghost")
-        self.tpa_step3_browse.clicked.connect(self._tpa_browse_step3)
-        self.tpa_step3_label = QtWidgets.QLabel("\N{EN DASH}")
-        self.tpa_step3_label.setObjectName("PageSubtitle")
-        self.tpa_step3_label.setWordWrap(True)
-        sgrid.addWidget(QtWidgets.QLabel("Step 3"), 0, 0)
-        sgrid.addWidget(self.tpa_step3_edit, 0, 1)
-        sgrid.addWidget(self.tpa_step3_browse, 0, 2)
-        sgrid.addWidget(self.tpa_step3_label, 1, 0, 1, 3)
-
         self.tpa_pairs_edit = QtWidgets.QLineEdit("2-6")
         self.tpa_pairs_edit.setToolTip(
             "Pair labels to calibrate, 1-based: \"2-6\", \"1,3,5\" or a mix.\n"
             "Pair i is the i-th channel of the Step-3 calibration."
         )
-        sgrid.addWidget(QtWidgets.QLabel("Pairs"), 2, 0)
-        sgrid.addWidget(self.tpa_pairs_edit, 2, 1, 1, 2)
+        sgrid.addWidget(QtWidgets.QLabel("Pairs"), 0, 0)
+        sgrid.addWidget(self.tpa_pairs_edit, 0, 1, 1, 2)
 
         # The cross line -- the levels eta is the slope of.  The single-beam
         # block is not on here: it is the five levels the background fit needs
@@ -4628,27 +4884,43 @@ class MainWindow(QtWidgets.QMainWindow):
             "The last one gets 6 repeats instead of 4: the top of the window "
             "carries the most leverage on the slope."
         )
-        sgrid.addWidget(QtWidgets.QLabel("Sweep min"), 3, 0)
-        sgrid.addWidget(self.tpa_sweep_min, 3, 1, 1, 2)
-        sgrid.addWidget(QtWidgets.QLabel("Sweep max"), 4, 0)
-        sgrid.addWidget(self.tpa_sweep_max, 4, 1, 1, 2)
-        sgrid.addWidget(QtWidgets.QLabel("Ramp points"), 5, 0)
-        sgrid.addWidget(self.tpa_points, 5, 1, 1, 2)
+        sgrid.addWidget(QtWidgets.QLabel("Sweep min"), 1, 0)
+        sgrid.addWidget(self.tpa_sweep_min, 1, 1, 1, 2)
+        sgrid.addWidget(QtWidgets.QLabel("Sweep max"), 2, 0)
+        sgrid.addWidget(self.tpa_sweep_max, 2, 1, 1, 2)
+        sgrid.addWidget(QtWidgets.QLabel("Ramp points"), 3, 0)
+        sgrid.addWidget(self.tpa_points, 3, 1, 1, 2)
+
+        # The rail ceiling, a page setting rather than outliers.BURST_MAX_V:
+        # it is a property of this bench at this gain, it has to clear the
+        # brightest honest read of the sweep, and nobody but the operator
+        # knows what that will be.
+        self.tpa_rail = self._double_spin(
+            1.0, 1000.0, 1e3 * BURST_MAX_V, " mV", 0)
+        self.tpa_rail.setSingleStep(50.0)
+        self.tpa_rail.setToolTip(
+            "Any read at or above this is a railed detector, not a "
+            "measurement, and is dropped.\n"
+            "A bench-fault ceiling, not a saturation limit: it only has to "
+            "sit above the brightest read this sweep honestly takes.\n"
+            "Applies to the next sweep AND to a Load's re-fit."
+        )
+        sgrid.addWidget(QtWidgets.QLabel("Rail"), 4, 0)
+        sgrid.addWidget(self.tpa_rail, 4, 1, 1, 2)
+
         box.addWidget(sweep)
 
-        self.tpa_step3_edit.textChanged.connect(lambda _="": self._tpa_describe_step3())
-        self._tpa_describe_step3()
-
-        # --- status + buttons -------------------------------------------
+        # --- buttons -----------------------------------------------------
         # No progress bar here: a run takes tens of minutes, so it gets the
         # shared CalibrationProgressDialog (bar, elapsed/ETA, live plot,
         # Stop) that steps 1-3 pop, rather than a strip in a column the
         # user is not watching.
-        self.tpa_status = QtWidgets.QLabel("\N{EN DASH}")
-        self.tpa_status.setObjectName("PageSubtitle")
-        self.tpa_status.setWordWrap(True)
-        box.addWidget(self.tpa_status)
-
+        #
+        # No status line either: `tpa_status` is beside the page title.  The
+        # read-rejection rules used to be spelled out down here as well -- the
+        # rail is a control now and says what it does in its own tooltip, and
+        # the burst guard and the sigma floor announce themselves in the log
+        # when they fire, which is when anybody wants them.
         self.tpa_run_button = QtWidgets.QPushButton("Run Sweep")
         self.tpa_run_button.clicked.connect(self._tpa_run)
         self.tpa_stop_button = QtWidgets.QPushButton("Stop")
@@ -4658,16 +4930,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tpa_load_button = QtWidgets.QPushButton("Load\N{HORIZONTAL ELLIPSIS}")
         self.tpa_load_button.setProperty("variant", "ghost")
         self.tpa_load_button.setToolTip(
-            "Load a recorded step-6 v2 measurement CSV; every pair is re-fit."
+            "Re-fit the step-6 sweep this calibration file records and show it: "
+            "every pair, from the CSV its step6 section names.\n"
+            "Reads only — nothing is written back."
         )
         self.tpa_load_button.clicked.connect(self._tpa_load)
-        self.tpa_save_button = QtWidgets.QPushButton("Save\N{HORIZONTAL ELLIPSIS}")
-        self.tpa_save_button.setProperty("variant", "ghost")
-        self.tpa_save_button.setEnabled(False)
-        self.tpa_save_button.clicked.connect(self._tpa_save)
         btns = QtWidgets.QGridLayout()
         btns.addWidget(self.tpa_load_button, 0, 0)
-        btns.addWidget(self.tpa_save_button, 0, 1)
         btns.addWidget(self.tpa_run_button, 1, 0)
         btns.addWidget(self.tpa_stop_button, 1, 1)
         box.addLayout(btns)
@@ -4738,28 +5007,25 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("no pairs given")
         return sorted(out)
 
-    def _tpa_browse_step3(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Run folder for this sweep", ""
-        )
-        if path:
-            self.tpa_step3_edit.setText(path)
-
     def _tpa_step3_path(self) -> Path | None:
-        text = self.tpa_step3_edit.text().strip().strip('"')
-        return Path(text) if text else None
+        """This page's calib.json -- a typed directory means the file inside it."""
+        return self._calib_file_path(6)
 
-    def _tpa_load_step3(self):
-        """``(calibration, layout)`` from the run folder's step-3 section, or raise.
+    def _tpa_load_step3(self, calib_file: "Path | None" = None):
+        """``(calibration, layout)`` from a file's step-3 section, or raise.
+
+        ``calib_file`` names the file; omitted, it is the one on the page.  A
+        Load passes the file it was pointed at, so the wavelengths on screen
+        belong to the sweep on screen.
 
         The layout is rebuilt here rather than taken from the Encoding page so
-        that what this sweep drives is decided by one named run, exactly as the
-        offline script's ``--run`` decides it.  Same loader, so a GUI run and a
-        terminal run against the same folder drive the same pixels.
+        that what this sweep drives is decided by one named calib file, exactly
+        as the offline script's ``--calib`` decides it.  Same loader, so a GUI
+        run and a terminal run against the same file drive the same pixels.
         """
-        run = self._tpa_step3_path()
+        run = calib_file if calib_file is not None else self._tpa_step3_path()
         if run is None:
-            raise ValueError("no run folder chosen")
+            raise ValueError("no calibration file chosen")
         calib = load_calib(run)
         result = calib.step3_result()
         return result, channel_layout_from_calibration(result)
@@ -4769,16 +5035,19 @@ class MainWindow(QtWidgets.QMainWindow):
         run = self._tpa_step3_path()
         if run is None:
             self._set_status(self.tpa_step3_label,
-                             "No run folder chosen — required to run.", "off")
+                             "No calibration file chosen — required to run.",
+                             "off")
             return
         try:
             _calib, layout = self._tpa_load_step3()
         except Exception as exc:
-            self._set_status(self.tpa_step3_label, f"{run.name}: {exc}", "error")
+            self._set_status(self.tpa_step3_label,
+                             f"{self._calib_name(run)}: {exc}", "error")
             return
         self._set_status(
             self.tpa_step3_label,
-            f"{run.name} · {self._run_chain(run)} · {layout.n_channels} pairs · "
+            f"{self._calib_name(run)} · {self._run_chain(run)} "
+            f"· {layout.n_channels} pairs · "
             f"{layout.channel_width_px} px window + "
             f"{layout.pitch_px - layout.channel_width_px} px pad",
             "ok",
@@ -4819,11 +5088,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _tpa_set_running(self, running: bool) -> None:
+        """Gate this page while a sweep is in flight (and re-gate when it ends)."""
+        self._tpa_set_running_impl(running)
+        if not running:
+            self._calib_gate_step(6)
+
+    def _tpa_set_running_impl(self, running: bool) -> None:
         self._mark_tpa_calibration("step6", running)
         self.tpa_run_button.setEnabled(not running)
         self.tpa_stop_button.setEnabled(running)
         self.tpa_load_button.setEnabled(not running)
-        self.tpa_save_button.setEnabled(not running and bool(self.tpa_fits))
         self.tpa_pairs_edit.setEnabled(not running)
 
     @staticmethod
@@ -4958,31 +5232,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 y=progress.mean_v,
             ))
 
-    def _tpa_fit_rows(self, rows_by_pair: dict[int, list], cfg: PairV2Config,
+    def _tpa_rail_v(self) -> float:
+        """The page's rail ceiling in VOLTS, for the guards that reject by it."""
+        return float(self.tpa_rail.value()) / 1e3
+
+    def _tpa_fit_rows(self, rows_by_pair: dict[int, list],
                       layout=None) -> list[str]:
-        """Fit every pair into ``self.tpa_fits``; return the pairs that failed."""
+        """Fit every pair into ``self.tpa_fits``; return the pairs that failed.
+
+        The fit reads the LEVELS off the rows, so a loaded file is fitted as it
+        was swept and the ramp controls play no part.  The rail does: it is a
+        rejection rule, not a drive setting, so a re-fit applies whatever is in
+        the box now -- which is the point of it being a box.
+        """
         self.tpa_rows = rows_by_pair
         self.tpa_fits = []
         failed: list[str] = []
+        # Over the whole sweep, not per pair: the floor is a property of the
+        # detector, and it is a voltage, so it has to be re-measured whenever
+        # the gain moves.  A file with no dark level has no floor and no fit.
+        try:
+            floor = sweep_floor(rows_by_pair)
+        except ValueError as exc:
+            self.tpa_floor = None
+            return [f"sweep: {exc}"]
+        self.tpa_floor = floor
+        self._log(f"[step 6] sigma floor {floor[0]*1e6:.1f} µV [{floor[1]}]")
+        rail_v = self._tpa_rail_v()
         for index in sorted(rows_by_pair):
             # average_levels drops these itself; logged here because a burst is a
             # BENCH fault, and silent cleaning would let a glitching bench read
             # as a clean run (the offline step-6 script prints the same thing).
             rows = list(rows_by_pair[index])
-            for row in (r for r, bad in zip(rows, burst_rows(rows)) if bad):
+            for row in (r for r, bad in zip(rows, burst_rows(rows, rail_v=rail_v))
+                        if bad):
                 self._log(
                     f"[step 6] pair {index}: BURST acquisition dropped — "
                     f"x={row[1]:g} w={row[2]:g} trial {int(row[0])} read "
                     f"{row[3]*1e3:+.4f} mV with a {row[4]*1e3:.4f} mV trace std"
                 )
             try:
-                fit = fit_pair(index, average_levels(rows), cfg)
+                fit = fit_pair(index, average_levels(rows, floor=floor,
+                                                     rail_v=rail_v))
             except (ValueError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {index}: {exc}")
                 continue
             if layout is not None:
                 fit.wl_x_nm, fit.wl_w_nm, fit.nominal_wl_nm = self._tpa_wavelengths(
-                    layout, cfg, index
+                    layout, fit.cfg, index
                 )
             self.tpa_fits.append(fit)
         return failed
@@ -4997,7 +5294,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._tpa_close_dialog(False, "Stopped before any pair finished.")
             return
         self.tpa_meta = payload.get("meta") or {}
-        failed = self._tpa_fit_rows(rows, payload["cfg"], payload.get("layout"))
+        failed = self._tpa_fit_rows(rows, payload.get("layout"))
         self._tpa_set_running(False)
         self._tpa_fill_table()
         self._tpa_redraw()
@@ -5021,6 +5318,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tpa_status.text()
                 + "  — η undefined (b < 0); check the Invert checkbox"
             )
+        self._tpa_autosave()
         self._tpa_close_dialog(not aborted, self.tpa_status.text())
 
     def _tpa_close_dialog(self, success: bool, message: str) -> None:
@@ -5048,9 +5346,6 @@ class MainWindow(QtWidgets.QMainWindow):
             pulls = fit.pulls
             checks = fit.checks or {}
             marks = []
-            intercept = checks.get("intercept") or {}
-            if "pull" in intercept:
-                marks.append("b0" if abs(intercept["pull"]) > 3.0 else "")
             for rec in checks.get("product") or []:
                 for pr in rec.get("pairs") or []:
                     if abs(pr.get("pull", 0.0)) > 3.0:
@@ -5115,8 +5410,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tpa_est_canvas.draw_idle()
             return
 
-        lo, hi = fit.cfg.fit_w_range
-        ax.axvspan(lo, hi, color="#8fd14f", alpha=0.10, label=f"fit window [{lo:g}, {hi:g}]")
+        lo, hi = fit.fit_w_range
+        ax.axvspan(lo, hi, color="#8fd14f", alpha=0.10,
+                   label=f"fitted range [{lo:g}, {hi:g}]")
         w = fit.fit_w
         ax.errorbar(w, fit.fit_d * 1e3, yerr=fit.fit_sigma * 1e3, fmt="o",
                     color="#8fd14f", ecolor="#41515c", ms=5, lw=0, elinewidth=0.9,
@@ -5124,21 +5420,9 @@ class MainWindow(QtWidgets.QMainWindow):
         grid_w = np.linspace(0.0, 1.05, 50)
         ax.plot(grid_w, (fit.b * grid_w + fit.beta0) * 1e3, "-", color="#8fd14f",
                 lw=1.2, label="GLS  D = η²w + β0")
-        for wx, dm, dme, *_ in fit.excluded:
-            ax.errorbar([wx], [dm * 1e3], yerr=[dme * 1e3], fmt="o", ms=8,
-                        mfc="none", mec="#e05a5a", ecolor="#e05a5a", lw=0,
-                        elinewidth=0.9, label="excluded (top drive)")
-        if np.isfinite(fit.anchor[0]):
-            ax.errorbar([0.0], [fit.anchor[0] * 1e3], yerr=[fit.anchor[1] * 1e3],
-                        fmt="s", ms=6, color="#a678de", ecolor="#a678de", lw=0,
-                        elinewidth=0.9, label="D(0) measured")
         ax.set_title(f"pair {fit.index}   η = {fit.eta:.4g} ± {fit.eta_err:.2g}",
                      color="#d8dee9", fontsize=9)
-        handles, labels = ax.get_legend_handles_labels()
-        seen: dict[str, Any] = {}
-        for h, lab in zip(handles, labels):
-            seen.setdefault(lab, h)         # the excluded loop repeats its label
-        ax.legend(seen.values(), seen.keys(), loc="upper left", fontsize=7)
+        ax.legend(loc="upper left", fontsize=7)
 
         axp.axhspan(-1, 1, color="#8fd14f", alpha=0.12)
         axp.axhline(0.0, color="#e0a447", ls="--", lw=1.0)
@@ -5197,22 +5481,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- files -------------------------------------------------------------
     def _tpa_load(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Step-6 v2 measurement CSV", "", "CSV (*.csv)"
-        )
-        if not path:
+        """Re-fit the sweep this calib file records, and show it.  Never writes.
+
+        ONE input, asked for: a calib.json.  Its step6 section says which CSV it
+        was fitted from and its step3 section labels the wavelengths, so looking
+        at last night's sweep is opening last night's calib file and there is no
+        second path to keep in step.  The fit reads that file's own levels; the
+        ramp controls describe the NEXT sweep and play no part here.
+
+        Reads only, and the page's own calib file is not touched -- an offline
+        re-fit is a copy of the JSON and its CSV and a run of
+        ``calib_step6_v2.py`` against the copy, which is where a fit that is
+        meant to be kept comes from.
+        """
+        picked = self._open_calib("Open a calibration to re-fit its step 6", 6)
+        if picked is None:
             return
-        cfg = self._tpa_config()
+        try:
+            calib = load_calib(picked)
+            path = calib.csv_path(6)
+        except Exception as exc:                        # noqa: BLE001
+            self.tpa_status.setText(f"Load failed: {exc}")
+            return
+        if not path.is_file():
+            self.tpa_status.setText(
+                f"Load failed: {calib.path.name} names {path.name}, which is "
+                f"not in {path.parent} — copy the CSV in beside it."
+            )
+            return
         try:
             rows = load_meas_csv(path)
         except Exception as exc:
             self.tpa_status.setText(f"Load failed: {exc}")
             return
-        # A re-fit needs only the CSV.  The Step-3 file is used for the
-        # wavelength labels when it is set, and simply left out when it is not
-        # -- the same tolerance `fit_csv` has, so a CSV is always re-fittable.
+        # A re-fit needs only the CSV.  The step-3 section labels the
+        # wavelengths when it is there, and is simply left out when it is not --
+        # the same tolerance `fit_csv` has, so a sweep is always re-fittable.
         try:
-            _calib, layout = self._tpa_load_step3()
+            _calib, layout = self._tpa_load_step3(picked)
             note3 = ""
         except Exception as exc:
             layout = None
@@ -5221,25 +5527,34 @@ class MainWindow(QtWidgets.QMainWindow):
         # from the file rather than from this session -- otherwise a Save would
         # stamp the loaded rows with the meta of whatever ran here last.
         self.tpa_meta = meas_csv_meta(path)
-        failed = self._tpa_fit_rows(rows, cfg, layout)
+        failed = self._tpa_fit_rows(rows, layout)
         self._tpa_fill_table()
         self._tpa_redraw()
-        self.tpa_save_button.setEnabled(bool(self.tpa_fits))
         note = f"  · {len(failed)} fit(s) failed" if failed else ""
+        if self.tpa_fits:
+            lo, hi = self.tpa_fits[0].fit_w_range
+            note += f"  · fitted over w {lo:g}–{hi:g}, as swept"
         self.tpa_status.setText(
-            f"Loaded {Path(path).name} · {len(self.tpa_fits)} pair(s) re-fit"
-            f"{note}{note3}"
+            f"Loaded {self._calib_name(calib.path)} · {Path(path).name} · "
+            f"{len(self.tpa_fits)} pair(s) re-fit{note}{note3}"
         )
         for line in failed:
             self._log(f"[step 6] fit failed — {line}")
 
-    def _tpa_save(self) -> None:
-        """Raw CSV, the run's step6 section, and one PNG per pair.
+    def _tpa_autosave(self) -> None:
+        """A finished sweep writes itself: the raw CSV, then the step6 section.
 
-        The folder the CSV goes into is the run that gets the section, and the
-        dialog opens in the run named on this page -- so the etas land beside
-        the step-3 layout they were measured through.  Writing them DROPS that
-        run's step 7 and step 8: they were fitted against the previous step 6.
+        Both into the calib file named on this page -- the CSV beside it, the
+        section in it -- so there is nothing to keep in step and no dialog to
+        get wrong.  Writing DROPS that file's step 7 and step 8: they were
+        fitted against the etas this sweep has just replaced.
+
+        No PNGs.  Load draws the same fit from the CSV the section points at,
+        which is better than a picture of it.
+
+        Only a sweep calls this.  Loading a recorded sweep re-fits and draws but
+        never writes -- Load is for inspection, and opening last week's file to
+        look at it must not overwrite its calibration.
 
         The rows are written first and unconditionally.  A measurement is an
         hour of bench time and must never be lost to a missing or unreadable
@@ -5247,42 +5562,40 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not self.tpa_fits:
             return
-        default = self._save_into_run(
-            self._tpa_step3_path(),
-            f"calib_step6v2_meas_{time.strftime('%m%d_%H%M')}.csv")
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Step-6 v2 Result", default, "CSV (*.csv)"
-        )
-        if not path:
-            return
-        csv_path, _json, png_path = _save_paths(path)
+        stamp = time.strftime("%m%d_%H%M")
+        calib_file = self._calib_file_path(6)
+        if calib_file is None:
+            folder = self._unfiled_run(stamp)
+            self._log(
+                f"[step 6] no calibration file on the page — rows parked in "
+                f"{folder}"
+            )
+        else:
+            folder = calib_file.parent
+            folder.mkdir(parents=True, exist_ok=True)
+        csv_path = folder / f"calib_step6v2_meas_{stamp}.csv"
         written = [Path(write_meas_csv(self.tpa_rows, csv_path,
                                        meta=self.tpa_meta)).name]
 
-        # The run is the folder saved into, which is the whole point of one
-        # calib.json per directory: there is no second path to keep in step.
-        run = csv_path.parent
         try:
             _calib, layout = self._tpa_load_step3()
         except Exception as exc:                        # noqa: BLE001
             self.tpa_status.setText(
-                f"Saved {written[0]} — no usable run folder ({exc}), so the "
-                "step6 section was not written (step 7 could not read it)."
+                f"Saved {written[0]} — no usable calibration file ({exc}), so "
+                "the step6 section was not written (step 7 could not read it)."
             )
             return
         try:
             calib = save_step6_section(
-                self.tpa_fits, run, csv=csv_path,
+                self.tpa_fits, calib_file, csv=csv_path,
                 center_wl=float(getattr(layout, "center_wl", 0.0)), log=None)
             written.append(f"step6 -> {calib.path.name}")
-            for fit in self.tpa_fits:
-                png = png_path(fit.index)
-                save_plot(fit, png)
-            written.append(f"{len(self.tpa_fits)} PNG(s)")
         except Exception as exc:
-            self.tpa_status.setText(f"Saved {written[0]}; section/plots failed: {exc}")
+            self.tpa_status.setText(f"Saved {written[0]}; section failed: {exc}")
             return
-        self.tpa_status.setText("Saved " + "  +  ".join(written))
+        self._calib_describe_all()
+        self.tpa_status.setText(
+            self.tpa_status.text() + "  ·  saved " + "  +  ".join(written))
 
     # ===================== TPA comb phase (step 7) tab ==================
     _TPA_PHASE_COLUMNS = (
@@ -5299,6 +5612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         page = self._page_shell("Comb Phase (ΔΦ_comb) Calibration")
 
+        self.tpa_phase_status = self._page_status(page, "\N{EN DASH}")
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(self._build_tpa_phase_controls())
         split.addWidget(self._build_tpa_phase_results())
@@ -5311,11 +5625,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return page
 
     def _build_tpa_phase_controls(self) -> QtWidgets.QWidget:
-        """The left column: DAQ, sweep, status, buttons."""
+        """The left column: the calib file, DAQ, sweep, buttons -- as on step 6.
+
+        The file first, and it is the one required input: it decides both what
+        is driven (its step-3 section IS the channel layout) and what the fringe
+        amplitudes are pinned to (its step-6 etas), so a run against the wrong
+        one does not fail -- it reports a phase measured under a different
+        aperture against someone else's etas.
+
+        It does not scroll, for the reason step 6's does not: everything that
+        is not a bench constant fits, and a setting you have to scroll to find
+        is a setting you will not check.
+        """
         col = QtWidgets.QWidget()
         box = QtWidgets.QVBoxLayout(col)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(12)
+
+        box.addWidget(self._calib_file_row(7))
+        self.tpa_phase_step6_edit = self._calib_edits[7]
+        self.tpa_phase_step6_label = self._calib_labels[7]
 
         # --- DAQ acquisition --------------------------------------------
         daq = self._panel("DAQ · acquisition")
@@ -5367,17 +5696,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         rows = [
             ("Channel", self.tpa_phase_daq_channel),
-            ("Sample rate", self.tpa_phase_daq_rate),
             ("Range", self.tpa_phase_daq_range),
-            ("Low-pass", self.tpa_phase_daq_fcut),
-            ("Settle", self.tpa_phase_settle),
             ("T_meas", self.tpa_phase_tmeas),
         ]
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QtWidgets.QLabel(label), r, 0)
             grid.addWidget(widget, r, 1)
         grid.addWidget(self.tpa_phase_invert, len(rows), 0, 1, 2)
-        grid.addWidget(self.tpa_phase_pmt, len(rows) + 1, 0, 1, 2)
+        # Bench constants, hidden for the reason step 6's are: they are the
+        # same on every run, and the four that are not are easier to check on a
+        # panel that holds only them.  Still live -- _tpa_phase_acq and the
+        # sweep read them.
+        for widget in (self.tpa_phase_daq_rate, self.tpa_phase_daq_fcut,
+                       self.tpa_phase_settle, self.tpa_phase_pmt):
+            widget.setParent(daq)
+            widget.hide()
         box.addWidget(daq)
 
         # --- sweep -------------------------------------------------------
@@ -5385,35 +5718,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sgrid = QtWidgets.QGridLayout(sweep)
         sgrid.setHorizontalSpacing(8)
         sgrid.setVerticalSpacing(6)
-
-        # ONE required input, exactly as the offline runner's --step6.  It
-        # decides both what is driven (its embedded Step-3 calibration IS the
-        # channel layout) and what the fringe amplitudes are pinned to, so a run
-        # against the wrong file does not fail -- it reports a phase measured
-        # under a different aperture against someone else's etas.
-        self.tpa_phase_step6_edit = QtWidgets.QLineEdit()
-        self.tpa_phase_step6_edit.setPlaceholderText(
-            "required — combined Step-6 result JSON"
-        )
-        self.tpa_phase_step6_edit.setToolTip(
-            "The combined step-6 result (Save on the Step 6 tab, or the offline "
-            "runner's calib_step6v2_result_*.json).\n"
-            "It carries BOTH halves this step needs: the Step-3 calibration the "
-            "layout is built from, and every pair's η + single-beam background, "
-            "which are pinned rather than fitted here."
-        )
-        self.tpa_phase_step6_browse = QtWidgets.QPushButton(
-            "Browse\N{HORIZONTAL ELLIPSIS}"
-        )
-        self.tpa_phase_step6_browse.setProperty("variant", "ghost")
-        self.tpa_phase_step6_browse.clicked.connect(self._tpa_phase_browse_step6)
-        self.tpa_phase_step6_label = QtWidgets.QLabel("\N{EN DASH}")
-        self.tpa_phase_step6_label.setObjectName("PageSubtitle")
-        self.tpa_phase_step6_label.setWordWrap(True)
-        sgrid.addWidget(QtWidgets.QLabel("Step 6"), 0, 0)
-        sgrid.addWidget(self.tpa_phase_step6_edit, 0, 1)
-        sgrid.addWidget(self.tpa_phase_step6_browse, 0, 2)
-        sgrid.addWidget(self.tpa_phase_step6_label, 1, 0, 1, 3)
 
         self.tpa_phase_ref = self._spin(0, 63, 1)
         self.tpa_phase_ref.setToolTip(
@@ -5487,22 +5791,37 @@ class MainWindow(QtWidgets.QMainWindow):
             "Leave it on — turn it off only to diagnose step 6."
         )
         sgrid.addWidget(self.tpa_phase_single_beam, 8, 0, 1, 3)
+
+        # The same ceiling step 6 carries, and it matters more here: step 7's
+        # all-off dark is ONE unrepeated read, subtracted from all ten of its
+        # target's drive rows, so a single railed dark takes the whole fringe
+        # with it (run_0930_noYsat pair 4, R^2 = -11438).  It is the only guard
+        # that catches that, because it needs no reference beyond itself.
+        self.tpa_phase_rail = self._double_spin(
+            10.0, 1000.0, 1e3 * BURST_MAX_V, " mV", 0)
+        self.tpa_phase_rail.setSingleStep(50.0)
+        self.tpa_phase_rail.setToolTip(
+            "Any read at or above this is a railed detector, not a measurement, "
+            "and is dropped \N{EM DASH} drive rows and the all-off dark alike.\n"
+            "A bench-fault ceiling, not a saturation limit. A railed DARK is the "
+            "expensive one: it is subtracted from every drive row of its target, "
+            "so it is replaced with the other targets' median and the swap is "
+            "recorded in the step7 section.\n"
+            "Applies to the next sweep AND to a Load's re-fit.")
+        sgrid.addWidget(QtWidgets.QLabel("Rail"), 9, 0)
+        sgrid.addWidget(self.tpa_phase_rail, 9, 1, 1, 2)
         box.addWidget(sweep)
 
-        self.tpa_phase_step6_edit.textChanged.connect(
-            lambda _="": self._tpa_phase_describe_step6()
-        )
-        self._tpa_phase_describe_step6()
-
-        # --- status + buttons -------------------------------------------
+        # --- buttons -----------------------------------------------------
         # No progress bar here, same as step 6: a run takes tens of minutes, so
         # it gets the shared CalibrationProgressDialog (bar, elapsed/ETA, live
         # plot, Stop) rather than a strip in a column nobody is watching.
-        self.tpa_phase_status = QtWidgets.QLabel("\N{EN DASH}")
-        self.tpa_phase_status.setObjectName("PageSubtitle")
-        self.tpa_phase_status.setWordWrap(True)
-        box.addWidget(self.tpa_phase_status)
-
+        #
+        # No status line either: `tpa_phase_status` is beside the page title.
+        # The read-rejection rules used to be spelled out down here as well --
+        # the rail is a control now and says what it does in its own tooltip,
+        # and the burst guard and the inherited sigma floor announce themselves
+        # in the log when they fire, which is when anybody wants them.
         self.tpa_phase_run_button = QtWidgets.QPushButton("Run Sweep")
         self.tpa_phase_run_button.clicked.connect(self._tpa_phase_run)
         self.tpa_phase_stop_button = QtWidgets.QPushButton("Stop")
@@ -5518,15 +5837,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "re-fit against the step-6 JSON named above."
         )
         self.tpa_phase_load_button.clicked.connect(self._tpa_phase_load)
-        self.tpa_phase_save_button = QtWidgets.QPushButton(
-            "Save\N{HORIZONTAL ELLIPSIS}"
-        )
-        self.tpa_phase_save_button.setProperty("variant", "ghost")
-        self.tpa_phase_save_button.setEnabled(False)
-        self.tpa_phase_save_button.clicked.connect(self._tpa_phase_save)
         btns = QtWidgets.QGridLayout()
         btns.addWidget(self.tpa_phase_load_button, 0, 0)
-        btns.addWidget(self.tpa_phase_save_button, 0, 1)
         btns.addWidget(self.tpa_phase_run_button, 1, 0)
         btns.addWidget(self.tpa_phase_stop_button, 1, 1)
         box.addLayout(btns)
@@ -5577,34 +5889,55 @@ class MainWindow(QtWidgets.QMainWindow):
         return stack
 
     # ---- inputs ------------------------------------------------------------
-    def _tpa_phase_browse_step6(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Run folder for this sweep", ""
-        )
-        if path:
-            self.tpa_phase_step6_edit.setText(path)
-
     def _tpa_phase_step6_path(self) -> Path | None:
-        text = self.tpa_phase_step6_edit.text().strip().strip('"')
-        return Path(text) if text else None
+        """This page's calib.json -- a typed directory means the file inside it."""
+        return self._calib_file_path(7)
 
-    def _tpa_phase_load_step6(self):
-        """``(layout, models)`` from the chosen run folder, or raise.
+    @staticmethod
+    def _tpa_phase_pool(paths: "list[Path]") -> tuple:
+        """``(targets, ref_of_each, csv_of_each)`` over every CSV a section names.
+
+        One sweep is the normal case.  A section naming several is a run that was
+        driven stage by stage and filed as one calibration, so the targets are
+        pooled and each remembers which file to be read out of; a target in two
+        files (the shared reference is in both) belongs to the first.
+        """
+        targets: list[int] = []
+        recorded: dict[int, int] = {}
+        csv_of: dict[int, Path] = {}
+        for path in paths:
+            refs = references_in_csv(path)
+            for k in targets_in_csv(path):
+                if k in csv_of:
+                    continue
+                targets.append(k)
+                csv_of[k] = path
+                if k in refs:
+                    recorded[k] = refs[k]
+        return targets, recorded, csv_of
+
+    def _tpa_phase_load_step6(self, calib_file: "Path | None" = None):
+        """``(layout, models)`` from a calib file, or raise.
+
+        ``calib_file`` names the file; omitted, it is the one on the page.  A
+        Load passes the file it was pointed at, so the etas the fringes are
+        pinned to belong to the sweep being looked at.
 
         Both halves come out of the one calib.json, exactly as the offline
-        runner's ``--run`` does it: the step-3 section builds the layout, the
+        runner's ``--calib`` does it: the step-3 section builds the layout, the
         step-6 pairs give the etas the fringe amplitudes are pinned to.  That is
         what guarantees the phase is measured through the aperture those etas
         were calibrated under.
         """
-        path = self._tpa_phase_step6_path()
+        path = (calib_file if calib_file is not None
+                else self._tpa_phase_step6_path())
         if path is None:
-            raise ValueError("no run folder chosen")
+            raise ValueError("no calibration file chosen")
         calib = load_calib(path)
         layout = channel_layout_from_calibration(calib.step3_result())
         models = load_pair_models([calib.path])
         if not models:
-            raise ValueError("no fitted pairs in the run's step6 section")
+            raise ValueError("no fitted pairs in its step6 section")
         return layout, models
 
     def _tpa_phase_describe_step6(self) -> None:
@@ -5613,20 +5946,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if path is None:
             self._set_status(
                 self.tpa_phase_step6_label,
-                "No Step-6 result chosen — required to run.", "off",
+                "No calibration file chosen — required to run.", "off",
             )
             return
         try:
             layout, models = self._tpa_phase_load_step6()
         except Exception as exc:
             self._set_status(
-                self.tpa_phase_step6_label, f"{path.name}: {exc}", "error"
+                self.tpa_phase_step6_label,
+                f"{self._calib_name(path)}: {exc}", "error"
             )
             return
         pairs = sorted(models)
         self._set_status(
             self.tpa_phase_step6_label,
-            f"{path.name} · {layout.n_channels} pairs · η for "
+            f"{self._calib_name(path)} · {self._run_chain(path)} "
+            f"· {layout.n_channels} pairs "
+            f"· η for "
             f"{self._compact_indices(pairs)}",
             "ok",
         )
@@ -5672,13 +6008,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _tpa_phase_set_running(self, running: bool) -> None:
+        """See :meth:`_tpa_set_running`."""
+        self._tpa_phase_set_running_impl(running)
+        if not running:
+            self._calib_gate_step(7)
+
+    def _tpa_phase_set_running_impl(self, running: bool) -> None:
         self._mark_tpa_calibration("step7", running)
         self.tpa_phase_run_button.setEnabled(not running)
         self.tpa_phase_stop_button.setEnabled(running)
         self.tpa_phase_load_button.setEnabled(not running)
-        self.tpa_phase_save_button.setEnabled(
-            not running and bool(self.tpa_phase_results)
-        )
         self.tpa_phase_targets.setEnabled(not running)
 
     # ---- run ---------------------------------------------------------------
@@ -5721,6 +6060,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"No step-6 η for pair(s) {missing}; the file covers "
                 f"{self._compact_indices(sorted(models))}."
             )
+        # A step 6 that cannot give this fit its sigma floor: say so before
+        # the hour is spent, not after.
+        self._tpa_phase_floor()
         # CascadeError is a ValueError, so an unreachable pair reaches the
         # status label by the same path as every other refusal here.
         stages = plan_cascade(targets, cfg.ref_index, n_pairs=layout.n_channels)
@@ -5877,7 +6219,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tpa_phase_fit_results(self, results: dict[int, PhaseResult],
                                models: dict[int, PairModel],
                                ref_index: int,
-                               stages: "Sequence[Stage] | None" = None) -> list[str]:
+                               stages: "Sequence[Stage] | None" = None, *,
+                               floor: "tuple[float, str] | None" = None) -> list[str]:
         """Fit every target into ``self.tpa_phase_results``; return the failures.
 
         Each target is fit against the reference it was actually SWEPT against
@@ -5887,6 +6230,25 @@ class MainWindow(QtWidgets.QMainWindow):
         measured; only ``self.tpa_phase_chains`` speaks in root coordinates.
         """
         single_beam_bg = self.tpa_phase_single_beam.isChecked()
+        # Step 7 has no dark LEVEL of its own to measure a floor from -- one
+        # all-off read per target and ten drive rows -- so it inherits the one
+        # step 6 measured on this run, through the same detector on the same
+        # night.  See calibration_module.fit.sigma.
+        # ``floor`` is given only by a caller that already holds it (a test
+        # driving this path without a run on the page); a sweep inherits it.
+        floor = self._tpa_phase_floor() if floor is None else floor
+        self.tpa_phase_floor = floor
+        self._log(f"[step 7] sigma floor {floor[0]*1e6:.1f} µV [{floor[1]}]")
+        for r in results.values():
+            r.sigma_floor_v, r.sigma_floor_source = float(floor[0]), str(floor[1])
+        # The dark is the one quantity no other guard sees: no repeat, no sweep
+        # median, and it is subtracted from every row of its target.
+        for key, entry in guard_darks(results).items():
+            self._log(
+                f"[step 7] pair {key}: DARK OVER CEILING — recorded "
+                f"{entry['recorded_v']*1e3:+.4f} mV, using "
+                f"{entry['used_v']*1e3:+.4f} mV (drive rows untouched)"
+            )
         self.tpa_phase_results = {}
         self.tpa_phase_chains = {}
         self.tpa_phase_root = int(ref_index)
@@ -6003,6 +6365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         for line in failed:
             self._log(f"[step 7] fit failed — {line}")
+        self._tpa_phase_autosave()
         self._tpa_phase_close_dialog(not aborted, self.tpa_phase_status.text())
 
     def _tpa_phase_close_dialog(self, success: bool, message: str) -> None:
@@ -6038,6 +6401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # comments and in calib_step8's docstring, where it does not take up
         # half the panel every time the tab is opened.
         page = self._page_shell("Two-Photon Saturation (Y_sat)")
+        self.step8_status = self._page_status(page, "Idle")
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(self._build_step8_controls())
         split.addWidget(self._build_step8_results())
@@ -6053,203 +6417,32 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(12)
 
-        src = self._panel("Input · step 7 result")
-        grid = QtWidgets.QGridLayout(src)
-        self.step8_step7_edit = QtWidgets.QLineEdit()
-        self.step8_step7_edit.setPlaceholderText("run folder holding calib.json")
-        browse = QtWidgets.QPushButton("Browse")
-        browse.clicked.connect(lambda: self._browse_dir_into(
-            self.step8_step7_edit, "Select the run folder"))
-        grid.addWidget(QtWidgets.QLabel("Run folder"), 0, 0)
-        grid.addWidget(self.step8_step7_edit, 0, 1)
-        grid.addWidget(browse, 0, 2)
-        # Numbers only, and empty until there is a forward model to quote:
-        # this step-7's Y_max, and where the ladder's two bands land on it.
-        # Anything that is not a number -- "pick a file", "that file could not be
-        # read" -- belongs in step8_status with the rest of the feedback.
-        self.step8_levels_note = QtWidgets.QLabel("")
-        self.step8_levels_note.setObjectName("PageSubtitle")
-        self.step8_levels_note.setWordWrap(True)
-        self.step8_levels_note.setTextInteractionFlags(
-            QtCore.Qt.TextSelectableByMouse)
-        grid.addWidget(self.step8_levels_note, 1, 0, 1, 3)
-        self.step8_step7_edit.textChanged.connect(self._step8_step7_changed)
-        box.addWidget(src)
+        # The forward model this sweep drives: step 3's layout, step 6's etas
+        # and step 7's phases, all out of the one file.
+        box.addWidget(self._calib_file_row(8))
+        self.step8_step7_edit = self._calib_edits[8]
 
-        sweep = self._panel("Sweep")
-        grid = QtWidgets.QGridLayout(sweep)
-        self.step8_ladder = self._spin(4, 400, STEP8.LADDER)
-        self.step8_ladder.setToolTip(
-            f"Rungs in the BRIGHT band \N{EM DASH} Band floor to Sweep max "
-            f"\N{EM DASH} one per stratum, each a fresh random drive. This is "
-            f"where all of the Y_sat leverage is: a rung's information about "
-            f"1/Y_sat goes as "
-            f"(Y\N{SUPERSCRIPT TWO}/\N{GREEK SMALL LETTER SIGMA})"
-            f"\N{SUPERSCRIPT TWO}, so the top of the band is worth orders more "
-            f"than the bottom."
-        )
-        self.step8_ladder.valueChanged.connect(self._step8_update_estimate)
-        self.step8_ladder.valueChanged.connect(self._step8_refresh_levels)
-        grid.addWidget(QtWidgets.QLabel("Ladder rungs"), 0, 0)
-        grid.addWidget(self.step8_ladder, 0, 1)
-
-        self.step8_low = self._spin(0, 100, STEP8.LADDER_LOW)
-        self.step8_low.setToolTip(
-            f"Rungs BELOW the bright band, Sweep min to Band floor. These carry "
-            f"no curvature worth fitting \N{EM DASH} they are forward-model "
-            f"checks.\n"
-            f"They are here because an inference run's MEDIAN read is ~40 mV: "
-            f"without them nothing in this sweep touches the decade the machine "
-            f"spends most of its time in, and a step-6/7 error down there would "
-            f"leave no trace. 0 drops them, and takes Sweep min with them."
-        )
-        self.step8_low.valueChanged.connect(self._step8_update_estimate)
-        self.step8_low.valueChanged.connect(self._step8_refresh_levels)
-        self.step8_low.valueChanged.connect(self._step8_refresh_buttons)
-        grid.addWidget(QtWidgets.QLabel("Model checks"), 0, 2)
-        grid.addWidget(self.step8_low, 0, 3)
-
-        # The band, in MILLIVOLTS, which is the unit every argument that set it
-        # was about: the amplifier, the noise floor, and how bright an inference
-        # run reads.  alpha is the DERIVED column beside them -- it is
-        # mV / Y_max, so it moves with the PMT gain, and typing it by hand would
-        # hand the geometry back to the gain.  Blank until a step-7 names a
-        # Y_max, because before that there is no alpha to show.
-        self.step8_sweep_max = self._double_spin(50.0, 1e3 * STEP8.AMP_LIMIT_V,
-                                                 1e3 * STEP8.LADDER_CEILING_V,
-                                                 " mV", 1)
-        self.step8_sweep_max.setSingleStep(10.0)
-        self.step8_sweep_max.setToolTip(
-            f"The brightest read of the whole sweep, and the only thing that "
-            f"decides where it stops.\n"
-            f"{1e3 * STEP8.LADDER_CEILING_V:.0f} mV is an UNVERIFIED figure for "
-            f"where the amplifier starts to compress, not a measurement: only "
-            f"its {STEP8.AMP_LIMIT_V:g} V hard rail is known. Compression bends "
-            f"the top of the ladder down exactly the way saturation does, and "
-            f"the fit has one free parameter and cannot tell them apart \N{EM DASH} "
-            f"so too high is SILENT, while too low only costs precision. Use "
-            f"the probe below to replace the guess."
-        )
-        self.step8_band_floor = self._double_spin(20.0, 1e3 * STEP8.AMP_LIMIT_V,
-                                                  1e3 * STEP8.LADDER_FLOOR_V,
-                                                  " mV", 1)
-        self.step8_band_floor.setSingleStep(10.0)
-        self.step8_band_floor.setToolTip(
-            "Where the bright band stops and the model checks start: the one "
-            "number here that is not an end of the sweep.\n"
-            "Everything above it is Y_sat leverage, everything below it is a "
-            "forward-model check. Push it up and the same rungs crowd into a "
-            "shorter, brighter band."
-        )
-        self.step8_sweep_min = self._double_spin(1.0, 1e3 * STEP8.AMP_LIMIT_V,
-                                                 1e3 * STEP8.LADDER_LOW_V,
-                                                 " mV", 1)
-        self.step8_sweep_min.setSingleStep(1.0)
-        self.step8_sweep_min.setToolTip(
-            "The dimmest read of the whole sweep, and the floor of the model "
-            "checks.\n"
-            "It is down at an inference run's MEDIAN read (~40 mV) on purpose. "
-            "Only meaningful with Model checks above 0."
-        )
-        self.step8_sweep_max_alpha = self._caption("")
-        self.step8_band_floor_alpha = self._caption("")
-        self.step8_sweep_min_alpha = self._caption("")
-        rows = (("Sweep max", self.step8_sweep_max, self.step8_sweep_max_alpha),
-                ("Band floor", self.step8_band_floor, self.step8_band_floor_alpha),
-                ("Sweep min", self.step8_sweep_min, self.step8_sweep_min_alpha))
-        for r, (label, spin, alpha) in enumerate(rows, start=1):
-            spin.valueChanged.connect(self._step8_refresh_levels)
-            grid.addWidget(QtWidgets.QLabel(label), r, 0)
-            grid.addWidget(spin, r, 1)
-            grid.addWidget(alpha, r, 2, 1, 2)
-        self.step8_sweep_max.valueChanged.connect(self._step8_probe_predict)
-        grid.setColumnStretch(2, 1)
-
-        self.step8_daq_channel = QtWidgets.QLineEdit("ai0")
-        grid.addWidget(QtWidgets.QLabel("DAQ channel"), 4, 0)
-        grid.addWidget(self.step8_daq_channel, 4, 1)
-
-        self.step8_daq_rate = QtWidgets.QDoubleSpinBox()
-        self.step8_daq_rate.setRange(1.0, 2_000_000.0)
-        self.step8_daq_rate.setDecimals(0)
-        self.step8_daq_rate.setValue(1000.0)
-        self.step8_daq_rate.setSuffix(" S/s")
-        grid.addWidget(QtWidgets.QLabel("Sample rate"), 5, 0)
-        grid.addWidget(self.step8_daq_rate, 5, 1)
-
-        self.step8_daq_fcut = self._double_spin(0.1, 100_000.0, 20.0, " Hz", 1)
-        self.step8_daq_fcut.setToolTip(
-            "Detector 3 dB bandwidth: the low-pass behind the reported mean and "
-            "std. Shared with steps 6 and 7.")
-        grid.addWidget(QtWidgets.QLabel("Detector BW"), 6, 0)
-        grid.addWidget(self.step8_daq_fcut, 6, 1)
-
-        self.step8_pmt = QtWidgets.QCheckBox("Log PMT thermistor (Keithley 2400)")
-        self.step8_pmt.setToolTip(
-            "Adds pmt_ohm_Ohm and pmt_c beside every read. Do not enable this "
-            "while anything else is talking to the 2400 -- one GPIB bus, one "
-            "instrument.")
-        grid.addWidget(self.step8_pmt, 7, 0, 1, 2)
-        box.addWidget(sweep)
-
-        run = self._panel("Run")
-        grid = QtWidgets.QGridLayout(run)
-        self.step8_run_button = QtWidgets.QPushButton("Run Sweep")
-        self.step8_run_button.clicked.connect(self._step8_run)
-        self.step8_stop_button = QtWidgets.QPushButton("Stop")
-        self.step8_stop_button.setEnabled(False)
-        self.step8_stop_button.clicked.connect(self._step8_stop)
-        # Load and Save, the pair steps 6 and 7 carry, for the same reason:
-        # a sweep is shown from wherever it was read, and nothing reaches
-        # calib_data until somebody says where it goes.
-        self.step8_load_button = QtWidgets.QPushButton(
-            "Load\N{HORIZONTAL ELLIPSIS}")
-        self.step8_load_button.setProperty("variant", "ghost")
-        self.step8_load_button.setToolTip(
-            "Fit a step-8 CSV that is already on disk and show it \N{EM DASH} "
-            "no hardware, no sweep.\n"
-            "The fit and its plot go to the staging directory, not next to the "
-            "file that was loaded: opening a CSV is not permission to write "
-            "beside it.")
-        self.step8_load_button.clicked.connect(self._step8_load)
-        self.step8_save_button = QtWidgets.QPushButton(
-            "Save\N{HORIZONTAL ELLIPSIS}")
-        self.step8_save_button.setProperty("variant", "ghost")
-        self.step8_save_button.setEnabled(False)
-        self.step8_save_button.setToolTip(
-            "Write the sweep on screen where you choose: the CSV, the result "
-            "JSON everything downstream reads, and the plot.\n"
-            "A run stages itself in a temp directory and goes nowhere else "
-            "until this is pressed.")
-        self.step8_save_button.clicked.connect(self._step8_save)
-        grid.addWidget(self.step8_run_button, 0, 0)
-        grid.addWidget(self.step8_stop_button, 0, 1)
-        grid.addWidget(self.step8_load_button, 1, 0)
-        grid.addWidget(self.step8_save_button, 1, 1)
-        self.step8_estimate = self._caption("")
-        grid.addWidget(self.step8_estimate, 2, 0, 1, 2)
-        self.step8_status = QtWidgets.QLabel("Idle")
-        self.step8_status.setWordWrap(True)
-        grid.addWidget(self.step8_status, 3, 0, 1, 2)
-        box.addWidget(run)
+        # The description of this file -- its chain, its pairs, its Y_max --
+        # goes to the page's status line beside the title (_STEP_STATUS), so
+        # the column is controls and nothing else.
 
         probe = self._panel("Probe one level")
         grid = QtWidgets.QGridLayout(probe)
         self.step8_probe_alpha = self._double_spin(0.0, 1.0, 0.3, "", 4)
         self.step8_probe_alpha.setSingleStep(0.01)
         self.step8_probe_alpha.setToolTip(
-            f"Fraction of Y_max to display and read once. Defaults to the "
-            f"ladder's own cap.\n"
+            f"Fraction of Y_max to display. Defaults to Alpha max, the "
+            f"brightest rung the sweep will take.\n"
             f"This is how the bench finds out where the READOUT stops being "
             f"linear, which is a question about the electronics and not about "
             f"the atoms: the amplifier rails at "
-            f"{1e3 * STEP8.AMP_LIMIT_V:.0f} mV and begins to compress somewhere "
-            f"below that, and either bends the top of a ladder down exactly the "
-            f"way saturation does \N{EM DASH} the fit has one free parameter and "
-            f"cannot tell them apart.\n"
+            f"{1e3 * STEP8.AMP_LIMIT_V:.0f} mV and begins to compress "
+            f"somewhere below that, and either bends the top of a band down "
+            f"exactly the way saturation does \N{EM DASH} the fit has one free "
+            f"parameter and cannot tell them apart.\n"
             f"Walk alpha up and watch the read fall behind the linear "
-            f"prediction, and the raw peak approach the rail. That measurement "
-            f"is what LADDER_CEILING_V "
+            f"prediction, and the raw peak approach the rail. That "
+            f"measurement is what LADDER_CEILING_V "
             f"({1e3 * STEP8.LADDER_CEILING_V:.0f} mV) encodes.")
         self.step8_probe_alpha.valueChanged.connect(self._step8_probe_predict)
         self.step8_probe_pred = self._caption("")
@@ -6263,9 +6456,174 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(QtWidgets.QLabel("alpha"), 0, 0)
         grid.addWidget(self.step8_probe_alpha, 0, 1)
         grid.addWidget(self.step8_probe_pred, 0, 2)
-        grid.addWidget(self.step8_probe_button, 1, 0, 1, 3)
+        # Display alone needs the SLM and not the DAQ, which is the point of
+        # it: a known level on the panel while something that is not this
+        # detector is looked at or adjusted.  It leaves the frame up.
+        self.step8_display_button = QtWidgets.QPushButton("Display")
+        self.step8_display_button.setProperty("variant", "ghost")
+        self.step8_display_button.setEnabled(False)
+        self.step8_display_button.setToolTip(
+            "Solve the drive for this alpha and put it on the panel. No "
+            "read, no DAQ, nothing written \N{EM DASH} the frame stays up until "
+            "something else displays.\n"
+            "The solver is the sweep's own, so what goes up is a rung the "
+            "sweep could have chosen.")
+        self.step8_display_button.clicked.connect(self._step8_display)
+        grid.addWidget(self.step8_display_button, 1, 0)
+        grid.addWidget(self.step8_probe_button, 1, 1, 1, 2)
         grid.setColumnStretch(2, 1)
         box.addWidget(probe)
+
+        # --- DAQ acquisition --------------------------------------------
+        # Its own group, and its own settings -- not STEP8.ACQ.  Steps 6 and 7
+        # put the window, the range and the sign on the page; this step read
+        # them off a module constant, which made the one page whose fit is a
+        # saturation curve the one page that could not say what it read at.
+        # Same four controls and the same BENCH_ACQ defaults, so an untouched
+        # page still runs exactly what the CLI runs.
+        daq = self._panel("DAQ \N{MIDDLE DOT} acquisition")
+        dgrid = QtWidgets.QGridLayout(daq)
+        dgrid.setHorizontalSpacing(8)
+        dgrid.setVerticalSpacing(6)
+
+        self.step8_daq_channel = QtWidgets.QLineEdit("ai0")
+        self.step8_daq_range = QtWidgets.QComboBox()
+        for lo, hi in self._DAQ_RANGES:
+            self.step8_daq_range.addItem(
+                f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
+        self._select_daq_range(self.step8_daq_range, BENCH_ACQ.range_v)
+        self.step8_daq_range.setToolTip(BENCH_RANGE_TIP)
+        self.step8_tmeas = self._double_spin(
+            0.001, 60.0, BENCH_ACQ.t_meas_s, " s", 3)
+        self.step8_tmeas.setToolTip(BENCH_WINDOW_TIP)
+        self.step8_invert = QtWidgets.QCheckBox("Invert sign (TIA)")
+        self.step8_invert.setChecked(BENCH_ACQ.invert)
+        self.step8_invert.setToolTip(
+            "The transimpedance amplifier outputs NEGATIVE volts for positive "
+            "light, so recording a positive light signal means inverting.\n"
+            "Leave this on. A sign-flipped run does not fail here \N{EM DASH} "
+            "it fits a saturation curve to reads that bend the wrong way and "
+            "reports a Y_sat for it."
+        )
+        for r, (label, widget) in enumerate((
+                ("Channel", self.step8_daq_channel),
+                ("Range", self.step8_daq_range),
+                ("T_meas", self.step8_tmeas))):
+            dgrid.addWidget(QtWidgets.QLabel(label), r, 0)
+            dgrid.addWidget(widget, r, 1)
+        dgrid.addWidget(self.step8_invert, 3, 0, 1, 2)
+        dgrid.setColumnStretch(1, 1)
+
+        # Bench constants, off the panel the way steps 6 and 7 keep theirs:
+        # live widgets the run still reads, just not ones anybody sets.
+        self.step8_daq_rate = QtWidgets.QDoubleSpinBox()
+        self.step8_daq_rate.setRange(1.0, 2_000_000.0)
+        self.step8_daq_rate.setDecimals(0)
+        self.step8_daq_rate.setValue(1000.0)
+        self.step8_daq_rate.setSuffix(" S/s")
+        self.step8_daq_fcut = self._double_spin(0.1, 100_000.0, 20.0, " Hz", 1)
+        self.step8_pmt = QtWidgets.QCheckBox(
+            "Log PMT thermistor (Keithley 2400)")
+        for widget in (self.step8_daq_rate, self.step8_daq_fcut,
+                       self.step8_pmt):
+            widget.setParent(daq)
+            widget.hide()
+        box.addWidget(daq)
+
+        # The estimate is quoted under these, so it has to move with them.
+        self.step8_tmeas.valueChanged.connect(self._step8_update_estimate)
+        self.step8_daq_range.currentIndexChanged.connect(
+            self._step8_update_estimate)
+
+        sweep = self._panel("Sweep")
+        grid = QtWidgets.QGridLayout(sweep)
+        self.step8_points = self._spin(4, 400, STEP8.LADDER)
+        self.step8_points.setToolTip(
+            "Rungs in the band, one per stratum, each a fresh random drive.\n"
+            "A rung's information about 1/Y_sat goes as "
+            "(Y²/σ)², so the top of the band is worth "
+            "orders more than the bottom — 30 over the bright end "
+            "return Y_sat to ~4 %, against the ~11 % it would have to be "
+            "wrong by before it cost as much as the model error beside it."
+        )
+        self.step8_points.valueChanged.connect(self._step8_update_estimate)
+        self.step8_points.valueChanged.connect(self._step8_refresh_levels)
+        grid.addWidget(QtWidgets.QLabel("Rungs"), 0, 0)
+        grid.addWidget(self.step8_points, 0, 1)
+
+        # The band in ALPHA, which is what the sweep is specified in and what
+        # every output records.  The MILLIVOLTS beside each box are the
+        # DERIVED column: alpha x Y_max, so they move with the PMT gain --
+        # and they are what the amplifier argument is actually about, which
+        # is why they are on screen rather than left to be worked out.  Blank
+        # until a calib file names a Y_max, because before that there are no
+        # millivolts to show.
+        self.step8_alpha_hi = self._double_spin(0.0001, 1.0, 0.2945, "", 4)
+        self.step8_alpha_hi.setSingleStep(0.01)
+        self.step8_alpha_hi.setToolTip(
+            f"The brightest rung, as a fraction of Y_max — and the only "
+            f"thing that decides where the sweep stops.\n"
+            f"The default is {1e3 * STEP8.LADDER_CEILING_V:.0f} mV converted "
+            f"against this file's Y_max. That figure is UNVERIFIED: nobody "
+            f"has measured where the amplifier starts to compress, only its "
+            f"{STEP8.AMP_LIMIT_V:g} V hard rail. Compression bends the top "
+            f"of the band down exactly the way saturation does, and the fit "
+            f"has one free parameter and cannot tell them apart — so too "
+            f"high is SILENT, while too low only costs precision. Use the "
+            f"probe below to replace the guess."
+        )
+        self.step8_alpha_lo = self._double_spin(0.0001, 1.0, STEP8.ALPHA_LO,
+                                                "", 4)
+        self.step8_alpha_lo.setSingleStep(0.01)
+        self.step8_alpha_lo.setToolTip(
+            "The dimmest rung, as a fraction of Y_max.\n"
+            "The bottom of the band weighs almost nothing in the fit: a "
+            "rung's leverage on Y_sat falls off as the square of its level, "
+            "so set this by what you want COVERED rather than by what you "
+            "want measured."
+        )
+        self.step8_alpha_hi_mv = self._caption("")
+        self.step8_alpha_lo_mv = self._caption("")
+        rows = (("Alpha max", self.step8_alpha_hi, self.step8_alpha_hi_mv),
+                ("Alpha min", self.step8_alpha_lo, self.step8_alpha_lo_mv))
+        for r, (label, spin, mv) in enumerate(rows, start=1):
+            spin.valueChanged.connect(self._step8_refresh_levels)
+            grid.addWidget(QtWidgets.QLabel(label), r, 0)
+            grid.addWidget(spin, r, 1)
+            grid.addWidget(mv, r, 2, 1, 2)
+        self.step8_alpha_hi.valueChanged.connect(self._step8_probe_predict)
+        grid.setColumnStretch(2, 1)
+
+        box.addWidget(sweep)
+
+        run = self._panel("Run")
+        grid = QtWidgets.QGridLayout(run)
+        self.step8_run_button = QtWidgets.QPushButton("Run Sweep")
+        self.step8_run_button.clicked.connect(self._step8_run)
+        self.step8_stop_button = QtWidgets.QPushButton("Stop")
+        self.step8_stop_button.setEnabled(False)
+        self.step8_stop_button.clicked.connect(self._step8_stop)
+        # Load, the same one step 6 and 7 carry: re-fit the sweep this calib
+        # file already records and show it.  There is no Save -- a finished
+        # sweep writes itself beside the file it was driven from, because that
+        # file is what was named before the bench was touched.
+        self.step8_load_button = QtWidgets.QPushButton("Load")
+        self.step8_load_button.setProperty("variant", "ghost")
+        self.step8_load_button.setToolTip(
+            "Re-fit the step-8 sweep this calibration file records and show it "
+            "\N{EM DASH} no hardware, no sweep.\n"
+            "Reads only: the fit on screen is not written back, and the plot it "
+            "draws goes to a temp directory.")
+        self.step8_load_button.clicked.connect(self._step8_load)
+        grid.addWidget(self.step8_run_button, 0, 0)
+        grid.addWidget(self.step8_stop_button, 0, 1)
+        grid.addWidget(self.step8_load_button, 1, 0, 1, 2)
+        # The estimate stays: it is a prediction about the sweep you are about
+        # to start, not feedback about one that ran.  step8_status is beside
+        # the page title.
+        self.step8_estimate = self._caption("")
+        grid.addWidget(self.step8_estimate, 2, 0, 1, 2)
+        box.addWidget(run)
 
         box.addStretch(1)
         self._step8_update_estimate()
@@ -6295,13 +6653,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- plan and estimate -------------------------------------------------
     def _step8_step7_path(self) -> Path:
-        text = self.step8_step7_edit.text().strip()
-        if not text:
-            raise ValueError("Pick a step-7 result JSON first.")
-        path = Path(text)
+        path = self._calib_file_path(8)
+        if path is None:
+            raise ValueError("Pick a calibration file first.")
         if not path.exists():
             raise FileNotFoundError(f"{path} does not exist")
         return path
+
+    def _step8_acq(self) -> PairV2Acq:
+        """Window, range and sign, straight off this page's DAQ group.
+
+        The settle is not on the page: ``run_patterns`` owns it for step 8, so
+        a control for it would set nothing.
+        """
+        _lo, hi = self.step8_daq_range.currentData()
+        return PairV2Acq(
+            t_meas_s=float(self.step8_tmeas.value()),
+            settle_s=BENCH_ACQ.settle_s,
+            range_v=float(hi),
+            invert=self.step8_invert.isChecked(),
+        )
 
     def _step8_update_estimate(self) -> None:
         """Reads and minutes, before the bench is asked for anything.
@@ -6309,30 +6680,38 @@ class MainWindow(QtWidgets.QMainWindow):
         Only the count and the windows, not the solved plan: solving the ladder
         takes seconds and this runs on every spinbox tick.
         """
-        n = self.step8_ladder.value() + self.step8_low.value() + 2
+        n = self.step8_points.value()
+        acq = self._step8_acq()
         self.step8_estimate.setText(
-            f"{n} reads, roughly {STEP8.run_seconds(n) / 60:.0f} min "
-            f"({STEP8.ACQ.t_meas_s:g} s every read at "
-            f"\N{PLUS-MINUS SIGN}{STEP8.ACQ.range_v:g} V, dark included)")
+            f"{n} reads, roughly {STEP8.run_seconds(n, acq) / 60:.0f} min "
+            f"({acq.t_meas_s:g} s every read at "
+            f"\N{PLUS-MINUS SIGN}{acq.range_v:g} V, dark included)")
 
     def _step8_step7_changed(self) -> None:
-        """Show where this run's Y_max lands, and gate the probe.
+        """Describe this page's file, show where its Y_max lands, gate the probe.
 
-        Runs on every keystroke, so it does nothing until the text names a run
-        folder (or a calib.json) that is there -- which for a browsed path is
-        once.  ``full_scale`` is a prediction and touches no hardware.
+        This page's entry in :attr:`_STEP_DESCRIBE`, so it owns the one line the
+        status line carries about the file -- the chain, the pairs and the Y_max
+        the band is placed on, which is the only number this page needs from the
+        file before it runs.
+
+        Runs on every keystroke, so it does nothing until the text names a
+        calib.json that is there (a directory means the file inside it) -- which
+        for a browsed path is once.  ``full_scale`` predicts and touches no
+        hardware.
         """
-        text = self.step8_step7_edit.text().strip()
-        # A run folder is what the box takes, so resolve it to its calib.json
-        # before asking whether it exists -- a directory is not is_file(), and
-        # testing that directly left the panel silently idle.
-        path = calib_file_path(text) if text else None
+        path = self._calib_file_path(8)
         if path is None or not path.is_file():
+            self._set_status(
+                self.step8_status,
+                "No calibration file chosen \N{EM DASH} required to run."
+                if path is None else
+                f"{path.name} does not exist yet ({path.parent})",
+                "off")
             self.step8_y_max = None
             self._step8_plan_for = None
-            # Not just the note: dropping Y_max drops the alphas with it, and a
-            # stale alpha beside a live box is the one thing this column must
-            # never show.
+            # Dropping Y_max drops the alphas with it, and a stale alpha
+            # beside a live box is the one thing this column must never show.
             self._step8_refresh_levels()
             self._step8_probe_predict()
             self._step8_refresh_buttons()
@@ -6350,88 +6729,73 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:                      # noqa: BLE001
             self.step8_y_max = None
             self._step8_plan_for = None
-            # Not just the note: dropping Y_max drops the alphas with it, and a
-            # stale alpha beside a live box is the one thing this column must
-            # never show.
+            # Dropping Y_max drops the alphas with it, and a stale alpha beside a
+            # live box is the one thing this column must never show.
             self._step8_refresh_levels()
-            self.step8_status.setText(f"Cannot read the forward model: {exc}")
+            self._set_status(self.step8_status,
+                             f"Cannot read the forward model: {exc}", "error")
             self._step8_probe_predict()
             self._step8_refresh_buttons()
             return
         self.step8_y_max = fs
         self._step8_plan_for = str(path.resolve())
+        self._set_status(
+            self.step8_status,
+            f"{self._calib_name(path)} \N{MIDDLE DOT} {self._run_chain(path)} "
+            f"\N{MIDDLE DOT} {len(models)} pairs "
+            f"\N{MIDDLE DOT} Y_max {fs * 1e3:.1f} mV "
+            f"\N{MIDDLE DOT} 4-bit step {fs / 15 * 1e3:.3f} mV",
+            "ok")
         self._step8_refresh_levels()
         # A fresh forward model means a fresh cap, and the cap is the alpha worth
         # probing by default -- it is the brightest read the sweep will take.
         self.step8_probe_alpha.setValue(
-            round(STEP8.ladder_levels(fs, **self._step8_levels_v())["cap"], 4))
+            round(float(self.step8_alpha_hi.value()), 4))
         self._step8_probe_predict()
         self._step8_refresh_buttons()
 
-    def _step8_levels_v(self) -> dict[str, float]:
-        """The three boxes as ``ladder_levels`` keywords, in VOLTS.
+    def _step8_alphas(self) -> dict[str, float]:
+        """The band, as :func:`calibration_module.steps.calib_step8.build` keywords.
 
-        One place turns millivolts into volts, and it spells the keywords, so a
-        box cannot end up wired to the wrong band.
+        One place reads the two boxes and spells the keyword names, so a box
+        cannot end up wired to the wrong end of the band.
         """
-        return {"ceiling_v": self.step8_sweep_max.value() / 1e3,
-                "floor_v": self.step8_band_floor.value() / 1e3,
-                "low_v": self.step8_sweep_min.value() / 1e3}
+        return {"alpha_lo": float(self.step8_alpha_lo.value()),
+                "alpha_hi": float(self.step8_alpha_hi.value())}
 
     def _step8_refresh_levels(self) -> None:
-        """The alpha beside each box, and the Y_max note above them.
+        """The millivolts beside each alpha box, and the Y_max note above them.
 
         Pure arithmetic on a cached ``Y_max`` -- no solve, no file read -- so it
-        runs on every spinbox tick.  The alphas are BLANK until a step-7 JSON is
-        loaded: alpha is mV / Y_max and there is no Y_max before that.
+        runs on every spinbox tick.  BLANK until a calib file is loaded: the
+        millivolts are alpha x Y_max, and there is no Y_max before that.
 
-        It also shows what :func:`~calibration_module.steps.calib_step8.ladder_levels`
-        CLAMPED.  A band floor above the ceiling is clamped rather than refused,
-        and a clamp that is not on screen is a box and a run that disagree.
+        The top row also says what the raw trace PEAK will be, because that is
+        what the amplifier limit is about: the 20 Hz low-pass averages a flat
+        top away, so a railed read still reports a civil mean.  It warns and
+        does not refuse -- what guards this is the recorded ``peak_v``.
         """
-        if not hasattr(self, "step8_sweep_min_alpha"):
+        if not hasattr(self, "step8_alpha_lo_mv"):
             return
         fs = getattr(self, "step8_y_max", None)
-        volts = self._step8_levels_v()
-        checks = self.step8_low.value()
+        a = self._step8_alphas()
         if fs is None:
-            self.step8_levels_note.clear()
-            for cap in (self.step8_sweep_max_alpha, self.step8_band_floor_alpha,
-                        self.step8_sweep_min_alpha):
+            for cap in (self.step8_alpha_hi_mv, self.step8_alpha_lo_mv):
                 cap.clear()
             return
-        lv = STEP8.ladder_levels(fs, **volts)
-        rungs = (f"{self.step8_ladder.value()} rungs above",
-                 f"{checks} rungs below" if checks else "no model checks")
-        def caption(alpha: float, asked_v: float, note: str = "",
-                    gap: str = "clamped") -> str:
-            # A clamp shows as the disagreement itself: alpha * Y_max is what
-            # will be driven, the box is what was asked for.  ``gap`` names why
-            # they differ, and it is not always a clamp -- at the ceiling of a
-            # forward model dimmer than the box, the atoms own the top.
-            got = alpha * fs
-            gap = (f"  = {got * 1e3:.1f} mV {gap}".rstrip()
-                   if abs(got - asked_v) > 1e-6 * max(asked_v, 1e-9) else "")
-            return (f"\N{GREEK SMALL LETTER ALPHA} {alpha:.4f}{gap}"
-                    + (f"   \N{MIDDLE DOT}  {note}" if note else ""))
-        self.step8_sweep_max_alpha.setText(caption(
-            lv["cap"], volts["ceiling_v"],
-            "" if lv["capped"] else "Y_max is below it: the atoms own the top",
-            gap=""))
-        self.step8_band_floor_alpha.setText(
-            caption(lv["floor"], volts["floor_v"], rungs[0]))
-        self.step8_sweep_min_alpha.setText(
-            caption(lv["low"], volts["low_v"], rungs[1]) if checks else "")
-        self.step8_levels_note.setText(
-            f"Y_max {fs * 1e3:.1f} mV (LINEAR)   \N{EM DASH}   4-bit step "
-            f"{fs / 15 * 1e3:.3f} mV\n"
-            + (f"capped at {volts['ceiling_v'] * 1e3:.0f} mV: Y_max is "
-               f"{fs / volts['ceiling_v']:.2f}\N{MULTIPLICATION SIGN} that, and "
-               f"{fs / STEP8.AMP_LIMIT_V:.2f}\N{MULTIPLICATION SIGN} the "
-               f"{STEP8.AMP_LIMIT_V:g} V amplifier limit"
-               if lv["capped"] else
-               "not capped: Y_max is under Sweep max, so the ladder reaches "
-               "alpha = 1"))
+        peak = a["alpha_hi"] * fs * STEP8.PEAK_OVER_MEAN
+        note = ""
+        if peak > 0.85 * STEP8.AMP_LIMIT_V:
+            note = (f"   \N{MIDDLE DOT}  raw peak ~{peak * 1e3:.0f} mV, "
+                    f"{100 * peak / STEP8.AMP_LIMIT_V:.0f} % of the "
+                    f"{STEP8.AMP_LIMIT_V:g} V limit")
+        self.step8_alpha_hi_mv.setText(
+            f"= {a['alpha_hi'] * fs * 1e3:.1f} mV" + note)
+        band = (f"   \N{MIDDLE DOT}  {self.step8_points.value()} rungs up to alpha max"
+                if a["alpha_lo"] < a["alpha_hi"] else
+                "   \N{MIDDLE DOT}  above alpha max: the band is empty")
+        self.step8_alpha_lo_mv.setText(
+            f"= {a['alpha_lo'] * fs * 1e3:.1f} mV" + band)
 
     def _step8_probe_predict(self) -> None:
         """The predicted millivolts for the alpha in the box, before committing.
@@ -6442,7 +6806,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ``alpha = 1`` is ~1534 mV into a 1 V amplifier, and that should not be
         one keystroke away without warning.
         """
-        if not hasattr(self, "step8_probe_pred"):
+        # Both, because the probe panel is built ABOVE the sweep panel: between
+        # the two, step8_probe_pred exists and step8_alpha_hi does not.
+        if not hasattr(self, "step8_alpha_hi"):
             return
         fs = getattr(self, "step8_y_max", None)
         if fs is None:
@@ -6450,14 +6816,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         a = float(self.step8_probe_alpha.value())
         v = a * float(fs)
-        ceiling = self._step8_levels_v()["ceiling_v"]
+        top = self._step8_alphas()["alpha_hi"]
+        peak = v * STEP8.PEAK_OVER_MEAN
         note = ""
-        if v > STEP8.AMP_LIMIT_V:
-            note = (f"   \N{EM DASH}  OVER the {STEP8.AMP_LIMIT_V:g} V amplifier limit, "
-                    f"this read will clip")
-        elif v > ceiling:
-            note = (f"   \N{EM DASH}  above Sweep max "
-                    f"{ceiling * 1e3:.0f} mV")
+        # Said, never refused.  The peak is what reaches the rail, and the
+        # mean cannot show it: the low-pass averages a flat top away.
+        if peak >= STEP8.AMP_LIMIT_V:
+            note = (f"   \N{EM DASH}  raw peak ~{peak * 1e3:.0f} mV is AT the "
+                    f"{STEP8.AMP_LIMIT_V:g} V limit: this read will be a "
+                    f"flat-top, and only peak_v will show it")
+        elif peak > 0.85 * STEP8.AMP_LIMIT_V:
+            note = (f"   \N{EM DASH}  raw peak ~{peak * 1e3:.0f} mV, close to "
+                    f"the {STEP8.AMP_LIMIT_V:g} V limit")
+        elif a > top:
+            note = (f"   \N{EM DASH}  above alpha max {top:.4f}, brighter than "
+                    f"the sweep goes")
         self.step8_probe_pred.setText(f"predicts {v * 1e3:.1f} mV{note}")
 
     def _step8_refresh_buttons(self) -> None:
@@ -6467,18 +6840,19 @@ class MainWindow(QtWidgets.QMainWindow):
         running = self.step8_stop_button.isEnabled()
         ready = getattr(self, "step8_y_max", None) is not None
         self.step8_probe_button.setEnabled(not running and ready)
+        self.step8_display_button.setEnabled(not running and ready)
         self.step8_probe_alpha.setEnabled(not running)
-        for w in (self.step8_ladder, self.step8_low, self.step8_sweep_max,
-                  self.step8_band_floor):
+        for w in (self.step8_points, self.step8_alpha_lo,
+                  self.step8_alpha_hi):
             w.setEnabled(not running)
-        # Sweep min is the model checks' floor; with no checks there is nothing
-        # below the band floor for it to bound.
-        self.step8_sweep_min.setEnabled(not running and self.step8_low.value() > 0)
-        # There is nothing to save until a sweep has been fitted.
-        self.step8_save_button.setEnabled(
-            not running and getattr(self, "step8_last", None) is not None)
 
     def _step8_set_running(self, running: bool) -> None:
+        """See :meth:`_tpa_set_running`."""
+        self._step8_set_running_impl(running)
+        if not running:
+            self._calib_gate_step(8)
+
+    def _step8_set_running_impl(self, running: bool) -> None:
         self.step8_run_button.setEnabled(not running)
         self.step8_load_button.setEnabled(not running)
         self.step8_stop_button.setEnabled(running)
@@ -6491,31 +6865,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- the run -----------------------------------------------------------
     def _step8_run(self) -> None:
-        volts = self._step8_levels_v()
-        # Asked BEFORE the solve, and only about the read the sweep will
-        # actually take: on a forward model dimmer than the ceiling the sweep
-        # never reaches it, and a dialog there would be a false alarm.  1.31 is
-        # the 0929 sweep's p90 raw peak/mean, so this is the ceiling at which the
-        # PEAK starts touching the rail -- and it is 30 rungs, not one probe
-        # read, every one of them bent the way saturation bends them.
-        top = min(volts["ceiling_v"], getattr(self, "step8_y_max", None)
-                  or volts["ceiling_v"])
-        if top * 1.31 > STEP8.AMP_LIMIT_V:
-            if QtWidgets.QMessageBox.question(
-                    self, "The ladder tops out near the rail",
-                    f"Sweep max {volts['ceiling_v'] * 1e3:.0f} mV puts the "
-                    f"brightest rungs at {top * 1e3:.0f} mV mean, whose raw "
-                    f"trace peak runs ~{top * 1.31 * 1e3:.0f} mV against the "
-                    f"{STEP8.AMP_LIMIT_V:g} V amplifier limit.\n\n"
-                    f"Clipping, and compression well below the rail, bend the "
-                    f"top of the ladder down in exactly the way saturation "
-                    f"does. The fit has one free parameter and cannot tell "
-                    f"them apart, so it will absorb the amplifier into Y_sat "
-                    f"and report a confident wrong number \N{EM DASH} across "
-                    f"every bright rung, not one read.\n\nRun it anyway?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
-                return
+        alphas = self._step8_alphas()
+        # No dialog.  The caption under Alpha max already says what the raw
+        # peak will be against the amplifier limit, and it says it while the
+        # box is being set rather than after Run is pressed.  A sweep that
+        # tops out near the rail is a judgement call about the electronics,
+        # and the recorded peak_v is what settles it afterwards.
         try:
             step7 = self._step8_step7_path()
             models, phases, _ref = verify_load_forward_model(step7)
@@ -6523,8 +6878,7 @@ class MainWindow(QtWidgets.QMainWindow):
             seed = int(np.random.SeedSequence().entropy % 2**32)
             scale, patterns, preds = STEP8.build(
                 models, phases, pairs, seed=seed,
-                ladder=self.step8_ladder.value(),
-                low=self.step8_low.value(), **volts)
+                n=self.step8_points.value(), **alphas)
             layout = STEP8.load_layout(step7, pairs)
         except (ValueError, FileNotFoundError) as exc:
             self.step8_status.setText(str(exc))
@@ -6542,8 +6896,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step8_status.setText("Open the SLM on the SLM Control page first.")
             return
 
-        acq = STEP8.ACQ
-        secs = STEP8.run_seconds(len(patterns))
+        acq = self._step8_acq()
+        secs = STEP8.run_seconds(len(patterns), acq)
         settings = DAQMonitorSettings(
             channel=self.step8_daq_channel.text().strip() or "ai0",
             sample_rate=self.step8_daq_rate.value(),
@@ -6553,8 +6907,12 @@ class MainWindow(QtWidgets.QMainWindow):
             f_cut=self.step8_daq_fcut.value(),
         )
 
-        # Staged, not saved: calib_data gets nothing until Save is pressed.
-        out = self._step8_staging()
+        # Beside the calib file this sweep was driven from: its step 3/6/7
+        # sections are the forward model, and the Y_sat measures THAT model.
+        # There is no staging and no Save -- the destination was decided when
+        # the file was named, before the bench was touched.
+        out = Path(step7).parent
+        out.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%m%d_%H%M")
         coh = [float(verify_predict(models, phases, pairs, p.x, p.w, coherent=True))
                for p in patterns]
@@ -6574,16 +6932,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_calibration_dialog(on_stop=self._step8_stop)
         if self.calibration_dialog is not None:
             self.calibration_dialog.note([
-                f"{len(patterns)} reads \N{MIDDLE DOT} "
-                f"{self.step8_ladder.value()} bright + "
-                f"{self.step8_low.value()} checks + 2 at the cap "
-                f"\N{MIDDLE DOT} {acq.t_meas_s:g} s at "
+                f"{len(patterns)} reads \N{MIDDLE DOT} {acq.t_meas_s:g} s at "
                 f"\N{PLUS-MINUS SIGN}{acq.range_v:g} V",
-                # The band is tunable, so the dialog has to say which one ran.
-                f"band {volts['floor_v'] * 1e3:.0f}"
-                f"\N{EN DASH}{volts['ceiling_v'] * 1e3:.0f} mV, checks down to "
-                f"{volts['low_v'] * 1e3:.0f} mV \N{MIDDLE DOT} brightest read "
-                f"{max(preds) * 1e3:.1f} mV",
+                # The band is tunable, so the dialog has to say which one ran,
+                # in both spellings: alpha is what was set, mV is what the
+                # amplifier sees.
+                f"band alpha {alphas['alpha_lo']:.4f}\N{EN DASH}"
+                f"{alphas['alpha_hi']:.4f} = {min(preds) * 1e3:.1f}\N{EN DASH}"
+                f"{max(preds) * 1e3:.1f} mV \N{MIDDLE DOT} raw peak at the top "
+                f"~{max(preds) * STEP8.PEAK_OVER_MEAN * 1e3:.0f} mV of the "
+                f"{STEP8.AMP_LIMIT_V:g} V limit",
                 f"Y_max {scale.fs * 1e3:.3f} mV \N{MIDDLE DOT} 4-bit step "
                 f"{scale.fs / 15 * 1e3:.3f} mV",
                 "Predictions are LINEAR: this run fits Y_sat, so it assumes none.",
@@ -6602,11 +6960,14 @@ class MainWindow(QtWidgets.QMainWindow):
             daq.configure_monitor(settings)
             rows: list[dict] = []
             meta = {"n_pairs": len(pairs), "y_max_v": scale.fs,
-                    "ladder": self.step8_ladder.value(),
-                    "ladder_low": self.step8_low.value(),
-                    "ceiling_v": f"{volts['ceiling_v']:.6g}",
-                    "floor_v": f"{volts['floor_v']:.6g}",
-                    "low_v": f"{volts['low_v']:.6g}"}
+                    "n": self.step8_points.value(),
+                    # Alpha is the band; the mV are what it meant at THIS
+                    # Y_max.  Both, because neither alone survives a gain
+                    # change -- same reason collect() writes both.
+                    "alpha_lo": f"{alphas['alpha_lo']:.6g}",
+                    "alpha_hi": f"{alphas['alpha_hi']:.6g}",
+                    "alpha_lo_mv": f"{alphas['alpha_lo'] * scale.fs * 1e3:.6g}",
+                    "alpha_hi_mv": f"{alphas['alpha_hi'] * scale.fs * 1e3:.6g}"}
             columns: list[str] = []
             status = "complete"
             if pmt is not None:
@@ -6633,13 +6994,13 @@ class MainWindow(QtWidgets.QMainWindow):
                        "coherent_v", "sb_pred_v", "t_meas_s", "peak_v",
                        *columns])
             result = STEP8.fit_and_write(
-                csv_path, step7, out_dir=out,
+                csv_path, step7,
                 log=lambda m: self._log(f"[step 8] {m}"))
-            # The step-7 file travels with the fit, because Save re-writes
-            # the result JSON at the destination and must use the model this
-            # fit was made against, not whatever the box holds by then.
-            return {"status": status, "csv": csv_path, "step7": Path(step7),
-                    "result": result}
+            # The calib file travels with the fit: editing the box between a
+            # run and its report must not change what the report says it was
+            # measured against.
+            return {"status": status, "csv": csv_path, "written": True,
+                    "step7": Path(step7), "result": result}
 
         self._run_slm_task("Step 8 saturation sweep", work,
                            self._step8_finished, self._step8_error)
@@ -6656,7 +7017,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ``total``, and ``step`` already counts only finished pattern reads.
 
         The plot is measured against PREDICTED, not against read number.  The
-        ladder is driven shuffled on purpose (see ``calib_step8.interleave``),
+        ladder is driven shuffled on purpose (see ``calib_step8.shuffle``),
         so read order carries no physics, while this is the saturation curve the
         run exists to fit -- it leaves the diagonal exactly where Y_sat bites.
         """
@@ -6693,6 +7054,66 @@ class MainWindow(QtWidgets.QMainWindow):
             y=progress.net_v * 1e3 if plot else None,
         ))
 
+    def _step8_display(self) -> None:
+        """Put one level on the panel and leave it there.  No read, no DAQ.
+
+        The other half of the probe: same solver, same drive, the reading left
+        off.  It needs the SLM only, so it works before the DAQ is up -- which
+        is most of what it is for, along with holding a known level while
+        something that is not this detector is looked at.
+
+        Nothing is written, and nothing clears the frame afterwards: the next
+        display wins, as it would on the SLM page.
+        """
+        alpha = float(self.step8_probe_alpha.value())
+        if alpha <= 0.0:
+            self.step8_status.setText(
+                "alpha has to be above 0 to display anything.")
+            return
+        try:
+            calib = self._step8_step7_path()
+            models, phases, _ref = verify_load_forward_model(calib)
+            pairs = sorted(models)
+            layout = STEP8.load_layout(calib, pairs)
+        except (ValueError, FileNotFoundError) as exc:
+            self.step8_status.setText(str(exc))
+            return
+        except Exception as exc:                      # noqa: BLE001
+            self.step8_status.setText(f"Forward model: {exc}")
+            return
+        controller = self._controller()
+        if not getattr(controller, "is_open", False):
+            self.step8_status.setText("Open the SLM on the SLM Control page first.")
+            return
+
+        self._step8_set_running(True)
+        self.step8_status.setText(f"Displaying alpha = {alpha:.4f}\N{HORIZONTAL ELLIPSIS}")
+
+        def work() -> dict[str, Any]:
+            pattern = STEP8.display_alpha(
+                controller, layout, models, phases, pairs, alpha,
+                log=lambda m: self._log(f"[step 8] {m}"))
+            pred = float(verify_predict(models, phases, pairs,
+                                        pattern.x, pattern.w))
+            return {"alpha": pattern.alpha, "pred_v": pred,
+                    "exact": pattern.exact}
+
+        self._run_slm_task("Step 8 display", work,
+                           self._step8_display_finished,
+                           self._step8_display_error)
+
+    def _step8_display_finished(self, info: dict[str, Any]) -> None:
+        self._step8_set_running(False)
+        self.step8_status.setText(
+            f"Displaying alpha = {info['alpha']:.4f}, predicts "
+            f"{info['pred_v'] * 1e3:.1f} mV (LINEAR). Nothing was read or "
+            f"written."
+            + ("" if info["exact"] else               "  The projection fell back to the deterministic drive."))
+
+    def _step8_display_error(self, _error: str) -> None:
+        self._step8_set_running(False)
+        self.step8_status.setText("Display failed (see Status log)")
+
     def _step8_probe(self) -> None:
         """Display one chosen level, read it once, report it.  Nothing written.
 
@@ -6700,33 +7121,20 @@ class MainWindow(QtWidgets.QMainWindow):
         the sweep uses -- the same all-off dark, the same fixed range, the same
         inversion -- so what comes back is literally a sweep read.
 
-        The alpha is the caller's.  This replaced a button that could only drive
-        ``alpha = 1``, which at the present gain is ~1534 mV into a 1 V
-        amplifier: it clipped by construction and then inverted the clipped read
-        to report a confident ceiling.  The predicted millivolts are on screen
-        before the press, and anything past :data:`AMP_LIMIT_V` asks first.
+        The alpha is the caller's, and nothing here refuses one.  The predicted
+        millivolts and the raw peak they imply are on screen beside the box
+        before the press; past the amplifier limit the read is a flat-top and
+        ``peak_v`` is what says so.  This replaced a button that could only
+        drive ``alpha = 1``, which at the present gain is ~1534 mV into a 1 V
+        amplifier: it clipped by construction and then inverted the clipped
+        read to report a confident ceiling.
         """
         alpha = float(self.step8_probe_alpha.value())
-        ceiling_v = self._step8_levels_v()["ceiling_v"]
         if alpha <= 0.0:
             self.step8_status.setText(
                 "alpha has to be above 0 \N{EM DASH} a zero drive is the dark, "
                 "which every read already takes first.")
             return
-        fs_hint = getattr(self, "step8_y_max", None)
-        if fs_hint is not None and alpha * float(fs_hint) > STEP8.AMP_LIMIT_V:
-            if QtWidgets.QMessageBox.question(
-                    self, "Past the amplifier limit",
-                    f"alpha = {alpha:.4f} predicts "
-                    f"{alpha * float(fs_hint) * 1e3:.0f} mV, past the "
-                    f"{STEP8.AMP_LIMIT_V:g} V amplifier limit.\n\n"
-                    f"The read will be a flat-top: the raw trace rails, the "
-                    f"20 Hz low-pass pulls the mean back under it, and the "
-                    f"reported mean looks reasonable while measuring nothing. "
-                    f"peak_v is what will show it.\n\nDisplay it anyway?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
-                return
         try:
             step7 = self._step8_step7_path()
             models, phases, _ref = verify_load_forward_model(step7)
@@ -6734,10 +7142,12 @@ class MainWindow(QtWidgets.QMainWindow):
             scale = STEP8.full_scale(models, phases, pairs)
             # Same solver the ladder uses, so a probe at the cap IS a ceiling
             # rung: closed form at alpha = 1, a least-move projection below it.
-            pattern = replace(
-                STEP8.ceiling_pattern(
-                    models, phases, pairs, alpha,
-                    seed=int(np.random.SeedSequence().entropy % 2**32)),
+            # Same solver the sweep uses, so what goes on the panel is a rung
+            # the sweep could have chosen: closed form at alpha = 1, a
+            # least-move projection below it.
+            pattern = STEP8.pattern_for_alpha(
+                models, phases, pairs, alpha,
+                seed=int(np.random.SeedSequence().entropy % 2**32),
                 label="probe")
             layout = STEP8.load_layout(step7, pairs)
         except (ValueError, FileNotFoundError) as exc:
@@ -6756,7 +7166,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.step8_status.setText("Open the SLM on the SLM Control page first.")
             return
 
-        acq = STEP8.ACQ
+        acq = self._step8_acq()
         coh = float(verify_predict(models, phases, pairs, pattern.x, pattern.w,
                                    coherent=True))
         tot = float(verify_predict(models, phases, pairs, pattern.x, pattern.w))
@@ -6790,8 +7200,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 alpha=alpha, y_max_v=scale.fs,
                 coherent_v=coh, sb_pred_v=tot - coh,
                 mean_v=r["mean_v"], dark_v=r["dark_v"], std_v=r["std_v"],
-                peak_v=r.get("peak_v", float("nan")), range_v=r["range_v"],
-                ceiling_v=ceiling_v)
+                peak_v=r.get("peak_v", float("nan")), range_v=r["range_v"],)
 
         self._run_slm_task("Step 8 probe", work,
                            self._step8_probe_finished, self._step8_probe_error)
@@ -6819,110 +7228,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._step8_set_running(False)
         self.step8_status.setText("Probe read failed (see Status log)")
 
-    def _step8_staging(self) -> Path:
-        """Where a sweep lands before anybody has said to keep it.
+    def _step8_render_dir(self) -> Path:
+        """Where a Load draws its report PNG: a temp directory, outside the repo.
 
-        Outside the repo on purpose.  A run nobody saved is not a calibration,
-        and ``calib_data`` is where calibrations live -- a page that filled it
-        on every press left the keeping and the discarding indistinguishable
-        afterwards.
-
-        It is not a way of holding the reads in memory either, and must not
-        become one: the CSV is written the moment the sweep ends, because five
-        minutes of bench time cannot live only in RAM, and the fit renders a
-        PNG to a path before this page can display it.  A crash between the
-        last read and a Save leaves both here.
+        The page displays an image from a path, so a fit it is only LOOKING at
+        still has to put one somewhere -- and that somewhere must not be beside
+        the calibration, because a Load writes nothing there.  Previously this
+        held whole staged runs waiting for a Save; a sweep now goes straight to
+        the file it was driven from, so all that is left here is a picture.
         """
         out = Path(tempfile.gettempdir()) / "rbonn_step8"
         out.mkdir(parents=True, exist_ok=True)
         return out
 
     def _step8_load(self) -> None:
-        """Fit a CSV that is already on disk and show it -- no hardware.
+        """Re-fit the step-8 sweep this calib file records, and show it.
 
-        The fit goes to staging, not beside the CSV that was named: opening a
-        file is not permission to write next to it.  Save is what chooses.
+        ONE input, asked for, as on steps 6 and 7: a calib.json.  Its step8
+        section says which CSV the Y_sat came from, and its step 3/6/7 sections
+        are the forward model the fit needs -- all of it in the file, so there
+        is nothing else to pick, and the page's own field does not move.
+
+        Reads only.  ``report_csv`` rather than ``fit_and_write``: the section
+        on disk stays whatever produced it, and the PNG goes to a temp
+        directory.  A fit meant to be KEPT comes from a sweep, or from
+        ``calib_step8.py`` against a copy of the file.
         """
+        picked = self._open_calib("Open a calibration to re-fit its step 8", 8)
+        if picked is None:
+            return
         try:
-            step7 = self._step8_step7_path()
-        except (ValueError, FileNotFoundError) as exc:
-            self.step8_status.setText(str(exc))
+            calib_file = picked
+            calib = load_calib(calib_file)
+            path = calib.csv_path(8)
+        except Exception as exc:                        # noqa: BLE001
+            self.step8_status.setText(f"Load failed: {exc}")
             return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load a step-8 CSV", str(STEP8.OUT_DIR), "CSV Files (*.csv)")
-        if not path:
+        if not path.is_file():
+            self.step8_status.setText(
+                f"Load failed: {calib.path.name} names {path.name}, which is "
+                f"not in {path.parent} — copy the CSV in beside it."
+            )
             return
-        out = self._step8_staging()
+        out = self._step8_render_dir()
         self._step8_set_running(True)
-        self.step8_status.setText(f"Fitting {Path(path).name}\N{HORIZONTAL ELLIPSIS}")
+        self.step8_status.setText(f"Fitting {path.name}\N{HORIZONTAL ELLIPSIS}")
 
         def work() -> dict[str, Any]:
-            return {"status": "complete", "csv": Path(path),
-                    "step7": Path(step7),
-                    "result": STEP8.fit_and_write(
-                        path, step7, out_dir=out,
+            from calibration_module.fit.step8_report import report_csv
+
+            return {"status": "complete", "csv": path, "written": False,
+                    "step7": Path(calib_file),
+                    "result": report_csv(
+                        path, calib_file, out_dir=out,
                         log=lambda m: self._log(f"[step 8] {m}"))}
 
         self._run_task("Step 8 fit", work,
                        self._step8_finished, self._step8_error)
 
-    def _step8_save(self) -> None:
-        """Put the sweep on screen where it is wanted: CSV, result JSON, plot.
-
-        The CSV is copied and the fit is then RE-WRITTEN at the destination
-        rather than copied with it.  The result JSON records the CSV and the
-        PNG it came from by absolute path -- deliberately, since a ``Y_sat``
-        and the reads that define ``g = 1`` are one object -- so a copied JSON
-        would point back into staging, which is temporary by design.  Writing
-        it there makes those pointers right by construction, and the fit is one
-        free parameter over thirty-odd reads: deterministic, and cheaper than
-        the plot it draws.
-
-        The step-7 file is the one this fit was made against, carried in the
-        payload.  Editing the box between a run and its save must not change
-        what the save records.
-        """
-        last = getattr(self, "step8_last", None)
-        if last is None:
-            return
-        src = Path(last["csv"])
-        # A staged run has no home yet, so it is offered calib_data; anything
-        # else is already somewhere, and offers itself back there -- which is
-        # how a loaded CSV gets its fit re-written beside it.
-        home = (Path(STEP8.OUT_DIR) if src.parent == self._step8_staging()
-                else src.parent)
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Step-8 Result", str(home / src.name), "CSV (*.csv)")
-        if not path:
-            return
-        dest = Path(path).with_suffix(".csv")
-        self.step8_save_button.setEnabled(False)
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.resolve() != src.resolve():
-                shutil.copy2(src, dest)
-            result = STEP8.fit_and_write(
-                dest, last["step7"], out_dir=dest.parent,
-                log=lambda m: self._log(f"[step 8] {m}"))
-        except Exception as exc:                            # noqa: BLE001
-            self.step8_status.setText(f"Save failed: {exc}")
-            self._step8_refresh_buttons()
-            return
-        # Saved is where it lives now, so a second Save offers this name and
-        # copies nothing.
-        self.step8_last = {**last, "csv": dest}
-        self._step8_refresh_buttons()
-        written = [dest.name, Path(result["result_json"]).name,
-                   Path(result["png"]).name]
-        self.step8_status.setText(
-            "Saved " + "  +  ".join(written)
-            + f"  \N{MIDDLE DOT} {dest.parent}")
-
     def _step8_finished(self, payload: dict[str, Any]) -> None:
         self.step8_stop_event = None
         csv_path = payload.get("csv")
-        # What Save will write.  Set before the buttons are refreshed, since
-        # this is what decides whether Save is alive.
+        # The last fit this page produced, sweep or Load.  Nothing acts on it
+        # any more (Save is gone); it is kept because a run that read nothing
+        # has to be distinguishable from one that was never started.
         self.step8_last = payload if csv_path is not None else None
         self._step8_set_running(False)
         if csv_path is None:
@@ -6941,14 +7310,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step8_result_text.setPlainText("\n".join(lines).strip())
 
         self._step8_show_png(Path(result["png"]))
+        # A sweep wrote the section; a Load only looked.  Saying which is the
+        # whole of what Save used to be for.
+        where = (f"wrote step8 + {Path(csv_path).name}"
+                 if payload.get("written") else
+                 f"re-fit {Path(csv_path).name} \N{EM DASH} nothing written")
+        # Re-describe BEFORE the result: a written section changes the chain
+        # every page quotes, and _calib_describe_all writes into this very
+        # line, so doing it after would replace the run with the file.
+        if payload.get("written"):
+            self._calib_describe_all()
         self.step8_status.setText(
             f"Y_sat = {result['y_sat_v']:.4f} \N{PLUS-MINUS SIGN} "
             f"{result['sigma_v']:.4f} V"
             + ("  (LIMIT: the sweep could not bound it)" if result["unbounded"] else "")
-            + (f"  \N{MIDDLE DOT} staged as {Path(csv_path).name} "
-               f"\N{EM DASH} press Save\N{HORIZONTAL ELLIPSIS} to keep it"
-               if Path(csv_path).parent == self._step8_staging() else
-               f"  \N{MIDDLE DOT} {Path(csv_path).name}"))
+            + f"  \N{MIDDLE DOT} {where}")
         if self.calibration_dialog is not None:
             self.calibration_dialog.finish(
                 not partial and not result["unbounded"],
@@ -7097,30 +7473,60 @@ class MainWindow(QtWidgets.QMainWindow):
         return roots[0] if len(roots) == 1 else None
 
     def _tpa_phase_load(self) -> None:
-        """Re-fit a recorded step-7 CSV: every target it carries, in one go.
+        """Re-fit the sweep this calib file records: every target, in one go.
 
-        Cascades included.  The file records a reference PER ROW, so a run that
-        needed a hub carries two of them, and each target is re-fit against the
-        one it was actually swept against before the lot is chained back to the
-        root.  Nothing here consults the planner: what was driven is what the
-        file says was driven.
+        ONE input, asked for: a calib.json.  Its step7 section says which
+        sweep(s) it was fitted from and its step6 section gives the etas the
+        amplitudes are pinned to -- which is the whole of what a step-7 fit
+        needs, and why this takes one file and not a file plus a CSV.  The
+        page's own field is not touched: it is where a SWEEP would write.
+
+        Cascades included.  A CSV records a reference PER ROW, so a run that
+        needed a hub carries two of them, and a section may even name one CSV
+        per stage (the hand-merged 0916 run does).  Each target is re-fit
+        against the reference it was actually swept against, out of the file
+        that carries it, before the lot is chained back to the root.  Nothing
+        here consults the planner: what was driven is what the files say.
+
+        Reads only -- an offline re-fit is a copy of the JSON and its CSVs and a
+        run of ``calib_step7_v2.py`` against the copy.
         """
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Step-7 measurement CSV", "", "CSV (*.csv)"
-        )
-        if not path:
+        picked = self._open_calib("Open a calibration to re-fit its step 7", 7)
+        if picked is None:
             return
         try:
-            _layout, models = self._tpa_phase_load_step6()
+            calib = load_calib(picked)
+            paths = calib.csv_paths(7)
+        except Exception as exc:                        # noqa: BLE001
+            self.tpa_phase_status.setText(f"Load failed: {exc}")
+            return
+        if not paths:
+            self.tpa_phase_status.setText(
+                f"Load failed: {calib.path.name}'s step7 section names no CSV, "
+                f"so there is no sweep to re-fit."
+            )
+            return
+        gone = [q for q in paths if not q.is_file()]
+        if gone:
+            self.tpa_phase_status.setText(
+                f"Load failed: {calib.path.name} names "
+                f"{', '.join(q.name for q in gone)}, which is not in "
+                f"{paths[0].parent} — copy the CSV in beside it."
+            )
+            return
+        try:
+            _layout, models = self._tpa_phase_load_step6(picked)
+            floor = self._tpa_phase_floor(picked)
         except Exception as exc:
-            # Unlike step 6, this is fatal: the amplitudes are PINNED to step 6,
-            # so without those etas there is no fit to do at all.
+            # Unlike step 6, this is fatal: the amplitudes are PINNED to step 6
+            # and the points are weighted by its floor, so without them there
+            # is no fit to do at all.
             self.tpa_phase_status.setText(f"Step 6 required to re-fit: {exc}")
             return
-        name = Path(path).name
+        name = (paths[0].name if len(paths) == 1
+                else f"{len(paths)} sweeps ({paths[0].name} + …)")
         try:
-            targets = targets_in_csv(path)
-            recorded = references_in_csv(path)
+            targets, recorded, csv_of = self._tpa_phase_pool(paths)
         except Exception as exc:
             self.tpa_phase_status.setText(f"Load failed: {exc}")
             return
@@ -7176,8 +7582,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for k in fittable:
             try:
                 loaded[k] = load_phase_csv(
-                    path, models[k], models[ref_of[k]],
+                    csv_of[k], models[k], models[ref_of[k]],
                     comb_only=True, single_beam_bg=single_beam_bg, only_tgt=k,
+                    floor=floor, rail_v=self._tpa_phase_rail_v(),
                 )
             except (ValueError, KeyError, np.linalg.LinAlgError) as exc:
                 failed.append(f"pair {k}: {exc}")
@@ -7190,10 +7597,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"x_t=w_t={b['x_t']:g} read {b['voltage_mean_v']*1e3:+.4f} mV "
                     f"with a {b['voltage_std_v']*1e3:.4f} mV trace std"
                 )
+        self.tpa_phase_floor = floor
+        self._log(f"[step 7] sigma floor {floor[0]*1e6:.1f} µV [{floor[1]}]")
         # Already fitted by load_phase_csv; this only re-refers them to the root,
         # over stages rebuilt from what the file recorded rather than planned.
         self.tpa_phase_results = loaded
-        self.tpa_phase_meta = meas_csv_meta(path)     # see the step-6 Load
+        # From the first sweep the section names: a re-save writes ONE CSV, so
+        # a merged run's second bracket has nowhere to go anyway.
+        self.tpa_phase_meta = meas_csv_meta(paths[0])  # see the step-6 Load
         self.tpa_phase_root = root
         self.tpa_phase_stages = self._tpa_phase_stages_for(loaded, root)
         self.tpa_phase_chains = chain_fits(
@@ -7202,7 +7613,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._tpa_phase_fill_table()
         self._tpa_phase_redraw()
-        self.tpa_phase_save_button.setEnabled(bool(self.tpa_phase_results))
         skipped = [k for k in targets if k not in fittable and k != root]
         note = ""
         if failed:
@@ -7215,8 +7625,8 @@ class MainWindow(QtWidgets.QMainWindow):
             note += (f"  · {self._compact_indices(chained)} chained to {root} "
                      f"via {self._compact_indices(sorted({self.tpa_phase_chains[k].via for k in chained}))}")
         self.tpa_phase_status.setText(
-            f"Loaded {name} · {len(self.tpa_phase_results)} "
-            f"target(s) re-fit vs ref {root}{note}"
+            f"Loaded {self._calib_name(calib.path)} · {name} · "
+            f"{len(self.tpa_phase_results)} target(s) re-fit vs ref {root}{note}"
         )
         for line in failed:
             self._log(f"[step 7] fit failed — {line}")
@@ -7240,36 +7650,80 @@ class MainWindow(QtWidgets.QMainWindow):
             ],
         }}
 
-    def _tpa_phase_save(self) -> None:
-        """Raw CSV, the combined JSON step 8 reads, and one PNG per target.
+    def _tpa_phase_extra(self) -> dict:
+        """What rides alongside the phases: the plan, the floor, repaired darks."""
+        extra = dict(self._tpa_phase_plan_payload())
+        floor = getattr(self, "tpa_phase_floor", None)
+        if floor is not None:
+            extra["sigma_floor_v"] = float(floor[0])
+            extra["sigma_floor_source"] = str(floor[1])
+        repaired: dict = {}
+        for r in self.tpa_phase_results.values():
+            repaired.update(getattr(r, "dark_overrides", {}) or {})
+        if repaired:
+            extra["dark_overrides"] = repaired
+        return extra
 
-        The JSON carries the step-3 and step-6 payloads over verbatim from the
-        file named on this page, so one file downstream holds the whole chain:
-        layout, etas, and the phase spectrum measured against them.
+    def _tpa_phase_rail_v(self) -> float:
+        """The page's rail ceiling in VOLTS, for the guards that reject by it."""
+        return float(self.tpa_phase_rail.value()) / 1e3
+
+    def _tpa_phase_floor(self,
+                         calib_file: "Path | None" = None) -> tuple[float, str]:
+        """The sigma floor to weight this fit by: the run's step-6 measurement.
+
+        Step 7 has no dark LEVEL of its own to measure a floor from -- one
+        all-off read per target and ten drive rows -- so it inherits the one
+        step 6 measured on this run, through the same detector on the same
+        night.  A step 6 that predates the recorded floor is measured from its
+        own CSV; one with neither refuses.  No constant stands in.
+        """
+        run = (calib_file if calib_file is not None
+               else self._tpa_phase_step6_path())
+        if run is None:
+            raise ValueError("no calibration file chosen")
+        return step6_floor(run)
+
+    def _tpa_phase_autosave(self) -> None:
+        """A finished sweep writes itself: the raw CSV, then the step7 section.
+
+        Both into the calib file named on this page -- the CSV beside it, the
+        section in it -- whose step3 and step6 sections are what this spectrum
+        is referred to.  Writing DROPS that file's step 8, which was fitted
+        against the phases this sweep has just replaced.
+
+        No PNGs, for the same reason step 6 writes none: Load redraws the fringe
+        from the CSV the section points at.
+
+        Only a sweep calls this.  Loading a recorded sweep re-fits and draws but
+        never writes.
 
         The rows are written first and unconditionally.  A measurement is an
-        hour of bench time and must never be lost to an unreadable step-6 file,
-        which is only needed for the derived JSON.
+        hour of bench time and must never be lost to an unreadable calibration,
+        which is only needed for the derived section.
         """
         if not self.tpa_phase_results:
             return
-        default = self._save_into_run(
-            self._tpa_phase_step6_path(),
-            f"calib_step7_meas_{time.strftime('%m%d_%H%M')}.csv")
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Step-7 Result", default, "CSV (*.csv)"
-        )
-        if not path:
-            return
-        csv_path, _json, png_path = _save_paths(path)
+        stamp = time.strftime("%m%d_%H%M")
+        calib_file = self._calib_file_path(7)
+        if calib_file is None:
+            folder = self._unfiled_run(stamp)
+            self._log(
+                f"[step 7] no calibration file on the page — rows parked in "
+                f"{folder}"
+            )
+        else:
+            folder = calib_file.parent
+            folder.mkdir(parents=True, exist_ok=True)
+        csv_path = folder / f"calib_step7_meas_{stamp}.csv"
         results = [r for _, r in sorted(self.tpa_phase_results.items())]
         written = [Path(write_phase_meas_csv(results, csv_path,
                                              meta=self.tpa_phase_meta)).name]
 
-        # The run is the folder saved into; its step3 and step6 sections are
-        # what this spectrum is referred to, and save_step7_section checks them.
+        # The file's step3 and step6 sections are what this spectrum is referred
+        # to, and save_step7_section checks them.
         try:
-            load_calib(csv_path.parent).require(3, 6)
+            load_calib(calib_file or folder).require(3, 6)
         except Exception as exc:                        # noqa: BLE001
             self.tpa_phase_status.setText(
                 f"Saved {written[0]} — {exc}, so the step7 section was not "
@@ -7293,27 +7747,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 else self._tpa_phase_config().ref_index)
         try:
             calib = save_step7_section(
-                fits, csv_path.parent,
+                fits, calib_file,
                 ref_index=root,
                 csv=csv_path,
                 single_beam_bg=self.tpa_phase_single_beam.isChecked(),
                 chains=self.tpa_phase_chains,
-                extra=self._tpa_phase_plan_payload(),
+                extra=self._tpa_phase_extra(),
                 log=None,
             )
             written.append(f"step7 -> {calib.path.name}")
-            for (k, _method), fit in fits.items():
-                png = png_path(k)
-                fig = Figure(figsize=(12, 5))
-                plot_fringe(fig, fit, k)
-                fig.savefig(png, dpi=150)
-            written.append(f"{len(fits)} PNG(s)")
         except Exception as exc:
             self.tpa_phase_status.setText(
-                f"Saved {written[0]}; JSON/plots failed: {exc}"
+                f"Saved {written[0]}; section failed: {exc}"
             )
             return
-        self.tpa_phase_status.setText("Saved " + "  +  ".join(written))
+        self._calib_describe_all()
+        self.tpa_phase_status.setText(
+            self.tpa_phase_status.text() + "  ·  saved " + "  +  ".join(written))
 
     def _build_tpa_center_tab(self) -> QtWidgets.QWidget:
         page = self._page_shell("TPA Centre-Wavelength Calibration")
@@ -8973,8 +9423,26 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(18)
         heading = QtWidgets.QLabel(title)
         heading.setObjectName("PageTitle")
-        layout.addWidget(heading)
+        # A row, not a bare label: _page_status hangs this page's one-line
+        # feedback off the end of it.  Item 0 of the page layout IS this row.
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(16)
+        header.addWidget(heading)
+        layout.addLayout(header)
         return page
+
+    def _page_status(self, page: QtWidgets.QWidget,
+                     text: str = "") -> StatusLine:
+        """This page's one-line status, beside its title.
+
+        Beside the title, not at the foot of the control column: it is the one
+        thing on the page that changes while you are reading it, and down there
+        it was a second paragraph of prose under a first one, which is what a
+        log looks like.  One line, newest only, nothing kept.
+        """
+        status = StatusLine(text)
+        page.layout().itemAt(0).layout().addWidget(status, 1)
+        return status
 
     def _panel(self, title: str) -> QtWidgets.QGroupBox:
         panel = QtWidgets.QGroupBox(title)
@@ -8993,21 +9461,25 @@ class MainWindow(QtWidgets.QMainWindow):
         spin.setValue(value)
         return spin
 
-    def _save_into_run(self, run: Path | None, name: str) -> str:
-        """The Save dialog's default path: ``name`` inside the chosen run folder.
+    def _unfiled_run(self, stamp: str) -> Path:
+        """Where a sweep goes when no calib file was named: never nowhere.
 
-        The folder a sweep is saved into IS the run its section lands in, so
-        offering a bare filename -- which opens the dialog wherever Qt happened
-        to be -- made it easy to write the CSV somewhere with no step-3 section
-        and get nothing but a refusal.  Pointing the dialog at the run named on
-        the page makes the common case one click.
+        Auto-save removed the dialog, and with it the chance to type a path for
+        a sweep whose page named no file.  The rows are still an hour of bench
+        time, so they are parked in a dated folder under the calibration
+        directory rather than dropped -- no section is written there (there is
+        no step 3 to interpret them against), and the page says so.
+
+        Gating should make this unreachable: a page with no file has no live Run
+        button.  It stays because the cost of being wrong about that is an hour
+        of bench time, and the cost of keeping it is a folder.
         """
-        if run is None:
-            return name
-        return str(Path(run) / name)
+        out = self._default_calib_dir() / f"unfiled_{stamp}"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
 
     def _run_chain(self, run: Path) -> str:
-        """``"step2 09-28 · step3 09-29 · step6 —"`` for a run folder's status pill.
+        """``"step2 09-28 · step3 09-29 · step6 —"`` for a calib file's status line.
 
         The same chain the offline runners print before touching the bench, short
         enough for one line.  A section that predates one above it is marked, not
@@ -9030,8 +9502,15 @@ class MainWindow(QtWidgets.QMainWindow):
         return " · ".join(parts)
 
     def _set_status(self, label: QtWidgets.QLabel, text: str, status: str) -> None:
-        """Update a status pill label (status in: ok, error, off)."""
+        """Update a status pill label (status in: ok, error, off).
+
+        A :class:`StatusLine` takes the text and none of the pill: it already
+        sits beside the title as the page's one line of feedback, and a green
+        capsule up there would be the loudest thing on the page saying the least.
+        """
         label.setText(text)
+        if isinstance(label, StatusLine):
+            return
         if label.property("status") != status:
             label.setProperty("status", status)
             label.style().unpolish(label)
@@ -9449,14 +9928,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _toggle_step2_source(self) -> None:
         index = self.step_widgets[2]["source"].currentIndex()
-        self.step_widgets[2]["in_row"].setVisible(index == 1)
-        self.step_widgets[2]["manual_row"].setVisible(index == 2)
-
-    def _toggle_step3c_source(self) -> None:
-        index = self.step_widgets["3c"]["source"].currentIndex()
-        self.step_widgets["3c"]["in_row"].setVisible(index == 1)
-        # manual min/max only matter for a bare wavelength-map CSV source
-        self.step_widgets["3c"]["manual_row"].setVisible(index == 1)
+        self.step_widgets[2]["manual_row"].setVisible(index == 1)
 
     def _toggle_fast_channel_source(self) -> None:
         if not hasattr(self, "fast_channel_source_combo"):
@@ -9558,16 +10030,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_step3_run_button()
 
     def _refresh_step3_run_button(self) -> None:
-        """Step 3c reads the DAQ, so its Run button is gated on the DAQ, not the OSA."""
+        """Step 3's Run: gated on the DAQ (not the OSA) AND on its calib file.
+
+        Two owners would fight over one button, so the file requirement is
+        folded in here rather than given its own entry in ``_STEP_BUTTONS``.
+        """
         widgets = getattr(self, "step_widgets", {}).get("3c")
         if not widgets or "run" not in widgets:
             return
         if getattr(self, "_calibration_is_running", False):
             widgets["run"].setEnabled(False)
             return
+        missing = self._calib_missing("3c")
         widgets["run"].setEnabled(
-            self.daq_controller is not None and self.daq_controller.is_connected
+            not missing
+            and self.daq_controller is not None
+            and self.daq_controller.is_connected
         )
+        widgets["run"].setToolTip(
+            "" if not missing else
+            "that file has no " + ", ".join(f"step{n}" for n in missing))
 
     # ----- per-step config readers (GUI thread) -----
     def _step_settings(self, step: int) -> MeasurementSettings:
@@ -9676,10 +10158,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return out_dir / self._default_calib_name(step, suffix)
 
     def _resolve_step_input(self, step: int | str) -> CalibrationResult:
+        """What a sweep needs out of its calib file: levels for 2, the map for 3.
+
+        Both come from the one file the page names, which is what the runners
+        do -- ``calib_step2.py`` reads its ``step1`` section and
+        ``calib_step3.py`` its ``step2`` section.  Step 2's levels can be typed
+        instead, and that is a first-class path (see its ``--min-max``); step 3
+        has nothing to type, so it has no choice to make.
+        """
         widgets = self.step_widgets[step]
-        index = widgets["source"].currentIndex()
+        calib_file = self._require_calib_file(step)
         if step == 2:
-            if index == 2:  # manual min/max
+            if widgets["source"].currentIndex() == 1:        # manual min/max
                 low = widgets["min"].value()
                 high = widgets["max"].value()
                 if high < low:
@@ -9691,35 +10181,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     min_level=low,
                     level_range=np.asarray([], dtype=int),
                 )
-            result = self._load_input_result(
-                index,
-                widgets["in_path"].text().strip(),
-                "run Step 1 first, or choose a file / manual min/max",
-                "choose a Step 1/2 result file",
+            section = load_calib(calib_file, missing_ok=True).get(1)
+            if section is None:
+                raise ValueError(
+                    f"{calib_file.name} has no step1 section — run step 1 "
+                    f"against it, or switch the source to Manual min/max"
+                )
+            return CalibrationResult(
+                wavelength=np.asarray([]),
+                coordinates=np.asarray([]),
+                max_level=int(section["max_level"]),
+                min_level=int(section["min_level"]),
+                level_range=np.asarray([], dtype=int),
             )
-            self._require_levels(result)
-            return result
 
-        # step 3 wavelength source
-        if index == 1:  # from file (JSON snapshot or coordinate-wavelength CSV)
-            path = widgets["in_path"].text().strip()
-            if not path:
-                raise ValueError("choose a run folder, its calib.json, or a "
-                                 "wavelength-map CSV")
-            # A run's step-2 map is its section's levels plus its CSV's line, so
-            # one loader covers all three of calib.json, a run folder and a bare
-            # CSV -- and a pre-v3 standalone step-2 JSON still opens below.
-            result = self._load_step2_source(
-                path, widgets["min"].value(), widgets["max"].value())
-        else:  # memory
-            result = self.calibration_result
-            if result is None:
-                raise ValueError("run Step 2 first, or choose a file")
+        # step 3: the map IS the file's step-2 section plus the CSV it points at
+        result = load_step2_map(calib_file)
         if (
             np.asarray(result.coordinates).size == 0
             or np.asarray(result.wavelength).size == 0
         ):
-            raise ValueError("the wavelength source has no coordinate -> wavelength map")
+            raise ValueError("the step2 section has no coordinate -> wavelength map")
         self._require_levels(result)
         return result
 
@@ -9764,18 +10246,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return load_wavelength_map_csv(
                 target, min_level=min_level, max_level=max_level)
         return load_calibration_result(target)
-
-    def _load_input_result(
-        self, index: int, path: str, empty_msg: str, no_path_msg: str
-    ) -> CalibrationResult:
-        if index == 1:  # from file
-            if not path:
-                raise ValueError(no_path_msg)
-            return load_calibration_result(path)
-        result = self.calibration_result  # in memory
-        if result is None:
-            raise ValueError(empty_msg)
-        return result
 
     def _require_levels(self, result: CalibrationResult) -> None:
         try:
@@ -9822,9 +10292,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             settings = self._step_settings(1)
             levels = self._step_levels(1)
+            calib_file = self._require_calib_file(1)
         except ValueError as exc:
             return self._reject_calibration(exc)
-        out_path = self._resolve_output_path(self.step_widgets[1]["out"].text(), 1)
         controller = self._controller()
         self._log(f"Step 1 started: {len(levels)} levels")
 
@@ -9833,9 +10303,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 osa, controller, levels, settings,
                 stop_event=stop_event, progress_callback=report,
             )
-            save_calibration_result(result, out_path)
+            # Written only now.  A step 1 drops every section under it, so an
+            # abandoned sweep must not have cost the file anything -- naming it
+            # in the dialog is not yet a decision to replace it.
+            calib = write_section(calib_file, 1, step1_section(result),
+                                  log=lambda m: self._log(m))
             return {
-                "status": "ok", "step": 1, "result": result, "saved": out_path,
+                "status": "ok", "step": 1, "result": result, "saved": calib.path,
                 "summary": f"min level {result.min_level}, max level {result.max_level}",
             }
 
@@ -9858,9 +10332,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if min_wl is not None and max_wl is not None and min_wl >= max_wl:
                 raise ValueError("usable λ minimum must be below the maximum")
             region = self._step_region(2)
+            calib_file = self._require_calib_file(2)
         except ValueError as exc:
             return self._reject_calibration(exc)
-        out_path = self._resolve_output_path(self.step_widgets[2]["out"].text(), 2)
         controller = self._controller()
         lo_txt = "open" if min_wl is None else f"{min_wl:.2f}"
         hi_txt = "open" if max_wl is None else f"{max_wl:.2f}"
@@ -9888,9 +10362,17 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             kept = clipped.coordinates.size
             note = "" if kept == swept else f" of {swept} swept ({span})"
-            save_calibration_result(clipped, out_path)
+            # CSV first and unconditionally: the map is on disk before the
+            # section that points at it can fail.
+            stamp = time.strftime("%m%d_%H%M")
+            calib_file.parent.mkdir(parents=True, exist_ok=True)
+            csv_path = write_wavelength_map_csv(
+                clipped, calib_file.parent / f"step2_{stamp}.csv")
+            calib = write_section(calib_file, 2, step2_section(clipped),
+                                  csv=csv_path, log=lambda m: self._log(m))
             return {
-                "status": "ok", "step": 2, "result": clipped, "saved": out_path,
+                "status": "ok", "step": 2, "result": clipped,
+                "saved": calib.path, "csv": csv_path,
                 "summary": f"{kept} coordinates{note}",
             }
 
@@ -9911,10 +10393,9 @@ class MainWindow(QtWidgets.QMainWindow):
             n_channels = widgets["count"].value()
             guard_bands = self._step3c_guard_bands()
             daq_settings = self._step3_daq_settings("3c")
+            calib_file = self._require_calib_file("3c")
         except ValueError as exc:
             return self._reject_calibration(exc)
-        out_json = self._resolve_output_path(widgets["out"].text(), "3c")
-        out_csv = self._resolve_output_path(widgets["out_csv"].text(), "3c", ".csv")
         controller = self._controller()
         daq.configure_monitor(daq_settings)
         read_timeout = max(30.0, daq_settings.duration * 3.0 + 10.0)
@@ -9943,11 +10424,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 stop_event=stop_event, progress_callback=report,
             )
             result = sweep.result
-            save_calibration_result(result, out_json)
-            csv_path = write_intensity_calibration_csv(result, out_csv)
+            # CSV first: the sweep is on disk before a fit can fail on it.
+            stamp = time.strftime("%m%d_%H%M")
+            csv_path = write_intensity_calibration_csv(
+                result, calib_file.parent / f"step3_{stamp}.csv")
+            calib = write_section(calib_file, 3, step3_section(result),
+                                  csv=csv_path, log=lambda m: self._log(m))
             return {
-                "status": "ok", "step": "3c", "result": result, "saved": out_json,
-                "csv": csv_path,
+                "status": "ok", "step": "3c", "result": result,
+                "saved": calib.path, "csv": csv_path,
                 "center_coordinate": sweep.center_coordinate,
                 "summary": (
                     f"{result.coordinates.size} channels, "
@@ -10378,10 +10863,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_result = result
 
         if step in (1, 2, "3c"):
-            self.step_widgets[step]["status"].setText(f"Done \N{MIDDLE DOT} {summary}")
-            out_edit = self.step_widgets[step]["out"]
-            if saved is not None and not out_edit.text().strip():
-                out_edit.setText(str(saved))
+            written = [f"step{3 if step == '3c' else step}"]
+            if payload.get("csv") is not None:
+                written.append(Path(payload["csv"]).name)
+            self.step_widgets[step]["status"].setText(
+                f"Done \N{MIDDLE DOT} {summary} \N{MIDDLE DOT} wrote "
+                + " + ".join(written))
+            # The file it went into may now carry a section it did not before,
+            # and every page that names it has to re-gate on that.
+            self._calib_describe_all()
             center_coordinate = payload.get("center_coordinate")
             if step == "3c" and center_coordinate is not None:
                 self._log(
@@ -10461,11 +10951,6 @@ class MainWindow(QtWidgets.QMainWindow):
         csv_path = payload.get("csv")
         if csv_path is not None:
             self._log(f"Calibration CSV saved: {csv_path}")
-            self.calibration_path_edit.setText(str(csv_path))
-            self.map_kind_combo.setCurrentIndex(0)
-            self._update_intensity_map()
-            # feed the freshly written CSV into the existing fit + plot flow
-            self._run_calibration_fit()
 
         if self.calibration_dialog is not None:
             self.calibration_dialog.finish(True, f"{label} done \N{MIDDLE DOT} {summary}")

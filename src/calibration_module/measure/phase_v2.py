@@ -1,15 +1,17 @@
 """Step 7 v2 acquisition -- sweep one target pair against the reference.
 
-This half touches the instruments and does no fitting.  It hands back a raw
-:class:`~calibration_module.fit.phase.PhaseResult` (no ``fit``) that
-:func:`~calibration_module.fit.phase.fit_result` turns into a ``dPhi_comb``, so
-the offline script and the GUI collect data through exactly one implementation
-and differ only in what they do with the rows afterwards.  Same split, same
-reasons, as :mod:`calibration_module.measure.pair_v2` -- and the near-rail
-escalation is literally that module's, imported rather than retyped.
+This half touches the instruments and does no fitting.
 
-``monitor`` is anything with the ``monitor_cycle(timeout=..., single=...)``
-protocol -- a :class:`~daq_module.DAQController` in every current caller.
+In:  ``monitor``, anything with the ``monitor_cycle(timeout=..., single=...)``
+     protocol -- a :class:`~daq_module.DAQController` in every current caller --
+     plus the SLM, the layout and the drive list.
+Out: a raw :class:`~calibration_module.fit.phase.PhaseResult` with no ``fit``,
+     which :func:`~calibration_module.fit.phase.fit_result` turns into a
+     ``dPhi_comb``.  So the offline script and the GUI collect through one
+     implementation and differ only in what they do with the rows.
+
+Same split and the same reasons as :mod:`calibration_module.measure.pair_v2`,
+whose read is imported here rather than retyped.
 """
 from __future__ import annotations
 
@@ -193,10 +195,10 @@ def measure_target(
 ) -> PhaseResult:
     """Drive one target pair against the reference over ``drive`` -> raw rows.
 
-    ``tgt_index`` and ``cfg.ref_index`` are pair LABELS; ``cfg.slot`` maps them
+    ``tgt_index`` and ``cfg.ref_index`` are pair LABELS, which ``cfg.slot`` maps
     onto the 0-based drive arrays.  Only those two channels are driven, every
-    other one held off.  An all-off dark is read once at the start (the longer
-    ``t_single`` window) and stored per row, so the fit subtracts it row by row.
+    other held off.  The all-off dark is read once at the start and stored per
+    row, so the fit subtracts it row by row.
 
     Needs no step-6 model -- raw data only.  The returned
     :class:`~calibration_module.fit.phase.PhaseResult` carries no ``fit``;

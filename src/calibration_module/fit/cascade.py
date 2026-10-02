@@ -1,41 +1,40 @@
 """Cascaded step-7 references: reach every pair from ONE root, two hops if needed.
 
+In:  the target pairs and a root reference.
+Out: :func:`plan_cascade` lays out the stages before anything is driven;
+     :func:`chain_fits` sums the hops into one spectrum against that root, and
+     :func:`cascade_covariance` its covariance.  So the GUI and the offline
+     runner both take one target list and one root and get one spectrum.
+
 Step 7 measures a pair's comb phase by interfering it with a reference pair, so
-one sweep yields ``Phi_k`` relative to whatever reference it was driven against.
-The catch is that a pair CANNOT be measured against its SLM neighbour: the two
-pairs' windows are adjacent on the panel (the column order is
-``x_n .. x_1 w_1 .. w_n``, so pair ``k`` sits next to ``k-1`` and ``k+1`` on
-BOTH sides) and the leakage between them is not in the model.  A run with
-reference 2 therefore cannot report pairs 1 and 3 at all.
+one sweep yields ``Phi_k`` relative to whatever it was driven against.  The
+catch is that a pair CANNOT be measured against its SLM neighbour: the column
+order is ``x_n .. x_1 w_1 .. w_n``, so pair ``k`` sits next to ``k-1`` and
+``k+1`` on BOTH sides, and the leakage between adjacent windows is not in the
+model.  A run with reference 2 therefore cannot report pairs 1 and 3 at all.
+The fix is to sweep them against a hub that is not their neighbour and merge
+with ``Phi_k|2 = Phi_k|5 + Phi_5|2``.
 
-The 0916 ten-pair run worked around it by hand: sweep 4-10 against reference 2,
-sweep 1 and 3 against reference 5, then merge with
-``Phi_k|2 = Phi_k|5 + Phi_5|2``.  This module is that workaround made automatic
--- :func:`plan_cascade` lays out the stages, :func:`chain_fits` does the sum and
-the error propagation, so the GUI and the offline runner both take one target
-list and one root reference and produce one spectrum against that root.
+Two questions, deliberately kept apart:
 
-Two separate questions, deliberately kept apart:
+* FEASIBILITY is decided here, before anything is driven, from adjacency alone.
+  ``pairs=[1,2,3], root=2`` has no answer -- 1 and 3 are both neighbours of 2
+  and nothing else was measured to hop through -- and that is worth saying in
+  the status line rather than an hour in.
+* WHICH HUB is a tie among everything eligible, broken on the lowest index.
+  Deliberately not scored on fit quality: the spread between the best and worst
+  ELIGIBLE hub is well inside the accuracy this stage needs, and a runtime
+  choice would mean the plan shown at the start is not the plan that runs.
 
-* **Feasibility** is decided here, before anything is driven, from adjacency
-  alone.  ``pairs=[1,2,3], root=2`` has no answer -- 1 and 3 are both neighbours
-  of 2 and nothing else was measured to hop through -- and that is worth saying
-  in the status line rather than an hour in.
-* **Which hub** is a tie among everything eligible, broken on the LOWEST index.
-  Deliberately not scored on fit quality: on the 0916 numbers the spread between
-  the best and worst *eligible* hub was well inside the accuracy this stage
-  needs, and a runtime choice would mean the plan shown when the run starts is
-  not the plan that runs.
-
-The chained error is NOT two error bars in quadrature.  The hub's eta appears
-in both hops -- as the target amplitude in ``Phi_h|root`` and as the reference
-amplitude in ``Phi_k|h`` -- so its error moves the two hops COHERENTLY and the
-sensitivities are summed before squaring.  On 0916 pair 1 that is
-``+6.13 + (-9.54) = -3.41 rad`` per unit eta rather than ``hypot(6.13, 9.54)``,
-i.e. 0.49 deg instead of 1.63 deg: treating the hops as independent overstates
-the chained error roughly threefold.  :func:`cascade_covariance` does the same
-bookkeeping across targets, where the shared hub also correlates every pair that
-hopped through it.
+The chained error is NOT two error bars in quadrature.  The hub's eta appears in
+both hops -- as the target amplitude in ``Phi_h|root`` and as the reference
+amplitude in ``Phi_k|h`` -- so its error moves them COHERENTLY and the
+sensitivities are summed before squaring.  Measured on one ten-pair run that is
+``+6.13 + (-9.54) = -3.41`` rad per unit eta rather than ``hypot(6.13, 9.54)``:
+0.49 deg instead of 1.63, so treating the hops as independent overstates the
+chained error roughly threefold.  :func:`cascade_covariance` does the same
+bookkeeping across targets, where a shared hub correlates every pair that hopped
+through it.
 """
 
 from __future__ import annotations
@@ -89,16 +88,14 @@ def plan_cascade(
 ) -> list[Stage]:
     """Stages that measure every pair in ``pairs`` back to ``root``.
 
-    ``pairs`` is what you want phases FOR; ``root`` defines ``Phi = 0`` and is
-    dropped from the list if it appears there.  Stage 1 is always the root
-    against everything it can reach directly; each later stage picks a hub from
-    the pairs already measured -- the one covering the most of what is left,
-    ties broken on the lowest label -- so the common case is exactly two stages
-    and the plan is fully known before the first pattern is written.
-
-    ``n_pairs`` (the layout's channel count) is used only to make the failure
-    message name real labels.  Raises :class:`CascadeError` if some pair can
-    never be reached.
+    In:  ``pairs``, what you want phases FOR, and ``root``, which defines
+         ``Phi = 0`` and is dropped from the list if it appears there.
+         ``n_pairs`` only makes the failure message name real labels.
+    Out: the stages.  Stage 1 is the root against everything it reaches
+         directly; each later stage picks a hub from the pairs already measured,
+         the one covering the most of what is left, ties on the lowest label.
+         So the common case is two stages, known before the first pattern is
+         written.  Raises :class:`CascadeError` if a pair can never be reached.
 
     >>> [(s.ref, s.targets) for s in plan_cascade(range(1, 11), 2)]
     [(2, (4, 5, 6, 7, 8, 9, 10)), (5, (1, 3))]
@@ -185,14 +182,14 @@ def plan_lines(stages: Sequence[Stage], root: int,
                seconds_per_target: float | None = None) -> list[str]:
     """The plan as text, for the progress dialog's log and the runner's stdout.
 
-    One line per stage plus a total, e.g.::
+    One line per stage plus a total::
 
         Stage 1/2 · ref 2 -> 4-10  (7 targets, ~72 min)
         Stage 2/2 · ref 5 -> 1,3   (2 targets, ~21 min, chained via 5)
         Total 9 targets, ~93 min
 
-    Deliberately ASCII apart from the separator (cp1252-safe): the same lines go
-    to a Windows console, where a nicer arrow is a UnicodeEncodeError.
+    ASCII apart from the separator, which is cp1252-safe: the same lines go to a
+    Windows console, where a nicer arrow is a UnicodeEncodeError.
     """
     lines: list[str] = []
     n_total = 0
@@ -227,20 +224,20 @@ def wrap_pi(angle: float) -> float:
 class ChainedPhase:
     """One pair's comb phase referred to the ROOT, however many hops it took.
 
-    ``dphi`` is the sum along the path, wrapped; ``dphi_raw`` is the unwrapped
-    sum, kept because a chain that lands near +/-pi is exactly where the wrap
-    could have gone the other way and that is worth being able to see.
+    ``dphi`` is the wrapped sum along the path; ``dphi_raw`` is the unwrapped
+    one, kept because a chain landing near +/-pi is exactly where the wrap could
+    have gone the other way.
 
-    The error is carried in the two pieces it is actually made of, because they
-    combine differently ACROSS pairs (see :func:`cascade_covariance`):
+    The error is carried in the two pieces it is made of, because they combine
+    differently ACROSS pairs (see :func:`cascade_covariance`):
 
-    * ``edge_var`` -- fringe-noise variance per measured hop, keyed by the hop
-      ``(target, reference)``.  Independent between hops, but SHARED between two
+    * ``edge_var`` -- fringe-noise variance per measured hop, keyed by
+      ``(target, reference)``.  Independent between hops, SHARED between two
       pairs whose paths cross the same hop.
-    * ``deta`` -- ``d(dphi)/d(eta_p)`` per pair ``p``, already summed over the
-      hops that touch ``p``.  That sum is the whole point: the hub's eta enters
-      one hop as the target amplitude and the next as the reference amplitude,
-      and the two sensitivities partially cancel.
+    * ``deta`` -- ``d(dphi)/d(eta_p)`` per pair, already summed over the hops
+      touching it.  That sum is the point: the hub's eta enters one hop as the
+      target amplitude and the next as the reference, so the two sensitivities
+      partially cancel.
     """
 
     tgt: int
@@ -290,16 +287,15 @@ def chain_fits(
 ) -> dict[int, ChainedPhase]:
     """Refer every fitted pair back to ``root``: ``{tgt: ChainedPhase}``.
 
-    ``fits`` maps a target pair to the :class:`~calibration_module.fit.phase.PhaseFit`
-    of the hop that MEASURED it -- one entry per pair, whichever stage it came
-    from.  Only :func:`~calibration_module.fit.phase.fit_phase_fixed` fills the
-    ``dphi_deta_*`` sensitivities, so only that fitter's results carry an
-    ``err_eta``; anything else chains with fringe noise alone.
-
-    Stages are walked in order, so a hub is always resolved before the stage
-    that hangs off it.  A target whose hub has no fit (its own fringe failed) is
-    skipped rather than chained onto nothing, and simply does not appear in the
-    result.
+    In:  ``fits``, each target pair against the
+         :class:`~calibration_module.fit.phase.PhaseFit` of the hop that
+         MEASURED it, one entry per pair whichever stage it came from.  Only
+         :func:`~calibration_module.fit.phase.fit_phase_fixed` fills the
+         ``dphi_deta_*`` sensitivities, so only its results carry an
+         ``err_eta``; anything else chains with fringe noise alone.
+    Out: one :class:`ChainedPhase` per target.  Stages are walked in order, so a
+         hub resolves before what hangs off it, and a target whose hub has no
+         fit is left out rather than chained onto nothing.
     """
     root = int(root)
     chains: dict[int, ChainedPhase] = {
@@ -341,22 +337,21 @@ def cascade_covariance(
 ) -> np.ndarray:
     """Covariance of the root-referred phases, in the order ``pairs`` gives.
 
-    Two pairs are correlated wherever their paths overlap -- through a shared
-    measurement hop, or through any pair whose eta both are pinned to::
+    Two pairs are correlated wherever their paths overlap -- a shared hop, or
+    any pair whose eta both are pinned to::
 
         cov_ij = sum_{hops on both paths} sigma_hop^2
                + sum_p  deta_i[p] * deta_j[p] * eta_err_p^2
 
-    With a flat (single-stage) plan every path is one hop and the only shared
-    pair is the root, so this collapses to
-    :func:`~calibration_module.fit.phase.phase_covariance`'s rank-1
-    ``eta_ref`` term.  Hand it to :func:`~calibration_module.fit.phase.fit_beta2`
-    as ``cov`` for a cascaded spectrum -- the flat version reads one common
-    ``eta_ref_err`` off the first fit and would mis-weight a run with two
-    references.
+    With a flat plan every path is one hop and the only shared pair is the root,
+    so this collapses to
+    :func:`~calibration_module.fit.phase.phase_covariance`'s rank-1 term.  Pass
+    it to :func:`~calibration_module.fit.phase.fit_beta2` for a cascaded
+    spectrum: the flat version reads one common ``eta_ref_err`` off the first
+    fit and would mis-weight a run with two references.
 
-    The diagonal is :attr:`ChainedPhase.err_total` squared, so an error bar
-    taken from ``sqrt(diag(cov))`` agrees with what the table quotes per pair.
+    The diagonal is :attr:`ChainedPhase.err_total` squared, so ``sqrt(diag)``
+    agrees with what the table quotes per pair.
     """
     pairs = [int(k) for k in pairs]
     if not pairs:

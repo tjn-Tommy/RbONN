@@ -1,36 +1,28 @@
 """Bench calibration in the form :mod:`onn_module.layer` wants.
 
-This module is the bridge between the calibration chain and the torch layer,
-and it is deliberately the only place the two meet.  It parses no calibration
-JSON of its own: ``eta`` and ``Phi`` come from
-:func:`calibration_module.fit.verify.load_forward_model`, the one reader that
-defines this project's phase-sign convention.  There is therefore exactly one
-answer to "what is Phi_k" in the repo, and re-deriving it here -- which is what
-an independent JSON walk amounts to -- is how the two would drift apart.
+In:  a ``calib.json``, or the directory holding one, or a flat template.
+Out: :class:`ONNParams` -- ``eta``, ``Phi`` and ``Y_sat`` as torch tensors.
 
-``phase_sign``
---------------
-The project has ONE sign convention (see the README): a stored
-``dphi_comb_rad`` IS ``Phi_k`` in
+The bridge between the calibration chain and the torch layer, and deliberately
+the only place the two meet.  It parses no calibration JSON of its own: ``eta``
+and ``Phi`` come from
+:func:`calibration_module.fit.verify.load_forward_model`, the one reader that
+defines this project's phase-sign convention, so there is exactly one answer in
+the repo to "what is Phi_k".
+
+That convention: a stored ``dphi_comb_rad`` IS ``Phi_k`` in
 
     E = sum_k eta_k sqrt(x_k w_k) exp(i [u_k + v_k + Phi_k])
 
 so every loader here sets ``phase_sign = +1`` and that is not a choice.  The
-field survives on :class:`ONNParams` for two reasons only: the flat template
-schema can express the ``exp(i[Phi - u - v])`` convention of
-``rbonn_3pair_sweep.py`` for a side-by-side comparison, and the layer's
-selftest exercises both branches.  Nothing that reads a real calibration
-should set it.
+field survives on :class:`ONNParams` only so the flat template can express
+``rbonn_3pair_sweep.py``'s ``exp(i[Phi - u - v])`` for a side-by-side
+comparison and the layer's selftest can exercise both branches; nothing reading
+a real calibration should set it.
 
-``y_sat``
----------
-Step 8 fits the saturation level into the ``step8`` section of the same
-``calib.json`` that holds the etas and the phases it was measured against, so
-:meth:`ONNParams.from_run` reads all three out of one file and there is no
-pointer to follow and no chance of pairing a ``Y_sat`` with the wrong forward
-model.  There is no default saturation level in this module on purpose: a
-hardcoded 5 V that silently disagrees with the run it is quoted against is worse
-than an explicit ``y_sat=None`` (no saturation).
+There is no default saturation level, on purpose: an explicit ``y_sat=None`` (no
+saturation) is better than a hardcoded 5 V that silently disagrees with the run
+it is quoted against.
 """
 from __future__ import annotations
 
@@ -106,22 +98,15 @@ class ONNParams:
     def from_run(run: str | Path, *, pairs: Sequence[int] | None = None,
                  y_sat: float | None = None,
                  method: str | None = None) -> "ONNParams":
-        """Load a run directory's calib.json -- eta, Phi and Y_sat in one file.
+        """Load one calib.json -- eta, Phi and Y_sat from the same file.
 
-        ``run`` is the run directory or the ``calib.json`` inside it.  The etas
-        come from its step-6 section, the phases from step 7 and the saturation
-        level from step 8; an explicit ``y_sat`` overrides the file's, and a run
-        with no step 8 runs linear unless one is passed.
-
-        ``pairs=None`` takes every pair the run calibrates end to end: a step-6
-        eta and, unless it is the reference, a step-7 phase.
-
-        There is no shape sniffing left.  The four variants this used to dispatch
-        between -- a step-8 result with eta/phi inlined, one with only y_sat and
-        a path to follow, a combined step-7 file, a hand-written template -- were
-        four ways of saying "the forward model", and the run directory is now the
-        one way.  Only the hand-written template survives, in
-        :meth:`from_template`, because nothing measured it.
+        In:  ``run``, a ``calib.json`` or the directory holding one.  ``pairs``
+             selects channels; ``None`` takes every pair the run calibrates end
+             to end (a step-6 eta and, unless it is the reference, a step-7
+             phase).  An explicit ``y_sat`` overrides the file's.
+        Out: :class:`ONNParams` -- etas from the step-6 section, phases from
+             step 7, the saturation level from step 8.  A file with no step 8
+             runs linear unless a ``y_sat`` is passed.
         """
         from calibration_module.calib_file import load_calib
 
@@ -159,7 +144,7 @@ class ONNParams:
     @staticmethod
     def from_json(path: str | Path, channels: Sequence[int] | None = None,
                   y_sat: float | None = None) -> "ONNParams":
-        """A run directory's calib.json, or a hand-written template.
+        """A ``calib.json``, or a hand-written template.
 
         Kept as the one entry point that does not make the caller know which it
         has.  The test is the ``schema`` key, not the shape of the payload: a v3

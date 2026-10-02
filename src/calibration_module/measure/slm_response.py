@@ -1,8 +1,13 @@
 """SLM response calibration sweeps (steps 1-3), read on the OSA or the DAQ.
 
-Each step is one ``run_step*`` call -- the GUI's Run buttons and the
-``steps/calib_step{1,2,3b,3c}.py`` scripts both make it, so the sequence a step
-runs is written once, here:
+In:  an instrument (OSA or DAQ), the SLM, and for step 3 the step-2 map.
+Out: a ``CalibrationResult``.  A runner SAVES nothing -- writing it is
+     :func:`calibration_module.fit.slm_response.save_calibration_result`, which
+     also fits the transfer curves.
+
+Each step is one ``run_step*`` call, made by both the GUI's Run buttons and the
+``steps/calib_step{1,2,3b,3c}.py`` scripts, so the sequence a step runs is
+written once, here:
 
     run_step1    find_min_max_intensity_levels        full-screen level sweep (OSA)
     run_step2    wavelength_calibration               bright-window sweep -> the
@@ -13,11 +18,9 @@ runs is written once, here:
     run_step3c   build_channel_calibration_grid       channel grid,
                  + intensity_calibration_daq          one window at a time (DAQ)
 
-``intensity_calibration`` is the retired step 3a (per-coordinate OSA sweep); no
-runner calls it.  A runner returns the ``CalibrationResult`` and saves nothing:
-writing it is ``fit.slm_response.save_calibration_result``, which also fits the
-transfer curves.  The result format, and all the array math these sweeps call,
-live in ``calibration_module.fit.slm_response``.
+``intensity_calibration`` is the retired step 3a, a per-coordinate OSA sweep; no
+runner calls it.  The result format and all the array math these sweeps call
+live in :mod:`calibration_module.fit.slm_response`.
 """
 from __future__ import annotations
 
@@ -183,46 +186,33 @@ def wavelength_calibration(
 ) -> CalibrationResult:
     """Map SLM x coordinates to wavelengths using a bright-window sweep.
 
-    The peak of each window measurement is located by weighted centroid over a
-    +/- peak_half_window_nm wavelength window when that is given, otherwise over
-    peak_half_window samples on each side.
+    Out: a result carrying the DENSE per-column grid, whatever was actually
+    measured -- the mapping is nearly linear, so the polynomial fit fills in
+    skipped coordinates.
 
-    ``region`` (x_start, x_end) limits the sweep to that inclusive band of SLM
-    columns, which is useful when the source only illuminates part of the SLM
-    width (e.g. a ~6 nm pulse on a ~20 nm aperture); None sweeps the full width.
+    Each window's peak is a weighted centroid, over +/- ``peak_half_window_nm``
+    when that is given, otherwise over ``peak_half_window`` samples each side.
 
-    ``coordinate_stride`` speeds up acquisition: only every Nth window position
-    is measured (the last position is always kept so the fit spans the whole
-    region). The coordinate->wavelength mapping is nearly linear, so the
-    polynomial fit over the strided points fills in the skipped coordinates:
-    the returned result still carries the dense per-column grid a stride-1
-    sweep would produce. 1 (default) measures every position.
+    Speed knobs.  ``region`` (x_start, x_end) limits the sweep to that inclusive
+    band of columns, for a source illuminating only part of the width.
+    ``coordinate_stride`` measures every Nth position, always keeping the last so
+    the fit spans the region.  ``sweep_span_nm`` measures the two region edges
+    first on the wide span as anchors, predicts every other position from the
+    line through them, and measures each on a narrow span re-centred on its
+    prediction; the dark/bright references keep the wide span and are
+    interpolated onto each narrow grid.
 
-    ``sweep_span_nm`` speeds up acquisition further: when set, the two
-    region-edge positions are measured first with the wide ``measure_settings``
-    span (anchors -- their wavelengths are unknown until measured), a straight
-    line through the two anchor peaks predicts every other position's
-    wavelength, and each remaining position is measured with a narrow OSA span
-    (``sweep_span_nm`` wide) re-centered on its prediction -- far fewer samples
-    per sweep with AUTO sampling. The dark/bright references keep the wide span
-    and are interpolated onto each narrow grid. None (default) uses the wide
-    span everywhere.
+    ``min_peak_wavelength_nm``/``max_peak_wavelength_nm`` mask trace samples out
+    of the peak SEARCH -- a fixed leakage artifact the SLM never modulates, say.
+    A mask on the search, NOT the usable output band: a window whose real peak
+    falls outside it reads as dark and aborts the run.  To keep part of the
+    finished mapping, sweep unmasked and pass the result through
+    :func:`clip_to_wavelength_range`, which is what the GUI does.
 
-    ``min_peak_wavelength_nm`` / ``max_peak_wavelength_nm`` exclude trace
-    samples below / above that wavelength from the peak search, e.g. to mask a
-    fixed leakage artifact the SLM never modulates (light falling outside the
-    active area). None (default) leaves that end of the trace unclipped.  This
-    is a mask on the SEARCH, so a window whose real peak falls outside it reads
-    as dark and aborts the run; it is not the usable output band.  To keep only
-    part of the finished mapping -- the band downstream steps can actually use
-    -- sweep unmasked and pass the result through
-    :func:`clip_to_wavelength_range`, which is what the GUI's step 2 does.
-
-    ``outlier_policy`` enables post-sweep auto-remeasurement: after the sweep, a
-    linear coordinate->wavelength fit flags points whose residual exceeds
-    ``k_sigma`` robust sigmas; each flagged window is re-displayed and
-    re-measured (up to ``max_retries`` rounds) and the point becomes the median
-    of its re-measurements. ``None`` (default) disables it.
+    ``outlier_policy`` enables post-sweep auto-remeasurement: a linear fit flags
+    points past ``k_sigma`` robust sigmas, each flagged window is re-displayed
+    and re-measured up to ``max_retries`` rounds, and the point becomes the
+    median of those.
     """
 
     del levels
@@ -474,30 +464,22 @@ def intensity_calibration(
 ) -> CalibrationResult:
     """Sweep levels and measure intensity near each calibrated wavelength.
 
-    intensity_levels (normalized to the bright reference) and
-    raw_intensity_levels (background-subtracted power, in watts) both have shape
-    (n_coordinates, n_levels). Each row belongs to
-    calibration_results.coordinates / calibration_results.wavelength; each
-    column belongs to the corresponding entry in levels.
+    Out: ``intensity_levels`` (normalized to the bright reference) and
+    ``raw_intensity_levels`` (background-subtracted watts), both
+    ``(n_coordinates, n_levels)`` -- rows following
+    ``calibration_results.coordinates``, columns following ``levels``.
 
     ``region`` (x_start, x_end) restricts the sweep to the calibrated
-    coordinates that fall within that inclusive band of SLM columns. This also
-    applies to a mapping loaded from a file, so only the selected slice of the
-    loaded range is calibrated; None calibrates every coordinate.
+    coordinates inside that inclusive band of columns, a mapping loaded from a
+    file included.  ``coordinate_stride`` measures every Nth of those, trading
+    spatial density for speed.
 
-    ``sweep_span_nm`` speeds up acquisition: when set, each coordinate's signal
-    sweep uses a narrow OSA span (``sweep_span_nm`` wide) re-centered on that
-    coordinate's calibrated wavelength, instead of the wide ``measure_settings``
-    span. Far fewer points per sweep (with AUTO sampling) means much faster
-    measurements. The dark/bright reference traces are still measured once with
-    the wide ``measure_settings`` span, so the narrow signal trace no longer
-    shares their wavelength grid; intensities are therefore reduced by sampling
-    each trace at the calibrated wavelength (see ``mean_near_wavelength``) rather
-    than the element-wise ``_reduce_trace`` used when ``sweep_span_nm`` is None.
-
-    ``coordinate_stride`` measures only every Nth calibrated coordinate (after the
-    region selection), trading spatial density for speed; 1 measures every
-    coordinate.
+    ``sweep_span_nm`` runs each coordinate's signal sweep on a narrow OSA span
+    re-centred on its calibrated wavelength, which is far fewer samples under
+    AUTO sampling.  The dark/bright references stay on the wide span, so the
+    narrow trace no longer shares their wavelength grid and intensities are
+    reduced by sampling each trace AT the calibrated wavelength (see
+    ``mean_near_wavelength``) rather than element-wise.
 
     ``refine_wavelength`` (narrow path only) re-fits the coordinate->wavelength
     mapping from Step 3's data: the narrow sweep resolves the peak more finely
@@ -1071,12 +1053,11 @@ def intensity_calibration_daq(
 ) -> CalibrationResult:
     """Step-3 intensity calibration read from a DAQ bucket detector.
 
-    This is the OSA ``intensity_calibration`` with the spectrometer swapped for a
-    single-photodiode DAQ: it walks the same calibrated coordinates, lights the
-    same one window at a time (rest of the panel at ``min_level``), and produces
-    the same ``CalibrationResult`` (``intensity_levels`` /
-    ``raw_intensity_levels`` shaped ``(n_coordinates, n_levels)``) so Step 3's
-    fit/plots and the downstream encoder are unchanged.
+    The OSA ``intensity_calibration`` with the spectrometer swapped for a single
+    photodiode: the same calibrated coordinates, the same one window at a time
+    with the rest of the panel at ``min_level``, and the same
+    ``CalibrationResult`` shape, so step 3's fit and the downstream encoder are
+    unchanged.
 
     Because a bucket detector has no spectral resolution, intensity is a plain
     dark-frame subtraction rather than a per-wavelength reduction: an all-``min``

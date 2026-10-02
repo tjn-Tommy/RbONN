@@ -1,133 +1,78 @@
 """Step 6 v2 -- the per-pair TPA efficiency estimator, driver-free.
 
-Arrays of commanded levels and measured volts in, a fitted ``eta`` per pair out.
-No SLM, no DAQ, no paths except the CSV/JSON readers that define this step's own
-formats -- which is what lets the estimator be re-run against a saved
-measurement CSV with the bench powered down.  :func:`load_meas_csv` is that
-entry point, and both the offline script and the GUI's Load button use it.
+In:  arrays of commanded levels and measured volts -- live from
+     :mod:`calibration_module.measure.pair_v2`, or from a saved measurement CSV
+     through :func:`load_meas_csv`, which is what lets the whole estimator
+     re-run with the bench powered down.
+Out: a :class:`PairV2Fit` per pair (``eta`` and its error, the background
+     parameters, the product check), written as the run's ``step6`` section by
+     :func:`save_step6_section`.
 
-The acquisition that produces those rows is
-:mod:`calibration_module.measure.pair_v2`; the runnable script that wires the
-two together is ``calibration_module/steps/calib_step6_v2.py``.  What the grid
-is for level by level, and what each parameter costs, is on
-:class:`PairV2Config`.
+No SLM, no DAQ, no paths but this step's own CSV/JSON formats.  The runnable
+script is ``steps/calib_step6_v2.py``; what the grid measures, level by level,
+is on :class:`PairV2Config`.
 
 Estimator
 ---------
 Along the cross line x = 1, subtract the w-only background::
 
-    D(w) = Y(1, w) - Y(0, w) = eta^2*w + (a_x + q_x)
+    D(w) = Y(1, w) - Bhat(w) = eta^2 w + (a_x + q_x)
 
-``a_w``, ``q_w`` and ``d`` cancel identically -- they play no part in eta.
-``a_x`` and ``q_x`` survive only as their sum, the intercept ``beta0``.  eta is
-then the slope of a two-parameter straight line, so no assumption is needed
-about the shape of the single-beam background and the q-term debate disappears.
+``a_w``, ``q_w`` and ``d`` cancel identically, so they play no part in eta, and
+``a_x``/``q_x`` survive only as their sum.  eta is then the slope of a
+two-parameter straight line, needing no assumption about the shape of the
+single-beam background.  That is what makes it immune to v1's joint
+6-parameter fit, where misfit on the x-only line leaked through the shared
+``d`` into the cross line's slope/intercept split.
 
-The q columns are nonetheless OFF by default (:attr:`PairV2Config.fit_q`).  With two drive
-levels per arm plus dark, fitting them saturates the background block, and a
-saturated block splits one measured curve between ``a`` and ``q`` arbitrarily --
-which is why it kept returning a negative ``a`` or ``q``, neither of which a
-single-beam response can be.  Dropping them leaves ``a_x*x + a_w*w + d`` with
-2 dof, whose residual is printed with every fit.
+``Bhat(w) = a_w w + d`` is FITTED, not measured: the w-only block sits at
+w in {0.5, 1} and the cross block at w in {0.2, 0.45, 0.7, 0.9}, so no
+point-by-point partner exists.  Every D therefore shares the background
+parameters and the D points are CORRELATED -- the background covariance is
+propagated into a full covariance for D and the slope is a GLS solution against
+it, not an ordinary one.  Treating them as independent re-introduces the very
+leak this estimator removes.
 
-Why this replaces v1's joint 6-parameter fit: there ``d`` is shared across all
-three lines, so misfit on the x-only line leaks into ``d`` and from there into
-the cross line's intercept/slope split.  Measured leak on pair 0 -- dropping
-``q_x`` moved eta by +0.55% / +0.61%.  The difference estimator is immune by
-construction.
+The q columns are off by default (:attr:`PairV2Config.fit_q`): with two drive
+levels per arm plus dark they saturate the background block, and a saturated
+block splits one measured curve between ``a`` and ``q`` arbitrarily, routinely
+landing on a negative one or the other.  Dropped, ``a_x x + a_w w + d`` has
+2 dof and the residual is printed with every fit.
 
-How the difference is formed
-----------------------------
-The spec allows either a point-by-point difference or a subtraction against the
-fitted background curve.  **This grid only supports the fitted curve**: the
-w-only block sits at w in {0.5, 1.0} while the cross block sits at
-w in {0.2, 0.45, 0.7, 0.9}, so ``Y(0, w)`` is never measured at a cross w and
-there is no point-by-point partner to subtract.  So::
-
-    D(w) = Y(1, w) - Bhat(w),   Bhat(w) = a_w*w + d   [+ q_w*w^2 with FIT_Q]
-
-``Bhat`` is fitted, which means every D shares its parameters and the D points
-are *correlated*.  That correlation is carried properly: the background
-covariance is propagated into a full covariance for D and the slope comes from
-a generalized least squares fit, not an ordinary one.  Getting this wrong would
-re-introduce exactly the slope/intercept leak the estimator exists to remove.
-
-Fit procedure
--------------
-1. Background block (dark + x-only + w-only, 5 levels) gives the
-   :attr:`PairV2Config.params_bg` parameters with their covariance -- 3 of them and 2 dof by
-   default, 5 and saturated with :attr:`PairV2Config.fit_q`.  These are needed only for the
-   step-7/8 forward model, never for eta.
-2. Form ``D(w)`` on the cross levels, propagating the background covariance.
-3. Restrict to ``w`` in ``cfg.fit_w_range`` and fit ``D(w) = eta^2*w + beta0`` by
-   GLS; ``eta = sqrt(eta^2)``.
-4. Report the fit range with eta -- the cross line is not exactly straight, so
-   eta is a *local* slope, not a global constant.
+There is no separate fit window -- the window IS the ramp the sweep drove, so a
+re-fit needs nothing but the CSV.  The fitted w range is reported, since the
+cross line is not exactly straight and eta is the slope over THAT range.
 
 Verification
------------
-Four checks are printed with every fit.  **None of them feeds the fit** -- they
-say whether the model eta is defined within still holds on this pair.
+------------
+One check, printed with every fit and feeding nothing.  The model says ``Y``
+depends on the drives only through ``x*w``, so two levels sharing a product but
+splitting the drive differently must leave the same TPA residue.  The groups are
+found in the data (:func:`product_groups`), so a recorded CSV carries its own
+check.  A split does not mean the estimator is wrong -- it means the pair has NO
+single eta, which would invalidate the one-number-per-pair model steps 7 and 8
+are built on.  The slope fit cannot catch it: a drive-split tilt is nearly
+linear in w along x = 1 and is absorbed into the slope and intercept.
 
-Two come free from the existing grid:
-
-* **anchor** -- ``D(0)`` is measured directly as ``Y(1,0) - Y(0,0)`` and must
-  agree with the fitted intercept ``beta0``.
-* **top-drive compression** -- the ``(1, 1.0)`` level is excluded from the slope
-  fit and compared against the extrapolated line, which is where v1's largest
-  residual lived (pair 0: -3.44 mV on exactly this point).
-
-Two are the explicit verification section:
-
-1. **Intercept identity** -- ``D(w) = eta^2 w + (a_x + q_x)`` says the cross
-   line extrapolated to ``w = 0`` must land on the x-side response measured
-   independently in the x-only block (``a_x`` alone without the q columns).
-   Curvature over the fit window shows up here first, because extrapolating to
-   zero amplifies it.  With :attr:`PairV2Config.fit_q` the background block is saturated, so
-   that sum equals the raw ``Y(1,0) - Y(0,0)`` exactly and the check only
-   restates the anchor through the fitted parameters; without it the block
-   carries 2 dof and the two genuinely differ, so the check has teeth.
-
-2. **Product-only dependence** -- the model says ``Y`` depends on the two drives
-   only through ``x*w``.  ``(1, 0.25)`` and ``(0.5, 0.5)`` share that product but
-   split the drive very differently, so after subtracting the full single-beam
-   background their TPA residues must agree.  This costs the six extra
-   acquisitions in :attr:`PairV2Config.verify_grid` (31 -> 37, about +1 min/pair), and it is
-   worth them: a split here does not mean this estimator is wrong, it means the
-   pair has **no single eta at all**, which would invalidate the
-   one-number-per-pair model steps 7 and 8 are built on.
-
-   The slope fit alone will not reliably catch that.  On synthetic data with a
-   10% drive-split tilt injected, R^2 still came out 0.9995 and eta moved only
-   0.26% -- the tilt is nearly linear in w along ``x = 1``, so it is absorbed
-   into the slope and intercept.  The residual pulls did rise (max 7.2), but
-   only the product check names the cause, at +6.8% split / 9.1 sigma.
-
-Set ``verify_enabled=False`` for the bare 31-acquisition grid; the product
-check then reports itself as not measured rather than silently passing.
+``verify_enabled=False`` gives the bare grid, and the check then reports itself
+as not measured rather than silently passing.
 
 Uncertainties
 -------------
-Every level is repeated, and the SLM is rewritten between repeats, so the
-scatter across repeats measures *encoding* repeatability and not just detector
-jitter.  A level's sigma is therefore built from that scatter::
+Every level is repeated with the SLM rewritten in between, so the repeat scatter
+measures ENCODING repeatability and not just detector jitter::
 
-    sigma = hypot(max(rep_std, trace_std) / sqrt(n_repeats), STD_FLOOR_V)
+    sigma = hypot(max(rep_std, trace_std) / sqrt(n_repeats), floor)
 
-``trace_std`` (the low-passed trace spread that v1 weights by) is kept only as a
-floor, so two repeats that happen to agree cannot manufacture an infinite
-weight.  :data:`~calibration_module.fit.sigma.STD_FLOOR_V` is the systematic floor
-on top of that: repeats average down statistical noise but not a systematic, and
-without it the all-off level -- the quietest read in the grid, since the trace
-spread scales as sqrt(signal) -- takes ~46% of the background block on its own.
-
-The ``/sqrt(n)`` is *not* the retired trace-SEM: repeats are genuinely independent
-acquisitions with a panel rewrite in between, so dividing by sqrt(n) is
-legitimate -- and it is what the grid intends, since the highest-leverage cross
-level carries n = 6.  Every fit prints rep_std beside trace_std per level so
-the two can be compared directly.
-
+``trace_std`` is a floor only, so two repeats that happen to agree cannot
+manufacture an infinite weight.  ``floor`` is the sweep's own systematic floor
+-- the median trace std of its dark acquisitions, pooled over every pair
+(:func:`sweep_floor`) -- so it is a voltage and follows the detection gain.
+Repeats average down statistical noise but not a systematic, so it goes on
+AFTER the ``/sqrt(n)``.  A sweep with no dark level cannot be fitted: there is
+nothing to measure the floor from and no constant stands in.
 """
+
 from __future__ import annotations
 
 import csv
@@ -138,15 +83,24 @@ from pathlib import Path
 
 import numpy as np
 
-from .outliers import BURST_K_REPEAT, flag_burst_repeats
-from .sigma import STD_FLOOR_V, floor_std
+from .outliers import (
+    BURST_K_REPEAT,
+    BURST_MAX_V,
+    flag_burst_repeats,
+    flag_over_range,
+)
+from .sigma import FloorSource, floor_std, measured_floor
 
 __all__ = [
     "PairV2Config",
     "DEFAULT_CONFIG",
+    "VERIFY_X",
+    "VERIFY_W",
     "Level",
     "PairV2Fit",
     "average_levels",
+    "sweep_floor",
+    "step6_floor",
     "burst_rows",
     "block_of",
     "design_bg",
@@ -154,7 +108,7 @@ __all__ = [
     "fit_background",
     "fit_difference",
     "fit_pair",
-    "verify_intercept",
+    "product_groups",
     "verify_product",
     "report",
     "report_verification",
@@ -171,94 +125,66 @@ __all__ = [
 # configuration
 # ======================================================================
 
-#: The estimator's levels: ``(x, w, n_repeats)``.  31 acquisitions.  Every
+#: The estimator's levels: ``(x, w, n_repeats)``.  28 acquisitions.  Every
 #: level is repeated (n >= 2) with an SLM rewrite between repeats, so the
 #: repeat scatter measures encoding repeatability rather than detector jitter.
 DEFAULT_GRID: tuple[tuple[float, float, int], ...] = (
-    (0.0, 0.00, 2),   # dark    -> d
+    (0.0, 0.00, 2),   # dark    -> d ; also the sigma floor (sweep_floor)
     (0.5, 0.00, 2),   # x-only  -> a_x, q_x
-    (1.0, 0.00, 3),   # x-only  -> a_x, q_x ; also the direct D(0) anchor
+    (1.0, 0.00, 2),   # x-only  -> a_x, q_x
     (0.0, 0.50, 2),   # w-only  -> a_w, q_w
     (0.0, 1.00, 2),   # w-only  -> a_w, q_w
     (1.0, 0.20, 4),   # cross   -> eta^2
     (1.0, 0.45, 4),   # cross
     (1.0, 0.70, 4),   # cross
     (1.0, 0.90, 6),   # cross   (highest leverage -> most repeats)
-    (1.0, 1.00, 2),   # cross, EXCLUDED from the slope fit: top-drive compression
 )
 
-#: Extra levels measured purely to test the model, never to fit eta.  They cost
-#: 6 more acquisitions (31 -> 37, roughly +1 min/pair).
+#: Where the product-check level sits: OFF the ``x = 1`` line, so no ramp point
+#: can ever land on it, at the same ``x*w = 0.25`` as ``(0.5, 0.5)``.  ``w`` is
+#: rounded to what the CSV writes (``%.6g``) so a reloaded row matches exactly.
+VERIFY_X = 0.95
+VERIFY_W = round(0.25 / VERIFY_X, 6)            # 0.263158
+
+#: Extra levels measured purely to test the model, never to fit eta; 6 more
+#: acquisitions, ~+1 min/pair.  Three repeats each, below which there is no
+#: usable repeat scatter to quote the check's pull against.
 DEFAULT_VERIFY_GRID: tuple[tuple[float, float, int], ...] = (
-    (1.0, 0.25, 3),
+    (VERIFY_X, VERIFY_W, 3),
     (0.5, 0.50, 3),
-)
-
-#: Groups of levels sharing the same product ``x*w``.  The model says Y depends
-#: on the two drives ONLY through that product, so once the single-beam
-#: background is subtracted the members must agree.  They sit at different x,
-#: which is the point: (1, 0.25) drives the x side hard and the w side softly,
-#: (0.5, 0.5) splits the drive evenly.  Disagreement means the pair's response
-#: is not a function of ``x*w`` alone and no single eta describes it -- which
-#: would undermine the one-number-per-pair model, not just this estimator.
-DEFAULT_PRODUCT_CHECKS: tuple[tuple[tuple[float, float], ...], ...] = (
-    ((1.0, 0.25), (0.5, 0.50)),      # both x*w = 0.25
 )
 
 
 @dataclass(frozen=True)
 class PairV2Config:
-    """What the estimator was specified with -- the fit's half of a run's setup.
+    """The sweep's specification -- what to drive, and the two fit switches.
 
-    Frozen, and carried on every :class:`PairV2Fit`, so a fit always knows the
-    grid and the fit window it came from: the report, the plot and the JSON all
-    read it off the fit rather than off a module global.  That is what lets the
-    GUI fit two differently-configured pairs in one process, which the old
-    module-level constants could not do.
+    The grid is what a SWEEP drives; a re-fit never needs it, reading the levels
+    off the rows instead, so a recorded CSV is fitted the way it was measured
+    whatever this says.  Carried on every :class:`PairV2Fit` for ``params_bg``
+    and the pair-label convention.
 
-    Only the *fit's* parameters live here.  Acquisition timing (T_both,
-    T_single, settle, DAQ range) belongs to
+    Only the FIT's parameters live here.  Acquisition timing belongs to
     :class:`~calibration_module.measure.pair_v2.PairV2Acq`, and the sigma floor
-    deliberately does not appear at all -- it has one owner, in
+    deliberately does not appear at all: it has one owner, in
     :mod:`calibration_module.fit.sigma`, and a per-run override would make
     published eta_err values incomparable.
     """
 
-    #: Levels the estimator fits.  See :data:`DEFAULT_GRID`.
+    #: Levels the sweep drives for the estimator.  See :data:`DEFAULT_GRID`.
     grid: tuple[tuple[float, float, int], ...] = DEFAULT_GRID
-    #: Slope-fit window in w.  The cross line is not exactly straight, so eta is
-    #: a local slope over this range -- reported alongside eta, and the levels
-    #: outside it become the compression diagnostic instead of being dropped.
-    fit_w_range: tuple[float, float] = (0.2, 0.9)
     #: Model-check levels.  See :data:`DEFAULT_VERIFY_GRID`.
     verify_grid: tuple[tuple[float, float, int], ...] = DEFAULT_VERIFY_GRID
-    #: False -> the bare 31-acquisition grid, no checks.
+    #: False -> the bare 28-acquisition grid, no product check.
     verify_enabled: bool = True
-    #: The verification levels stay OUT of the slope fit by default, so the
-    #: estimator sees exactly the levels it was specified with and the checks
-    #: stay independent of what they are checking.  (1, 0.25) is a legitimate
-    #: cross point and could join the fit; flip this to let it.
-    verify_in_slope_fit: bool = False
-    #: Level groups sharing a product.  See :data:`DEFAULT_PRODUCT_CHECKS`.
-    product_checks: tuple[tuple[tuple[float, float], ...], ...] = DEFAULT_PRODUCT_CHECKS
-    #: Keep the quadratic saturation columns ``q_x x^2`` and ``q_w w^2``.
-    #:
-    #: Off by default.  The grid has only TWO drive levels per arm plus the dark
-    #: level, so with the q columns the background block is exactly saturated:
-    #: a_w and q_w are pinned by two points, and one measured curve can be split
-    #: between them any way at all.  Noise then routinely lands on a negative a
-    #: or a negative q -- a single-beam response cannot go DOWN as its drive
-    #: goes up, so that split was never measured, only interpolated.  Dropping
-    #: the q columns fits ``Y_bg = a_x x + a_w w + d``: 5 levels, 3 parameters,
-    #: 2 dof, and the background residual becomes visible instead of being
-    #: absorbed into a q.
-    #:
-    #: What it costs: eta only ever sees ``Bhat(w)``, so this moves eta only if
-    #: the w-only arm is genuinely curved -- and with 2 dof that curvature now
-    #: shows up in the printed background residual instead of hiding in q_w.
-    #: If those pulls go large, add w levels (so a and q are separately
-    #: measured) rather than just flipping this back on, which only returns to
-    #: the arbitrary split.
+    #: Keep the quadratic saturation columns ``q_x x^2`` and ``q_w w^2``.  Off
+    #: by default: two drive levels per arm plus dark saturates the background
+    #: block, so one measured curve splits between ``a`` and ``q`` any way at
+    #: all and noise routinely lands on a negative one of them, which a
+    #: single-beam response cannot be.  Dropped, the block has 2 dof and its
+    #: residual becomes visible instead of being absorbed into a q.  If those
+    #: pulls go large the w-only arm is genuinely curved: add w levels, so a and
+    #: q are separately MEASURED, rather than returning to the arbitrary split.
     fit_q: bool = False
     #: Pairs are labelled from here and that label is what every CSV / JSON
     #: records; the Step-3 layout arrays are always 0-based, so :meth:`slot`
@@ -270,28 +196,16 @@ class PairV2Config:
                   **kw) -> "PairV2Config":
         """Rebuild the grid with an evenly spaced cross-line ramp.
 
-        The single-beam block is fixed -- it is the five levels
-        :func:`fit_background` needs and nothing about a ramp changes them --
-        and so is the verification block, which is defined by its products
-        rather than by the ramp.  What this replaces is the cross line, the part
-        eta is actually the slope of, and ``fit_w_range`` follows the ramp so
-        the estimator fits exactly what was measured.
+        Only the cross line is replaced -- the part eta is the slope of.  The
+        single-beam block is the five levels :func:`fit_background` needs, and
+        the verification block is defined by its product, so a ramp changes
+        neither.  The fit then uses exactly these levels: the window IS the
+        ramp.  Four repeats per level, six on the last, where the slope has the
+        most leverage.
 
-        Repeat counts follow the same rule the hand-built
-        :data:`DEFAULT_GRID` uses: four per level, six on the last one because
-        the top of the window carries the most leverage on the slope, and two on
-        the excluded top-drive level.
-
-        ``(1, 1.0)`` is appended as the compression diagnostic only when the
-        ramp stops short of it.  Take ``sweep_max`` to 1.0 and there is no
-        excluded level left: top-drive compression then sits inside the fit
-        instead of being measured against it, and the printed ``excluded`` list
-        is empty.  That is the cost of the wider window, not a bug.
-
-        Note this is a *different grid* from :data:`DEFAULT_GRID`, whose cross
-        levels (0.2, 0.45, 0.7, 0.9) are not evenly spaced.  Results measured on
-        one are not identical to results measured on the other; re-fits of an
-        existing CSV are unaffected, since only ``fit_w_range`` reaches those.
+        A DIFFERENT grid from :data:`DEFAULT_GRID`, whose cross levels are not
+        evenly spaced, so results on the two are not identical.  A re-fit of an
+        existing CSV sees neither, only the CSV's own levels.
         """
         lo, hi, n = float(sweep_min), float(sweep_max), int(points)
         if n < 2:
@@ -303,10 +217,8 @@ class PairV2Config:
         ramp = np.round(np.linspace(lo, hi, n), 6)
         cross = tuple((1.0, float(w), 6 if i == n - 1 else 4)
                       for i, w in enumerate(ramp))
-        if hi < 1.0:
-            cross += ((1.0, 1.00, 2),)          # excluded: top-drive compression
         background = tuple(lv for lv in DEFAULT_GRID if block_of(lv[0], lv[1]) != "cross")
-        return cls(grid=background + cross, fit_w_range=(lo, hi), **kw)
+        return cls(grid=background + cross, **kw)
 
     # -- derived ---------------------------------------------------------
     @property
@@ -336,14 +248,8 @@ class PairV2Config:
         return pair - self.pair_index_base
 
     def full_grid(self) -> tuple[tuple[float, float, int], ...]:
-        """Everything actually measured: the estimator's levels + the checks."""
+        """Everything the sweep drives: the estimator's levels + the check."""
         return self.grid + self.verify_grid if self.verify_enabled else self.grid
-
-    def verification_points(self) -> set[tuple[float, float]]:
-        """Levels measured only to test the model, never to fit eta."""
-        if not self.verify_enabled or self.verify_in_slope_fit:
-            return set()
-        return {(round(x, 6), round(w, 6)) for x, w, _ in self.verify_grid}
 
 
 #: The configuration every validated run to date used.
@@ -381,17 +287,22 @@ def block_of(x: float, w: float) -> str:
 class Level:
     """One commanded ``(x, w)`` setting, averaged over its repeats.
 
-    ``rep_std`` is the scatter of the repeat means -- encoding repeatability
-    plus drift plus detector noise.  ``trace_std`` is the mean within-acquisition
-    low-passed trace spread -- detector noise only.  Comparing the two is the
-    point of repeating every level; ``sigma`` is what the fits actually weight
-    by (see the module docstring).
+    ``rep_std`` is the scatter of the repeat means (encoding repeatability plus
+    drift plus detector noise); ``trace_std`` is the mean within-acquisition
+    spread (detector noise alone).  Comparing the two is the point of repeating
+    every level.  ``sigma`` is what the fits weight by.
     """
 
     x: float
     w: float
     means: np.ndarray          # one entry per repeat, volts
     trace_stds: np.ndarray     # one entry per repeat, volts
+    #: This sweep's sigma floor (:func:`sweep_floor`), carried on the level so a
+    #: fit, its report and its JSON all read the floor they were actually
+    #: weighted by.  No default: a level without a measured floor is not a level.
+    floor: float
+    #: How that floor was arrived at -- a :class:`FloorSource` value.
+    floor_source: str
 
     @property
     def n(self) -> int:
@@ -420,52 +331,52 @@ class Level:
     def sigma(self) -> float:
         """Uncertainty of this level's mean: trace spread, then the systematic.
 
-        The ``/sqrt(n)`` is legitimate (independent acquisitions with a panel
-        rewrite between them), but it applies only to what averaging can reduce.
-        STD_FLOOR_V goes on AFTER it: a systematic does not average away, and
-        no level should read as better known than the floor however many
-        repeats it got.
+        The ``/sqrt(n)`` is legitimate -- independent acquisitions with a panel
+        rewrite between them -- but applies only to what averaging reduces, so
+        :attr:`floor` goes on AFTER it: no level reads as better known than the
+        floor however many repeats it got.
         """
         rep = self.rep_std
         spread = max(rep if np.isfinite(rep) else 0.0, self.trace_std)
         sigma = spread / np.sqrt(self.n)
         sigma = sigma if sigma > 0.0 else 1e-12   # never an infinite weight
-        return float(floor_std(sigma))
+        return float(floor_std(sigma, self.floor))
 
-    def is_verification(self, cfg: "PairV2Config") -> bool:
-        """Measured only to check the model (see :attr:`PairV2Config.product_checks`)."""
-        return (round(self.x, 6), round(self.w, 6)) in cfg.verification_points()
+    def is_verification(self) -> bool:
+        """A cross-block level OFF the ``x = 1`` line: measured for the product
+        check only, never on the slope (see :func:`product_groups`)."""
+        return self.block == "cross" and self.x != 1.0
 
-    def on_cross_line(self, cfg: "PairV2Config") -> bool:
+    def on_cross_line(self) -> bool:
         """On the ``x = 1`` line the difference estimator is derived for.
 
-        ``D(w) = Y(1,w) - Y(0,w)`` assumes ``x = 1``; a cross level at any other
-        x is not on this line at all and must never reach the slope fit.
+        ``D(w) = Y(1,w) - Bhat(w)`` assumes ``x = 1``, so a cross level at any
+        other x must never reach the slope fit.  Every level that IS on it is
+        fitted: the window is whatever was swept.
         """
-        return (self.block == "cross" and self.x == 1.0
-                and not self.is_verification(cfg))
-
-    def in_fit_window(self, cfg: "PairV2Config") -> bool:
-        """Cross level inside ``cfg.fit_w_range`` -- i.e. one the slope fit uses."""
-        lo, hi = cfg.fit_w_range
-        return self.on_cross_line(cfg) and lo - 1e-9 <= self.w <= hi + 1e-9
+        return self.block == "cross" and self.x == 1.0
 
 
-def burst_rows(rows, *, k: float = BURST_K_REPEAT) -> np.ndarray:
+def burst_rows(rows, *, k: float = BURST_K_REPEAT,
+               rail_v: float = BURST_MAX_V) -> np.ndarray:
     """Boolean mask of ``rows`` that are bursts, not measurements.
 
-    Every step-6 level is measured several times, so each row is judged against
-    the other repeats of its OWN ``(x, w)`` cell
-    (:func:`~calibration_module.fit.outliers.flag_burst_repeats`) rather than
-    against the sweep.  The sweep would be a much blunter ruler: it spans dark
-    to full scale, so its trace stds legitimately vary ~100x -- enough that it
-    reads an honest full-scale point as a burst.  Repeats of one cell agree to
-    1.6x at the 99th percentile across every run on disk, and never past 1.81x.
+    Each row is judged against the other repeats of its OWN ``(x, w)`` cell
+    (:func:`~calibration_module.fit.outliers.flag_burst_repeats`), not against
+    the sweep: the sweep spans dark to full scale, so its trace stds vary ~100x
+    and it reads an honest full-scale point as a burst.  Repeats of one cell
+    agree to 1.6x at the 99th percentile across every run on disk.
 
-    Never empties a cell: if every repeat of one ``(x, w)`` is flagged, all of
-    them are kept.  A level with no acquisitions would silently drop out of the
-    design matrix and change which model is being fitted, which is a worse
-    failure than a known-bad level that the caller has been warned about.
+    Never empties a cell -- if every repeat of one is flagged, all are kept.  A
+    level with no acquisitions drops out of the design matrix and changes which
+    model is fitted, which is worse than a known-bad level the caller was warned
+    about.
+
+    That reprieve does NOT extend to the absolute ceiling
+    (:func:`~calibration_module.fit.outliers.flag_over_range`): a read past
+    :data:`~calibration_module.fit.outliers.BURST_MAX_V` is a railed detector,
+    and keeping the matrix square by re-admitting it would fit the model to the
+    rail.  Such a cell is dropped and ``fit_pair`` says so.
     """
     rows = list(rows)
     if not rows:
@@ -480,36 +391,120 @@ def burst_rows(rows, *, k: float = BURST_K_REPEAT) -> np.ndarray:
         if all(mask[i] for i in idx):
             for i in idx:
                 mask[i] = False
-    return mask
+    railed = flag_over_range([float(r[3]) for r in rows], limit=rail_v)
+    return mask | railed
 
 
-def average_levels(rows, *, drop_bursts: bool = True) -> list[Level]:
+def sweep_floor(rows_by_pair) -> tuple[float, str]:
+    """This step-6 sweep's sigma floor, from its own all-off acquisitions.
+
+    Out: ``(volts, source)``.  The grid's dark level is commanded with both arms
+    off, so what it still fluctuates by is the additive electronics term and
+    nothing else.
+
+    Pooled across every pair, not per pair: two repeats is an anecdote, twenty
+    is a measurement, and the floor is a property of the detector.  Selected by
+    COMMANDED drive, never by voltage, so a sweep sitting on a stray-light
+    pedestal still reports the noise its points actually carry.
+
+    Every real grid has the dark level.  A file with no ``(0, 0)`` rows raises:
+    there is nothing to measure from, and no constant stands in.
+    """
+    means: list[float] = []
+    stds: list[float] = []
+    for rows in (rows_by_pair.values() if hasattr(rows_by_pair, "values")
+                 else rows_by_pair):
+        for row in rows:
+            _rep, x, w, mean_v, std_v = (r for r in row[:5])
+            if float(x) == 0.0 and float(w) == 0.0:
+                means.append(float(mean_v))
+                stds.append(float(std_v))
+    if not means:
+        raise ValueError(
+            "no dark level (x = w = 0) in this sweep -- the sigma floor cannot "
+            "be measured, and there is no constant to fall back on"
+        )
+    # quiet_frac=1.0: the dark level IS the pre-selected quiet set; min_points=1
+    # because it was selected by commanded drive, not by voltage, so even one
+    # pair's two repeats are the detector's own all-off noise.
+    floor, source = measured_floor(means, stds, quiet_frac=1.0, min_points=1)
+    if source is not FloorSource.MEASURED:
+        raise ValueError(
+            f"dark level has no usable trace std ({len(means)} acquisitions) -- "
+            "the sigma floor cannot be measured"
+        )
+    return float(floor), source.value
+
+
+def step6_floor(run) -> tuple[float, str]:
+    """A run's step-6 sigma floor, for the steps that inherit it (step 7).
+
+    Out: ``(volts, INHERITED)``.  Normally the section's own
+    ``sigma_floor_v``; an older step 6 recorded none but still names its CSV,
+    which holds the dark rows, so the floor is measured now the way
+    :func:`sweep_floor` would have.  A run with neither raises -- there is no
+    constant to fall back on.
+    """
+    from calibration_module.calib_file import CalibFileError, load_calib
+
+    try:
+        calib = load_calib(run)
+        section = calib.section(6)
+    except CalibFileError as exc:
+        raise ValueError(f"needs the run's step 6 for its sigma floor: {exc}") from exc
+    value = section.get("sigma_floor_v")
+    if value is None:
+        try:
+            csv = calib.csv_path(6)
+        except CalibFileError as exc:
+            raise ValueError(
+                f"{Path(run).name}: its step 6 records no sigma floor and names no "
+                f"CSV to measure one from ({exc}) -- re-fit step 6 first"
+            ) from exc
+        if not csv.is_file():
+            raise ValueError(
+                f"{Path(run).name}: its step 6 records no sigma floor and its CSV "
+                f"{csv.name} is not beside it -- re-fit step 6 first"
+            )
+        value, _measured = sweep_floor(load_meas_csv(csv))
+    return float(value), FloorSource.INHERITED.value
+
+
+def average_levels(rows, *, drop_bursts: bool = True,
+                   floor: tuple[float, str] | None = None,
+                   rail_v: float = BURST_MAX_V) -> list[Level]:
     """Group raw ``(rep, x, w, mean_v, std_v)`` rows into repeat-averaged levels.
 
-    Rows may carry the two PMT-thermistor cells after ``std_v``; the fit has no
-    use for them, so only the first five fields are read.
+    Rows may carry the two PMT-thermistor cells after ``std_v``; only the first
+    five fields are read.
 
-    Burst acquisitions (:func:`burst_rows`) are dropped first, because
-    :attr:`Level.mean` is a PLAIN mean over repeats: on run_0929 pair 10 one
-    burst repeat read 15.97 mV against five honest ones at 1.70-1.72 mV, which
-    put the cell at 4.09 mV instead of 1.71 mV and -- through the blown-up
-    :attr:`Level.rep_std` -- took eta_err from 13.4% to 17.8%.  Pass
-    ``drop_bursts=False`` for the unfiltered historical behaviour.
+    Bursts (:func:`burst_rows`) go first, because :attr:`Level.mean` is a PLAIN
+    mean over repeats -- one burst repeat can carry a cell several times off and
+    blow up its :attr:`Level.rep_std` with it.
+
+    ``floor`` is :func:`sweep_floor`'s ``(volts, source)``, measured over the
+    WHOLE sweep and so passed by the caller, the only one holding every pair's
+    rows.  Omitted, it is measured from this pair's own dark repeats, which is
+    right for a one-pair file and raises for rows with no dark level.
     """
     rows = list(rows)
     if drop_bursts and rows:
-        mask = burst_rows(rows)
+        mask = burst_rows(rows, rail_v=rail_v)
         rows = [r for r, bad in zip(rows, mask) if not bad]
+    if not rows:
+        return []
     grouped: dict[tuple[float, float], list[tuple[float, float]]] = {}
     for _rep, x, w, mean_v, std_v in (r[:5] for r in rows):
         grouped.setdefault((round(float(x), 6), round(float(w), 6)), []).append(
             (float(mean_v), float(std_v))
         )
+    f_v, f_src = floor if floor is not None else sweep_floor({0: rows})
     levels = [
         Level(
             x=x, w=w,
             means=np.array([m for m, _ in vals], dtype=float),
             trace_stds=np.array([s for _, s in vals], dtype=float),
+            floor=float(f_v), floor_source=str(f_src),
         )
         for (x, w), vals in grouped.items()
     ]
@@ -550,10 +545,8 @@ def grad_bg_w(w, cfg: "PairV2Config") -> np.ndarray:
 class PairV2Fit:
     """Everything the v2 estimator produces for one pair.
 
-    Carries its own :class:`PairV2Config`, so the report, the plot and the
-    JSON never have to be told again what grid and fit window this fit came
-    from -- and two pairs fitted under different configurations can coexist
-    in one process, which the old module-level constants forbade.
+    Carries its own :class:`PairV2Config` and levels, so the report, the plot
+    and the JSON all read what was fitted off the fit itself.
     """
 
     index: int
@@ -574,14 +567,16 @@ class PairV2Fit:
     eta: float
     eta_err: float
     r2: float
-    # -- checks
-    anchor: tuple[float, float]             # measured D(0) +/- err
-    excluded: list[tuple[float, float, float, float, float]]
-    # (w, D_meas, D_meas_err, D_extrapolated, D_extrapolated_err)
-    checks: dict = field(default_factory=dict)   # see verify_intercept/_product
+    # -- the check
+    checks: dict = field(default_factory=dict)   # see verify_product
     wl_x_nm: float = float("nan")
     wl_w_nm: float = float("nan")
     nominal_wl_nm: float = float("nan")
+
+    @property
+    def fit_w_range(self) -> tuple[float, float]:
+        """The w range the slope was fitted over: the cross line as measured."""
+        return float(np.min(self.fit_w)), float(np.max(self.fit_w))
 
     @property
     def residuals(self) -> np.ndarray:
@@ -594,12 +589,10 @@ class PairV2Fit:
     def bg_residuals(self) -> tuple[list["Level"], np.ndarray, np.ndarray]:
         """Background-block levels with their fit residuals and pulls.
 
-        Returns empty arrays when the block is saturated (:attr:`PairV2Config.fit_q`): a
-        zero-dof fit passes exactly through its points, so the residual is
-        identically zero and says nothing.  With the q columns dropped there
-        are 2 dof, and these pulls are the evidence that the straight
-        single-beam background is good enough -- large ones mean the arm is
-        genuinely curved and needs more w levels, not a re-fitted q.
+        Empty arrays when the block is saturated (:attr:`PairV2Config.fit_q`):
+        a zero-dof fit passes through its points, so the residual says nothing.
+        With the q columns dropped there are 2 dof, and these pulls are the
+        evidence that a straight single-beam background is good enough.
         """
         cfg = self.cfg
         used = [L for L in self.levels if L.block != "cross"]
@@ -630,12 +623,11 @@ def fit_background(
 ) -> tuple[dict[str, tuple[float, float]], np.ndarray]:
     """WLS the single-beam block -> ``(params, covariance)``.
 
-    Uses the dark, x-only and w-only levels only: five distinct settings for
-    the :attr:`PairV2Config.params_bg` parameters.  With :attr:`PairV2Config.fit_q` that is five for five
-    -- saturated, passing exactly through the level means, and the a/q split on
-    each arm is interpolation rather than measurement.  Without it, three
-    parameters and 2 dof, so the block is genuinely over-determined and its
-    residual is a real check (see :meth:`PairV2Fit.bg_residuals`).
+    Uses the dark, x-only and w-only levels: five settings for the
+    :attr:`PairV2Config.params_bg` parameters.  With
+    :attr:`PairV2Config.fit_q` that is five for five -- saturated, so the a/q
+    split is interpolation; without it, three parameters and 2 dof, whose
+    residual is a real check (:meth:`PairV2Fit.bg_residuals`).
 
     Either way the covariance comes entirely from the level sigmas, which is
     what makes the propagation into D honest.
@@ -662,29 +654,21 @@ def fit_difference(
     bg: dict[str, tuple[float, float]],
     bg_cov: np.ndarray,
     cfg: "PairV2Config",
-    *,
-    include_anchor: bool = False,
 ) -> dict:
-    """GLS ``D(w) = eta^2*w + beta0`` over the in-window cross levels.
+    """GLS ``D(w) = eta^2*w + beta0`` over every cross level at ``x = 1``.
 
-    ``D`` is formed against the *fitted* background, so all its points share the
-    background parameters and are correlated.  The covariance is built as::
+    ``D`` is formed against the FITTED background, so its points share those
+    parameters and are correlated::
 
         Cov(D) = diag(sigma_Y^2) + G Cov(bg) G^T
 
-    with ``G`` the gradient of ``Bhat(w)`` -- and the slope is then a
-    generalized least squares solution against that full matrix.  Treating the
-    points as independent here would bias the slope/intercept split, which is
-    the very thing the difference estimator exists to avoid.
-
-    ``include_anchor`` additionally puts the directly measured
-    ``D(0) = Y(1,0) - Y(0,0)`` into the fit at ``w = 0``, pinning the intercept
-    on measured data rather than on extrapolation.  Off by default: the spec
-    fits the window only and keeps ``D(0)`` as an independent check.
+    with ``G`` the gradient of ``Bhat(w)``, and the slope solved against that
+    full matrix.  Treating the points as independent would bias the
+    slope/intercept split -- the very thing this estimator exists to avoid.
     """
-    used = [L for L in levels if L.in_fit_window(cfg)]
+    used = [L for L in levels if L.on_cross_line()]
     if len(used) < 2:
-        raise ValueError(f"need >= 2 cross levels in {cfg.fit_w_range}, got {len(used)}")
+        raise ValueError(f"need >= 2 cross levels at x = 1, got {len(used)}")
 
     w = np.array([L.w for L in used], dtype=float)
     y = np.array([L.mean for L in used], dtype=float)
@@ -693,19 +677,6 @@ def fit_difference(
     g = grad_bg_w(w, cfg)
     d = y - (g @ np.array([bg[n][0] for n in cfg.params_bg]))
     cov_d = np.diag(y_sig**2) + g @ bg_cov @ g.T
-
-    if include_anchor:
-        dark = _level_at(levels, 0.0, 0.0)
-        x_on = _level_at(levels, 1.0, 0.0)
-        if dark is not None and x_on is not None:
-            # D(0) = Y(1,0) - Y(0,0), measured directly: no background model in
-            # it at all, so it is uncorrelated with the other D points.
-            w = np.append(w, 0.0)
-            d = np.append(d, x_on.mean - dark.mean)
-            extra = x_on.sigma**2 + dark.sigma**2
-            cov_d = np.pad(cov_d, ((0, 1), (0, 1)))
-            cov_d[-1, -1] = extra
-            y_sig = np.append(y_sig, np.sqrt(extra))
 
     a = np.column_stack([w, np.ones_like(w)])
     cov_inv = np.linalg.pinv(cov_d)
@@ -734,13 +705,17 @@ def _level_at(levels: list[Level], x: float, w: float) -> Level | None:
 
 
 def fit_pair(
-    index: int, levels: list[Level], cfg: "PairV2Config" | None = None, *,
-    include_anchor: bool = False,
+    index: int, levels: list[Level], cfg: "PairV2Config" | None = None,
 ) -> PairV2Fit:
-    """Background block, then the difference slope; plus both consistency checks."""
+    """Background block, then the difference slope; plus the product check.
+
+    ``cfg`` supplies only ``params_bg`` (the q switch) and the label convention.
+    Which levels are fitted is read off ``levels`` -- a recorded CSV is fitted
+    exactly as it was swept, whatever the current sweep settings are.
+    """
     cfg = DEFAULT_CONFIG if cfg is None else cfg
     bg, bg_cov = fit_background(levels, cfg)
-    df = fit_difference(levels, bg, bg_cov, cfg, include_anchor=include_anchor)
+    df = fit_difference(levels, bg, bg_cov, cfg)
 
     b, beta0 = float(df["beta"][0]), float(df["beta"][1])
     b_err = float(np.sqrt(max(df["cov"][0, 0], 0.0)))
@@ -751,122 +726,68 @@ def fit_pair(
     else:
         eta, eta_err = float("nan"), float("nan")
 
-    # anchor: D(0) straight off the measured levels, no background model in it
-    dark = _level_at(levels, 0.0, 0.0)
-    x_on = _level_at(levels, 1.0, 0.0)
-    if dark is not None and x_on is not None:
-        anchor = (x_on.mean - dark.mean,
-                  float(np.hypot(x_on.sigma, dark.sigma)))
-    else:
-        anchor = (float("nan"), float("nan"))
-
-    # top-drive diagnostic: cross-line levels the slope fit deliberately skipped
-    # (verification levels are not on this line and are handled separately)
-    excluded = []
-    for L in levels:
-        if not L.on_cross_line(cfg) or L.in_fit_window(cfg):
-            continue
-        g = grad_bg_w([L.w], cfg)
-        d_meas = L.mean - float((g @ np.array([bg[n][0] for n in cfg.params_bg]))[0])
-        d_err = float(np.sqrt(L.sigma**2 + float((g @ bg_cov @ g.T)[0, 0])))
-        a_row = np.array([L.w, 1.0])
-        d_pred = float(a_row @ df["beta"])
-        d_pred_err = float(np.sqrt(max(a_row @ df["cov"] @ a_row, 0.0)))
-        excluded.append((L.w, d_meas, d_err, d_pred, d_pred_err))
-
     fit = PairV2Fit(
         index=index, cfg=cfg, levels=levels, bg=bg, bg_cov=bg_cov,
         fit_w=df["w"], fit_d=df["d"], fit_sigma=df["sigma"], fit_pred=df["pred"],
         b=b, b_err=b_err, beta0=beta0, beta0_err=beta0_err,
         eta=eta, eta_err=eta_err, r2=float(df["r2"]),
-        anchor=anchor, excluded=excluded,
     )
-    fit.checks = {
-        "intercept": verify_intercept(fit),
-        "product": verify_product(fit),
-    }
+    fit.checks = {"product": verify_product(fit)}
     return fit
 
 
 # ======================================================================
-# verification  (checks on the model, not inputs to it)
+# verification  (a check on the model, not an input to it)
 # ======================================================================
 
-def verify_intercept(fit: "PairV2Fit") -> dict:
-    """Check 1 -- the fitted intercept must equal the single-beam x-side sum.
+def product_groups(levels: list[Level], *, decimals: int = 3) -> list[list[Level]]:
+    """Cross-block levels sharing a product ``x*w`` at different ``(x, w)``.
 
-    ``D(w) = eta^2*w + (a_x + q_x)`` -- or ``+ a_x`` alone without the q columns
-    -- so the cross line extrapolated to ``w = 0`` has to land on the x-side
-    response measured independently in the x-only block.  A disagreement means
-    the cross line is not the straight line the estimator assumes; curvature
-    over the fit window shows up here first, because extrapolating to zero
-    amplifies it.
-
-    With :attr:`PairV2Config.fit_q` the background block is saturated, so the x-side sum
-    equals the raw ``Y(1,0) - Y(0,0)`` exactly and this is the same statement as
-    the anchor check, just phrased through the fitted parameters.  Without it
-    the block carries 2 dof, the x-only levels are no longer reproduced exactly,
-    and the two genuinely differ -- so the check has teeth on the standard grid.
-
-    ``beta0`` and the x-side sum are not independent -- the background
-    covariance is inside ``beta0``'s error -- so the quoted joint error is an
-    overestimate and the pull is conservative.
+    Found in the data rather than declared, so a recorded CSV carries its own
+    product check: ``(VERIFY_X, VERIFY_W)`` and ``(0.5, 0.5)`` share 0.25.  Ramp
+    levels all sit at ``x = 1`` with distinct ``w``, so they never form a group.
+    Each group is ordered hardest x side first.
     """
-    cfg = fit.cfg
-    idx = [cfg.params_bg.index(n) for n in cfg.x_side]
-    value = float(sum(fit.bg[n][0] for n in cfg.x_side))
-    # sum of the full sub-block, i.e. Var(a_x) + 2Cov(a_x,q_x) + Var(q_x)
-    var = float(fit.bg_cov[np.ix_(idx, idx)].sum())
-    err = float(np.sqrt(max(var, 0.0)))
-    diff = fit.beta0 - value
-    joint = float(np.hypot(fit.beta0_err, err))
-    return {
-        "beta0": fit.beta0, "beta0_err": fit.beta0_err,
-        "a_x_plus_q_x": value, "a_x_plus_q_x_err": err,
-        "diff": diff, "err": joint,
-        "pull": diff / joint if joint else float("nan"),
-    }
+    by_product: dict[float, list[Level]] = {}
+    for L in levels:
+        if L.block == "cross":
+            by_product.setdefault(round(L.x * L.w, decimals), []).append(L)
+    return [sorted(g, key=lambda L: -L.x)
+            for g in by_product.values() if len(g) >= 2]
 
 
 def verify_product(fit: "PairV2Fit") -> list[dict]:
-    """Check 2 -- ``Y`` must depend on the drives only through the product ``x*w``.
+    """``Y`` must depend on the drives only through the product ``x*w``.
 
-    For each group in :attr:`PairV2Config.product_checks` every member shares the same
-    ``x*w`` but splits the drive differently -- ``(1, 0.25)`` pushes the x side
-    hard, ``(0.5, 0.5)`` splits it evenly.  Subtract the full single-beam
-    background from each and what remains is the TPA term, which the model says
-    is ``eta^2*(x*w)`` and therefore identical across the group.
+    Within a :func:`product_groups` group every member shares ``x*w`` but
+    splits the drive differently -- ``(0.95, 0.263)`` pushes the x side hard,
+    ``(0.5, 0.5)`` splits it evenly.  Subtract the full single-beam background
+    and what is left is the TPA term, which the model says is ``eta^2*(x*w)``
+    and so identical across the group.
 
-    A split here is not a problem with this estimator -- it means the pair has
-    no single eta at all, because its response is not a function of the product.
-    That would invalidate the one-number-per-pair model that steps 7 and 8 are
-    built on, so it is worth measuring even though it costs acquisitions.
+    A split is not a problem with this estimator: it means the pair has no
+    single eta at all, which would invalidate the one-number-per-pair model
+    steps 7 and 8 are built on.
 
-    Both residues are built from the same fitted background, so they are
-    correlated; the difference propagates that properly via
-    ``(g_a - g_b) C (g_a - g_b)^T`` rather than adding the two errors in
-    quadrature.
+    Both residues come from the same fitted background and are correlated, so
+    the difference propagates ``(g_a - g_b) C (g_a - g_b)^T`` rather than adding
+    the two errors in quadrature.
     """
     cfg = fit.cfg
     out: list[dict] = []
     p = np.array([fit.bg[n][0] for n in cfg.params_bg])
-    for group in cfg.product_checks:
+    for group in product_groups(fit.levels):
         pts = []
-        for x, w in group:
-            level = _level_at(fit.levels, x, w)
-            if level is None:
-                continue
-            g = design_bg([x], [w], cfg)          # full background, cfg.params_bg order
+        for level in group:
+            g = design_bg([level.x], [level.w], cfg)   # full background, cfg.params_bg order
             tpa = level.mean - float((g @ p)[0])
             pts.append({
-                "x": x, "w": w, "n": level.n, "tpa": tpa,
+                "x": level.x, "w": level.w, "n": level.n, "tpa": tpa,
                 "tpa_err": float(np.sqrt(level.sigma**2
                                          + float((g @ fit.bg_cov @ g.T)[0, 0]))),
                 "_g": g[0], "_sigma": level.sigma,
             })
-        if len(pts) < 2:
-            continue
-        product = float(group[0][0] * group[0][1])
+        product = float(np.mean([L.x * L.w for L in group]))
         rec = {"product": product, "expected": fit.b * product,
                "points": pts, "pairs": []}
         for i in range(len(pts)):
@@ -897,27 +818,25 @@ def _sigma_ratio(value: float, err: float) -> float:
 
 
 def report(fit: PairV2Fit) -> None:
-    """Print the level table, both fit stages and the two consistency checks."""
+    """Print the level table, both fit stages and the product check."""
     cfg = fit.cfg
-    lo, hi = cfg.fit_w_range
+    lo, hi = fit.fit_w_range
     print("Estimator: difference   "
           f"D(w) = Y(1,w) - [{cfg.bhat_label}] = eta^2 w + ({cfg.x_side_label})")
-    print(f"Fit window: w in [{lo:.2f}, {hi:.2f}]  ({fit.fit_w.size} levels)")
+    print(f"Fit window: w in [{lo:.2f}, {hi:.2f}]  ({fit.fit_w.size} levels, "
+          "the cross line as swept)")
 
+    floor_v = fit.levels[0].floor
+    floor_src = fit.levels[0].floor_source
     print(f"\n  Level means  (sigma = hypot(max(rep_std, trace_std)/sqrt(n), "
-          f"{STD_FLOOR_V*1e3:.3f} mV systematic floor)):")
+          f"{floor_v*1e3:.3f} mV floor [{floor_src}])):")
     print("    block     x     w   n   mean(mV)  rep_std(mV)  trace_std(mV)  sigma(mV)")
     for L in fit.levels:
-        tag = L.block
-        if L.is_verification(cfg):
-            tag = "verify+"
-        elif L.block == "cross" and not L.in_fit_window(cfg):
-            tag = "cross*"
+        tag = "verify" if L.is_verification() else L.block
         rep = f"{L.rep_std*1e3:11.4f}" if np.isfinite(L.rep_std) else f"{'--':>11}"
-        print(f"    {tag:<7} {L.x:5.2f} {L.w:5.2f} {L.n:3d} {L.mean*1e3:10.4f} "
+        print(f"    {tag:<7} {L.x:5.2f} {L.w:5.3f} {L.n:3d} {L.mean*1e3:10.4f} "
               f"{rep}  {L.trace_std*1e3:13.4f} {L.sigma*1e3:10.4f}")
-    print("    (* excluded from the slope fit -- top-drive diagnostic; "
-          "+ verification only)")
+    print("    (verify: off the x = 1 line -- product check only, not on the slope)")
 
     repeated = [L for L in fit.levels if np.isfinite(L.rep_std)]
     if not repeated:
@@ -973,59 +892,27 @@ def report(fit: PairV2Fit) -> None:
     rms = float(np.sqrt(np.mean(fit.residuals**2)))
     print(f"    residual RMS = {rms*1e3:.4f} mV")
 
-    print("\n  Checks:")
-    a_val, a_err = fit.anchor
-    if np.isfinite(a_val):
-        pull = (a_val - fit.beta0) / np.hypot(a_err, fit.beta0_err)
-        print(f"    anchor      D(0) measured = {a_val*1e3:8.4f} +/- {a_err*1e3:.4f} mV  "
-              f"vs beta0 = {fit.beta0*1e3:8.4f} mV   pull = {pull:+.2f}")
-    for w, dm, dme, dp, dpe in fit.excluded:
-        frac = (dm / dp - 1.0) * 100.0 if dp else float("nan")
-        pull = (dm - dp) / np.hypot(dme, dpe) if np.hypot(dme, dpe) else float("nan")
-        print(f"    top-drive   D({w:.2f}) measured = {dm*1e3:8.4f} +/- {dme*1e3:.4f} mV  "
-              f"vs line = {dp*1e3:8.4f} mV   {frac:+.2f}%  (pull {pull:+.2f})")
-
     report_verification(fit)
 
 
 def report_verification(fit: PairV2Fit) -> None:
-    """The two model checks: the intercept identity and product-only dependence.
+    """The product-only dependence check.
 
-    Neither feeds the fit -- they say whether the model eta is defined within
+    It does not feed the fit -- it says whether the model eta is defined within
     still holds on this pair.
     """
-    cfg = fit.cfg
-    checks = fit.checks or {}
-    print("\n  Verification (checks on the model, not inputs to it):")
-
-    ic = checks.get("intercept")
-    if ic:
-        verdict = "OK" if abs(ic["pull"]) < 3.0 else "** CHECK **"
-        print(f"    1. intercept identity   beta0 = eta^2*0 + ({cfg.x_side_label})")
-        print(f"       beta0       = {ic['beta0']*1e3:9.4f} +/- {ic['beta0_err']*1e3:.4f} mV "
-              f"(cross line extrapolated to w=0)")
-        print(f"       {cfg.x_side_label:<11} = {ic['a_x_plus_q_x']*1e3:9.4f} +/- "
-              f"{ic['a_x_plus_q_x_err']*1e3:.4f} mV (x-only block)")
-        print(f"       difference  = {ic['diff']*1e3:+9.4f} +/- {ic['err']*1e3:.4f} mV   "
-              f"pull = {ic['pull']:+.2f}   {verdict}")
-        n_bg = sum(1 for L in fit.levels if L.block != "cross")
-        if n_bg == len(cfg.params_bg):
-            print(f"       (background block is saturated, so {cfg.x_side_label} is exactly "
-                  "the measured Y(1,0) - Y(0,0);")
-            print("        this therefore tests the cross line's extrapolation, "
-                  "not the arithmetic)")
-
-    prods = checks.get("product") or []
+    prods = (fit.checks or {}).get("product") or []
+    print("\n  Verification (a check on the model, not an input to it):")
     if not prods:
-        print("    2. product-only dependence: NOT MEASURED "
-              "(needs the verification levels -- set cfg.verify_enabled = True and re-run)")
+        print("    product-only dependence: NOT MEASURED (no two cross levels share "
+              "an x*w -- set cfg.verify_enabled = True and re-run)")
         return
-    print("    2. product-only dependence   Y depends on (x, w) only via x*w")
+    print("    product-only dependence   Y depends on (x, w) only via x*w")
     for rec in prods:
         print(f"       x*w = {rec['product']:.3f}   "
               f"model expects eta^2*(x*w) = {rec['expected']*1e3:.4f} mV")
         for pt in rec["points"]:
-            print(f"         ({pt['x']:.2f}, {pt['w']:.2f}) n={pt['n']}  "
+            print(f"         ({pt['x']:.2f}, {pt['w']:.3f}) n={pt['n']}  "
                   f"TPA residue = {pt['tpa']*1e3:9.4f} +/- {pt['tpa_err']*1e3:.4f} mV")
         for pr in rec["pairs"]:
             verdict = "OK" if abs(pr["pull"]) < 3.0 else "** CHECK **"
@@ -1037,28 +924,20 @@ def report_verification(fit: PairV2Fit) -> None:
 def make_plot(fig, fit: PairV2Fit) -> None:
     """Six panels drawn into ``fig`` -- a Matplotlib Figure the caller owns.
 
-    Taking the figure rather than making one is what lets the GUI render
-    this onto a canvas and the offline script save the identical PNG, from
-    one implementation.  :func:`save_plot` is the headless wrapper.
+    Taking the figure rather than making one is what lets the GUI draw this on a
+    canvas and the offline script save the identical PNG from one
+    implementation; :func:`save_plot` is the headless wrapper.
 
-    Top-left -- the single-beam block: x-only and w-only level means with the
-    saturated background curves through them, plus the shared dark point.
-
-    Top-right -- **the estimator**: ``D(w)`` against ``w`` with the GLS line.
-    The fit window is shaded; the excluded top-drive level is drawn as an open
-    marker, and the directly measured ``D(0)`` anchor as a square, so the two
-    consistency checks are visible rather than buried in the text report.
-
-    Bottom-left -- pulls of the fitted D points against the +/-1 sigma band.
-
-    Bottom-right -- repeatability: each level's repeat scatter beside its trace
-    noise.  Bars above the diagonal are levels where rewriting the SLM moves the
-    reading more than the detector does, which is what the repeats are for.
-
-    The remaining two panels are the product check and the verification text.
+    Top-left, the single-beam block with its background curves and the shared
+    dark point.  Top-right, THE ESTIMATOR: ``D(w)`` with the GLS line and the
+    fitted range shaded.  Bottom-left, pulls against the +/-1 sigma band.
+    Bottom-right, repeatability -- each level's repeat scatter beside its trace
+    noise, where a bar above the diagonal means rewriting the SLM moves the
+    reading more than the detector does.  The other two are the product check
+    and its summary text.
     """
     cfg = fit.cfg
-    lo, hi = cfg.fit_w_range
+    lo, hi = fit.fit_w_range
     fig.clear()
     axes = fig.subplots(2, 3)
     (ax1, ax2, ax5), (ax3, ax4, ax6) = axes
@@ -1100,7 +979,7 @@ def make_plot(fig, fit: PairV2Fit) -> None:
 
     # --- the difference line: this is the estimator --------------------------
     ax2.axvspan(lo, hi, color="tab:green", alpha=0.10, zorder=0,
-                label=f"fit window [{lo:g}, {hi:g}]")
+                label=f"fitted range [{lo:g}, {hi:g}]")
     w_fine = np.linspace(0.0, 1.05, 200)
     ax2.plot(w_fine, (fit.b * w_fine + fit.beta0) * 1e3, "-", color="tab:green",
              lw=1.5, zorder=2, label="GLS  $D = \\eta^2 w + \\beta_0$")
@@ -1109,15 +988,6 @@ def make_plot(fig, fit: PairV2Fit) -> None:
                  yerr=fit.fit_sigma[order] * 1e3, fmt="o", color="tab:green",
                  ms=6, capsize=2, lw=0.8, mec="k", mew=0.3, zorder=4,
                  label="$D(w)$ fitted")
-    for w, dm, dme, _dp, _dpe in fit.excluded:
-        ax2.errorbar([w], [dm * 1e3], yerr=[dme * 1e3], fmt="o", mfc="none",
-                     color="tab:red", ms=8, capsize=2, lw=0.9, mew=1.2, zorder=4,
-                     label="excluded (top drive)")
-    a_val, a_err = fit.anchor
-    if np.isfinite(a_val):
-        ax2.errorbar([0.0], [a_val * 1e3], yerr=[a_err * 1e3], fmt="s",
-                     color="tab:purple", ms=7, capsize=2, lw=0.9, mec="k",
-                     mew=0.3, zorder=4, label="$D(0)$ measured (anchor)")
     ax2.text(0.03, 0.97,
              f"eta = {fit.eta:.4g} $\\pm$ {fit.eta_err:.2g}  "
              f"({_sigma_ratio(fit.eta, fit.eta_err):.0f}$\\sigma$)\n"
@@ -1129,12 +999,7 @@ def make_plot(fig, fit: PairV2Fit) -> None:
     ax2.set_xlabel("w   (x = 1 on this line)")
     ax2.set_ylabel("$D(w) = Y(1,w) - \\hat{B}(w)$   (mV)")
     ax2.set_title("Difference estimator -- $\\eta$ is this slope")
-    # de-duplicate the repeated "excluded" label
-    h, lb = ax2.get_legend_handles_labels()
-    seen: dict[str, object] = {}
-    for handle, name in zip(h, lb):
-        seen.setdefault(name, handle)
-    ax2.legend(seen.values(), seen.keys(), loc="lower right", fontsize=8)
+    ax2.legend(loc="lower right", fontsize=8)
 
     # --- pulls ---------------------------------------------------------------
     ax3.axhspan(-1, 1, color="tab:blue", alpha=0.12, label="$\\pm1\\sigma$")
@@ -1219,31 +1084,18 @@ def make_plot(fig, fit: PairV2Fit) -> None:
 
     # --- verification summary text ------------------------------------------
     ax6.axis("off")
-    lines = ["Verification", ""]
-    ic = (fit.checks or {}).get("intercept")
-    if ic:
-        lines += [
-            f"1. intercept identity   $\\beta_0$ = {cfg.x_side_label}",
-            f"     $\\beta_0$ = {ic['beta0']*1e3:8.4f} $\\pm$ "
-            f"{ic['beta0_err']*1e3:.4f} mV",
-            f"     {cfg.x_side_label} = {ic['a_x_plus_q_x']*1e3:8.4f} $\\pm$ "
-            f"{ic['a_x_plus_q_x_err']*1e3:.4f} mV",
-            f"     pull = {ic['pull']:+.2f}   "
-            f"{'OK' if abs(ic['pull']) < 3 else 'CHECK'}",
-            "",
-        ]
+    lines = ["Verification", "", "product-only dependence"]
     if prods:
-        lines.append("2. product-only dependence")
         for rec in prods:
-            lines.append(f"     $x\\,w$ = {rec['product']:g}")
+            lines.append(f"     $x\\,w$ = {rec['product']:.3g}")
             for pr in rec["pairs"]:
                 lines.append(
                     f"     {pr['a']} vs {pr['b']}: {pr['frac']*100:+.2f}%   "
                     f"pull = {pr['pull']:+.2f}   "
                     f"{'OK' if abs(pr['pull']) < 3 else 'CHECK'}")
     else:
-        lines += ["2. product-only dependence", "     not measured"]
-    lines += ["", "Neither check feeds the fit -- they say whether",
+        lines.append("     not measured")
+    lines += ["", "The check does not feed the fit -- it says whether",
               "the model $\\eta$ is defined within still holds."]
     ax6.text(0.02, 0.98, "\n".join(lines), transform=ax6.transAxes, va="top",
              ha="left", fontsize=9, family="monospace",
@@ -1283,15 +1135,14 @@ def write_meas_csv(rows_by_pair: dict[int, list], path: str | Path,
                    *, meta: Mapping[str, object] | None = None) -> Path:
     """Raw rows, v1's column layout (``trial`` carries the repeat index).
 
-    Keeping v1's columns means the same file can be re-fit with v1's joint
-    6-parameter estimator for a direct comparison of the two estimators on
-    identical data.
+    v1's columns, so the same file can be re-fit with v1's joint 6-parameter
+    estimator and the two compared on identical data.
 
-    A row is ``(rep, x, w, mean_v, std_v)`` or that plus the two PMT-thermistor
-    cells; rows without them get the columns blank, so one sweep's file has one
-    shape whether or not the 2400 was there.  ``meta``, if given, is appended as
-    trailing ``# key,value`` lines -- where the run brackets itself with a
-    start and end temperature.
+    A row is ``(rep, x, w, mean_v, std_v)``, optionally plus the two
+    PMT-thermistor cells; without them those columns are blank, so one sweep's
+    file has one shape whether or not the 2400 was there.  ``meta`` is appended
+    as trailing ``# key,value`` lines, where a run brackets itself with a start
+    and end temperature.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1348,7 +1199,6 @@ def _checks_dict(fit: PairV2Fit) -> dict:
     """JSON-safe view of the verification results (drops the working arrays)."""
     checks = fit.checks or {}
     return {
-        "intercept": checks.get("intercept"),
         "product": [
             {
                 "product": rec["product"],
@@ -1383,30 +1233,32 @@ def save_step6_section(fits: list[PairV2Fit], run: str | Path,
                        dropped_bursts: dict[int, list[dict]] | None = None,
                        csv: str | Path | None = None,
                        log=print):
-    """Write every v2 pair fit as the ``step6`` section of the run's calib.json.
+    """Write every v2 pair fit as the run's ``step6`` section.
 
     ``channels[].fit.{eta, eta_err, params.{a_x,q_x,a_w,q_w,d}.value}`` is the
     contract :meth:`calibration_module.fit.phase.PairModel.from_json_channel`
-    parses, so step 7 consumes this section with no change.  The v2-specific
-    numbers (the slope, the fit window, both checks) ride alongside it.
+    parses, so step 7 consumes this with no change; the v2-specific numbers
+    ride alongside.  ``grid`` is the levels AS MEASURED -- what the CSV holds,
+    not what a sweep was asked for.
 
-    The step-3 calibration is NOT copied in.  It is already the ``step3`` section
-    of the same file, and writing a new one drops this section, so the layout a
-    result was measured through cannot drift from the layout the file reports --
-    which is what embedding a copy used to be guarding against.
+    ``csv`` is the sweep this came from, stored relative to the run directory.
+    ``dropped_bursts`` maps a pair index to the burst acquisitions left out of
+    its fit, so a result traces back to the rows that made it and a glitching
+    bench cannot later be mistaken for a clean one.
 
-    ``csv`` is the sweep this fit came from, stored relative to the run
-    directory.  ``dropped_bursts`` maps a pair index to the burst acquisitions
-    (:func:`burst_rows`) left out of its fit, so a result can always be traced
-    back to the rows that made it and a run whose bench was glitching cannot be
-    mistaken later for a clean one.
+    Step 3 is not copied in: it is the ``step3`` section of the same file, and
+    writing a new one drops this section, so the layout a result was measured
+    through cannot drift from the layout the file reports.
     """
     from calibration_module.calib_file import load_calib, write_section
 
+    if not fits:
+        raise ValueError("no pair fits to save")
     # A step 6 with no layout above it is not interpretable; say so before the
     # file is touched rather than leaving a section nothing can read.
     load_calib(run, missing_ok=True).require(3)
     cfg = fits[0].cfg
+    first = fits[0]
 
     def _fit_dict(fit: PairV2Fit) -> dict:
         params = {n: {"value": v, "err": e} for n, (v, e) in fit.bg.items()}
@@ -1422,15 +1274,9 @@ def save_step6_section(fits: list[PairV2Fit], run: str | Path,
             "params": params,
             "r2": fit.r2,
             "estimator": "difference",
-            "fit_w_range": list(cfg.fit_w_range),
-            "anchor_d0": {"value": fit.anchor[0], "err": fit.anchor[1]},
+            "fit_w_range": list(fit.fit_w_range),
             "checks": _checks_dict(fit),
             "background": _background_dict(fit),
-            "excluded": [
-                {"w": w, "d_meas": dm, "d_meas_err": dme,
-                 "d_line": dp, "d_line_err": dpe}
-                for w, dm, dme, dp, dpe in fit.excluded
-            ],
             "levels": [
                 {"x": L.x, "w": L.w, "n": L.n, "mean_v": L.mean,
                  "rep_std_v": None if not np.isfinite(L.rep_std) else L.rep_std,
@@ -1444,12 +1290,15 @@ def save_step6_section(fits: list[PairV2Fit], run: str | Path,
         "estimator": "difference",
         "fit_q": cfg.fit_q,
         "params_bg": list(cfg.params_bg),
-        "fit_w_range": list(cfg.fit_w_range),
-        "grid": [{"x": x, "w": w, "n": n} for x, w, n in cfg.grid],
-        "verify_grid": ([{"x": x, "w": w, "n": n} for x, w, n in cfg.verify_grid]
-                        if cfg.verify_enabled else []),
-        "product_checks": [[list(pt) for pt in group] for group in cfg.product_checks],
+        "fit_w_range": list(first.fit_w_range),
+        # As measured: every distinct level in the file with its repeat count.
+        "grid": [{"x": L.x, "w": L.w, "n": L.n} for L in first.levels],
         "center_wl": center_wl,
+        # The floor these etas were weighted by -- this sweep's own dark level.
+        # Recorded because it is a voltage: an eta_err is only comparable with
+        # another night's once you know both runs' floors (see fit.sigma).
+        "sigma_floor_v": float(first.levels[0].floor),
+        "sigma_floor_source": str(first.levels[0].floor_source),
         "dropped_bursts": {str(k): v for k, v in (dropped_bursts or {}).items()},
         "channels": [
             {

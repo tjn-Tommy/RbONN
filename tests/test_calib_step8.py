@@ -94,79 +94,55 @@ class BuildTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Solving the ladder takes seconds, and every test here reads the same
+        # Solving the band takes seconds, and every test here reads the same
         # plan, so it is built once.
         cls.models, cls.phases, cls.pairs = model()
         cls.scale, cls.patterns, cls.preds = SA.build(
             cls.models, cls.phases, cls.pairs, seed=101)
 
-    def counts(self):
-        return {k: sum(1 for p in self.patterns if p.kind == k) for k in "ABCF"}
+    def alphas(self):
+        return np.array([p.alpha for p in self.patterns])
 
-    def test_the_sweep_is_the_two_bands_and_the_bracket_and_nothing_else(self):
-        c = self.counts()
-        self.assertEqual(c["A"], SA.LADDER + SA.LADDER_LOW)
-        self.assertEqual(c["F"], 2)
-        self.assertEqual(c["B"], 0)
-        self.assertEqual(c["C"], 0)
+    def test_the_sweep_is_one_band_and_nothing_else(self):
+        """One family, n rungs.  No second band, no bracket, no stray kinds."""
+        self.assertEqual(len(self.patterns), SA.LADDER)
+        self.assertEqual({p.kind for p in self.patterns}, {"A"})
 
-    def test_the_ceiling_brackets_the_run(self):
-        self.assertEqual(self.patterns[0].kind, "F")
-        self.assertEqual(self.patterns[-1].kind, "F")
-        self.assertTrue(self.patterns[0].label.endswith("@start"))
-        self.assertTrue(self.patterns[-1].label.endswith("@end"))
-        self.assertFalse(any(p.kind == "F" for p in self.patterns[1:-1]))
+    def test_every_rung_is_a_distinct_drive(self):
+        """Stratified with jitter, so no two rungs ask for the same level."""
+        a = self.alphas()
+        self.assertEqual(len(set(np.round(a, 9).tolist())), len(a))
 
-    def test_the_bracket_is_the_top_of_the_ladder(self):
-        """The fit lives at the top, so the bracket has to BE the top."""
-        cap = SA.ladder_levels(self.scale.fs)["cap"]
-        alpha = max(p.alpha for p in self.patterns if p.kind == "A")
-        for p in (self.patterns[0], self.patterns[-1]):
-            self.assertAlmostEqual(p.alpha, cap, places=6)
-            self.assertGreaterEqual(p.alpha + 1e-9, alpha)
-        # and both ends drive the identical frame, or the drift bracket is not one
-        np.testing.assert_array_equal(self.patterns[0].x, self.patterns[-1].x)
-        np.testing.assert_array_equal(self.patterns[0].w, self.patterns[-1].w)
+    def test_the_band_is_the_requested_alphas(self):
+        a = self.alphas()
+        hi = SA.alpha_for_volts(self.scale.fs)
+        self.assertGreaterEqual(a.min(), SA.ALPHA_LO - 1e-9)
+        self.assertLessEqual(a.max(), hi + 1e-6)
+        # and it REACHES both ends: within one stratum's width of either edge
+        width = (hi - SA.ALPHA_LO) / SA.LADDER
+        self.assertLess(a.min(), SA.ALPHA_LO + width)
+        self.assertGreater(a.max(), hi - width)
 
-    def test_the_ladder_is_not_in_level_order(self):
+    def test_the_band_is_not_in_level_order(self):
         """Ascending order would alias drift onto the level axis."""
-        alpha = [p.alpha for p in self.patterns if p.kind == "A"]
-        self.assertFalse(alpha == sorted(alpha))
-        # Scale-free, because the band's width is a bench number now: a sorted
-        # ladder steps by span/(n-1) between neighbours, a shuffled one by
-        # O(span).  Anything past a few times the sorted step is not an order.
-        span = max(alpha) - min(alpha)
-        self.assertGreater(np.mean(np.abs(np.diff(alpha))),
-                           5 * span / (len(alpha) - 1))
+        a = list(self.alphas())
+        self.assertFalse(a == sorted(a))
+        # Scale-free, because the band's width is a bench number: a sorted band
+        # steps by span/(n-1) between neighbours, a shuffled one by O(span).
+        span = max(a) - min(a)
+        self.assertGreater(np.mean(np.abs(np.diff(a))),
+                           5 * span / (len(a) - 1))
 
-    def test_the_bright_band_holds_the_leverage(self):
-        """LADDER rungs above the floor, LADDER_LOW below, and no strays."""
-        lv = SA.ladder_levels(self.scale.fs)
-        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
-        self.assertEqual(int((alpha >= lv["floor"] - 1e-9).sum()), SA.LADDER)
-        self.assertEqual(int((alpha < lv["floor"] - 1e-9).sum()), SA.LADDER_LOW)
-
-    def test_the_bright_band_is_covered_evenly(self):
+    def test_the_band_is_covered_evenly(self):
         """Stratified, so 30 rungs cannot leave a tenth of the band empty."""
-        lv = SA.ladder_levels(self.scale.fs)
-        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
-        bright = alpha[alpha >= lv["floor"] - 1e-9]
-        bins = np.clip(((bright - lv["floor"]) / (lv["cap"] - lv["floor"])
-                        * 10).astype(int), 0, 9)
+        a = self.alphas()
+        hi = SA.alpha_for_volts(self.scale.fs)
+        bins = np.clip(((a - SA.ALPHA_LO) / (hi - SA.ALPHA_LO) * 10).astype(int),
+                       0, 9)
         self.assertEqual(len(set(bins.tolist())), 10)
 
-    def test_the_low_rungs_reach_down_to_the_check_floor(self):
-        """They are not leverage; they are the only reads near the ONN median."""
-        lv = SA.ladder_levels(self.scale.fs)
-        alpha = np.array([p.alpha for p in self.patterns if p.kind == "A"])
-        low = alpha[alpha < lv["floor"] - 1e-9]
-        self.assertGreaterEqual(low.min(), lv["low"] - 1e-9)
-        # inside the first stratum of the low band, so genuinely near the floor
-        width = (lv["floor"] - lv["low"]) / SA.LADDER_LOW
-        self.assertLess(low.min(), lv["low"] + width)
-
-    def test_a_bright_bench_stops_at_the_ceiling_in_VOLTS(self):
-        """The whole point of the cap: 450 mV, whatever Y_max happens to be.
+    def test_a_bright_bench_stops_where_the_volts_say(self):
+        """alpha_hi defaults to the ceiling VOLTAGE over this model's Y_max.
 
         The file on disk is dimmer than the ceiling, so this uses a scaled model
         -- the present bench, where Y_max is 1534 mV against a 1 V amplifier.
@@ -174,85 +150,115 @@ class BuildTests(unittest.TestCase):
         hot, phases, pairs = hot_model(1.534)
         scale, patterns, preds = SA.build(hot, phases, pairs, seed=5)
         self.assertAlmostEqual(scale.fs, 1.534, places=6)
-        lv = SA.ladder_levels(scale.fs)
-        self.assertTrue(lv["capped"])
         coh = [float(V.predict(hot, phases, pairs, p.x, p.w, coherent=True))
                for p in patterns]
-        self.assertAlmostEqual(max(coh), SA.LADDER_CEILING_V, places=4)
+        # Within one stratum of the ceiling, not ON it: with the bracket gone
+        # nothing drives alpha_hi exactly, so it is the band's upper BOUND and
+        # the brightest rung is the top stratum's jittered sample.
+        stratum = (SA.alpha_for_volts(scale.fs) - SA.ALPHA_LO) / SA.LADDER
+        self.assertLessEqual(max(coh), SA.LADDER_CEILING_V + 1e-9)
+        self.assertGreater(max(coh),
+                           SA.LADDER_CEILING_V - stratum * scale.fs)
         # and nothing anywhere near the amplifier: that is what buys the margin
         self.assertLess(max(preds), 0.55 * SA.AMP_LIMIT_V)
 
-    def test_a_dim_bench_is_not_capped_at_all(self):
-        """Under the ceiling the atoms own the top, and alpha reaches 1."""
-        lv = SA.ladder_levels(0.300)
-        self.assertFalse(lv["capped"])
-        self.assertEqual(lv["cap"], 1.0)
+    def test_a_dim_bench_reaches_full_scale(self):
+        """Under the ceiling voltage the atoms own the top, and alpha reaches 1."""
+        self.assertEqual(SA.alpha_for_volts(0.300), 1.0)
 
-    def test_the_levels_are_the_constants_divided_by_y_max(self):
-        lv = SA.ladder_levels(1.534)
-        self.assertAlmostEqual(lv["cap"] * 1.534, SA.LADDER_CEILING_V, places=9)
-        self.assertAlmostEqual(lv["floor"] * 1.534, SA.LADDER_FLOOR_V, places=9)
-        self.assertAlmostEqual(lv["low"] * 1.534, SA.LADDER_LOW_V, places=9)
+    def test_alpha_for_volts_is_the_voltage_over_y_max(self):
+        self.assertAlmostEqual(SA.alpha_for_volts(1.534) * 1.534,
+                               SA.LADDER_CEILING_V, places=9)
+        self.assertAlmostEqual(SA.alpha_for_volts(1.534, 0.700) * 1.534,
+                               0.700, places=9)
 
-    def test_the_three_voltages_are_arguments_and_still_volts(self):
-        """The GUI and the CLI can move the band without editing the module.
-
-        In VOLTS at the boundary too, for the same reason they are volts in the
-        module: the same three numbers have to mean the same three reads after
-        the PMT gain moves.
-        """
-        for fs in (1.534, 0.900):
+    def test_the_same_voltage_is_the_same_read_at_any_gain(self):
+        """Why the ceiling stays a voltage: it has to survive a gain change."""
+        for fs in (1.534, 0.900, 0.500):
             with self.subTest(y_max_v=fs):
-                lv = SA.ladder_levels(fs, ceiling_v=0.700, floor_v=0.350,
-                                      low_v=0.040)
-                self.assertAlmostEqual(lv["cap"] * fs, 0.700, places=9)
-                self.assertAlmostEqual(lv["floor"] * fs, 0.350, places=9)
-                self.assertAlmostEqual(lv["low"] * fs, 0.040, places=9)
+                self.assertAlmostEqual(SA.alpha_for_volts(fs, 0.450) * fs,
+                                       0.450, places=9)
 
-    def test_a_moved_ceiling_moves_the_brightest_read_of_the_sweep(self):
-        """Not just the arithmetic: the solved drives land on the new volts.
-
-        This is the measurement the probe exists to enable -- find where the
-        amplifier really compresses, then put it in this box.
-        """
-        hot, phases, pairs = hot_model(1.534)
-        scale, patterns, _preds = SA.build(hot, phases, pairs, seed=7,
-                                           ceiling_v=0.700, floor_v=0.350,
-                                           low_v=0.040)
-        coh = np.array([float(V.predict(hot, phases, pairs, p.x, p.w,
-                                        coherent=True)) for p in patterns])
-        self.assertAlmostEqual(coh.max(), 0.700, places=4)
-        bright = coh[coh >= 0.350 - 1e-9]
-        self.assertEqual(len(bright), SA.LADDER + 2)      # the bracket is up here
-        self.assertAlmostEqual(coh.min(), 0.040, delta=0.055)
-
-    def test_a_raised_band_floor_crowds_the_rungs_without_moving_the_top(self):
-        hot, phases, pairs = hot_model(1.534)
-        _scale, patterns, _preds = SA.build(hot, phases, pairs, seed=7,
-                                            floor_v=0.350)
-        coh = np.array([float(V.predict(hot, phases, pairs, p.x, p.w,
-                                        coherent=True)) for p in patterns])
-        self.assertAlmostEqual(coh.max(), SA.LADDER_CEILING_V, places=4)
-        bright = np.sort(coh)[-(SA.LADDER + 2):]
-        self.assertGreaterEqual(bright.min(), 0.350 - 1e-6)
-        # and the checks still reach down to their own floor, unmoved
-        self.assertLess(coh.min(), 0.06)
-
-    def test_the_bands_stay_ordered_for_an_absurdly_dim_model(self):
-        """Clamped, so a bad step 7 cannot produce an empty or inverted band."""
+    def test_alpha_for_volts_never_exceeds_one(self):
+        """A model dimmer than the voltage cannot reach it; the top is Y_max."""
         for fs in (1e-4, 1e-3, 0.01, 0.05, 0.3, 1.0, 5.0):
             with self.subTest(y_max_v=fs):
-                lv = SA.ladder_levels(fs)
-                self.assertLess(lv["low"], lv["floor"])
-                self.assertLess(lv["floor"], lv["cap"])
-                self.assertLessEqual(lv["cap"], 1.0)
-                self.assertGreater(lv["low"], 0.0)
+                a = SA.alpha_for_volts(fs)
+                self.assertGreater(a, 0.0)
+                self.assertLessEqual(a, 1.0)
+
+    def test_a_moved_band_moves_the_brightest_read_of_the_sweep(self):
+        """Not just the arithmetic: the solved drives land on the new alphas.
+
+        This is the measurement the probe exists to enable -- find where the
+        amplifier really compresses, then put it in the box.
+        """
+        hot, phases, pairs = hot_model(1.534)
+        hi = SA.alpha_for_volts(1.534, 0.700)
+        lo = SA.alpha_for_volts(1.534, 0.350)
+        _scale, patterns, _preds = SA.build(hot, phases, pairs, seed=7,
+                                           alpha_lo=lo, alpha_hi=hi)
+        coh = np.array([float(V.predict(hot, phases, pairs, p.x, p.w,
+                                        coherent=True)) for p in patterns])
+        stratum = (hi - lo) / SA.LADDER * 1.534
+        self.assertLessEqual(coh.max(), 0.700 + 1e-9)
+        self.assertGreater(coh.max(), 0.700 - stratum)
+        self.assertGreaterEqual(coh.min(), 0.350 - 1e-6)
+        self.assertEqual(len(coh), SA.LADDER)
+
+    def test_the_rung_count_is_the_rung_count(self):
+        for n in (4, 12, 30):
+            with self.subTest(n=n):
+                _s, patterns, _p = SA.build(self.models, self.phases,
+                                            self.pairs, seed=3, n=n)
+                self.assertEqual(len(patterns), n)
+
+    def test_an_empty_band_is_refused_rather_than_clamped(self):
+        """A band with nothing in it is a typo, and silence would hide it."""
+        for lo, hi in ((0.5, 0.2), (0.3, 0.3), (0.0, 0.3), (0.2, 1.5)):
+            with self.subTest(alpha_lo=lo, alpha_hi=hi):
+                with self.assertRaises(ValueError):
+                    SA.build(self.models, self.phases, self.pairs, seed=1,
+                             alpha_lo=lo, alpha_hi=hi)
 
     def test_seed_reproduces_the_whole_plan(self):
         _, again, _ = SA.build(self.models, self.phases, self.pairs, seed=101)
         self.assertEqual([p.label for p in again], [p.label for p in self.patterns])
         for a, b in zip(again, self.patterns):
             np.testing.assert_array_equal(a.x, b.x)
+
+
+class PatternForAlphaTests(unittest.TestCase):
+    """One solved drive at one alpha -- what display and the probe both use."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models, cls.phases, cls.pairs = model()
+        cls.scale = V.full_scale(cls.models, cls.phases, cls.pairs)
+
+    def test_it_lands_on_the_requested_level(self):
+        for want in (0.05, 0.2, 0.5, 0.9):
+            with self.subTest(alpha=want):
+                p = SA.pattern_for_alpha(self.models, self.phases, self.pairs,
+                                         want, seed=11)
+                self.assertAlmostEqual(p.alpha, want, places=3)
+
+    def test_alpha_one_is_the_closed_form_ceiling(self):
+        """At alpha = 1 the level set is a single point, so there is no search."""
+        p = SA.pattern_for_alpha(self.models, self.phases, self.pairs, 1.0,
+                                 seed=11)
+        self.assertAlmostEqual(p.alpha, 1.0, places=6)
+        coh = float(V.predict(self.models, self.phases, self.pairs, p.x, p.w,
+                              coherent=True))
+        self.assertAlmostEqual(coh, self.scale.fs, places=6)
+
+    def test_it_is_an_ordinary_rung(self):
+        """Kind A, so a displayed level is a drive the sweep could have chosen."""
+        for want in (0.3, 1.0):
+            with self.subTest(alpha=want):
+                p = SA.pattern_for_alpha(self.models, self.phases, self.pairs,
+                                         want, seed=2)
+                self.assertEqual(p.kind, "A")
 
 
 class CollectTests(unittest.TestCase):
@@ -406,7 +412,7 @@ class YSatFitTests(unittest.TestCase):
     def setUpClass(cls):
         cls.models, cls.phases, cls.pairs = model()
         cls.scale, cls.patterns, cls.preds = SA.build(
-            cls.models, cls.phases, cls.pairs, seed=11, ladder=40)
+            cls.models, cls.phases, cls.pairs, seed=11, n=40)
         cls.pred = np.array([float(V.predict(cls.models, cls.phases, cls.pairs,
                                              p.x, p.w, coherent=True))
                              for p in cls.patterns])
@@ -500,13 +506,12 @@ class YSatFitTests(unittest.TestCase):
                              run / "calib_step8_0000_0000_ysat.png")
 
         self.assertAlmostEqual(result["y_sat_v"], truth, places=2)
-        fs = result["full_scale"]
-        self.assertEqual(result["n_full_scale"], 2)
-        # the ceiling was driven, so measured |E|^2 must come back at Y_max
-        self.assertAlmostEqual(fs["y_max_meas_v"], self.scale.fs, places=4)
-        self.assertAlmostEqual(fs["y_max_pred_v"], self.scale.fs, places=9)
-        # a perfect bench does not drift between the two ends
-        self.assertAlmostEqual(fs["drift_frac"], 0.0, places=9)
+        # Y_max is PREDICTED and never measured: the band stops well short of
+        # full scale on purpose, so nothing in the sweep reads it.  What the
+        # section carries is the prediction, for the 4-bit step the report draws.
+        self.assertAlmostEqual(result["y_max_pred_v"], self.scale.fs, places=9)
+        self.assertAlmostEqual(written["y_max_pred_v"], self.scale.fs, places=9)
+        self.assertNotIn("full_scale", result)
         # and the section downstream reads carries the sweep that anchored it
         self.assertAlmostEqual(written["y_sat_v"], result["y_sat_v"])
         self.assertEqual(written["csv"], "calib_step8_0000_0000.csv")
@@ -640,7 +645,7 @@ class PmtTemperatureTests(unittest.TestCase):
 
     def test_the_hook_stamps_every_read_and_survives_the_csv(self):
         models, phases, pairs = model()
-        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, n=4)
         patterns = patterns[:6]
         slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
         daq = _FakeDAQ(slm, models, phases)
@@ -665,7 +670,7 @@ class PmtTemperatureTests(unittest.TestCase):
 
     def test_run_patterns_without_a_hook_is_unchanged(self):
         models, phases, pairs = model()
-        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, n=4)
         patterns = patterns[:3]
         slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
         x = np.stack([p.x for p in patterns])[None]
@@ -713,7 +718,7 @@ class FixedRangeTests(unittest.TestCase):
 
     def _run(self, acq):
         models, phases, pairs = model()
-        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=6)
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, n=6)
         slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
         daq = _RangeSpyDAQ(slm, models, phases)
         x = np.stack([p.x for p in patterns])[None]
@@ -752,7 +757,7 @@ class ProgressCallbackTests(unittest.TestCase):
 
     def _run(self, n=4, acq=None, **kw):
         models, phases, pairs = model()
-        _, patterns, _ = SA.build(models, phases, pairs, seed=3, ladder=4)
+        _, patterns, _ = SA.build(models, phases, pairs, seed=3, n=4)
         patterns = patterns[:n]
         slm, layout = _FakeSLM(), SimpleNamespace(n_channels=len(pairs))
         x = np.stack([p.x for p in patterns])[None]
@@ -844,7 +849,9 @@ class PmtInStepsSixAndSevenTests(unittest.TestCase):
         seven = [(0, 0.5, 0.5, 0.01, 1e-4, "9070", "27.2"),
                  (1, 0.5, 0.5, 0.02, 1e-4, "9071", "27.1")]
         five = [r[:5] for r in seven]
-        a, b = P6.average_levels(seven), P6.average_levels(five)
+        floor = (1e-4, "test")                     # no dark row in these two
+        a, b = (P6.average_levels(seven, floor=floor),
+                P6.average_levels(five, floor=floor))
         self.assertEqual(len(a), 1)
         np.testing.assert_allclose(a[0].means, b[0].means)
 
@@ -930,7 +937,7 @@ class ProbeTests(unittest.TestCase):
 
     def _verdict(self, y_sat, *, fs=None, alpha=1.0, sb=1.2e-3, dark=-1.2e-4,
                  peak_extra=6e-2, mean_override=None, peak_override=None,
-                 ceiling_v=SA.LADDER_CEILING_V):
+                 alpha_hi=None):
         fs = self.FS_HOT if fs is None else fs
         coh = alpha * fs
         meas = V.saturate(coh, y_sat) + sb
@@ -940,7 +947,7 @@ class ProbeTests(unittest.TestCase):
         return SA.probe_verdict(
             alpha=alpha, y_max_v=fs, coherent_v=coh, sb_pred_v=sb,
             mean_v=meas + dark, dark_v=dark, std_v=2.2e-4,
-            peak_v=peak, range_v=1.0, ceiling_v=ceiling_v)
+            peak_v=peak, range_v=1.0, alpha_hi=alpha_hi)
 
     def test_one_read_recovers_the_y_sat_it_was_taken_under(self):
         for truth in (3.0, 4.82, 12.0):
@@ -986,32 +993,30 @@ class ProbeTests(unittest.TestCase):
         d = self._verdict(None, fs=self.FS_COLD, peak_extra=0.0)
         self.assertFalse(np.isfinite(d["y_sat_implied_v"]))
 
-    def test_a_moved_ceiling_is_what_the_probe_judges_against(self):
-        """Raise the box and a read that WAS over the ceiling stops being over it.
+    def test_a_moved_band_is_what_the_probe_judges_against(self):
+        """Raise alpha_hi and a read that WAS above the band stops being above it.
 
-        The probe is how the ceiling gets measured, so it has to answer about
-        the ceiling being tried, not about the module's default.
+        The probe is how the band's top gets measured, so it has to answer about
+        the band being tried, not about the module's default.
         """
-        d = self._verdict(4.82, alpha=0.550, ceiling_v=0.700)
-        self.assertAlmostEqual(d["ceiling_v"], 0.700)
-        self.assertAlmostEqual(d["alpha_cap"] * self.FS_HOT, 0.700, places=9)
+        top = SA.alpha_for_volts(self.FS_HOT, 0.700)
+        d = self._verdict(4.82, alpha=0.550, alpha_hi=top)
+        self.assertAlmostEqual(d["alpha_hi"] * self.FS_HOT, 0.700, places=9)
         self.assertGreater(d["measured_v"], SA.LADDER_CEILING_V)
-        self.assertFalse(d["over_ceiling"])
-        # and the default still calls that same read over the ceiling
-        self.assertTrue(self._verdict(4.82, alpha=0.550)["over_ceiling"])
+        self.assertFalse(d["over_band"])
+        # and the default band still calls that same read above it
+        self.assertTrue(self._verdict(4.82, alpha=0.550)["over_band"])
 
-    def test_it_reports_where_the_ladder_would_stop(self):
+    def test_it_reports_where_the_band_would_stop(self):
         """So the panel can say "you are above the sweep" without guessing."""
         d = self._verdict(4.82)
-        self.assertAlmostEqual(d["alpha_cap"],
-                               SA.ladder_levels(self.FS_HOT)["cap"])
-        self.assertAlmostEqual(d["ceiling_v"], SA.LADDER_CEILING_V)
-        # 835 mV against a 450 mV ceiling
-        self.assertTrue(d["over_ceiling"])
+        self.assertAlmostEqual(d["alpha_hi"], SA.alpha_for_volts(self.FS_HOT))
+        # alpha 1.0 against a band topping out at 450 mV of a 1010 mV Y_max
+        self.assertTrue(d["over_band"])
 
-    def test_a_read_inside_the_ladder_is_not_flagged_over_the_ceiling(self):
-        d = self._verdict(4.82, alpha=SA.ladder_levels(self.FS_HOT)["cap"])
-        self.assertFalse(d["over_ceiling"])
+    def test_a_read_inside_the_band_is_not_flagged_above_it(self):
+        d = self._verdict(4.82, alpha=SA.alpha_for_volts(self.FS_HOT))
+        self.assertFalse(d["over_band"])
         self.assertEqual(d["verdict"], "OK")
 
 
@@ -1054,10 +1059,10 @@ class ProbeReadTests(unittest.TestCase):
     def setUpClass(cls):
         cls.models, cls.phases, cls.pairs = model()
         cls.scale = V.full_scale(cls.models, cls.phases, cls.pairs)
-        # The GUI solves the probe pattern with ceiling_pattern, so the test
-        # drives what the bench drives.
-        cls.pattern = SA.ceiling_pattern(cls.models, cls.phases, cls.pairs,
-                                         cls.ALPHA, seed=3)
+        # The GUI and the CLI both solve the probe pattern with
+        # pattern_for_alpha, so the test drives what the bench drives.
+        cls.pattern = SA.pattern_for_alpha(cls.models, cls.phases, cls.pairs,
+                                           cls.ALPHA, seed=3)
 
     def _read(self, y_sat, rail=None, limit_v=None):
         # The 0911 file on disk tops out at ~317 mV, well under the real 1 V

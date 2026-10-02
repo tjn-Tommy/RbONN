@@ -1,39 +1,29 @@
 """The .npz the bench side consumes: what to display, and what Y to expect.
 
-This is the handover between the two halves of the project.  The training env
-(``rbonn-ml``) writes it; the bench env (``rbonn``) reads it with numpy alone and
-needs no torch.  Every number in it is in the units the bench works in: drives
-are commanded intensities in [0, 1], ready for
-``slm_module.encoding.channel_layout_from_calibration`` to turn into grayscale
-levels, and ``y_block`` is dark-free, background-free detector volts -- the
-quantity ``fit.verify.predict(..., coherent=True)`` returns and the quantity the
-bench post-processing produces.
+The handover between the two halves of the project: the training env
+(``rbonn-ml``) writes it, the bench env (``rbonn``) reads it with numpy alone.
 
-What the bench does with it
----------------------------
-For image ``n``, shot ``t`` and output ``o``: display ``x[n].reshape(79, 10)[t]``
-on the input arm and ``W[o].reshape(79, 10)[t]`` on the weight arm, read the
-detector, subtract dark and the single-beam background, and compare against
-``y_block[n, o, t]``.  Summing over ``t`` gives ``y_sum[n, o]``, and that times
-the readout gain in ``meta`` is the logit.
+In:  a trained checkpoint, and ``--images``, which is the only thing that sets
+     the bench cost -- ``N * 79 * 10`` reads, so 10 images is 7,900 and the 512
+     the protocol quotes is 404,480.  Default 10: the first question is whether
+     the bench reproduces ``y_block`` at all.
+Out: the npz, in the units the bench works in.  Drives are commanded intensities
+     in [0, 1], ready for ``slm_module.encoding``; ``y_block`` is dark-free,
+     background-free detector volts -- what ``fit.verify.predict(...,
+     coherent=True)`` returns and what the bench post-processing produces.
 
-``--images`` decides how many, and it is the only thing that decides the bench
-cost: ``N * 79 * 10`` reads, so 10 images is 7,900 and the 512 the protocol
-quotes is 404,480.  The default is 10, because the first question is whether the
-bench reproduces ``y_block`` at all, and that is answerable on a handful of
-images.  Raise it once it does.
+For image ``n``, shot ``t``, output ``o``: display ``x[n].reshape(79, 10)[t]`` on
+the input arm and ``W[o].reshape(79, 10)[t]`` on the weight arm, read, subtract
+dark and the single-beam background, compare against ``y_block[n, o, t]``.
+Summing over ``t`` gives ``y_sum[n, o]``, times the readout gain in ``meta`` for
+the logit.
 
-The padding is not dark
------------------------
-784 features over 79 shots of 10 leaves 6 channels in the last shot with no
-data.  They are padded with zero BEFORE the learned input gain, so they end up
-driven at ``tanh(in_shift[k])`` -- measured up to 0.758 on a trained onn784,
-image-independent, and interfering coherently with the 4 real channels of that
-shot.  So ``x`` ships 790 columns, not 784, and shot 78 must display all ten.
-A reconstruction from the 784 real features alone will not reproduce it.
-
-    python src/onn_module/bench_reference.py --checkpoint runs/onn784_ctrl/model.pt
-    python src/onn_module/bench_reference.py --images 512 --out runs/full.npz
+THE PADDING IS NOT DARK.  784 features over 79 shots of 10 leaves 6 channels of
+the last shot with no data, padded with zero BEFORE the learned input gain, so
+they are driven at ``tanh(in_shift[k])`` -- image-independent, and interfering
+coherently with that shot's 4 real channels.  So ``x`` ships 790 columns, shot 78
+must display all ten, and a reconstruction from the 784 real features alone will
+not reproduce it.
 """
 from __future__ import annotations
 

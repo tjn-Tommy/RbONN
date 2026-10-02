@@ -82,18 +82,18 @@ REF_INDEX = 2                   # step 7's reference pair (Phi = 0); must be in 
 VERIFY_N = (1, 2)
 
 # Per step: module stem, the constants to rebind, and its pair flags.  Every
-# step now takes ``--run <run folder>`` and reads its own input out of that
-# folder's one calib.json, so there is nothing for this script to carry from one
-# step to the next and no result file to go looking for -- which is the whole
-# point of the layout.  A step with an ``n_flag`` is run once per entry of
-# VERIFY_N.
+# step now takes ``--calib <calib.json>``, reads its own input out of that one
+# file and writes everything beside it, so there is nothing for this script to
+# carry from one step to the next and no result file to go looking for -- which
+# is the whole point of the layout.  A step with an ``n_flag`` is run once per
+# entry of VERIFY_N.
 STEPS = {
-    6: {"module": "calib_step6_v2", "out_attr": "CALIB_PATH",
+    6: {"module": "calib_step6_v2",
         "needs": (3,), "pairs_attr": "PAIR_INDICES", "pairs_flag": "--pairs"},
-    7: {"module": "calib_step7_v2", "out_attr": "CALIB_PATH",
+    7: {"module": "calib_step7_v2",
         "needs": (3, 6), "pairs_attr": "TGT_INDICES", "pairs_flag": "--targets",
         "ref_flag": "--ref"},
-    8: {"module": "calib_step8", "out_attr": "OUT_DIR",
+    8: {"module": "calib_step8",
         "needs": (3, 6, 7), "pairs_attr": "PAIRS"},
 }
 
@@ -196,15 +196,17 @@ def _set_ref_index(mod, ref_index) -> int | None:
 def run_step(n: int, run_dir: Path, *, pairs=None,
              ref_index=None, dry_run: bool = False,
              verify_n=VERIFY_N) -> Path | None:
-    """Point step ``n`` at this run folder and run it.
+    """Point step ``n`` at this folder's calib.json and run it.
 
     Nothing is returned and nothing is carried: the step writes its section into
-    ``run_dir/calib.json``, which is where the next step looks for it.
+    ``run_dir/calib.json``, which is where the next step looks for it, and every
+    output of its own lands in that file's folder.
     """
     spec = STEPS[n]
     mod = _load_step(spec["module"])
-    setattr(mod, spec["out_attr"], run_dir)     # all outputs -> the run folder
-    argv: list[str] = ["--run", str(run_dir)]
+    from calibration_module.calib_file import CALIB_NAME
+
+    argv: list[str] = ["--calib", str(run_dir / CALIB_NAME)]
     runs = ([[spec["n_flag"], str(k)] for k in verify_n]
             if spec.get("n_flag") else [[]])
     if pairs is not None:

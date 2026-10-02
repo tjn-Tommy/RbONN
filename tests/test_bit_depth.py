@@ -1,9 +1,13 @@
-"""Parity, geometry, and learned-encoding tests for the bit_depth package.
+"""Geometry, fractional-guard and learned-encoding tests for ``bit_depth``.
 
-The parity tests assert the refactored package reproduces the pre-refactor
-behavior captured in ``fixtures/bit_depth_golden.npz`` (see
-``scratchpad/capture_golden.py``). The fractional-guard and NN tests cover the
-new functionality.
+This file also used to hold a ``RefactorParityTest`` comparing the refactored
+package against ``fixtures/bit_depth_golden.npz``. That .npz was never
+committed, and neither was the ``capture_golden.py`` that wrote it, so the
+module failed to import and NOT ONE test here had ever run -- the suite's
+standing "1 error, test_bit_depth" was this. The golden cannot be rebuilt: it
+captured the pre-refactor code, which is gone, so regenerating it from today's
+package would only pin today's behaviour to itself. The parity tests are
+therefore dropped rather than skipped; what is left below needs no fixture.
 """
 from __future__ import annotations
 
@@ -19,63 +23,11 @@ sys.path.insert(0, str(ROOT))
 import bit_depth as bd  # noqa: E402
 from bit_depth import nn_encoder  # noqa: E402
 
-GOLDEN = np.load(Path(__file__).resolve().parent / "fixtures" / "bit_depth_golden.npz")
-MC_KEYS = [str(k) for k in GOLDEN["mc_keys"]]
-
-
-class RefactorParityTest(unittest.TestCase):
-    """Refactor must not change any numeric behavior."""
+class ActiveModelTest(unittest.TestCase):
+    """The one check from the old parity block that needed no golden file."""
 
     def setUp(self):
         self.c = bd.Cfg()
-        self.amp = np.array([0.0, 0.1, 0.37, 0.5, 0.83, 1.0])
-
-    def test_phase_from_targets_parity(self):
-        for enc in bd.ENCODING_ORDER:
-            phase = bd.phase_from_targets(self.c, self.amp, px_per_ch=5, guard=2, encoding=enc)
-            np.testing.assert_allclose(phase, GOLDEN[f"phase_{enc}"], atol=1e-12)
-
-    def test_amplitude_from_targets_parity(self):
-        amp = bd.amplitude_from_targets(self.c, self.amp, px_per_ch=5, guard=1, encoding="flat")
-        np.testing.assert_allclose(amp, GOLDEN["amp_flat_g1"], atol=1e-12)
-
-    def test_readout_calibration_parity(self):
-        blank, response = bd.readout_calibration(self.c, n_ch=7, px_per_ch=5, guard=1)
-        np.testing.assert_allclose(blank, GOLDEN["cal_blank"], atol=1e-12)
-        np.testing.assert_allclose(response, GOLDEN["cal_response"], atol=1e-12)
-
-    def test_transfer_curves_parity(self):
-        t, r = bd.single_channel_transfer_curve(self.c, px_per_ch=5, guard=1, n_ch=7, n_points=21)
-        np.testing.assert_allclose(t, GOLDEN["transfer_t"], atol=1e-12)
-        np.testing.assert_allclose(r, GOLDEN["transfer_r"], atol=1e-12)
-        tt, cmd, rec = bd.lut_corrected_transfer_curve(
-            self.c, px_per_ch=5, guard=1, n_ch=7, n_points=21, correction="lut"
-        )
-        np.testing.assert_allclose(tt, GOLDEN["lutc_targets"], atol=1e-12)
-        np.testing.assert_allclose(cmd, GOLDEN["lutc_command"], atol=1e-12)
-        np.testing.assert_allclose(rec, GOLDEN["lutc_recovered"], atol=1e-12)
-
-    def test_monte_carlo_geometry_parity(self):
-        for enc in bd.ENCODING_ORDER:
-            for corr in ("none", "lut"):
-                row = bd.monte_carlo_geometry(
-                    self.c, px_per_ch=5, guard=1, n_ch=7, n_trials=8, seed=0,
-                    correction=corr, encoding=enc,
-                )
-                got = np.array([row[k] for k in MC_KEYS], dtype=float)
-                np.testing.assert_allclose(
-                    got, GOLDEN[f"mc_{enc}_{corr}"], atol=1e-10, equal_nan=True,
-                    err_msg=f"mismatch for {enc}/{corr}",
-                )
-
-    def test_weights_and_power_parity(self):
-        for enc in bd.ENCODING_ORDER:
-            np.testing.assert_allclose(
-                bd.edge_taper_weights(5, enc), GOLDEN[f"weights_{enc}"], atol=1e-12
-            )
-            self.assertAlmostEqual(
-                bd.taper_active_power_factor(5, enc), float(GOLDEN[f"tapf_{enc}"]), places=12
-            )
 
     def test_validate_active_model(self):
         bd.validate_active_model(self.c)  # raises on failure
@@ -175,14 +127,21 @@ class NNEncoderTest(unittest.TestCase):
 
 
 class CalibrationDataTest(unittest.TestCase):
-    def test_nm_per_px_and_geometry(self):
-        nm = bd.measured_nm_per_px()
-        self.assertTrue(0.001 < nm < 0.02)  # ~0.0057 nm/px
-        cfg = bd.cfg_from_calibration()
-        self.assertEqual(cfg.group, 20)
+    def test_the_operating_geometry_is_15_on_20(self):
         geom = bd.operating_geometry()
         self.assertEqual(geom["px_per_ch"], 15)
         self.assertEqual(geom["guard"], 2.5)
+        self.assertEqual(geom["group_px"], 20)
+
+    def test_nm_per_px_comes_off_the_measured_calibration(self):
+        """Needs ``calibration.csv`` at the repo root, which is not committed."""
+        from bit_depth.calibration_data import CALIBRATION_CSV
+
+        if not CALIBRATION_CSV.is_file():
+            self.skipTest(f"{CALIBRATION_CSV} not in the tree")
+        nm = bd.measured_nm_per_px()
+        self.assertTrue(0.001 < nm < 0.02)  # ~0.0057 nm/px
+        self.assertEqual(bd.cfg_from_calibration().group, 20)
 
 
 if __name__ == "__main__":

@@ -1,88 +1,73 @@
 """Synthetic data generator for the step-6 / step-7 calibration chain.
 
 No hardware.  Builds ground-truth parameters for 5 pairs (= 10 SLM channels),
-evaluates the full forward model, adds noise, and writes CSVs in exactly the
-formats the real scripts read -- then optionally re-fits them with the real
-fitters and prints fitted-vs-truth::
+evaluates the full forward model, adds noise, writes CSVs in exactly the formats
+the real scripts read, then optionally re-fits them with the real fitters and
+prints fitted-vs-truth::
 
     python src/calibration_module/steps/calib_synth_v1.py             # generate + check
     python src/calibration_module/steps/calib_synth_v1.py --no-check  # generate only
-    python src/calibration_module/steps/calib_synth_v1.py --seed 7    # different noise draw
+    python src/calibration_module/steps/calib_synth_v1.py --seed 7    # another noise draw
 
-Outputs land in ``OUT_DIR`` as ``synth_truth_*.json`` (the ground truth),
-``synth_step6_*.csv`` (loads with ``calibration_module.fit.pair.load_tpa_pair_csv``
-and with ``calib_step6_v2.py <csv>``) and ``synth_step7_*.csv`` (loads with
-``calib_step7_v2.py <csv>``).
+In:  the TRUTH block below -- nothing else.
+Out: into ``OUT_DIR``, ``synth_truth_*.json`` (the ground truth),
+     ``synth_step6_*.csv`` (re-fits with ``calib_step6_v2.py <csv>`` or
+     ``fit.pair.load_tpa_pair_csv``) and ``synth_step7_*.csv`` (re-fits with
+     ``calib_step7_v2.py <csv>``).
 
-Pairs are numbered from :data:`PAIR_INDEX_BASE` (= 1), so the five pairs are
-1..5 and pair 1 is the reference -- that number is what every CSV's
-``pair_index`` / ``tgt_index`` column carries.  The truth arrays stay 0-based;
-:func:`_slot` maps a pair number onto its slot.
+Pairs are numbered from :data:`PAIR_INDEX_BASE`, so they are 1..5 with pair 1
+the reference, and that number is what every CSV's ``pair_index`` /
+``tgt_index`` column carries.  The truth arrays stay 0-based; :func:`_slot` maps
+a pair number onto its slot.
 
 The field model
 ---------------
-Each SLM channel carries a comb line.  Pair ``n`` uses two channels, ``x`` and
-``w``, and the panel puts a phase depth ``theta`` on each::
+Each SLM channel carries a comb line.  Pair ``n`` uses two, ``x`` and ``w``, and
+the panel puts a phase depth ``theta`` on each::
 
     x_n = C_n^x sin(theta_n^x / 2) exp(+j theta_n^x / 2) exp(j Psi_n^x)
     w_n = C_n^w sin(theta_n^w / 2) exp(+j theta_n^w / 2) exp(j Psi_n^w)
 
-``theta`` is what we tune (the commanded intensity is ``I = sin^2(theta/2)``, so
-``theta = 2 asin(sqrt(I))`` and the CSVs record ``I``); ``C`` is the channel's
-power; ``Psi`` is the comb phase it arrives with.  The panel phase ADDS
-(``exp(+j theta/2)``, i.e. ``u = theta/2 = asin sqrt(I)``), so a pair's field is
+``theta`` is what is tuned (the commanded intensity is ``I = sin^2(theta/2)``,
+and the CSVs record ``I``), ``C`` is the channel's power, ``Psi`` the comb phase
+it arrives with.  The panel phase ADDS, so a pair's field is
 ``eta sqrt(x w) exp(j[u + v + Phi])`` and the fringe is
 ``cos(dPhi_SLM + dPhi_comb)`` -- THE model, the one every fit in the project is
-taken under.  Flipping this sign here is what forced a sign flip downstream;
-the generator and the fitters now agree without one.
+taken under, generator and fitters agreeing without a sign flip anywhere.
 
-The comb phase, with the pair's two lines sitting SYMMETRICALLY about the
-two-photon centre (``+n`` and ``-n`` comb lines, ``Delta = 2 pi f_rep``)::
+With the pair's two lines sitting SYMMETRICALLY about the two-photon centre
+(``+n`` and ``-n``, ``Delta = 2 pi f_rep``)::
 
     Psi_i^w = beta1 (+m_i Delta) + beta2 (+m_i Delta)^2
     Psi_i^x = beta1 (-m_i Delta) + beta2 (-m_i Delta)^2
     -> Phi_i = Psi_i^x + Psi_i^w = 2 beta2 (m_i Delta)^2 = 2 beta2 Omega_i^2
 
-so the group delay ``beta1`` CANCELS in the pair and only the second-order
-dispersion ``beta2`` survives.  Against the reference pair that is
-
-    dPhi_comb,i = Phi_i - Phi_1 = 2 beta2 (Omega_i^2 - Omega_1^2)
-
-which is the spectrum step 7 recovers.  NOTE that this needs the REAL comb
-lines (m_1 = 10000, m_i = 12000, 14000, ...), not the pair index -- see the
-COMB_LINE block below.
+so the group delay ``beta1`` CANCELS within a pair and only the second-order
+dispersion survives.  Against the reference that is
+``dPhi_comb,i = 2 beta2 (Omega_i^2 - Omega_1^2)``, the spectrum step 7 recovers
+-- which needs the REAL comb lines, not the pair index; see the COMB_LINE block.
 
 The measured signal
 -------------------
 Two-photon absorption is coherent across pairs, single-beam response is not::
 
-    Y = | sum_n eta_n x_n w_n |^2                          (TPA, interferes)
-      + sum_channels (a_c I_c + q_c I_c^2)                 (single beam, adds)
-      + d                                                  (dark)
+    Y = | sum_n eta_n x_n w_n |^2            (TPA, interferes)
+      + sum_channels (a_c I_c + q_c I_c^2)   (single beam, adds)
+      + d                                    (dark)
 
-with ``I_c = sin^2(theta_c/2)`` the commanded intensity.  Expanding one pair on
-its own gives step 6's ``Y = eta_fit^2 (x w) + a_x x + q_x x^2 + a_w w + q_w w^2
-+ d`` with ``eta_fit = eta_n C_n^x C_n^w`` -- i.e. the step-6 fit CANNOT separate
-the intrinsic ``eta`` from the channel powers ``C``, it only ever sees the
-product (v1's report calls it "eta CxCw").  Expanding two pairs gives step 7's
-fringe.
+One pair on its own collapses to step 6's
+``Y = eta_fit^2 (x w) + a_x x + q_x x^2 + a_w w + q_w w^2 + d`` with
+``eta_fit = eta_n C_n^x C_n^w``: the step-6 fit CANNOT separate the intrinsic
+``eta`` from the channel powers, it only ever sees the product.  Two pairs on
+gives step 7's fringe.
 
-Parameters (see the TRUTH block below)
---------------------------------------
-Set here, per the model above:
-
-* ``ETA[n]``            -- 5, one per pair (intrinsic TPA efficiency)
-* ``C_X[n]``/``C_W[n]`` -- 10, one per channel (channel power)
-* ``A_X/Q_X/A_W/Q_W``   -- 20, a and q per channel (single-beam response)
-* ``D_V``               -- 1, the shared dark offset
-* ``COMB_LINE[n]``      -- 5, which comb line each pair sits on (sets Phi_n)
-* ``BETA1_S``/``BETA2_S2``, ``F_REP_HZ`` -- the comb dispersion
-
-RECOVERABLE from the data: ``eta_fit = eta C^x C^w`` (5), ``a/q`` per channel
-(20), ``d`` (1), ``dPhi_comb`` per target pair (4), and from those the single
-slope ``beta2`` (1).  NOT recoverable: ``eta`` and ``C`` separately (only their
-product enters), ``beta1`` (cancels in every pair), and the absolute ``Phi_n``
-(only differences vs the reference are observable, and only mod 2 pi).
+What is recoverable
+-------------------
+From the data: ``eta_fit = eta C^x C^w`` (5), ``a``/``q`` per channel (20),
+``d`` (1), ``dPhi_comb`` per target (4), and from those the single slope
+``beta2`` (1).  NOT recoverable: ``eta`` and ``C`` separately, ``beta1`` (it
+cancels in every pair), and the absolute ``Phi_n`` (only differences against the
+reference are observable, and only mod 2 pi).
 """
 from __future__ import annotations
 
@@ -118,20 +103,17 @@ DELTA = 2.0 * np.pi * F_REP_HZ   # rad/s per comb line
 BETA1_S = 1e-9                   # group delay          (s)      -- cancels per pair
 BETA2_S2 = 1e4 * (1e-15) ** 2    # 1e4 fs^2 of GDD      (s^2)    -- what step 7 sees
 
-# Which comb line each pair sits on (its x line is the mirror, -n).  With
-# beta2 = 1e4 fs^2 a SINGLE comb line away from centre gives Phi ~ 5e-9 rad --
-# unmeasurable -- so the pairs sit thousands of lines out, where beta2 actually
-# bites: 1e3 lines is 80 GHz (~0.16 nm at 780 nm) and gives Phi ~ 5e-3 rad,
-# 1e4 lines is 0.8 THz (~1.6 nm) and gives Phi ~ 0.5 rad.  Set these to your
-# real channel frequencies.
+# Which comb line each pair sits on (its x line is the mirror, -n).  Set these
+# to your real channel frequencies.  One line from centre gives Phi ~ 5e-9 rad
+# at beta2 = 1e4 fs^2 -- unmeasurable -- so the pairs sit thousands of lines
+# out, where beta2 bites: 1e4 lines is 0.8 THz (~1.6 nm) and Phi ~ 0.5 rad.
 #
-# Written as an OFFSET plus a per-pair-index step, which is the form
-# calib_step7_v2.py's verification config takes (OMEGA_ZERO_INDEX / OMEGA_STEP).
-# The offset MATTERS: the dispersion regressor is Omega^2, and
+# Written as an OFFSET plus a per-pair step, the form step 7's verification
+# config takes.  The offset MATTERS: the regressor is Omega^2, and
 #     Phi_n - Phi_0 = 2 beta2 Delta^2 [dm^2 n^2 + 2 m0 dm n]
-# carries a LINEAR-in-n term, so re-indexing to a bare pair index (m0 -> 0) is
-# not a relabelling -- a pure n^2 model cannot absorb it and beta2 comes out
-# wrong by ~4x on these numbers.  Keep m0, or fit the n term as well.
+# carries a LINEAR-in-n term, so re-indexing to a bare pair index is not a
+# relabelling -- a pure n^2 model cannot absorb it and beta2 comes out ~4x
+# wrong.  Keep m0, or fit the n term too.
 COMB_LINE_0 = 1_100              # comb line of the FIRST pair (index PAIR_INDEX_BASE)
 COMB_LINE_STEP = 2_000           # dm: comb lines per pair index
 # -> {1: 1100, 2: 3100, 3: 5100, 4: 7100, 5: 9100}
@@ -147,13 +129,11 @@ C_W = [0.96, 1.01, 0.95, 1.02, 0.98]
 # ---- per-channel single-beam response a*I + q*I^2, in volts ----
 # Real pairs sit at a few tens of uV against a ~25 mV cross term.
 #
-# The quadratic q is OFF (all zero) to match calib_step6_v2.FIT_Q = False: the
-# step-6 background block has 5 levels, so fitting q as well saturates it and
-# leaves 0 dof -- no residual, no check.  With q = 0 in the data the linear
-# a is the whole truth, the 3-parameter fit has 2 dof, and the background
-# residual is a real test of the model rather than an exact interpolation.
-# Turn a q back on (e.g. Q_X[0] = 0.627e-3, the value the real pair 1 showed)
-# to check that step 6's "arm is curved" pull actually fires.
+# The quadratic q is OFF to match calib_step6_v2's FIT_Q: fitting it saturates
+# the 5-level background block and leaves no residual to check.  With q = 0 in
+# the data the linear a is the whole truth and the 3-parameter fit has 2 dof.
+# Turn one back on (e.g. Q_X[0] = 0.627e-3, what the real pair 1 showed) to
+# check that step 6's "arm is curved" pull actually fires.
 A_X = [0.029e-3, 0.040e-3, 0.012e-3, 0.006e-3, 0.021e-3]
 Q_X = [0.0, 0.0, 0.0, 0.0, 0.0]
 A_W = [0.011e-3, 0.025e-3, 0.033e-3, 0.040e-3, 0.009e-3]
@@ -235,10 +215,9 @@ def eta_fit(pair: int) -> float:
 def signal(x_vals, w_vals) -> float:
     """Noise-free ``Y`` for one SLM pattern.
 
-    ``x_vals``/``w_vals`` are commanded intensities in [0, 1], one per pair (the
-    same shape ``encode_to_pattern`` takes).  TPA is coherent across pairs so the
-    pair terms are summed as FIELDS and squared; the single-beam response of
-    every driven channel adds incoherently; the dark is a constant.
+    In: commanded intensities in [0, 1], one per pair -- the shape
+    ``encode_to_pattern`` takes.  TPA is coherent, so the pair terms are summed
+    as FIELDS and squared; single-beam response adds incoherently.
     """
     x_vals = np.asarray(x_vals, dtype=float)
     w_vals = np.asarray(w_vals, dtype=float)
@@ -260,9 +239,9 @@ def signal(x_vals, w_vals) -> float:
 def measure(x_vals, w_vals, rng) -> tuple[float, float]:
     """One noisy acquisition -> ``(voltage_mean_v, voltage_std_v)``.
 
-    ``std`` is the spread the DAQ would report for the low-passed trace and is
-    what every fit weights by, so it is written to the CSV as-is: a fixed
-    detector floor added in quadrature with a signal-proportional term.
+    ``std`` is what the DAQ would report for the low-passed trace, and what
+    every fit weights by, so it goes to the CSV as-is: a fixed detector floor in
+    quadrature with a signal-proportional term.
     """
     y = signal(x_vals, w_vals)
     sigma = float(np.hypot(NOISE_ABS_V, NOISE_REL * abs(y)))
@@ -298,8 +277,8 @@ def gen_step6_csv(path: Path, rng) -> Path:
     """Step-6 grid: one pair at a time over :data:`STEP6_GRID`, repeats included.
 
     Only that pair's two channels are driven, so the TPA term collapses to
-    ``|eta_n x_n w_n|^2 = eta_fit^2 (x w)`` -- no comb phase, no interference,
-    which is exactly why step 6 can calibrate eta without knowing any phase.
+    ``eta_fit^2 (x w)`` -- no comb phase, no interference, which is why step 6
+    can calibrate eta without knowing any phase.
     """
     rows = []
     for i in PAIRS:
@@ -452,13 +431,12 @@ def check_step6(csv_path: Path) -> dict[int, PairModel]:
 def check_step7(csv_path: Path, models: dict[int, PairModel]) -> None:
     """Re-fit dPhi_comb per target with the step-7 v2 fit, compare against truth.
 
-    Uses the models fitted from the synthetic step-6 CSV -- not the truth
-    values -- so this exercises the real chain, step-6 errors and all.  That is
-    also why the quoted sigma has to be ``dphi_comb_err_total``: the step-7 fit
-    PINS a = eta_ref and b = eta_tgt to those fitted step-6 models, so its own
-    ``dphi_comb_err`` is the fringe photon noise alone and step 6's eta error is
-    invisible in it, not absent.  Judging the fit against truth on the fringe
-    term alone reads several sigma off on data that is fine.
+    Uses the models FITTED from the synthetic step-6 CSV, not the truth values,
+    so this exercises the real chain with step-6 errors and all.  Which is why
+    the quoted sigma must be ``dphi_comb_err_total``: the fit pins a and b to
+    those models, so its own ``dphi_comb_err`` is fringe noise alone and step
+    6's eta error is invisible in it, not absent.  Judging against truth on the
+    fringe term alone reads several sigma off on data that is fine.
     """
     print("\n=== Check: step-7 v2 dPhi_comb vs truth ===")
     print("sigma = fringe noise (+) the PINNED step-6 eta, in quadrature "

@@ -1,37 +1,36 @@
-"""Per-channel-pair TPA efficiency (eta) calibration by a 2-D level grid.
+"""Step 6 v1 -- per-pair TPA efficiency (eta) from a 2-D level grid.
 
-This supersedes the diagonal-only sweep in :mod:`scope_tpa`. Instead of driving
-a pair along ``x = w = sqrt(u)`` and fitting ``a*u^2`` against a *separately
-measured* background, this sweeps the two sides of a pair **independently** over
-a grid (with the zero axes included) and fits the full response
+The joint fit, kept as the cross-check on :mod:`pair_v2`'s difference estimator.
+
+In:  commanded levels and measured volts, live or from a CSV through
+     :func:`load_tpa_pair_csv`.
+Out: a :class:`PairFit` per pair.
+
+The two sides of a pair are swept INDEPENDENTLY over a grid with the zero axes
+included, and the full response is fitted directly::
 
     Y = eta^2*(x*w) + a_x*x + q_x*x^2 + a_w*w + q_w*w^2 + d
-      └ 2-photon CROSS term ┘└ x single-beam ┘└ w single-beam ┘ └ dark ┘
+      |-- 2-photon --||-- x single-beam --||-- w single --| |dark|
 
-directly.  x, w are per-channel commanded INTENSITIES in [0, 1]; eta multiplies
-the field amplitude, so the cross term is ``eta^2 * (x*w)``.  The fit is LINEAR
-in ``b := eta^2, a_x, q_x, a_w, q_w, d`` and solved by weighted least squares;
-``eta = sqrt(b)`` is recovered afterwards.  Because the swept grid includes the
-``x=0`` and ``w=0`` axes (which carry ``x*w = 0``), the single-channel terms are
-pinned without eta contamination and eta is cleanly identifiable -- no separate
-background measurement is needed (the dark offset ``d`` and the single-beam
-slopes are fit in-model).
+``x``, ``w`` are per-channel commanded INTENSITIES in [0, 1]; eta multiplies the
+field amplitude, hence the square on the cross term.  The fit is LINEAR in
+``b := eta^2, a_x, q_x, a_w, q_w, d``, solved by weighted least squares, and
+``eta = sqrt(b)`` is recovered afterwards.  Because the grid includes the
+``x = 0`` and ``w = 0`` axes, which carry ``x*w = 0``, the single-channel terms
+are pinned without eta contamination and no separate background measurement is
+needed.
 
-The measurement is instrument-agnostic: it drives an SLM (``get_slm_info`` +
-``display_array``) and reads whatever *monitor* object exposes the
-``ScopeController`` / ``DAQController`` shape (``monitor_cycle`` returning a
-``MonitorSample`` and caching the raw waveform on ``last_values``).  Each grid
-point is read ONCE over a long fixed window -- T_single (``x == 0 or w == 0``,
-the weak single-beam and dark points) or T_both (both beams on) on the DAQ --
-and weighted by the instrument-reported trace STD.  The std is used as measured,
-undivided by any effective-N: the low-passed samples are correlated, so a
-standard error of the mean derived from them would claim an uncertainty far
-below the scatter actually seen between repeats.
+Instrument-agnostic: it drives an SLM (``get_slm_info`` + ``display_array``) and
+reads anything with the ``ScopeController`` / ``DAQController`` shape.  Each
+point is read ONCE over a long fixed window -- ``T_single`` when either arm is
+off, ``T_both`` otherwise -- and weighted by the instrument-reported trace std,
+used AS MEASURED and undivided by any effective-N: the low-passed samples are
+correlated, so a standard error derived from them would claim an uncertainty far
+below the scatter seen between repeats.
 
-Raw rows are persisted as a CSV (one row per grid point; the ``trial`` column
-is kept so multi-trial CSVs from older runs still load) matching the
-``tests/tpa_pair_calibration_test.py`` layout, so a run can be reloaded and
-re-fit offline.
+Raw rows persist as a CSV, one row per grid point, so a run can be re-fit
+offline.  The ``trial`` column is kept so multi-trial CSVs from older runs still
+load.
 """
 from __future__ import annotations
 
@@ -118,15 +117,11 @@ def average_cells(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Average repeated trials per (x, w) cell -> x, w, y, std arrays.
 
-    ``std`` (returned) is the across-trial standard deviation for a cell when it
-    was measured more than once -- the spread as measured, NOT divided by
-    sqrt(n).  A cell measured only once has no across-trial spread, so it falls
-    back to the recorded per-point ``std`` (the instrument's reported trace
-    spread stored alongside each row) when available -- that keeps the weighted
-    fit meaningful even with ``n_trials == 1`` (otherwise every cell would be
-    floored to a bogus 1.0 V, flattening the fit).  A cell with neither repeats
-    nor a recorded std is floored to the median positive std so the weighted fit
-    never divides by zero/NaN.
+    The returned ``std`` is the across-trial standard deviation -- as measured,
+    NOT divided by sqrt(n).  A cell measured ONCE has none and falls back to its
+    recorded per-point trace spread, which keeps a weighted fit meaningful at
+    ``n_trials == 1``; a cell with neither is floored to the median positive std,
+    so the fit never divides by zero.
     """
     ycells: dict[tuple[float, float], list[float]] = defaultdict(list)
     scells: dict[tuple[float, float], list[float]] = defaultdict(list)
@@ -168,16 +163,14 @@ def fit_cells(
 ) -> PairFit:
     """Weighted least-squares fit of averaged cells to the TPA model.
 
-    Cells are weighted by ``1/std`` and the parameter errors come straight from
-    the weighted covariance -- there is no chi2/dof goodness-of-fit number and
-    no Birge rescaling of the errors.  ``eta`` is recovered as ``sqrt(b)`` with
-    propagated error ``b_err/(2*sqrt(b))``.
+    Weighted by ``1/std``, errors straight from the weighted covariance -- no
+    chi2/dof, no Birge rescaling.  ``eta = sqrt(b)``, with propagated error
+    ``b_err/(2 sqrt(b))``.
 
-    ``drop_q=True`` drops the ``q_x``/``q_w`` saturation columns and fits the
-    purely linear background ``Y = b*(x*w) + a_x*x + a_w*w + d`` (the a's then
-    carry the full single-beam slopes, with no a<->q split).  The q entries stay
-    in ``params`` pinned to ``(0.0, 0.0)`` so downstream report/plot/JSON code
-    sees the usual keys.
+    ``drop_q=True`` drops the saturation columns and fits
+    ``Y = b*(x*w) + a_x*x + a_w*w + d``, the a's then carrying the full
+    single-beam slopes with no a<->q split.  The q entries stay in ``params``
+    pinned at ``(0.0, 0.0)``, so the report, plot and JSON see the usual keys.
     """
     x = np.asarray(x, dtype=float)
     w = np.asarray(w, dtype=float)
@@ -254,22 +247,19 @@ def build_pair_points(
 ) -> list[tuple[float, float]]:
     """Reduced 1-D calibration curves for a pair (not the full 2-D grid).
 
-    Rather than the ``(n+1) x (n+1)`` outer-product grid, this measures only the
-    lines that each fit term needs, ``n_points`` per line plus one shared dark
-    point::
+    Only the lines each fit term needs, ``n_points`` per line plus one shared
+    dark point, with ``r`` over ``linspace(sweep_min, sweep_max, n_points)``::
 
-        dark    (0, 0)   -- anchors the offset d
-        x-only  (r, 0)   -- only x on -> pins a_x, q_x
-        w-only  (0, r)   -- only w on -> pins a_w, q_w
-        cross   (1, r)   -- x pinned at 1, w swept -> the ONLY points with
-                            x*w != 0, so they pin eta once the single-beam
-                            terms above are known
+        dark    (0, 0)   anchors the offset d
+        x-only  (r, 0)   pins a_x, q_x
+        w-only  (0, r)   pins a_w, q_w
+        cross   (1, r)   the ONLY points with x*w != 0, so they pin eta once
+                         the single-beam terms above are known
 
-    ``r`` runs over ``linspace(sweep_min, sweep_max, n_points)``.  The full
-    TPA model stays identifiable because the w-only line sees ``a_w``/``q_w``
-    but carries ``x*w = 0``, so it separates the single-beam ``w`` response
-    from the ``eta^2*(x*w)`` cross term measured on the ``x=1`` line.  Points
-    are de-duplicated so a level shared across lines is measured once.
+    The model stays identifiable because the w-only line sees ``a_w``/``q_w``
+    while carrying ``x*w = 0``, which separates the single-beam w response from
+    the cross term measured on the ``x = 1`` line.  Points are de-duplicated, so
+    a level shared across lines is measured once.
     """
     ramp = np.linspace(float(sweep_min), float(sweep_max), int(n_points))
     pts: list[tuple[float, float]] = [(0.0, 0.0)]
@@ -298,11 +288,9 @@ _CSV_HEADER = [
 def write_tpa_pair_csv(result: TPAPairResult, path: str | Path) -> str:
     """Raw rows: one line per (trial, pair, grid point).  Round-trips via load.
 
-    ``voltage_std_v`` is the low-passed trace spread the fit weights by, and
-    ``std_ratio`` = std/|mean| is derived per row for at-a-glance measurement
-    quality (recomputed on load, so :func:`load_tpa_pair_csv` ignores it).
-    Legacy CSVs carrying the retired ``voltage_sem_v``/``sem_ratio`` columns
-    still load -- those columns are simply ignored.
+    ``voltage_std_v`` is the low-passed trace spread the fit weights by;
+    ``std_ratio`` is derived per row for at-a-glance quality and recomputed on
+    load, so :func:`load_tpa_pair_csv` ignores it.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)

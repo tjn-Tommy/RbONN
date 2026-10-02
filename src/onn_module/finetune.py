@@ -3,61 +3,40 @@
 The convolutional trunk is identical in all three models; only the head that
 turns 16x7x7 feature maps into 10 logits changes.
 
-  bench    Flatten(784) -> Linear(784, 10)
-           The ordinary digital baseline.  784*10 + 10 = 7,850 parameters.
+  bench    Flatten(784) -> Linear(784, 10).  The digital baseline, 7,850 params.
+  onn784   Flatten(784) -> ONN(784 -> 10).  The same map done optically.  The
+           bench has 10 channels and holds a 10x10 weight block at a time, so
+           784 inputs run as 79 successive shots whose readings are summed.
+  onn49    mean over the 16 channels -> Flatten(49) -> ONN(49 -> 10).  The same
+           map in 5 shots.  Averaging over channels is exactly the big Linear
+           with its weights tied across channels: 16x cheaper, and it throws
+           away WHICH kernel fired at a pixel while keeping WHERE.
 
-  onn784   Flatten(784) -> ONN(784 -> 10)
-           The same map, done optically.  The bench has 10 channels and can
-           hold a 10x10 weight block at a time, so 784 inputs run as 79
-           successive shots whose detector readings are summed.
+In:  MNIST, and ``--calib`` for the eta/Phi to train against.  What this exists
+     for on the bench PC is one short fine-tune after a recalibration --
+     ``--finetune CKPT`` carries a trained head onto fresh optics, the checkpoint
+     holding weights only -- and ``--model all`` still trains all three from
+     scratch, which is how that checkpoint was made.
+Out: ``runs/<model>/`` -- config.json, metrics.csv (written every epoch, so it
+     survives a crash), result.json, model.pt and PNGs -- plus the same numbers
+     to trackio unless ``--no-trackio``.
 
-  onn49    mean over the 16 channels -> Flatten(49) -> ONN(49 -> 10)
-           Collapse the channel axis first, so the same map needs only 5
-           shots.  Averaging over channels is exactly the big Linear with its
-           weights tied across channels: 16x cheaper, and it throws away
-           *which* kernel fired at a pixel while keeping *where*.
+Two consequences of going optical, both deliberate.  NO BIAS: a logit is nothing
+but the weighted coherent quadratic sum, and the only digital step after the
+detector is a per-output gain (readout "scale"), because Y is of order
+eta^2 ~ 0.1 V and a softmax over that spread cannot train.  NO NEGATIVE WEIGHTS:
+w lives in [0, 1] so Y >= 0 always, and ``--onn-differential`` runs each shot
+twice and subtracts (Y+ - Y-), which is how a signed weight is realised on the
+bench.
 
-Two consequences of going optical, both deliberate:
-
-  * No bias.  A logit is nothing but the weighted coherent quadratic sum
-    Y = |sum_k eta_k sqrt(x_k w_k) e^{i(u_k+v_k+Phi_k)}|^2 summed over shots.
-    The only digital step after the detector is a per-output gain (readout
-    "scale"), because Y is of order eta^2 ~ 0.1 V and a softmax over a 0.1 V
-    spread cannot train.  --onn-readout none removes even that.
-
-  * No negative weights.  w lives in [0, 1], so Y >= 0 always.  Pass
-    --onn-differential to run each shot twice and subtract (Y+ - Y-), which
-    is how a signed weight is realised on the bench.
-
-Every run is logged to trackio (project --project, default "rbonn-mnist"):
-config, per-epoch loss / val accuracy / lr, the final test numbers, and the
-plots.  Browse them with
-
-    trackio show --project rbonn-mnist
-
-and --no-trackio turns it off.  The same numbers also land in runs/<model>/ as
-config.json, metrics.csv (written every epoch, so it survives a crash),
-result.json, model.pt and PNGs, so nothing depends on the tracker being up.
---model all trains all three and writes runs/compare.json plus a chart.
-
-Gaussian noise of std --noise is added to every input image, training and
-test alike, after ToTensor and before clamping back to [0, 1].  The final
-table reports accuracy on the clean test set and on the noisy one, so the
-comparison says something about robustness and not just peak accuracy.
-
-Runs in the rbonn-ml conda env (torch, torchvision, sklearn), not in rbonn.
+``--noise`` adds Gaussian noise of that std to every image, train and test alike,
+after ToTensor and before clamping back to [0, 1]; the final table reports clean
+and noisy accuracy both.  Runs in the ``rbonn-ml`` conda env (torch, torchvision,
+sklearn), not ``rbonn``.
 
     python src/onn_module/finetune.py --model all --epochs 15 --noise 0.1
-    python src/onn_module/finetune.py --model onn49 --onn-differential
-    python src/onn_module/finetune.py --model bench --eval
-
-After a recalibration, carry a trained head over to the new eta/Phi instead of
-starting again -- the checkpoint holds weights only, so --calib is what sets the
-calibration and the run reports the eta it ends up with:
-
     python src/onn_module/finetune.py --model onn784 --tag recal --epochs 3
-        --finetune runs/onn784_ctrl/model.pt
-        --calib src/calib_data/<run>/calib_step7_result_<stamp>.json
+        --finetune runs/onn784_ctrl/model.pt --calib src/calib_data/<run>/calib.json
 """
 
 import argparse
@@ -91,11 +70,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = str(REPO_ROOT / "data")
 RUNS_ROOT = str(REPO_ROOT / "runs")
 LEGACY_WEIGHTS = str(REPO_ROOT / "runs" / "checkpoints" / "part2.pt")
-#: The calibration a run defaults to.  Point --calib at the newest step-7 or
-#: step-8 result; a step-8 file also carries the fitted Y_sat, which a step-7
-#: one does not (see onn_module.params).
+#: The calibration a run defaults to.  Point --calib at a run's calib.json; its
+#: step-6/7 sections give eta and Phi, and a step-8 section the fitted Y_sat
+#: (see onn_module.params).  A file with no step 8 runs unsaturated.
 DEFAULT_CALIB = str(REPO_ROOT / "src" / "calib_data" / "calib_0917_1617"
-                    / "calib_step7_result_0917_1831.json")
+                    / "calib.json")
 
 MODELS = ("bench", "onn784", "onn49")
 
@@ -196,11 +175,10 @@ def build_model(kind="bench", p_conv=0.15, p_fc=0.3, p_head=None,
         MaxPool2d(2)                 -> 16 x 7 x 7
         <head>                       -> 10 class scores
 
-    The convs use bias=False: BatchNorm subtracts the mean straight after,
-    which erases any bias, then adds its own learnable shift.  Dropout2d
-    drops whole channels rather than pixels -- neighbouring pixels in a
-    feature map are so correlated that dropping them singly removes almost
-    no information.
+    The convs use bias=False, BatchNorm erasing any bias straight after and
+    adding its own shift.  Dropout2d drops whole channels, not pixels:
+    neighbouring pixels in a feature map are correlated enough that dropping
+    them singly removes almost no information.
     """
     if kind not in MODELS:
         raise ValueError(f"model: {kind!r}, expected one of {MODELS}")
@@ -291,12 +269,11 @@ def calibrate_readout(model, loader, device, target_std=1.0, floor=None):
 def load_checkpoint(model, path, device, kind, missing=None):
     """Load weights into `model`, reporting what the file did and did not carry.
 
-    A checkpoint holds weights only.  The calibration is registered
-    non-persistent (see ONNLayer.__init__), so eta and Phi always come from
-    --calib and never from the file -- which is what makes fine-tuning against a
-    fresh step 6/7 mean anything.  This prints the eta actually in force, because
-    "did my recalibration take effect" is the first question a fine-tune raises
-    and the answer used to be silently no.
+    A checkpoint holds weights only: the calibration is registered non-persistent
+    (see :meth:`ONNLayer.__init__`), so eta and Phi always come from ``--calib``
+    and never from the file, which is what makes fine-tuning against a fresh
+    step 6/7 mean anything.  The eta actually in force is printed, because "did
+    my recalibration take effect" is the first question a fine-tune raises.
     """
     if not os.path.exists(path):
         raise SystemExit(missing or f"--finetune {path} not found")
@@ -724,16 +701,16 @@ def parse_args():
                         "a peak sized for a random head is a destructive first "
                         "step for a trained one")
     p.add_argument("--calib", default=DEFAULT_CALIB,
-                   help="ONN calibration JSON: a step-7 result (eta, Phi) or a "
-                        "step-8 / system-accuracy result, which also carries the "
-                        "fitted Y_sat")
+                   help="a run's calib.json, or the directory holding one: eta "
+                        "and Phi come from its step-6/7 sections and the fitted "
+                        "Y_sat from step 8, if it has one")
     p.add_argument("--y-sat", type=float, default=None,
                    help="atom saturation level in detector volts, overriding the "
                         "calibration file.  Default: whatever --calib says (a "
-                        "step-8 result carries a fitted y_sat_v; a step-7 one "
-                        "does not, and the layer then runs unsaturated).  At the "
+                        "file with a step-8 section carries a fitted y_sat_v; "
+                        "without one the layer runs unsaturated).  At the "
                         "drive a trained onn784 actually uses, peak compression "
-                        "is ~2%, so this is not a sensitive knob -- but a "
+                        "is ~2%%, so this is not a sensitive knob -- but a "
                         "hardcoded value that disagrees with the run it is quoted "
                         "against is worse than none")
     p.add_argument("--drive-bits", type=int, default=None,
@@ -781,7 +758,7 @@ def parse_args():
                         "top of their range, so there is nothing to win, and "
                         "at 0.1 the penalty gradient (~0.9) swamps cross-"
                         "entropy's (~0.004) and drags the conv trunk with it: "
-                        "97.7% -> 61.7% one-sided, -> 15.7% two-sided.  The "
+                        "97.7%% -> 61.7%% one-sided, -> 15.7%% two-sided.  The "
                         "headroom is logged as a diagnostic either way")
     p.add_argument("--onn-drive-top", type=float, default=0.01,
                    help="fraction of the batch counted as a channel's bright "

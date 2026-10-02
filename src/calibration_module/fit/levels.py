@@ -1,69 +1,67 @@
-"""Drives that land on a chosen fraction of full scale -- the system-accuracy patterns.
+"""Drives that land on a chosen fraction of full scale.
 
-Driving ``x_k, w_k`` uniform in a box -- what the n-pair verification this
-module replaced did -- is useless for anything but the bottom of the scale: ``E = sum_k z_k`` is a random phasor sum,
-so ``|E|^2`` concentrates near the INCOHERENT value ``sum_k |z_k|^2`` ~ Y_max/10.
-Measured on the 0911 runs, uniform drives give ``Y/Y_max`` a mean of 0.096 and
-``P(Y > 0.5 Y_max) = 5e-6`` -- the 0911 10-pair run covered 4..24 % of full
-scale, seven of its eight patterns below 10 %.  A 4-bit computation has to
-divide the WHOLE scale into sixteen levels, so it has to be verified over the
-whole scale.
+In:  the step-6 pair models and step-7 phases, plus a target ``alpha``.
+Out: :class:`Pattern` objects -- commanded ``(x, w)`` per pair, the alpha
+     achieved, and whether the solve converged.  Imports no driver, so all of it
+     runs offline.
 
-This module builds the pattern families the level sweeps drive:
+Driving ``x_k, w_k`` uniform in a box is useless for anything but the bottom of
+the scale: ``E = sum_k z_k`` is a random phasor sum, so ``|E|^2`` concentrates
+near the INCOHERENT value ``sum_k |z_k|^2`` ~ Y_max/10.  Measured, uniform
+drives give ``Y/Y_max`` a mean of 0.096 and ``P(Y > 0.5 Y_max) = 5e-6``.  A
+4-bit computation divides the WHOLE scale into sixteen levels, so it has to be
+verified over the whole scale.
+
+The pattern families::
 
     A  level_patterns      one pattern per stratum of [0, Y_max], each a fresh
                            random drive -- model error against level
-    F  full_scale_pattern  the closed-form drive that reaches Y_max exactly --
-                           the ceiling, measured rather than predicted
+    F  full_scale_pattern  the closed-form drive reaching Y_max exactly -- the
+                           ceiling, measured rather than predicted
     B  repeat_patterns     ONE drive per level, repeated -- readout
                            reproducibility, the 4-bit noise budget
     C  psi_scan_patterns   the support-optimal drive for a fan of projection
                            axes -- where full scale is, and the phase error
 
-``calib_step8.py`` drives A and F: one free parameter, Y_sat, and the ceiling
-is where the whole of its leverage lives.  B and C are kept because runs on
-disk contain them and ``levels_report.py`` still reads those.
+``calib_step8.py`` drives A and F: one free parameter, and the ceiling is where
+its leverage lives.  B and C are kept because runs on disk contain them and
+``levels_report.py`` still reads those.
 
-Only A needs solving.  Given a target ``alpha``, roll a uniform random drive and
-move it as little as possible until it predicts ``alpha * Y_max``::
+Only A needs solving.  Roll a uniform random drive and move it as little as
+possible until it predicts ``alpha * Y_max``::
 
     minimize ||d - d0||^2    subject to    |E(d)|^2 = alpha * Y_max
 
 The least-move constraint is what keeps the randomness: millions of drives reach
-any given level, and an unconstrained solve would return the same one every
-time, so all of A would be one drive repeated.  Starting from a fresh ``d0`` and
-moving minimally lets ``d0``'s randomness survive into the answer.
+any given level and an unconstrained solve would return the same one every time,
+making all of A one drive repeated.
 
 The (u, v) parametrisation
 --------------------------
 Solving in ``x, w`` is badly conditioned -- ``dphi/dx`` diverges at ``x = 1``.
-With ``u = phi_half(x) = asin sqrt(x)`` (so ``x = sin^2 u``) and ``u, v`` in
-``[0, pi/2]``::
+With ``u = phi_half(x) = asin sqrt(x)`` and ``u, v`` in ``[0, pi/2]``::
 
     z_k(u, v) = eta_k sin u sin v exp(i [u + v + Phi_k])
 
-which is exactly the field :func:`verify.predict` sums, and both ``|E|^2`` and
-its gradient are closed form.  That is the difference between 10 ms and 3 s per
-pattern, so all 120 are solved before the hardware is touched.
+which is exactly the field :func:`verify.predict` sums, with ``|E|^2`` and its
+gradient both closed form.  That is the difference between 10 ms and 3 s per
+pattern, so every pattern is solved before the hardware is touched.
 
-Note what the formula says: a pair's amplitude and phase move TOGETHER.  Turning
-a pair up lengthens its phasor and rotates it.  Two knobs per pair is what makes
-the level reachable at all -- at fixed ``u + v`` the phase is fixed, and trading
-``u`` against ``v`` changes the amplitude.
+Note what the formula says: a pair's amplitude and phase move TOGETHER, so
+turning a pair up lengthens its phasor and rotates it.  Two knobs per pair is
+what makes a level reachable at all -- at fixed ``u + v`` the phase is fixed,
+and trading ``u`` against ``v`` changes the amplitude.
 
 Alpha is COHERENT
 -----------------
-``alpha`` is a fraction of ``FS = Y_max = max |E|^2``, which excludes the
+``alpha`` is a fraction of ``FS = Y_max = max |E|^2``, which EXCLUDES the
 single-beam background: that term is detector response to each beam separately,
-not TPA field, and :class:`verify.FullScale` leaves it out.  So every target
-here is on ``|E|^2`` alone -- :func:`verify.predict` with ``coherent=True``.
-The background is put back for two purposes only: choosing a read's input range
-(the ADC sees the total), and predicting the raw voltage in the CSV.  The report
-subtracts it again.  Mixing the two conventions would tilt the level axis: on
-the 0911 run the background ramps 0.64 -> 1.14 mV from the bottom of the scale
-to the top, which is 35 % of the real bias at level 1.
-
-Imports no driver, so all of it runs offline.
+not TPA field.  So every target here is on ``|E|^2`` alone
+(:func:`verify.predict` with ``coherent=True``).  The background is put back for
+two purposes only -- choosing a read's input range, since the ADC sees the
+total, and predicting the raw voltage in the CSV -- and the report subtracts it
+again.  Mixing the two conventions tilts the level axis: the background ramps
+with level, which is a third of the real bias at level 1.
 """
 from __future__ import annotations
 
@@ -194,14 +192,13 @@ def drive_at_psi(scale: FullScale, psi: float) -> np.ndarray:
 def attenuated_drive(scale: FullScale, alpha: float) -> np.ndarray:
     """The ``x = w`` drive on the Y_max ray scaled down to ``alpha * Y_max``.
 
-    The Y_max drive corresponds to ``t_k = u_k + v_k`` per pair; scaling every
-    ``t_k`` by a common ``gamma`` in [0, 1] walks ``|E|^2`` monotonically from 0
-    (all pairs off) to ``Y_max``, so a 1-D root-find always lands on the target.
+    Scaling every ``t_k = u_k + v_k`` by a common ``gamma`` in [0, 1] walks
+    ``|E|^2`` monotonically from 0 to ``Y_max``, so a 1-D root-find always lands
+    on the target.
 
-    This is the fallback for :func:`project_to_level`, and it is deterministic --
-    it carries no randomness at all.  It should fire only above ``alpha ~ 0.95``,
-    where the level set has collapsed to essentially one drive anyway and there
-    is no diversity left to lose.
+    The fallback for :func:`project_to_level`, and DETERMINISTIC -- it carries no
+    randomness.  It should fire only above ``alpha ~ 0.95``, where the level set
+    has collapsed to one drive and there is no diversity left to lose.
     """
     eta = np.asarray(scale.amplitudes, dtype=float)
     phi = np.asarray(scale.phases, dtype=float)
@@ -229,14 +226,13 @@ def project_to_level(alpha: float, uv0, eta, phase, *, ymax: float,
                      u_max: float = U_MAX) -> tuple[np.ndarray, float]:
     """``(uv, rel_err)`` -- the point nearest ``uv0`` with ``|E|^2 = alpha * ymax``.
 
-    ``rel_err`` is ``|achieved - target| / ymax``, so the caller can reject a
-    solve that did not converge rather than silently drive a pattern at the
-    wrong level.
+    ``rel_err`` is ``|achieved - target| / ymax``, so a caller can reject a
+    solve that did not converge rather than drive a pattern at the wrong level.
 
     The bounds are the FULL ``[0, u_max]`` box even when ``uv0`` was rolled from
-    a narrower one: a bright target genuinely needs some pairs at ``x ~ 0`` (the
-    ones whose ``Phi_k`` cannot be brought into line contribute least when they
-    are off), and clamping them away makes the high levels infeasible.
+    a narrower one: a bright target genuinely needs some pairs at ``x ~ 0`` --
+    those whose ``Phi_k`` cannot be brought into line contribute least when off
+    -- and clamping them away makes the high levels infeasible.
     """
     uv0 = np.asarray(uv0, dtype=float)
     target = float(alpha) * float(ymax)
@@ -281,23 +277,19 @@ def level_patterns(models: Mapping[int, PairModel], phases: Mapping[int, float],
                    alpha_lo: float = 0.0, alpha_hi: float = 0.995,
                    x_lo: float = 0.02, x_hi: float = 1.0,
                    tries: int = 12, tol: float = 1e-4) -> list[Pattern]:
-    """``count`` patterns, one per stratum of ``[alpha_lo, alpha_hi]``, each a fresh drive.
+    """``count`` patterns, one per stratum of ``[alpha_lo, alpha_hi]``.
 
     Stratified rather than uniform: ``alpha_i = alpha_lo + (i + u_i) * width /
-    count`` with ``u_i`` uniform in [0, 1).  The strata guarantee even coverage of
-    the scale -- which uniform sampling of ``alpha`` would only get on average --
-    and the jitter inside each stratum keeps every prediction distinct, so the
-    measured-vs-predicted plot is a scatter rather than a handful of vertical
-    stripes.  Binning these by 4-bit level afterwards still gives ``count/16``
-    different drives per level, so the "do different drives at one level read the
-    same" question comes out of the same data at no extra cost.
+    count`` with ``u_i`` uniform in [0, 1).  The strata guarantee even coverage,
+    which uniform sampling only gets on average, and the jitter inside each keeps
+    every prediction distinct, so the measured-vs-predicted plot is a scatter
+    rather than vertical stripes.  Binning by 4-bit level afterwards still leaves
+    ``count/16`` different drives per level, so "do different drives at one level
+    read the same" comes out of the same data at no extra cost.
 
-    ``alpha_hi`` stops short of 1: at ``alpha = 1`` the level set is a single
-    point, so patterns there carry no diversity and belong to the C scan, which
-    measures the ceiling properly.
-
-    ``x_lo``/``x_hi`` bound the random START only, not the solution -- see
-    :func:`project_to_level`.
+    ``alpha_hi`` stops short of 1, where the level set is a single point and
+    patterns carry no diversity -- that is :func:`full_scale_pattern`'s job.
+    ``x_lo``/``x_hi`` bound the random START only, not the solution.
     """
     scale = _scale_of(models, phases, driven)
     eta = np.asarray(scale.amplitudes, dtype=float)
@@ -342,16 +334,12 @@ def full_scale_pattern(models: Mapping[int, PairModel], phases: Mapping[int, flo
                        driven: Sequence[int], *, label: str = "FS") -> Pattern:
     """The closed-form drive that reaches ``Y_max`` exactly -- the top of the scale.
 
-    :func:`level_patterns` deliberately stops short of ``alpha = 1``: at exactly
-    1 the level set is a single point, so there is no random drive to find and
-    its top stratum only ever APPROACHES the ceiling.  That single point is
-    this one, and it needs no solver -- :func:`attenuated_drive` at
-    ``alpha = 1`` is the ``Y_max`` ray itself.
+    The single point :func:`level_patterns` stops short of, and it needs no
+    solver: :func:`attenuated_drive` at ``alpha = 1`` is the ``Y_max`` ray.
 
-    Driving it is what turns a PREDICTED full scale into a measured one.  It is
-    also where a saturation fit has nearly all of its leverage: the curvature
-    the fit is looking for grows with ``|E|^2`` and vanishes at the bottom of
-    the scale, so a sweep that never reaches the ceiling cannot bound ``Y_sat``.
+    Driving it turns a PREDICTED full scale into a measured one, and it is where
+    a saturation fit has nearly all its leverage -- the curvature grows with
+    ``|E|^2`` and vanishes at the bottom of the scale.
     """
     scale = _scale_of(models, phases, driven)
     drive = attenuated_drive(scale, 1.0)
@@ -373,13 +361,11 @@ def repeat_patterns(models: Mapping[int, PairModel], phases: Mapping[int, float]
                     tries: int = 40, tol: float = 1e-4) -> list[Pattern]:
     """One drive per level in ``alphas``, each repeated ``repeats`` times.
 
-    The drive is solved ONCE per level and copied, so every repeat displays a
-    byte-identical SLM pattern: the spread of its reads is readout
-    reproducibility with the model held fixed, which is the number that decides
-    whether a single read can separate two 4-bit levels.  That is a different
-    question from A's -- A changes the drive every time and tests the model, B
-    never changes it and tests the machine -- and the two cannot be separated
-    from A alone.
+    Solved ONCE per level and copied, so every repeat displays a byte-identical
+    frame: the spread of its reads is readout reproducibility with the model held
+    fixed, which is what decides whether a single read separates two 4-bit
+    levels.  A changes the drive every time and tests the MODEL; B never changes
+    it and tests the MACHINE, and A alone cannot separate the two.
 
     ``alpha = 1`` is allowed here and uses the exact Y_max drive, so B doubles as
     the drift anchor at the top of the scale.
@@ -438,31 +424,24 @@ def psi_scan_patterns(models: Mapping[int, PairModel], phases: Mapping[int, floa
                       ) -> list[Pattern]:
     """The support-optimal ``x = w`` drive for ``psi* + offset``, one per offset.
 
-    Offset 0 is the drive :func:`verify.reachable_max` says attains ``Y_max``;
-    the rest fall off on either side.  Reading the fan rather than the single
+    Offset 0 is the drive :func:`verify.reachable_max` says attains ``Y_max``
+    and the rest fall off either side.  Reading the FAN rather than the single
     peak turns full scale into a measured quantity: the peak of the scan is
-    ``FS`` and its displacement from offset 0 is the model's global phase error,
-    which a single read at ``psi*`` cannot show.
+    ``FS``, and its displacement from offset 0 is the model's global phase error,
+    which one read at ``psi*`` cannot show.
 
-    The measured peak is a LOWER bound on the true reachable ceiling -- this
-    scans one direction of a 2n-dimensional drive space, so if ``eta`` or ``Phi``
-    are off the real optimum need not lie on this curve at all.  An NRMSE quoted
-    against it is therefore conservative, which is the safe direction.
+    The measured peak is a LOWER bound on the true ceiling -- this scans one
+    direction of a 2n-dimensional space, so a wrong ``eta`` or ``Phi`` can put
+    the real optimum off this curve entirely.  An NRMSE quoted against it is
+    conservative, which is the safe direction.
 
-    One case this cannot measure.  A pair's field phase is ``Phi_k + t`` with
-    ``t`` in ``[0, pi]``, so it can only ever be ADVANCED, never retarded.  When
-    the ``Phi_k`` are tightly clustered, ``psi*`` lands at the edge of that
-    reachable half-plane: rotating one way moves the optimum interior and costs
-    amplitude as usual, but rotating the other way is impossible, so every pair
-    pins at the corner ``t = pi`` (``x = w = 1``) and that whole side of the fan
-    returns the SAME drive at ``alpha = 1``.  The scan is then one-sided and
-    cannot bracket a peak.
-
-    It brackets properly only when ``psi*`` is interior, which needs the phases
-    spread -- they span ~290 deg on the ten-pair runs, and the fan falls off on
-    both sides there as intended.  :func:`verify.full_scale` reports
-    ``headroom = Y_max / S^2``: near 1 means clustered phases, so check it before
-    reading a peak position out of this scan.
+    What it cannot measure: a pair's field phase is ``Phi_k + t`` with ``t`` in
+    ``[0, pi]``, so it can only be ADVANCED, never retarded.  With the ``Phi_k``
+    tightly clustered, ``psi*`` lands at the edge of that reachable half-plane,
+    every pair pins at the corner ``x = w = 1``, and that whole side of the fan
+    returns the same drive -- one-sided, so no peak to bracket.  Check
+    :func:`verify.full_scale`'s ``headroom = Y_max / S^2`` first: near 1 means
+    clustered phases.
     """
     scale = _scale_of(models, phases, driven)
     eta = np.asarray(scale.amplitudes, dtype=float)

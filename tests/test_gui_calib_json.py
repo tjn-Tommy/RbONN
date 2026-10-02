@@ -122,31 +122,38 @@ class StepPageTests(_WindowCase):
         w.tpa_step3_edit.setText(str(RUN))
         self.addCleanup(w.tpa_step3_edit.setText, "")
         text = w.tpa_step3_label.text()
-        self.assertEqual(w.tpa_step3_label.property("status"), "ok", text)
+        # Beside the title, not a pill under the field: _STEP_STATUS routes it
+        # to the page's own status line and _set_status leaves it unstyled.
+        self.assertIs(w.tpa_step3_label, w.tpa_status)
+        self.assertIsNone(w.tpa_step3_label.property("status"), text)
         self.assertIn("step3", text)            # the stamp chain
         self.assertIn("pairs", text)
 
         w.tpa_phase_step6_edit.setText(str(RUN))
         self.addCleanup(w.tpa_phase_step6_edit.setText, "")
-        self.assertNotEqual(w.tpa_phase_step6_label.property("status"), "error",
-                            w.tpa_phase_step6_label.text())
+        self.assertNotIn("Cannot", w.tpa_phase_step6_label.text())
+        self.assertNotIn("no step", w.tpa_phase_step6_label.text())
 
-    def test_the_save_dialog_opens_in_the_run_the_page_is_pointed_at(self) -> None:
-        """The folder saved into IS the run that gets the section.
+    def test_the_page_resolves_its_calib_file(self) -> None:
+        """The file named here IS what gets the section.
 
-        A bare default filename opened the dialog wherever Qt last was, which
-        made it easy to write the sweep into a folder with no step-3 section and
-        get a refusal instead of a calibration.
+        There is no Save dialog any more -- a finished sweep writes itself into
+        this file and its folder -- so this is the only thing standing between a
+        sweep and the wrong calibration.  A typed DIRECTORY resolves to the
+        calib.json inside it, exactly as the runners' --calib does.
         """
         w = self.win
         w.tpa_step3_edit.setText(str(RUN))
         self.addCleanup(w.tpa_step3_edit.setText, "")
-        offered = Path(w._save_into_run(w._tpa_step3_path(), "x.csv"))
-        self.assertEqual(offered.parent, RUN)
+        self.assertEqual(Path(w._tpa_step3_path()).resolve(),
+                         (RUN / "calib.json").resolve())
 
-        # With no run chosen there is nothing to default to, and the bare name
-        # is right: the dialog has to ask.
-        self.assertEqual(w._save_into_run(None, "x.csv"), "x.csv")
+        w.tpa_step3_edit.setText(str(RUN / "calib.json"))
+        self.assertEqual(Path(w._tpa_step3_path()).resolve(),
+                         (RUN / "calib.json").resolve())
+
+        w.tpa_step3_edit.setText("")
+        self.assertIsNone(w._tpa_step3_path())
 
     def test_step_8_reads_the_forward_model_out_of_a_run_folder(self) -> None:
         """A directory is not is_file(), which left this panel silently idle."""
@@ -155,7 +162,110 @@ class StepPageTests(_WindowCase):
         self.addCleanup(w.step8_step7_edit.setText, "")
         self.assertIsNotNone(w.step8_y_max, w.step8_status.text())
         self.assertGreater(float(w.step8_y_max), 0.0)
-        self.assertIn("Y_max", w.step8_levels_note.text())
+        self.assertIn("Y_max", w.step8_status.text())
+
+
+class PerPageCalibFileTests(_WindowCase):
+    """Every step page names its own calib.json, and gates on that one.
+
+    There was a single shared field in the calibration tab's header until
+    2026-10-01, built to stop step 7's phases being pinned to one night's etas
+    while step 8 drove another night's model.  It did stop that, by making six
+    pages agree by force -- which also meant that looking at last night's step 6
+    re-pointed step 8, and that is the common case, not the mix-up.  The file is
+    the argument now, as it is on the command line, and each page takes one.
+    """
+
+    def test_each_page_has_its_own_field(self) -> None:
+        w = self.win
+        edits = [w.tpa_step3_edit, w.tpa_phase_step6_edit, w.step8_step7_edit]
+        self.assertEqual(len({id(e) for e in edits}), 3)
+
+        w.tpa_step3_edit.setText(str(RUN))
+        self.addCleanup(w.tpa_step3_edit.setText, "")
+        self.assertEqual(w.tpa_phase_step6_edit.text(), "")
+        self.assertEqual(w.step8_step7_edit.text(), "")
+
+    def test_a_step_is_disabled_until_its_file_has_what_it_needs(self) -> None:
+        """Said before the click: a step 7 with no step 6 used to spend the
+        sweep and only then refuse to fit it."""
+        import json
+        import tempfile
+
+        w = self.win
+        payload = json.loads((RUN / "calib.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            thin = Path(tmp) / "run_thin"
+            thin.mkdir()
+            (thin / "calib.json").write_text(json.dumps(
+                {k: v for k, v in payload.items()
+                 if not k.startswith("step") or k in ("step2", "step3")}),
+                encoding="utf-8")
+            for edit in (w.tpa_step3_edit, w.tpa_phase_step6_edit,
+                         w.step8_step7_edit):
+                edit.setText(str(thin))
+                self.addCleanup(edit.setText, "")
+
+            self.assertTrue(w.tpa_run_button.isEnabled(), "step 3 is there")
+            self.assertFalse(w.tpa_phase_run_button.isEnabled())
+            self.assertIn("step6", w.tpa_phase_run_button.toolTip())
+            self.assertFalse(w.step8_run_button.isEnabled())
+            self.assertIn("step7", w.step8_run_button.toolTip())
+
+    def test_an_empty_field_disables_its_own_page_and_says_so(self) -> None:
+        w = self.win
+        for edit in (w.tpa_step3_edit, w.tpa_phase_step6_edit,
+                     w.step8_step7_edit):
+            edit.setText("")
+        for button in (w.tpa_run_button, w.tpa_phase_run_button,
+                       w.step8_run_button):
+            self.assertFalse(button.isEnabled())
+        self.assertIn("No calibration file", w.tpa_step3_label.text())
+
+    def test_an_empty_field_leaves_load_alone(self) -> None:
+        """Load asks which file to re-fit, so the field cannot be its gate.
+
+        Gating it meant you could not open a calibration until you had already
+        named a different one -- and the field is where a SWEEP writes, which is
+        a question Load never asks.
+        """
+        w = self.win
+        for edit in (w.tpa_step3_edit, w.tpa_phase_step6_edit,
+                     w.step8_step7_edit):
+            edit.setText("")
+        for button in (w.tpa_load_button, w.tpa_phase_load_button,
+                       w.step8_load_button):
+            self.assertTrue(button.isEnabled())
+
+    def test_browse_starts_in_the_calibration_directory(self) -> None:
+        """src/calib_data, where the folders are: the dialog is how one is picked."""
+        import unittest.mock
+
+        w = self.win
+        seen = {}
+
+        def open_spy(_parent, _title, start, _filt):
+            seen["open"] = start
+            return ("", "")
+
+        def save_spy(_parent, _title, start, _filt):
+            seen["save"] = start
+            return ("", "")
+
+        edit = QtWidgets.QLineEdit()
+        with unittest.mock.patch.object(QtWidgets.QFileDialog,
+                                        "getOpenFileName",
+                                        staticmethod(open_spy)):
+            w._browse_calib_into(edit)
+        with unittest.mock.patch.object(QtWidgets.QFileDialog,
+                                        "getSaveFileName",
+                                        staticmethod(save_spy)):
+            w._browse_new_calib_into(edit)
+
+        home = w._default_calib_dir().resolve()
+        self.assertEqual(Path(seen["open"]).resolve(), home)
+        # Step 1 CREATES the file, so its dialog offers a name in that folder.
+        self.assertEqual(Path(seen["save"]).resolve(), home / "calib.json")
 
 
 if __name__ == "__main__":

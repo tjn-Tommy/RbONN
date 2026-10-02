@@ -1,41 +1,44 @@
-"""The one calibration file a run directory holds: ``<run>/calib.json``.
+"""The one calibration file every step appends to: ``calib.json``.
 
-One directory, one JSON.  Every step reads that file, replaces its own section
-and writes it back; no step ever copies another step's payload, so the step-3
-channel layout exists once instead of once per downstream result.  The raw
-readings live in the sibling CSVs -- several per directory is normal, one per
-acquisition -- and the JSON keeps only what was fitted from them plus a
-relative pointer back.
+In:  a path -- the file, or a directory as shorthand for the ``calib.json``
+     inside it, which is all a "run folder" ever was.
+Out: a :class:`Calib`: which sections exist, when each ran, where its CSV is,
+     and what a new section invalidates.
+
+Each step reads the file, replaces its OWN section and writes it back.  No step
+copies another's payload, so the step-3 channel layout exists once instead of
+once per downstream result.  The raw readings stay in CSVs beside it, several
+per calibration being normal, and the JSON keeps only what was fitted from them
+plus a relative pointer back::
 
     run_0931/
-      calib.json            step2 + step3 + step6 + step7 + step8 sections
+      calib.json            step1 .. step8 sections
       step2_0928_1744.csv   px -> nm
       step3_0931_1802.csv   per-channel transfer sweep
       step6_meas_*.csv      per-pair TPA sweep
-      ...
 
-**Inheriting an older calibration is a filesystem operation.**  Copy the
-directory (or just its ``calib.json`` and the CSVs you want to keep) to a new
-name and run the step you want to redo.  There is no ``--inherit`` flag and no
-provenance field: what you copied is what the file says, and you did it with
-your own hands.
+THE FILE IS THE CALIBRATION; the folder is only where its CSVs land.
 
-**Writing a section drops the sections below it.**  A fresh step 3 means a new
-channel layout, so the step-6 etas and step-7 phases in that file were measured
-through an aperture that no longer exists -- keeping them would leave the file
-in a state that reads as valid and is not.  They are dropped, named as they go,
-and the directory they were copied from still has them.
+Inheriting an older calibration is a FILESYSTEM operation: copy the
+``calib.json`` and the CSVs worth keeping to a new folder, then run the step you
+want to redo.  There is no ``--inherit`` flag and no provenance field -- what you
+copied is what the file says.  An offline re-fit is the same move, which is why
+nothing ever writes a fit back over the file a GUI was pointed at to look at.
 
-**Section payloads are not this module's business.**  Each fit owns its own, as
-``calibration_module``'s docstring says it should: ``fit.slm_response`` for
-step 3, ``fit.pair_v2`` for step 6, ``fit.phase`` for step 7.  What lives here
-is the container -- which sections exist, when each one ran, where its CSV is,
-and what a new section invalidates.
+WRITING A SECTION DROPS THE SECTIONS BELOW IT.  A fresh step 3 is a new channel
+layout, so that file's step-6 etas and step-7 phases were measured through an
+aperture that no longer exists; keeping them would leave the file reading as
+valid when it is not.  They are dropped, named as they go, and the directory
+they were copied from still has them.
 
-Every section carries ``ran``, a full local ISO timestamp of when the step
-executed.  Nothing enforces an order -- a hand-copied file can hold a step 6
-older than its step 3 -- but :meth:`Calib.stale` finds it and
-:meth:`Calib.chain_lines` says so before an hour is spent on it.
+Section payloads are not this module's business -- each fit owns its own
+(``fit.slm_response``, ``fit.pair_v2``, ``fit.phase``).  What lives here is the
+container.
+
+Every section carries ``ran``, a full local ISO timestamp.  Nothing enforces an
+order -- a hand-copied file can hold a step 6 older than its step 3 -- but
+:meth:`Calib.stale` finds it and :meth:`Calib.chain_lines` says so before an
+hour is spent on it.
 """
 
 from __future__ import annotations
@@ -66,11 +69,11 @@ STEP_WHAT: dict[int, str] = {
 
 
 class CalibFileError(Exception):
-    """Anything wrong with a run directory's calib.json."""
+    """Anything wrong with a calib.json."""
 
 
 class CalibNotFound(CalibFileError):
-    """No calib.json in the directory (or the named file is not there)."""
+    """The named calib.json is not there (nor one in the named directory)."""
 
 
 class SectionMissing(CalibFileError):
@@ -105,9 +108,9 @@ def step_number(step: int | str) -> int:
     return int(step_key(step)[4:])
 
 
-def calib_path(run: str | Path) -> Path:
-    """The calib.json a run directory holds, or the file itself if named."""
-    path = Path(run).expanduser()
+def calib_path(calib: str | Path) -> Path:
+    """The named file, or the ``calib.json`` inside a named directory."""
+    path = Path(calib).expanduser()
     return path / CALIB_NAME if path.is_dir() or path.suffix == "" else path
 
 
@@ -138,19 +141,29 @@ def _as_csv_list(csv: str | Path | Sequence[str | Path] | None) -> list[Path]:
     return [Path(entry) for entry in csv]
 
 
-def _relative_to(run_dir: Path, target: Path) -> str:
+def _relative_to(folder: Path, target: Path) -> str:
     """Store CSV pointers relative to the JSON, in posix form.
 
-    Relative so the whole directory can be moved or copied without breaking;
-    posix so a file written on Windows still resolves elsewhere.  A CSV outside
-    the run directory (an offline re-fit of another night's sweep) comes out as
-    ``../run_0930/step6_meas_0930_2201.csv``, which is honest about what it is.
+    Relative so the JSON and its CSVs can be moved or copied together without
+    breaking; posix so a file written on Windows still resolves elsewhere.  A
+    CSV outside the folder (an offline re-fit of another night's sweep) comes
+    out as ``../run_0930/step6_meas_0930_2201.csv``, which is honest about what
+    it is.
     """
     target = Path(target).expanduser()
     if not target.is_absolute():
-        target = (run_dir / target).resolve()
+        # A relative pointer is ambiguous: argv and every ``folder / name`` give
+        # one relative to the CWD, while a bare filename usually means "beside
+        # the JSON".  Whichever names a real file wins, CWD first, because that
+        # is what a command line means -- otherwise ``--calib
+        # src/calib_data/run_x/calib.json sweep.csv`` from the repo root stores
+        # the whole repo-relative path and nothing downstream can resolve it.
+        from_cwd = (Path.cwd() / target).resolve()
+        from_folder = (folder / target).resolve()
+        target = (from_cwd if from_cwd.exists() or not from_folder.exists()
+                  else from_folder)
     try:
-        rel = os.path.relpath(target, run_dir)
+        rel = os.path.relpath(target, folder)
     except ValueError:                      # different drive on Windows
         return target.as_posix()
     return Path(rel).as_posix()
@@ -162,7 +175,7 @@ def _relative_to(run_dir: Path, target: Path) -> str:
 
 @dataclass
 class Calib:
-    """A loaded ``calib.json``, and the directory it sits in."""
+    """A loaded ``calib.json``, and the folder it sits in."""
 
     path: Path
     payload: dict[str, Any] = field(default_factory=dict)
@@ -170,8 +183,18 @@ class Calib:
     # -- where it is -------------------------------------------------
 
     @property
-    def run_dir(self) -> Path:
+    def folder(self) -> Path:
+        """Where this file lives -- and so where its CSVs and plots go."""
         return self.path.parent
+
+    def beside(self, name: str) -> Path:
+        """``name`` in this file's folder: the one place a step writes to.
+
+        Every derived artefact of a step -- its meas CSV above all -- is named
+        through here, so "beside the calib.json" is one expression rather than a
+        ``.parent`` each caller spells for itself.
+        """
+        return self.folder / name
 
     # -- what it holds -----------------------------------------------
 
@@ -193,8 +216,8 @@ class Calib:
             number = step_number(step)
             raise SectionMissing(
                 f"{self.path} has no step{number} section "
-                f"({STEP_WHAT.get(number, 'that step')}) -- run step {number} in "
-                f"this directory, or copy a calib.json that has it. "
+                f"({STEP_WHAT.get(number, 'that step')}) -- run step {number} "
+                f"against this file, or copy a calib.json that has it. "
                 f"Present: {', '.join(f'step{s}' for s in self.steps()) or 'nothing'}"
             )
         return section
@@ -238,7 +261,7 @@ class Calib:
         was left behind in the directory it was copied from.
         """
         stored = self.section(step).get("csv")
-        return [(self.run_dir / entry).resolve() for entry in _as_csv_list(stored)]
+        return [(self.folder / entry).resolve() for entry in _as_csv_list(stored)]
 
     def csv_path(self, step: int | str) -> Path:
         """The one CSV the section names; raises if it names none or several."""
@@ -274,8 +297,9 @@ class Calib:
     def chain_lines(self) -> list[str]:
         """The stamp chain, one line per section, stale ones flagged.
 
-        Printed by every runner before it touches the bench, and by the GUI's
-        run-folder strip.  A note, never a refusal: whether a step 6 older than
+        Printed by every runner before it touches the bench, and beside every
+        GUI page's calib file field.  A note, never a refusal: whether a step 6
+        older than
         its step 3 matters is the operator's call, but it is not going to be a
         surprise.
         """
@@ -303,19 +327,19 @@ class Calib:
 # read / write
 # ----------------------------------------------------------------------
 
-def load_calib(run: str | Path, *, missing_ok: bool = False) -> Calib:
-    """Load ``<run>/calib.json`` (or the named file).
+def load_calib(calib: str | Path, *, missing_ok: bool = False) -> Calib:
+    """Load the named ``calib.json`` (or the one in the named directory).
 
     ``missing_ok`` returns an empty :class:`Calib` instead of raising, which is
-    what a step needs when it is the first one to write into a fresh directory.
+    what a step needs when it is the first one to write into a fresh file.
     """
-    path = calib_path(run)
+    path = calib_path(calib)
     if not path.is_file():
         if missing_ok:
             return Calib(path=path, payload={})
         raise CalibNotFound(
-            f"no {CALIB_NAME} in {path.parent} -- start a run by copying one in, "
-            f"or run step 1/2/3 there first"
+            f"{path} is not there -- create it with step 1, or copy a "
+            f"{CALIB_NAME} into that folder"
         )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -333,7 +357,7 @@ def load_calib(run: str | Path, *, missing_ok: bool = False) -> Calib:
 
 
 def write_section(
-    run: str | Path,
+    calib_file: str | Path,
     step: int | str,
     payload: dict[str, Any],
     *,
@@ -341,7 +365,7 @@ def write_section(
     ran: str | None = None,
     log: Callable[[str], None] | None = print,
 ) -> Calib:
-    """Stamp ``payload``, put it in the run's calib.json, drop what it invalidates.
+    """Stamp ``payload``, put it in the calib.json, drop what it invalidates.
 
     ``csv`` is stored relative to the JSON.  ``ran`` defaults to now -- pass it
     only to preserve an original timestamp, which is what the converter does.
@@ -349,7 +373,7 @@ def write_section(
     """
     key = step_key(step)
     number = step_number(step)
-    path = calib_path(run)
+    path = calib_path(calib_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     calib = load_calib(path, missing_ok=True)
 

@@ -1,13 +1,15 @@
 """SLM response calibration (steps 1-3): the result format and its array math.
 
-``CalibrationResult`` is what steps 1, 2 and 3 hand on -- to each other, to the
-encoder (``slm_module.encoding``) and to steps 6-8 -- so it lives here, beside
-the JSON/CSV readers and writers that define its file layout.  Also here: the
-step-3 channel grid designed from a step-2 map, the peak centroids, the band
-clip, and the validators the sweeps share.
+In:  the arrays the step-1/2/3 sweeps measure, or a stored ``calib.json`` /
+     CSV through the loaders here.
+Out: a :class:`CalibrationResult` -- what steps 1, 2 and 3 hand on to each
+     other, to the encoder (``slm_module.encoding``) and to steps 6-8 -- plus
+     the ``step2``/``step3`` section payloads.
 
-Nothing in here imports a driver.  The sweeps that fill these arrays are in
-``calibration_module.measure.slm_response``.
+Also here: the step-3 channel grid designed from a step-2 map, the peak
+centroids, the band clip, and the validators the sweeps share.  Nothing imports
+a driver; the sweeps that fill these arrays are in
+:mod:`calibration_module.measure.slm_response`.
 """
 from __future__ import annotations
 
@@ -111,21 +113,15 @@ def local_peak_centroid(
     *,
     half_window_nm: float | None = None,
 ) -> tuple[float, int, float]:
-    """
-    Estimate peak center by local weighted centroid.
+    """Estimate peak center by local weighted centroid.
 
-    The returned center uses the same unit as wavelengths_m. The name is kept
-    for compatibility with earlier code, but callers may pass nm or m.
-
-    The local window is either a fixed number of samples on each side of the
-    peak (``half_window``) or, when ``half_window_nm`` is given, every sample
-    within +/- half_window_nm of the peak wavelength. The nm form keeps the
-    averaging width physical and independent of the OSA sampling density.
-
-    Returns:
-        center_wavelength
-        argmax_index
-        peak_strength
+    In:  a trace.  Despite the name, ``wavelengths_m`` may be nm or m, and the
+         centre comes back in whatever unit went in.  The window is either a
+         fixed number of samples each side of the peak (``half_window``) or,
+         with ``half_window_nm``, every sample within that many nm of it -- the
+         nm form keeps the averaging width physical and independent of the OSA's
+         sampling density.
+    Out: ``(center_wavelength, argmax_index, peak_strength)``.
     """
 
     wavelengths = np.asarray(wavelengths_m, dtype=float)
@@ -279,20 +275,18 @@ def clip_to_wavelength_range(
 ) -> CalibrationResult:
     """Keep only the coordinates whose mapped wavelength lies in [min, max] nm.
 
-    Step 2 sweeps whatever SLM region is illuminated and fits ONE line through
-    every peak it measured.  A peak outside the usable band is good fit data,
-    not an error -- the wider lever arm pins the slope down better -- so the
-    band is not a peak-search mask.  It is a property of the DOWNSTREAM steps:
-    only channels inside it carry usable light.  Hence it is applied here,
-    where the mapping is handed on (saved to JSON, or passed to step 3), and
-    never during acquisition.
+    The band is NOT a peak-search mask.  Step 2 sweeps whatever region is
+    illuminated and fits one line through every peak; a peak outside the usable
+    band is good fit data, the wider lever arm pinning the slope down better.
+    The band is a property of the DOWNSTREAM steps -- only channels inside it
+    carry usable light -- so it is applied here, where the mapping is handed on,
+    and never during acquisition.
 
-    ``wavelength_fit_coefficients`` is carried over untouched: it is the fit
-    over the whole swept region, and it is what predicts a wavelength at a
-    coordinate this clip dropped.  Per-coordinate arrays (the intensity sweeps,
-    the transfer fits, per-coordinate min/max levels) are sliced along with the
-    mapping; ``level_range`` and scalar levels are not per coordinate and are
-    left alone.  ``None`` on either bound leaves that end unclipped.
+    ``wavelength_fit_coefficients`` carries over untouched: it is the fit over
+    the whole swept region, and what predicts a wavelength at a coordinate this
+    clip dropped.  Per-coordinate arrays are sliced along with the mapping;
+    ``level_range`` and the scalar levels are not per coordinate and are left
+    alone.  ``None`` on either bound leaves that end unclipped.
     """
     coordinates = np.asarray(calibration_results.coordinates).ravel()
     wavelengths = np.asarray(calibration_results.wavelength, dtype=float).ravel()
@@ -373,37 +367,28 @@ def build_channel_calibration_grid(
     guard_bands_nm: Iterable[tuple[float, float]] | None = None,
     require_symmetric_guard_bands: bool = True,
 ) -> tuple[CalibrationResult, float]:
-    """Generate a Step-3 seed only at channel centers around a target wavelength.
+    """A step-3 seed at channel centers around a target wavelength.
 
-    The center coordinate is the middle of the gap between the nearest two
-    channels.  For the default 15 px channel plus 5 px gap, the first channels
-    sit at center +/- 10 px, leaving the target wavelength 2.5 px from each
-    inner channel edge.
+    The measured coordinates ARE the encoding layout's channel centers -- the
+    encoder loads the result verbatim through
+    :func:`slm_module.encoding.channel_layout_from_calibration` -- so the grid
+    designed here is the single source of the channel geometry.
+
+    Channels sit at mirror-image offsets ``center +/- (k + 0.5) * pitch`` about
+    the middle of the gap between the nearest two, so the k-th channel on each
+    side pairs at equal wavelength offset from the target ONLY if the skipped
+    guard bands are themselves symmetric about it.  ``require_symmetric_guard_
+    bands`` (the default) rejects an asymmetric guard set up front so a lopsided
+    pairing cannot slip through; pass False to probe the skip mechanics alone.
 
     ``center_gap_px`` widens the central dark pad to at least that many pixels
-    (first offset ``ceil((width + center_gap_px)/2)`` instead of half a pitch).
-    The measured coordinates ARE the encoding layout's channel centers: the
-    encoder loads the result verbatim via
-    :func:`slm_module.encoding.channel_layout_from_calibration`, so the grid
-    designed here is the single source of the channel geometry.
-    ``None`` keeps the legacy half-pitch placement.
-
-    When ``center_coordinate`` is supplied, the linear wavelength map is shifted
-    so that this refined coordinate is exactly ``target_wavelength_nm``.  That
-    keeps OSA center fine tuning compatible with the very linear Step-2 fit.
-
-    If guard bands are supplied, any candidate channel whose active window
-    overlaps one of those wavelength bands is skipped and the next pitch outward
-    is tried. The requested number of channels per side is preserved when the
-    Step-2 range is wide enough.
-
-    Channels are placed at mirror-image offsets ``center +/- (k + 0.5) * pitch``,
-    so the k-th channel on each side pairs up at equal wavelength offset from the
-    target only when the skipped (guard) bands are themselves symmetric about
-    ``target_wavelength_nm``. With ``require_symmetric_guard_bands`` (the
-    default), an asymmetric guard set is rejected up front so a lopsided pairing
-    cannot slip through; pass False to allow it (e.g. to probe the skip
-    mechanics in isolation).
+    (first offset ``ceil((width + center_gap_px)/2)`` instead of half a pitch);
+    ``None`` keeps the legacy half-pitch placement.  ``center_coordinate``
+    shifts the linear map so that refined coordinate is exactly
+    ``target_wavelength_nm``, which keeps OSA centre fine tuning compatible with
+    the step-2 fit.  A candidate channel whose window overlaps a guard band is
+    skipped for the next pitch outward, and the requested count per side is
+    preserved while the step-2 range is wide enough.
     """
 
     target = float(target_wavelength_nm)
@@ -648,25 +633,22 @@ def save_calibration_result(
 ) -> Path:
     """Write a full CalibrationResult to JSON so a later step can resume from it.
 
-    Every field is stored (arrays as nested lists), so loading the file rebuilds
-    an equivalent CalibrationResult.
+    Every field is stored, arrays as nested lists, so loading the file rebuilds
+    an equivalent result.
 
-    ``fit_transfer`` (default on) fits each channel's measured curve to the
-    4-parameter sin^2 transfer model and stores the coefficients under
-    ``transfer_fits``.  That is what
-    :func:`slm_module.encoding.channel_layout_from_calibration` inverts to turn
-    a requested value into a grayscale level, so fitting HERE -- once, at write
-    time -- freezes the encoding with the calibration.  Steps 6, 7 and 8 run at
-    different moments against the same JSON and must agree on what "x = 0.5"
-    means; re-deriving the fit on every load would let an optimizer path or a
-    scipy version quietly move it between them.  The raw ``intensity_levels``
-    stay in the file alongside the fits, so a curve can always be refitted.
+    ``fit_transfer`` (default on) fits each channel's curve to the sin^2
+    transfer model and stores the coefficients under ``transfer_fits``.  That is
+    what :func:`slm_module.encoding.channel_layout_from_calibration` inverts to
+    turn a requested value into a grayscale level, so fitting HERE, once at
+    write time, freezes the encoding with the calibration: steps 6, 7 and 8 run
+    at different moments against the same file and must agree on what
+    ``x = 0.5`` means, which re-deriving the fit on every load would let an
+    optimizer path or a scipy version quietly move.  The raw
+    ``intensity_levels`` stay alongside, so a curve can always be re-fitted.
 
-    A channel whose curve will not fit is reported and ``transfer_fits`` is
-    stored as null -- the measurement is never lost to a fit failure, and the
-    raw sweep is still in the file.  The encoder then fails loudly on load,
-    which is the right moment for it: before a run rather than after one.  Pass
-    ``fit_transfer=False`` to skip the fit entirely.
+    A channel whose curve will not fit is reported and stored as null -- the
+    measurement is never lost to a fit failure -- and the encoder then fails
+    loudly on load, which is the right moment: before a run rather than after.
     """
 
     fits = calibration_results.transfer_fits
@@ -744,19 +726,19 @@ def step2_section(result: CalibrationResult) -> dict:
 def step3_section(result: CalibrationResult, *, fit_transfer: bool = True) -> dict:
     """Step 3: the channel grid and its FITTED transfer curves, no raw sweep.
 
-    ``intensity_levels`` / ``raw_intensity_levels`` are exactly the columns of
-    ``step3_*.csv``, so they are not duplicated here.  What is left is the
-    channel layout -- a wavelength and coordinate per channel, the window/pad
-    split it was swept with, the levels swept -- plus one
+    ``intensity_levels``/``raw_intensity_levels`` are the columns of
+    ``step3_*.csv`` and are not duplicated here.  What is left is the channel
+    layout -- a wavelength and coordinate per channel, the window/pad split, the
+    levels swept -- plus one
     :class:`~calibration_module.fit.transfer.TransferFit` per channel, which IS
     the encoding from here on: ``channel_layout_from_calibration`` inverts these
     and nothing re-fits them.
 
-    A channel whose curve will not fit is fatal here, unlike in
-    :func:`save_calibration_result`, which could fall back on storing the curves.
-    There is no fallback left: without a fit that channel cannot be encoded at
-    all, and the right moment to say so is now -- the sweep is already safe in
-    the CSV -- rather than at the start of a step-6 run.
+    A channel whose curve will not fit is FATAL here, unlike in
+    :func:`save_calibration_result`, which could fall back on storing the raw
+    curves.  There is no fallback left -- without a fit that channel cannot be
+    encoded at all -- and the right moment to say so is now, the sweep already
+    being safe in the CSV, rather than at the start of a step-6 run.
     """
     fits = result.transfer_fits
     if fit_transfer and fits is None and result.intensity_levels is not None:
@@ -845,9 +827,10 @@ def calibration_result_from_dict(payload: dict) -> CalibrationResult:
 
 
 def load_calibration_result(path: str | Path) -> CalibrationResult:
-    """The channel calibration at ``path``: a run directory, or a JSON file.
+    """The channel calibration at ``path``: a calib.json, or a JSON file.
 
-    Takes a run directory or its ``calib.json`` (the step-3 section comes back),
+    Takes a ``calib.json`` or the directory holding one (the step-3 section
+    comes back),
     a pre-v3 standalone result from :func:`save_calibration_result`, or an older
     combined step-6/step-7 result (its embedded ``step3``).  All four are things
     somebody has reasonably pointed this at, and which one it is does not change
@@ -925,22 +908,22 @@ def load_wavelength_map_csv(
     )
 
 
-def load_step2_map(run: str | Path, *,
+def load_step2_map(calib: str | Path, *,
                    fallback_min_max: tuple[int, int] = (0, 1023)) -> CalibrationResult:
     """A run's px -> nm map: the line from its CSV, the levels from its section.
 
-    The two halves are deliberately apart -- a thousand measured coordinates are
-    a table, the polynomial and the off/on levels are not -- so neither
-    :func:`load_calibration_result` (which gives the step-3 CHANNEL grid) nor the
-    CSV alone (which carries no levels) is the whole answer.  This is what step 3
-    and the GUI's step-2 source both need, and it is one function so they cannot
-    disagree about it.
+    In:  ``calib``, a ``calib.json``, the directory holding one, or a bare
+         coordinate -> wavelength CSV.  A bare CSV has no levels of its own and
+         gets ``fallback_min_max``.
+    Out: the map.
 
-    ``run`` is a run directory, its ``calib.json``, or a bare coordinate ->
-    wavelength CSV; a bare CSV has no levels of its own, so it gets
-    ``fallback_min_max``.
+    The two halves live apart -- a thousand measured coordinates are a table, the
+    polynomial and the off/on levels are not -- so neither
+    :func:`load_calibration_result` (which gives the step-3 CHANNEL grid) nor the
+    CSV alone is the whole answer.  One function, so step 3 and the GUI's step-2
+    source cannot disagree about it.
     """
-    src = Path(run).expanduser()
+    src = Path(calib).expanduser()
     if src.is_file() and src.suffix.lower() == ".csv":
         low, high = fallback_min_max
         return load_wavelength_map_csv(src, min_level=low, max_level=high)

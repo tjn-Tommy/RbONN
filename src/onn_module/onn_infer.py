@@ -1,108 +1,57 @@
 """Run one inference on the bench: display what the npz says, read what it predicts.
 
-This is the other end of :mod:`onn_module.bench_reference`.  That file simulates
-the layer and writes down, for every measurement, both the drive to display and
-the ``Y`` it should produce; this one displays those drives, reads the detector,
-undoes the instrument response, and asks whether the optics agree -- and, at the
-end, whether they classified the digit.
+The other end of :mod:`onn_module.bench_reference`.  That file writes down the
+drives and the ``Y`` each should produce; this one displays them, reads the
+detector, undoes the instrument response and reports whether the optics picked
+the right digit.
 
-    python src/onn_module/onn_infer.py --npz runs/onn784_ctrl/bench_reference.npz
-        --step8-csv src/calib_data/<run>/calib_step8_<stamp>.csv
+In:  a ``bench_reference.npz`` and the run's ``calib.json`` (``--calib``), which
+     holds every step the forward model needs.  ``--t-meas`` is the window for
+     EVERY read -- inference, anchor and the opening dark alike -- and defaults
+     to the bench window :data:`~calibration_module.measure.pair_v2.T_MEAS_S`,
+     the one steps 6-8 read at, so a read and the rung it is scaled against
+     average the same noise.
+Out: a CSV, one row per read: the volts, the recovered ``Y``, the ``g`` used,
+     ``kind=gain`` rows for the anchors it was built from and ``kind=gain_drop``
+     for the anchor reads it refused.
 
-``--t-meas`` is the window for EVERY read of the run -- inference, anchor and
-the opening dark alike -- and defaults to the bench window
-(:data:`~calibration_module.measure.pair_v2.T_MEAS_S`), the one steps 6, 7 and 8
-also read at, so an inference read and the step-8 rung it is scaled against
-average the same noise unless you say otherwise.  It is still worth deciding:
-the window is the whole cost of the run (``N * n_tiles * n_out`` reads, 7,900
-for ten onn784 images) and also what sets whether the read noise fits inside the
-budget ``bench_reference.py`` prints.  Those pull in opposite directions.
-
-Which env
----------
-``rbonn``, not ``rbonn-ml``: this module imports the SLM and DAQ drivers and no
-torch, which is the opposite of the rest of the package.  The npz is the seam --
-it is read with numpy alone.
-
-The post-processing
--------------------
 The detector sees, for gain ``g`` and the step-6 single-beam response,
 
     V = g * [ Y + SUM_k (a_x x_k + q_x x_k^2 + a_w w_k + q_w w_k^2) ] + dark
 
-so recovering the ``Y`` the layer models means
+so ``Y = (V - dark) / g - SUM_k (...)``, IN THAT ORDER -- the single-beam light
+went through the same gain, and step 6 fits those coefficients where ``g`` is 1
+by definition.
 
-    Y = (V - dark) / g  -  SUM_k (...)
+The gain is anchored to THIS RUN'S FIRST MINUTE.  :func:`build_anchors` solves
+:data:`GAIN_RUNGS` ladder rungs over :data:`GAIN_BAND` with step 8's own
+builder; the first block reads them right after the dark and DEFINES ``g = 1``
+there.  Every ``--gain-every`` the same drives are replayed verbatim -- so eta,
+Phi and Y_sat all cancel -- and ``g`` is the origin-slope of ``(V_now - dark) =
+g * (V_first - dark)``, interpolated in time between blocks
+(:func:`apply_gain`).  The dark is read once and held.
 
-in that order: the single-beam term is light on the detector, so it went through
-the same gain, and step 6 fits ``a_x``/``a_w`` from reads where ``g`` is 1 by
-definition.  Subtracting before dividing would be right only if those
-coefficients were in raw ADC volts, and they are not.
+Each anchor block is checked on its own: a rung whose ratio to its reference
+-- the model's prediction in the first block, the g = 1 volts after it -- is
+more than :data:`GAIN_TOL` off the block's fitted slope is a bad read and is
+dropped from the fit, written as ``kind=gain_drop``.  The first block re-reads
+what it drops once; off again, the rung leaves the ladder for the run.  Nothing
+checks an inference read: there is nothing to judge one against.
 
-The gain
---------
-``g`` is measured, not assumed, and relative to the step-8 sweep that DEFINES
-``g = 1`` (see ``gain_reference`` in a step-8 result JSON).  Five of that
-sweep's own ladder rungs -- :data:`ANCHOR_FRACTIONS` of that ladder's top rung,
-so the bright end of it, where the SNR is -- are replayed here, and ``g`` is the
-slope of
+What that does NOT measure is the gain change between the step-7 fit behind
+the npz and the start of this run: that is step 8's job, and a run without one
+carries it in the residual as a multiplicative tilt.  Within the run, the
+drift is tracked.
 
-    (V_now - dark)  =  g * (V_step8 - dark_step8)
+The PMT thermistor is read with every gain block and stamped on every row
+until the next one; ``--no-pmt`` turns it off.
 
-through the origin.  Identical SLM frames on both sides, so ``eta``, ``Phi`` and
-``Y_sat`` all cancel and ``g`` needs no model at all.  The drives are taken
-VERBATIM from the step-8 CSV rather than recomputed, so a later change to the
-level solver cannot silently make the two runs different measurements.
-
-Five DIFFERENT rungs rather than five repeats of one: the same read budget buys
-a slope instead of a mean, and a slope can be wrong in a way a mean cannot show.
-A pure gain change scales every level by the same factor, so a bad fit means
-something other than gain moved -- the residuals are printed per rung for that
-reason.
-
-The fit is through the origin, not slope-plus-intercept.  All five anchors sit in
-the top half of the ladder, so extrapolating a line back to zero inflates the
-intercept's noise 2.2x over a single read -- millivolts of noise on a quantity
-whose true value is -0.08 mV.  An intercept there costs more than it measures.
-
-``--gain-every`` re-measures during a long run, and every inference read is
-corrected with ``g`` INTERPOLATED IN TIME between the two measurements that
-bracket it (:func:`apply_gain`), not with the one that preceded it.  The drift is
-continuous; a staircase would leave half of it in the residual.  The ``g`` column
-holds the interpolated value actually used, and the ``kind=gain`` rows hold the
-measurements it was built from.
-
-The dark
---------
-Read ONCE, at the start, and held for the run -- the way a single-sweep step
-gets one for free.  Over the 14 h 0929 run the dark moved 0.034 mV with a
-0.026 mV warm-up transient, against a 4.7 mV residual, and it is a common offset
-across the ten outputs so it cancels exactly in a per-image argmax.  Tracking it
-at the default :data:`~calibration_module.measure.patterns.DARK_EVERY_S` cost
-that run 182 reads and half an hour.  Step 6 must keep re-reading it -- there the
-all-off level is a fitted point of the background block, not an offset -- and
-does; this is not step 6.
-
-Without a step-8 CSV
---------------------
-``--step8-csv`` may be omitted, and then ``g = 1`` -- which is not "the gain is
-one" but "the gain is what it was when the step-7 fit behind this npz was taken",
-since ``y_block`` is in that fit's volts.  Nothing in the run measures it, so a
-gain error since then shows up as a multiplicative tilt on the residuals and
-cannot be told apart from a model error.  Measured on the 0929 run, which had no
-anchor: the best-fit scale wandered 0.939..1.064 over 14 h, and removing it per
-2 h bin took the residual from 4.71 to ~3.9 mV.  A joint (g, Y_sat) fit on the
-inference reads themselves is degenerate -- Y_sat wandered 1.0..5.0 V per bin
-with no gain in rms -- so the run cannot anchor itself and the replay is the only
-way.  For a quick check on a bench that has not moved since its calibration
-omitting it is a fair trade; for anything quantitative it is not, and the CSV
-meta records ``g_reference_v = 1 (assumed, ...)`` so a later reader cannot
-mistake one run for the other.
+Runs in ``rbonn``, not ``rbonn-ml``: this imports the SLM and DAQ drivers and no
+torch.  The npz is the seam, read with numpy alone.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 import time
@@ -114,7 +63,9 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from calibration_module.calib_file import calib_path  # noqa: E402
 from calibration_module.fit.verify import (  # noqa: E402
+    full_scale,
     load_forward_model,
     write_verify_csv,
 )
@@ -125,9 +76,11 @@ from calibration_module.measure.patterns import (  # noqa: E402
     run_patterns,
     select_pairs,
 )
-from calibration_module.measure.pmt_temp import (  # noqa: E402
-    PMT_PERIOD_S,
-    PmtTemperature,
+from calibration_module.measure.pmt_temp import open_pmt  # noqa: E402
+from calibration_module.steps.calib_step8 import (  # noqa: E402
+    LADDER_CEILING_V,
+    alpha_for_volts,
+    build as build_ladder,
 )
 
 # ---- Edit these to match your setup ----
@@ -137,26 +90,44 @@ USB_SLM_NO = 1              # SLM_Ctrl_* device index for the DVI-mode switch
 DAQ_DEVICE = "Dev1"
 DAQ_CHANNEL = "ai0"
 
-ACQ = DEFAULT_ACQ           # the bench acquisition; --t-both may override the window
+T_MEAS_S = 4.8        # DAQ window per read, seconds; --t-meas overrides
 
-GAIN_EVERY_S = 900.0        # re-measure g at most this often (15 min)
+ACQ = replace(DEFAULT_ACQ, t_meas_s=T_MEAS_S)   # the bench acquisition
 
-#: The step-8 ladder rungs replayed to measure ``g``, as fractions of THAT
-#: LADDER'S TOP RUNG -- not of Y_max.
+GAIN_EVERY_S = 1200.0       # re-measure g (and the PMT temperature) this often (20 min)
+
+#: The gain anchors: ``GAIN_RUNGS`` ladder rungs stratified over ``GAIN_BAND``,
+#: as fractions of ``Y_max``, solved by step 8's own :func:`build` so a rung
+#: here is the same object as a rung there.
 #:
-#: All in the bright end of the ladder on purpose: a gain is a scale factor, so
-#: it can be measured at any level, and the bright end is where the SNR is.  Five
-#: distinct rungs rather than five repeats of one buys a slope for the same read
-#: budget; see "The gain" above for why the fit runs through the origin.
+#: All in the bright half on purpose: a gain is a scale factor, so it can be
+#: measured at any level, and the bright end is where the SNR is.  Ten distinct
+#: rungs rather than ten repeats of one buys a slope for the same read budget;
+#: see the module docstring for why the fit runs through the origin.
 #:
-#: Relative to the ladder rather than to Y_max because step 8 no longer drives
-#: full scale.  Its ceiling is :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V`
-#: in VOLTS, so the top alpha depends on the PMT gain -- presently ~0.29.  Absolute
-#: targets of 0.55..0.95 would all land above it, the nearest-rung picker would
-#: hand back the five brightest rungs whatever they were, and a slope fitted over
-#: rungs 10 % apart is a mean with extra steps.  As fractions, the 1.8x lever arm
-#: survives any gain.
-ANCHOR_FRACTIONS = (0.55, 0.66, 0.77, 0.88, 1.00)
+#: The top is capped the way step 8 caps its ladder -- at
+#: :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V` in VOLTS,
+#: through :func:`alpha_for_volts` against this model's ``Y_max`` -- because
+
+GAIN_BAND = (0.4, 0.8)
+GAIN_RUNGS = 10
+
+#: A rung more than this (relative) off the block's FITTED SLOPE is a bad read
+#: and is dropped from that block's fit.
+#:
+#: What this is for: on run_1001 single anchor reads came in 4-6 % high with a
+#: perfectly ordinary trace std -- a level shift lasting the whole window, not
+#: a transient inside it, so the step-6/7 trace guards have nothing to see.
+#: The two bad reference reads on disk sit 4.1 % and 4.6 % off their block's
+#: slope to the model, and the -4.8 / -5.1 % they left in every later block are
+#: the same reads seen from the other side.  The body of the scatter is much
+#: tighter -- 0.9 % per read (MAD sigma) once each rung's fixed model error is
+#: out -- but a later block is judged against a SINGLE-read reference, so its
+#: deviations carry both reads: p90 3.4 % on that run.  4 % passes that body
+#: and takes the tail; 3 % would drop about one read in seven.
+#:
+#: Inference reads are never checked -- there is nothing to judge one against.
+GAIN_TOL = 0.04
 
 OUT_DIR = REPO_ROOT / "runs"
 
@@ -213,73 +184,47 @@ def load_npz(path: Path) -> dict:
 # the gain
 # ======================================================================
 
-def read_step8_anchors(path: Path, pairs: list[int],
-                       fractions=ANCHOR_FRACTIONS) -> dict:
-    """Step-8 ladder rungs to replay: their drives, and their g = 1 volts.
+def build_anchors(models, phases, pairs: list[int], *, seed: int,
+                  n: int = GAIN_RUNGS, band=GAIN_BAND) -> dict:
+    """The gain ladder to replay: ``n`` solved rungs over ``band``, in alpha order.
 
-    ``fractions`` are of the ladder's OWN top rung, which this reads off the CSV
-    -- step 8 caps itself in volts, so its top alpha is whatever the PMT gain
-    made it.  See :data:`ANCHOR_FRACTIONS`.
+    In:  the forward model and a seed.  ``band`` is in fractions of ``Y_max``;
+         its top is capped at :data:`LADDER_CEILING_V` exactly as step 8 caps
+         its own ladder, so the brightest anchor never exceeds what step 8 was
+         willing to drive.
+    Out: each rung's drive, its achieved alpha, its linear prediction in volts,
+         ``v_ref = None`` -- the g = 1 volts do not exist until the first
+         block has read them (:func:`measure_gain` fills them in) -- and
+         ``keep``, all ``True``: the rungs still in the ladder.  A rung the
+         first block cannot read within :data:`GAIN_TOL` twice is turned off
+         there and never displayed again.
 
-    Each rung is ONE row of the CSV -- one drive, read once -- so this returns
-    the drive exactly as it was displayed and the dark-corrected voltage it
-    produced.  Replaying the drive and dividing gives ``g`` with no model in it.
-
-    Rungs are picked nearest-first and never twice, so a sparse ladder degrades
-    to fewer distinct anchors rather than to the same one counted five times --
-    which would quietly turn the slope back into a mean.
-
-    The ``F`` rows (the rung step 8 brackets its run with) are deliberately
-    eligible: they are ordinary reads at the top of the ladder, and the
-    brightest anchors available.
+    Solved with step 8's :func:`build`, so a rung here is one of its rungs:
+    a random drive moved by least-move projection onto its level set.  Only the
+    drive matters for the ratio; the prediction is for the plan and the plot.
     """
-    text = [ln for ln in Path(path).read_text(encoding="utf-8").splitlines()
-            if not ln.startswith("#")]
-    rows = list(csv.DictReader(text))
-    if not rows:
-        raise SystemExit(f"{Path(path).name} has no data rows")
-    if "alpha" not in rows[0]:
-        raise SystemExit(f"{Path(path).name} has no 'alpha' column -- point "
-                         f"--step8-csv at a step-8 / system-accuracy CSV")
-    missing = [k for k in pairs if f"x_{k}" not in rows[0]]
-    if missing:
-        raise SystemExit(f"{Path(path).name} has no x_/w_ columns for pair(s) "
-                         f"{missing}: it did not drive the pairs this run does")
-    usable = [r for r in rows if r.get("alpha") and r.get(f"x_{pairs[0]}")]
-    if not usable:
-        raise SystemExit(f"{Path(path).name} has no rows with both an alpha and "
-                         f"a drive to replay")
-
-    have = np.array([float(r["alpha"]) for r in usable])
-    # The ladder's own ceiling, so the anchors span its bright end whatever alpha
-    # that turned out to be.  max() rather than the config, because a run stopped
-    # early has a CSV that stops early too and the rows are the only truth here.
-    top = float(have.max())
-    alphas = [float(f) * top for f in fractions]
-    picked: list[int] = []
-    for target in alphas:
-        order = np.argsort(np.abs(have - float(target)))
-        for j in order:
-            if int(j) not in picked:
-                picked.append(int(j))
-                break
-    picked.sort(key=lambda j: have[j])
-    got = [usable[j] for j in picked]
-
-    x = np.array([[float(r[f"x_{k}"]) for k in pairs] for r in got])
-    w = np.array([[float(r[f"w_{k}"]) for k in pairs] for r in got])
-    v = np.array([float(r["voltage_mean_v"]) - float(r["dark_v"]) for r in got])
-    if not np.all(v > 0):
-        raise SystemExit(f"{Path(path).name}: anchor rung(s) at alpha "
-                         f"{have[picked][v <= 0]} read at or below their dark; "
-                         f"there is nothing to take a ratio against")
+    lo, hi = float(band[0]), float(band[1])
+    cap = alpha_for_volts(full_scale(models, phases, pairs).fs)
+    scale, patterns, preds = build_ladder(models, phases, pairs, seed=int(seed),
+                                          n=int(n), alpha_lo=lo,
+                                          alpha_hi=min(hi, cap))
+    order = np.argsort([p.alpha for p in patterns])
+    patterns = [patterns[i] for i in order]
+    preds = [preds[i] for i in order]
     return {
-        "x": x, "w": w, "v_ref": v,
-        "alpha": have[picked],
-        "want": np.asarray(alphas, dtype=float),
-        "top": top,
-        "n": len(got),
-        "csv": str(path),
+        "x": np.array([p.x for p in patterns], dtype=float),
+        "w": np.array([p.w for p in patterns], dtype=float),
+        "alpha": np.array([p.alpha for p in patterns], dtype=float),
+        "pred_v": np.array(preds, dtype=float),
+        "labels": [p.label for p in patterns],
+        "exact": [bool(p.exact) for p in patterns],
+        "v_ref": None,
+        "keep": np.ones(len(patterns), dtype=bool),
+        "band": (lo, float(min(hi, cap))),
+        "capped": bool(cap < hi),
+        "y_max_v": float(scale.fs),
+        "n": len(patterns),
+        "seed": int(seed),
     }
 
 
@@ -299,37 +244,140 @@ def fit_gain(v_now: np.ndarray, v_ref: np.ndarray) -> tuple[float, float]:
     return g, rms
 
 
+def flag_off_rungs(v, ref, *, tol: float = GAIN_TOL) -> np.ndarray:
+    """Mask of rungs more than ``tol`` (relative) off the block's fitted slope.
+
+    The slope is :func:`fit_gain`'s -- ``v = g * ref`` through the origin, the
+    block's common factor: the gain, and in the first block the step-7-to-now
+    tilt as well.  What is left per rung is that one read, and a read whose
+    ``v / (g * ref)`` is off by more than ``tol`` is dropped.  Relative, so the
+    test is the same at 200 mV as at 450 mV.  A deviation that is not a number
+    (a reference at zero) is off.
+    """
+    v = np.asarray(v, dtype=float)
+    ref = np.asarray(ref, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g, _ = fit_gain(v, ref)
+        dev = np.abs(v / (g * ref) - 1.0)
+    return ~(dev <= float(tol))
+
+
+def _read_rungs(bench, anchors: dict, idx, *, seq0: int, t0: float,
+                dark: float | None, pmt, log) -> list[dict]:
+    """Display the rungs ``idx`` once each; their rows, in read order."""
+    idx = np.asarray(idx, dtype=int)
+    extra = [[dict(BLANK, kind="gain", seq=seq0 - k,
+                   alpha=f"{anchors['alpha'][i]:.6f}") for k, i in enumerate(idx)]]
+    got: list[dict] = []
+    run_patterns(bench["daq"], bench["slm"], bench["layout"], [tuple(bench["pairs"])],
+                 anchors["x"][idx][None], anchors["w"][idx][None],
+                 bench["models"], bench["phases"], rows=got, extra=extra,
+                 acq=bench["acq"], y_sat=bench["y_sat"], dark=dark, log=log,
+                 row_hook=_hook(t0, pmt, live=False))
+    return got
+
+
 def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
                  dark: float | None, pmt=None, log=print) -> tuple[float, float, float]:
-    """Replay every anchor once; return ``(g, rms, dark)`` against step 8.
+    """Replay the ladder once; return ``(g, rms, dark)`` against the first block.
 
-    The reads are appended to ``rows`` as ``kind=gain``, in read order, so the
-    CSV carries its own evidence for every number in the ``g`` column.
+    The first call is the reference: it fills ``anchors["v_ref"]`` with what
+    the rungs read and returns ``g = 1`` by definition.  Every later call is a
+    ratio against those volts.
+
+    Every block is checked on its own with :func:`flag_off_rungs`: a rung more
+    than :data:`GAIN_TOL` off the block's fitted slope is dropped from the fit.
+    The first block judges against the model's prediction, the only reference
+    it has, and re-reads what it drops ONCE -- off again, the rung leaves the
+    ladder for the run (``anchors["keep"]``).  Later blocks judge against the
+    g = 1 volts and read only the rungs still in the ladder.
+
+    Every read reaches ``rows`` in read order: ``kind=gain`` for the ones the
+    fit used, ``kind=gain_drop`` for the ones it did not, so the CSV carries
+    its own evidence for every number in the ``g`` column.
 
     ``dark`` is passed straight through to :func:`run_patterns`: ``None`` on the
     first call, which measures one, and that value on every call after it.  The
     dark it used comes back so the caller can hold it.
+
+    The PMT is read fresh here, once per block, so the gain rows and every
+    inference row until the next block carry the temperature of this moment.
     """
-    pairs = bench["pairs"]
     n = anchors["n"]
-    extra = [[dict(BLANK, kind="gain", seq=seq0 - i,
-                   alpha=f"{anchors['alpha'][i]:.6f}") for i in range(n)]]
-    got: list[dict] = []
-    run_patterns(bench["daq"], bench["slm"], bench["layout"], [tuple(pairs)],
-                 anchors["x"][None], anchors["w"][None],
-                 bench["models"], bench["phases"], rows=got, extra=extra,
-                 acq=bench["acq"], y_sat=bench["y_sat"], dark=dark, log=log,
-                 row_hook=_hook(t0, pmt, live=False))
-    v = np.array([r["mean_v"] - r["dark_v"] for r in got])
-    g, rms = fit_gain(v, anchors["v_ref"])
-    for r in got:
+    alpha = anchors["alpha"]
+    if pmt is not None:
+        pmt.read()
+    first = anchors["v_ref"] is None
+    idx = np.arange(n) if first else np.flatnonzero(anchors["keep"])
+    reads = _read_rungs(bench, anchors, idx, seq0=seq0, t0=t0, dark=dark,
+                        pmt=pmt, log=log)
+    dark = float(reads[0]["dark_v"])
+    last: dict[int, dict] = dict(zip(idx.tolist(), reads))   # the read each rung is judged by
+    v = np.full(n, np.nan)
+    for i, r in last.items():
+        v[i] = r["mean_v"] - r["dark_v"]
+
+    def alphas(mask) -> str:
+        return " ".join(f"{a:.4f}" for a in alpha[mask])
+
+    if first:
+        off = flag_off_rungs(v, anchors["pred_v"])
+        if off.any():
+            log(f"  rung(s) at alpha {alphas(off)} more than {GAIN_TOL:.0%} off "
+                f"the block's slope to the model: re-reading")
+            again = _read_rungs(bench, anchors, np.flatnonzero(off),
+                                seq0=seq0 - len(reads), t0=t0, dark=dark,
+                                pmt=pmt, log=log)
+            for i, r in zip(np.flatnonzero(off).tolist(), again):
+                last[i] = r
+                v[i] = r["mean_v"] - r["dark_v"]
+            reads = reads + again
+            off = flag_off_rungs(v, anchors["pred_v"])
+            if off.any():
+                log(f"  still off after the re-read, out of the ladder for "
+                    f"this run: alpha {alphas(off)}")
+        keep = ~off
+        if not keep.any():
+            raise SystemExit(f"no anchor rung within {GAIN_TOL:.0%} of the block's "
+                             f"own slope to the model, read twice; the bench is "
+                             f"not holding a level")
+        if not np.all(v[keep] > 0):
+            raise SystemExit(f"anchor rung(s) at alpha {alphas(keep & ~(v > 0))} "
+                             f"read at or below the dark; there is nothing to "
+                             f"take a ratio against")
+        anchors["v_ref"], anchors["keep"] = v, keep
+        use, g, rms = keep, 1.0, 0.0
+    else:
+        keep = anchors["keep"]
+        off = np.zeros(n, dtype=bool)
+        off[keep] = flag_off_rungs(v[keep], anchors["v_ref"][keep])
+        use = keep & ~off
+        if not use.any():
+            log("  every rung is off the block's own slope: nothing to drop "
+                "against, the block is fitted whole")
+            use = keep
+        g, rms = fit_gain(v[use], anchors["v_ref"][use])
+
+    judged = {id(r): i for i, r in last.items()}
+    for r in reads:
+        i = judged.get(id(r))
+        # a read that was re-read is not judged by anything and is dropped
+        r["kind"] = "gain" if i is not None and use[i] else "gain_drop"
         r["g"], r["g_rms_v"] = f"{g:.9g}", f"{rms:.9g}"
-    rows.extend(got)
-    log(f"  g = {g:.5f}   fit rms {rms * 1e3:.4f} mV over {n} rungs")
-    for a, ref, now in zip(anchors["alpha"], anchors["v_ref"], v):
-        log(f"    alpha {a:.4f}  {now * 1e3:9.4f} mV now vs {ref * 1e3:9.4f} "
-            f"at step 8   resid {(now - g * ref) * 1e3:+.4f} mV")
-    return g, rms, float(got[0]["dark_v"])
+    rows.extend(reads)
+
+    if first:
+        log(f"  g = 1 by definition: {int(use.sum())} of {n} rungs kept, "
+            f"{v[use].min() * 1e3:.3f}..{v[use].max() * 1e3:.3f} mV above dark")
+        return g, rms, dark
+    log(f"  g = {g:.5f}   fit rms {rms * 1e3:.4f} mV over {int(use.sum())} rungs"
+        + (f"   dropped {int(off.sum())}: alpha {alphas(off)}" if off.any() else ""))
+    for i in np.flatnonzero(keep):
+        ref, now = anchors["v_ref"][i], v[i]
+        log(f"    alpha {alpha[i]:.4f}  {now * 1e3:9.4f} mV now vs {ref * 1e3:9.4f} "
+            f"at start   resid {(now - g * ref) * 1e3:+.4f} mV"
+            + ("   DROPPED" if off[i] else ""))
+    return g, rms, dark
 
 
 # ======================================================================
@@ -340,13 +388,9 @@ def _hook(t0: float, pmt, live: bool):
     """Row hook: stamp the clock, the PMT, and a provisional Y.
 
     ``live`` is ``False`` for the anchor reads, which have no predicted Y to be
-    compared against -- they are the measurement the comparison depends on, not
-    part of it.
-
-    For inference reads the Y written here uses the ``g`` measured BEFORE the
-    chunk, so an interrupted run still lands with usable numbers.  It is
-    provisional: :func:`apply_gain` rewrites every one of them at the end with
-    ``g`` interpolated between the anchors that bracket the read.
+    compared against.  An inference row's Y uses the ``g`` measured BEFORE the
+    chunk, so an interrupted run still lands with usable numbers; it is
+    provisional, and :func:`apply_gain` rewrites every one at the end.
     """
     def hook(row: dict) -> None:
         row["t_s"] = f"{time.monotonic() - t0:.1f}"
@@ -376,15 +420,11 @@ def _set_y(row: dict, g: float) -> None:
 def apply_gain(rows: list, log=print) -> int:
     """Re-derive every inference Y with ``g`` interpolated in time.  Returns n.
 
-    The anchors are measurements of a continuous quantity at discrete times, so
-    the read halfway between two of them is best served by the value halfway
-    between: holding the earlier one leaves a sawtooth in the residual whose
-    amplitude is the full drift across the interval.  Outside the bracketing
-    anchors -- there are none before the first or after the last -- ``np.interp``
-    clamps, which is the right answer: the nearest measurement is all there is.
-
-    Idempotent, and safe on a partial run: with a single anchor it reduces to
-    that one constant, and with none it leaves the rows alone.
+    The anchors measure a continuous quantity at discrete times, so holding the
+    earlier one leaves a sawtooth in the residual the size of the drift across
+    the interval.  Outside them ``np.interp`` clamps, which is the right answer:
+    the nearest measurement is all there is.  Idempotent, and safe on a partial
+    run -- one anchor reduces to a constant, none leaves the rows alone.
     """
     onn = [r for r in rows if r.get("kind") == "onn" and r.get("y_pred_v") not in ("", None)]
     # One mark per MEASUREMENT, not per read: the rungs of one anchor share a
@@ -490,26 +530,30 @@ def summarise(rows: list, ref: dict, log=print) -> None:
 
 
 def print_anchor(anchors: dict, log=print) -> None:
-    """The g = 1 reference: which CSV, which rungs, and what they read.
+    """The gain ladder: the band, the seed, and what each rung should read.
 
-    The anchors' own precision propagates straight into every ``y_meas_v``, and
-    it is a COMMON-MODE systematic on the whole run -- a slope fitted against
-    five single step-8 reads cannot be averaged down by reading more here.  That
-    is why the rungs are listed rather than summarised: a step-8 sweep that read
-    each of them once is the floor, and reading them 3x at each end of step 8 is
-    what moves it.
+    The first block's own precision propagates straight into every
+    ``y_meas_v``, and it is a COMMON-MODE systematic on the whole run -- a slope
+    fitted against ten single reads cannot be averaged down by reading more
+    later.  That is why the rungs are listed rather than summarised.
     """
-    log(f"g anchor  : {Path(anchors['csv']).name}   {anchors['n']} rungs, "
-        f"g = 1 by definition   (ladder top alpha {anchors['top']:.4f})")
-    for want, got, v in zip(anchors["want"], anchors["alpha"], anchors["v_ref"]):
-        near = "" if abs(want - got) < 5e-3 else f"  (wanted {want:.4f})"
-        log(f"            alpha {got:.4f}   {v * 1e3:9.4f} mV{near}")
-    lo, hi = anchors["v_ref"].min(), anchors["v_ref"].max()
-    if lo > 0:
-        log(f"            lever arm {hi / lo:.2f}x "
-            f"({lo * 1e3:.1f}..{hi * 1e3:.1f} mV)"
-            + ("   -- too short to be a slope, check the ladder"
-               if hi / lo < 1.3 else ""))
+    lo, hi = anchors["band"]
+    log(f"g anchor  : {anchors['n']} rungs over alpha {lo:.3f}..{hi:.3f} of "
+        f"Y_max = {anchors['y_max_v'] * 1e3:.1f} mV   seed {anchors['seed']}   "
+        f"g = 1 at the first block of this run")
+    if anchors["capped"]:
+        log(f"            top capped at {LADDER_CEILING_V * 1e3:.0f} mV, "
+            f"step 8's ladder ceiling")
+    for a, v, lab, ok in zip(anchors["alpha"], anchors["pred_v"],
+                             anchors["labels"], anchors["exact"]):
+        log(f"            alpha {a:.4f}   {v * 1e3:9.4f} mV predicted   {lab}"
+            + ("" if ok else "   [solver fell back: deterministic drive]"))
+    lo_v, hi_v = anchors["pred_v"].min(), anchors["pred_v"].max()
+    if lo_v > 0:
+        log(f"            lever arm {hi_v / lo_v:.2f}x "
+            f"({lo_v * 1e3:.1f}..{hi_v * 1e3:.1f} mV)"
+            + ("   -- too short to be a slope, widen the band"
+               if hi_v / lo_v < 1.3 else ""))
 
 
 def main() -> int:
@@ -518,6 +562,9 @@ def main() -> int:
     ap.add_argument("--npz", required=True, type=Path,
                     help="bench_reference.npz: the drives to display and the Y "
                          "each should produce")
+    ap.add_argument("--calib", required=True, type=Path, metavar="FILE|DIR",
+                    help="the run's calib.json (or the directory holding one): "
+                         "every step the forward model needs")
     ap.add_argument("--t-meas", type=float, default=ACQ.t_meas_s, metavar="S",
                     help=f"DAQ averaging window, in seconds, for EVERY read of "
                          f"the run -- inference, anchor and the opening dark "
@@ -525,43 +572,47 @@ def main() -> int:
                          f"steps 6-8 read at). It is the whole cost of the run "
                          f"and also what decides whether the read noise fits "
                          f"the budget bench_reference.py prints")
-    ap.add_argument("--step8-csv", type=Path, default=None, metavar="CSV",
-                    help="the step-8 CSV that DEFINES g = 1; the ladder rungs "
-                         "nearest --gain-alphas give both the drives to replay "
-                         "and the reference voltages. "
-                         "Omit it to assume g = 1 -- i.e. to assert the detector "
-                         "gain is unchanged since the step-7 fit the npz was built "
-                         "against.  Nothing then measures a drift, and any gain "
-                         "error lands in the residual as a multiplicative tilt")
-    ap.add_argument("--step7", type=Path, default=None,
-                    help="calibration JSON (default: the npz's step7_json)")
     ap.add_argument("--p", "--pairs", dest="pairs", nargs="+", type=int, default=None,
                     metavar="PAIR", help="drive only these pairs (default: all)")
     ap.add_argument("--gain-every", type=float, default=GAIN_EVERY_S, metavar="S",
-                    help=f"re-measure g at most this often (default {GAIN_EVERY_S:g})")
-    ap.add_argument("--gain-alphas", nargs="+", type=float,
-                    default=ANCHOR_FRACTIONS, metavar="F",
-                    help=f"step-8 ladder rungs to replay as gain anchors, as "
-                         f"fractions of that ladder's TOP rung (default "
-                         f"{' '.join(f'{a:g}' for a in ANCHOR_FRACTIONS)})")
+                    help=f"replay the gain anchors, and read the PMT thermistor, "
+                         f"this often (default {GAIN_EVERY_S:g})")
+    ap.add_argument("--gain-band", nargs=2, type=float, default=GAIN_BAND,
+                    metavar=("LO", "HI"),
+                    help=f"the anchor ladder, as fractions of Y_max (default "
+                         f"{GAIN_BAND[0]:g} {GAIN_BAND[1]:g}); the top is capped "
+                         f"at {LADDER_CEILING_V * 1e3:.0f} mV like step 8's")
+    ap.add_argument("--gain-n", type=int, default=GAIN_RUNGS, metavar="N",
+                    help=f"rungs in the anchor ladder (default {GAIN_RUNGS})")
+    ap.add_argument("--gain-seed", type=int, default=None, metavar="SEED",
+                    help="seed for the anchor drives (default: fresh, printed "
+                         "and written to the CSV meta)")
+    ap.add_argument("--no-gain", action="store_true",
+                    help="measure no gain at all and assume g = 1 throughout; "
+                         "nothing then tracks a drift")
     ap.add_argument("--out", type=Path, default=None, metavar="DIR")
-    ap.add_argument("--pmt", nargs="?", const="", default=None, metavar="RESOURCE",
-                    help="log the PMT thermistor with each read")
-    ap.add_argument("--pmt-period", type=float, default=PMT_PERIOD_S, metavar="S")
+    ap.add_argument("--pmt", default=None, metavar="RESOURCE",
+                    help="VISA address of the Keithley 2400 reading the PMT "
+                         "thermistor (default: daq_pmt_monitor.K2400_RESOURCE)")
+    ap.add_argument("--no-pmt", action="store_true",
+                    help="do not log the PMT thermistor")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and the cost; touch no instrument")
     args = ap.parse_args()
 
     ref = load_npz(args.npz)
-    step7 = Path(args.step7 or ref["step7_json"] or "")
-    if not step7.is_file():
-        raise SystemExit(f"step-7 calibration not found at {step7} -- pass --step7 "
-                         f"(the npz records {ref['step7_json']!r})")
+    calib = calib_path(args.calib)
+    if not calib.is_file():
+        raise SystemExit(f"no calib.json at {calib}")
     want = select_pairs(args.pairs) or list(ref["channels"])
-    models, phases, reference = load_forward_model(step7, pairs=want)
+    models, phases, reference = load_forward_model(calib, pairs=want)
     pairs = sorted(models)
-    anchors = (read_step8_anchors(args.step8_csv, pairs, args.gain_alphas)
-               if args.step8_csv else None)
+    anchors = None
+    if not args.no_gain:
+        seed = (int(np.random.SeedSequence().entropy % 2**32)
+                if args.gain_seed is None else int(args.gain_seed))
+        anchors = build_anchors(models, phases, pairs, seed=seed,
+                                n=args.gain_n, band=args.gain_band)
 
     x, w, extra = build_reads(ref, pairs, models)
     n_reads = x.shape[1]
@@ -574,36 +625,32 @@ def main() -> int:
 
     print(f"npz       : {args.npz}  ({ref['n']} images, {ref['n_tiles']} shots, "
           f"{ref['n_out']} outputs, {ref['n_banks']} bank(s))")
-    print(f"step7     : {step7.name}   pairs {pairs}   ref {reference}")
+    print(f"calib     : {calib}   pairs {pairs}   ref {reference}")
     print(f"y_sat     : {ref['y_sat']}")
     if anchors is None:
-        print("g         : 1.0 assumed (no --step8-csv) -- the detector gain is "
-              "taken to be unchanged since the step-7 fit; nothing here measures it")
+        print("g         : 1.0 assumed (--no-gain) -- nothing here measures a drift")
     else:
         print_anchor(anchors)
     print(f"Read      : {n_reads} inference reads at {args.t_meas:g} s "
           f"+ {ACQ.settle_s:g} s settle")
     if anchors is not None:
         print(f"Gain      : {anchors['n']} rungs every {args.gain_every / 60:g} min, "
-              f"~{n_gain} measurements ({n_gain * anchors['n']} reads)")
+              f"~{n_gain} measurements ({n_gain * anchors['n']} reads); "
+              f"the first defines g = 1; a rung more than {GAIN_TOL:.0%} off "
+              f"its block's slope is dropped")
     print("Dark      : one read, at the start, held for the run")
+    print(f"PMT       : {'off (--no-pmt)' if args.no_pmt else 'read with every gain block'}")
     print(f"Estimate  : {secs / 60:.1f} min ({secs / 3600:.2f} h)   "
           f"[nominal; the 0929 run cost ~2 s/read more than this]")
     if args.dry_run:
         return 0
 
-    pmt = None
-    if args.pmt is not None:
-        try:
-            pmt = PmtTemperature(args.pmt or None, period_s=args.pmt_period)
-            pmt.read()
-        except Exception as exc:                       # noqa: BLE001 -- never fatal
-            print(f"--pmt ignored ({type(exc).__name__}: {exc})")
+    pmt = open_pmt(args.pmt, period_s=args.gain_every, enabled=not args.no_pmt)
 
     out = Path(args.out or OUT_DIR)
     stamp = time.strftime("%m%d_%H%M")
     csv_path = out / f"onn_infer_{stamp}.csv"
-    columns = BEFORE + AFTER + (list(PmtTemperature.COLUMNS) if pmt else [])
+    columns = BEFORE + AFTER + (list(pmt.COLUMNS) if pmt else [])
 
     slm = connect_slm(SLM_DISPLAY_NO, USB_SLM_NO)
     daq = connect_daq(device=DAQ_DEVICE, channel=DAQ_CHANNEL,
@@ -611,7 +658,7 @@ def main() -> int:
                       min_val=-ACQ.range_v, max_val=ACQ.range_v)
     bench = {"slm": slm, "daq": daq, "pairs": pairs, "models": models,
              "phases": phases, "y_sat": ref["y_sat"],
-             "layout": load_layout(step7, pairs),
+             "layout": load_layout(calib, pairs),
              "acq": replace(ACQ, t_meas_s=args.t_meas)}
 
     rows: list[dict] = []
@@ -621,15 +668,29 @@ def main() -> int:
     def flush():
         """The CSV on disk, whole rows only, after every chunk and at the end."""
         if rows:
+            if anchors is None:
+                gain_meta = {"g_reference": "1 (assumed, --no-gain)",
+                             "g_reference_v": "", "gain_alphas": "",
+                             "gain_seed": "", "gain_band": "", "gain_tol": "",
+                             "gain_rungs_out": "", "y_max_v": ""}
+            else:
+                gain_meta = {
+                    "g_reference": "first gain block of this run (g = 1)",
+                    "g_reference_v": (
+                        "" if anchors["v_ref"] is None else
+                        " ".join(f"{v:.6g}" for v in anchors["v_ref"])),
+                    "gain_alphas": " ".join(f"{a:.4f}" for a in anchors["alpha"]),
+                    "gain_seed": anchors["seed"],
+                    "gain_band": f"{anchors['band'][0]:.4f} {anchors['band'][1]:.4f}",
+                    "gain_tol": f"{GAIN_TOL:g}",
+                    "gain_rungs_out": " ".join(
+                        f"{a:.4f}" for a in anchors["alpha"][~anchors["keep"]]),
+                    "y_max_v": f"{anchors['y_max_v']:.9g}"}
             write_verify_csv(csv_path, pairs, rows,
-                             meta={"npz": ref["path"], "step7_json": step7.resolve(),
-                                   "step8_csv": anchors["csv"] if anchors else "",
-                                   "g_reference_v": (
-                                       " ".join(f"{v:.6g}" for v in anchors["v_ref"])
-                                       if anchors else "1 (assumed, no step-8 anchor)"),
-                                   "gain_alphas": (
-                                       " ".join(f"{a:.4f}" for a in anchors["alpha"])
-                                       if anchors else ""),
+                             meta={"npz": ref["path"], "calib": calib.resolve(),
+                                   "npz_calib": ref["step7_json"] or "",
+                                   **gain_meta,
+                                   "gain_every_s": f"{args.gain_every:g}",
                                    "t_meas_s": f"{args.t_meas:g}",
                                    "dark_v": "" if dark is None else f"{dark:.9g}",
                                    "y_sat_v": f"{ref['y_sat']:g}",
@@ -644,11 +705,14 @@ def main() -> int:
                                   dark=dark, pmt=pmt)
         return g
 
+    def taken() -> int:
+        """Anchor reads so far, re-reads included: the next block's seq offset."""
+        return sum(1 for r in rows if r.get("kind") in ("gain", "gain_drop"))
+
     try:
-        g, taken = 1.0, 0
+        g = 1.0
         if anchors is not None:
             g = anchor(-1)
-            taken = anchors["n"]
             flush()
         lo = 0
         while lo < n_reads:
@@ -659,8 +723,7 @@ def main() -> int:
             # the nominal estimate; every one after it uses the measured rate.
             hi = min(lo + max(1, int(args.gain_every / max(per_read, 1e-6))), n_reads)
             if lo and anchors is not None:
-                g = anchor(-1 - taken)
-                taken += anchors["n"]
+                g = anchor(-1 - taken())
             print(f"\n--- reads {lo}..{hi - 1} of {n_reads}  (g = {g:.5f}) ---")
             part = [dict(e, g=f"{g:.9g}") for e in extra[lo:hi]]
             t_chunk = time.monotonic()
@@ -672,7 +735,7 @@ def main() -> int:
             lo = hi
             flush()
         if anchors is not None:
-            anchor(-1 - taken)
+            anchor(-1 - taken())
     except BaseException as exc:
         done = sum(1 for r in rows if r.get("kind") == "onn")
         status = f"partial ({type(exc).__name__} after {done} of {n_reads} reads)"

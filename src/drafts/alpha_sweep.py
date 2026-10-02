@@ -49,7 +49,6 @@ import argparse
 import csv
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -88,9 +87,8 @@ def solve(step7: Path, lo: float, hi: float, n: int, seed: int):
     scale = STEP8.full_scale(models, phases, pairs)
     seeds = np.random.SeedSequence(seed).generate_state(n)
     patterns = [
-        replace(STEP8.ceiling_pattern(models, phases, pairs, float(a),
-                                      seed=int(s)),
-                label=f"a{a:.3f}", kind="F" if a >= 1.0 - 1e-9 else "A")
+        STEP8.pattern_for_alpha(models, phases, pairs, float(a),
+                                seed=int(s), label=f"a{a:.3f}")
         for a, s in zip(np.linspace(lo, hi, n), seeds)
     ]
     return models, phases, pairs, scale, patterns

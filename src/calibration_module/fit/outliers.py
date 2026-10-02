@@ -1,16 +1,17 @@
 """Post-sweep outlier detection for calibration measurements.
 
-A sweep is measured once, then fitted against the step's theoretical model
-(linear coordinate->wavelength map for Step 2, the sin^2 transfer curve for
-Step 3).  Points whose residual exceeds ``k_sigma`` robust standard deviations
-(MAD-based, so the outliers themselves do not inflate the threshold) are
-flagged and re-measured; the flagged original is discarded and the cell becomes
-the median of its re-measurements.  The flag -> re-measure round repeats up to
-``max_retries`` times per sweep.
+In:  measured values, and for the burst guards their trace stds.
+Out: boolean masks.  Pure numerics, Qt-free and hardware-free; the re-display
+     and re-measure loops belong to
+     :mod:`calibration_module.measure.slm_response`.
 
-Only the pure numerics live here (Qt-free, hardware-free); the calibration
-sweeps in :mod:`calibration_module.measure.slm_response` own the actual
-re-display + re-measure loops.
+Two unrelated jobs live here.  The residual guards fit a sweep against the
+step's theoretical model -- the linear px -> nm map for step 2, the sin^2
+transfer curve for step 3 -- and flag points beyond ``k_sigma`` robust sigmas
+(MAD-based, so the outliers cannot inflate the threshold they are judged
+against) for re-measurement, up to ``max_retries`` rounds per sweep.  The burst
+guards judge a single acquisition's TRACE instead, for steps 6 to 8, where a
+transient landing inside the read window is the recurring bench fault.
 """
 from __future__ import annotations
 
@@ -69,17 +70,15 @@ def flag_by_residual(
 ) -> np.ndarray:
     """Boolean mask of residuals beyond ``k_sigma`` robust sigmas.
 
-    Non-finite residuals (e.g. a NaN centroid from a dead trace) are always
-    flagged -- they are outliers by definition.
+    Non-finite residuals -- a NaN centroid from a dead trace -- are always
+    flagged, being outliers by definition.
 
-    Residuals are centered on their median before thresholding: a non-robust
-    fit dragged by an outlier gives the clean points a common residual offset,
-    and comparing raw |r| against the (tiny) MAD would flag all of them.
-
-    ``rel_floor_scale`` (typically the data's max magnitude) floors the sigma
-    at ``1e-6 * |rel_floor_scale|``: on numerically clean data the MAD collapses
-    toward zero and would otherwise flag harmless fit noise forever. A one-ppm
-    floor is far below any physically meaningful deviation.
+    Residuals are CENTERED on their median first: a non-robust fit dragged by an
+    outlier gives the clean points a common offset, and raw |r| against the tiny
+    MAD would flag all of them.  ``rel_floor_scale`` (typically the data's max
+    magnitude) floors the sigma at one ppm of it, since on numerically clean
+    data the MAD collapses toward zero and would flag harmless fit noise
+    forever.
     """
     r = np.asarray(residuals, dtype=float)
     finite = r[np.isfinite(r)]
@@ -95,15 +94,15 @@ def flag_by_residual(
 
 
 def linear_fit_residuals(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Residuals of a robust degree-1 fit y ~ a*x + b (Step-2 map shape).
+    """Residuals of a robust degree-1 fit y ~ a*x + b (step-2 map shape).
 
-    Uses the Theil-Sen estimator (median of pairwise slopes) so an outlier
-    cannot drag the reference line -- with plain least squares the outlier
-    shifts every clean point's residual and the flagging degenerates. Falls
-    back to ``np.polyfit`` if scipy is unavailable.
+    Theil-Sen (median of pairwise slopes), so an outlier cannot drag the
+    reference line the way it would under least squares, where it shifts every
+    clean point's residual and the flagging degenerates.  Falls back to
+    ``np.polyfit`` without scipy.
 
-    The fit runs on the finite subset only; entries with non-finite ``y`` keep
-    a NaN residual so :func:`flag_by_residual` picks them up.
+    Fitted on the finite subset only; a non-finite ``y`` keeps a NaN residual so
+    :func:`flag_by_residual` picks it up.
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -126,13 +125,12 @@ def linear_fit_residuals(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def transfer_fit_residuals(levels: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Residuals of the sin^2 SLM transfer model (Step-3 curve shape).
+    """Residuals of the sin^2 SLM transfer model (step-3 curve shape).
 
-    Fits ``I = i0 * sin((a*level + b)/2)^2`` (the
-    :func:`calibration_module.fit.legacy_intensity.intensity_model`) by nonlinear
-    least squares.  If the fit cannot converge it falls back to a cubic
-    polynomial -- the point is a smooth reference to flag spikes against, not a
-    physics-grade fit -- so this never raises for finite input arrays.
+    Fits ``I = i0 * sin((a*level + b)/2)^2`` by nonlinear least squares, falling
+    back to a cubic polynomial if that will not converge -- the point is a smooth
+    reference to flag spikes against, not a physics-grade fit -- so this never
+    raises for finite input.
     """
     levels = np.asarray(levels, dtype=float)
     values = np.asarray(values, dtype=float)
@@ -199,6 +197,41 @@ BURST_K = 10.0
 #: at 1.81x, while every real anomaly is >= 5.1x.  3 splits that gap.
 BURST_K_REPEAT = 3.0
 
+#: Hard ceiling on a step-6/step-7 READ, volts.  Anything above it is a bench
+#: fault, dropped without appeal.
+#:
+#: Both guards above judge an acquisition by its TRACE SPREAD, which is the
+#: right test for a transient that lands inside one acquisition window but blind
+#: to two things.  A read can be far too high with a perfectly calm trace -- the
+#: rail latched before the window opened, so there is nothing within it to
+#: spread.  And a quantity recorded ONCE, with no repeats and no sweep median to
+#: sit against, is judged by neither: run_0930_noYsat's step-7 all-off dark for
+#: pair 4 read +345.7 mV where its eight neighbours read -60 uV, was subtracted
+#: from all ten of that pair's drive rows, and put the fit at R^2 = -11438 with
+#: ten good drive rows underneath it.  An absolute ceiling catches both, because
+#: it needs no reference beyond itself.
+#:
+#: 300 mV against what steps 6 and 7 actually read: the 0930 13:25 sweep peaked
+#: at 163 mV and the 20:41 sweep at 58 mV, so this is ~1.8x headroom over the
+#: HIGHER of the two gains on disk.  It is a bench-fault ceiling, not a
+#: saturation limit -- raise the detection gain much past 13:25's and it will
+#: start rejecting honest reads, which is why it says so when it fires.
+BURST_MAX_V = 0.300
+
+
+def flag_over_range(values, *, limit: float = BURST_MAX_V) -> np.ndarray:
+    """Boolean mask of reads at or above ``limit`` volts -- a bench fault, flatly.
+
+    Orthogonal to the trace-spread guards and deliberately dumb: no median, no
+    neighbours, no repeats.  That is the point -- the acquisitions this is for
+    have no reference to be judged against (see :data:`BURST_MAX_V`).  A
+    non-finite entry is flagged too; a NaN read is not a read.
+    """
+    v = np.asarray(values, dtype=float)
+    if not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("limit must be a positive voltage")
+    return ~np.isfinite(v) | (np.abs(v) >= float(limit))
+
 
 def flag_burst_traces(
     trace_stds,
@@ -208,23 +241,20 @@ def flag_burst_traces(
 ) -> np.ndarray:
     """Boolean mask of acquisitions whose trace std is a burst, not noise.
 
-    A burst is a transient that lands part-way through one acquisition window:
-    the mean comes out multiples too high AND the within-trace spread explodes
-    with it.  On run_0929 step 7 one point read 0.910 V against a step-6 full
-    scale of 0.122 V, with a 0.354 V trace std.
+    A burst is a transient landing part-way through one acquisition window: the
+    mean comes out multiples too high AND the within-trace spread explodes with
+    it.
 
-    Thresholds the **absolute** trace std against ``k * median(trace_stds)``.
-    Deliberately NOT the std/|mean| ratio: at a near-zero background level that
-    ratio is meaningless and reaches 44 on perfectly good data, whereas the
-    absolute spread of a clean acquisition tracks the signal smoothly.
+    Thresholds the ABSOLUTE trace std against ``k * median(trace_stds)``.
+    Deliberately not the std/|mean| ratio, which is meaningless at a near-zero
+    background level and reaches 44 on perfectly good data, while the absolute
+    spread of a clean acquisition tracks the signal smoothly.
 
-    The median (not the MAD) sets the scale here because trace std is bounded
-    below by detector noise and only ever spikes upward -- the distribution has
-    no left tail for a robust sigma to measure, and a couple of bursts cannot
-    drag a median.  Non-finite entries are always flagged.
-
-    Below ``min_points`` acquisitions the median is too soft to threshold
-    against, so nothing is flagged.
+    The median rather than the MAD sets the scale: trace std is bounded below by
+    detector noise and only spikes upward, so the distribution has no left tail
+    for a robust sigma to measure, and a couple of bursts cannot drag a median.
+    Non-finite entries are always flagged; below ``min_points`` acquisitions
+    nothing is, the median being too soft to threshold against.
     """
     s = np.asarray(trace_stds, dtype=float)
     if s.ndim != 1:
@@ -249,31 +279,30 @@ def flag_burst_repeats(
 ) -> np.ndarray:
     """Boolean mask of burst acquisitions, judged against their own repeats.
 
-    ``group_ids`` is any sequence of hashable labels marking which acquisitions
-    are repeats of one another (for step 6, the commanded ``(x, w)`` cell).
-    Within a group every entry measures the identical setting, so the group is a
-    reference with no dynamic range in it at all -- unlike
-    :func:`flag_burst_traces`, whose sweep median has to straddle everything from
-    dark to full scale and therefore reads the honest full-scale point as 10x
-    the typical one.
+    In:  ``group_ids``, any hashable labels marking which acquisitions are
+         repeats of one another -- for step 6, the commanded ``(x, w)`` cell.
+    Out: a mask flagging any entry above ``k`` times its group's MINIMUM trace
+         std.
 
-    Flags any entry above ``k`` times its group's MINIMUM trace std.  The minimum
-    is the right reference because trace std only ever spikes upward: it is
-    bounded below by detector noise, so the smallest repeat is the one least
-    disturbed.  Measured over the 1482 cells on disk the clean population tops
-    out at 1.81x while every real anomaly is >= 5.1x, so k = 3 sits in the gap
-    with 1.7x margin.
+    Within a group every entry measures the identical setting, so the group has
+    no dynamic range in it at all -- unlike :func:`flag_burst_traces`, whose
+    sweep median straddles dark to full scale and so reads the honest full-scale
+    point as 10x the typical one.
 
-    This catches the mild kind of burst the sweep test cannot: on run_0906 one
-    repeat of ``x=1, w=0.7`` carried a 3.976 mV trace std against siblings at
-    0.72-0.81 mV while its MEAN, 25.46 mV, sat right on the cell's 25.33 mV.
-    Only the trace was disturbed, so nothing reading the mean could have seen it.
+    The minimum is the right reference because trace std only spikes upward,
+    bounded below by detector noise, so the smallest repeat is the least
+    disturbed.  Over the 1482 cells on disk the clean population tops out at
+    1.81x while every real anomaly is >= 5.1x, so k = 3 sits in the gap.
 
-    Degrades gracefully with no special case: a single-acquisition group is its
-    own minimum, giving a ratio of 1, and is never flagged -- correctly, since
-    nothing in the data can say whether it was disturbed.  Note the minimum is a
-    downward-biased scale estimate, so the ratio creeps up with group size; that
-    is measured out to the 6 repeats the step-6 grids actually use.
+    This catches the mild burst the sweep test cannot -- a repeat whose TRACE was
+    disturbed while its mean sat right on the cell's, which nothing reading the
+    mean could see.
+
+    Degrades with no special case: a single-acquisition group is its own minimum,
+    ratio 1, never flagged -- correctly, since nothing in the data can say
+    whether it was disturbed.  The minimum is a downward-biased scale estimate,
+    so the ratio creeps up with group size; that is measured out to the 6 repeats
+    the step-6 grids use.
     """
     s_arr = np.asarray(trace_stds, dtype=float)
     # kept as a plain sequence, not an array: the ids are typically (x, w)
@@ -304,6 +333,8 @@ def flag_burst_repeats(
 __all__ = [
     "BURST_K",
     "BURST_K_REPEAT",
+    "BURST_MAX_V",
+    "flag_over_range",
     "OutlierRemeasurePolicy",
     "flag_burst_repeats",
     "flag_burst_traces",

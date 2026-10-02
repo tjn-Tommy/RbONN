@@ -13,6 +13,7 @@ same committed measurement CSV the offline runner refits.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -33,6 +34,7 @@ from PyQt5 import QtWidgets
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
+from calibration_module.calib_file import load_calib  # noqa: E402
 from calibration_module.measure.phase_v2 import (  # noqa: E402
     DEFAULT_ACQ,
     DEFAULT_CONFIG,
@@ -45,9 +47,9 @@ from calibration_module.measure.phase_v2 import (  # noqa: E402
 RUN = REPO / "src/calib_data/archive/2026-09/run_0907_1724"
 #: The archived combined step-6 result the run folder below is seeded from.
 STEP6_LEGACY = RUN / "calib_step6v2_result_0907_1757.json"
-#: The run folder the page is pointed at: one calib.json with step3 + step6.
-#: Seeded in setUpModule, because the archive is frozen in the old shape and a
-#: page that now takes a directory needs one to exist.
+#: The calib file the page is pointed at: step3 + step6 + the step7 section
+#: whose ``csv`` pointer IS what Load re-fits.  Seeded in setUpModule, because
+#: the archive is frozen in the old per-step shape.
 STEP6: Path
 MEAS_CSV = RUN / "calib_step7_meas_0907_1808.csv"
 RESULT_JSON = RUN / "calib_step7_result_0907_1808.json"
@@ -66,6 +68,16 @@ RECORDED_DPHI = {
     for c in json.loads(RESULT_JSON.read_text(encoding="utf-8"))["step7"]["channels"]
 }
 
+#: How far a re-fit may sit from an archived phase, radians (0.69 deg).  The
+#: archives were weighted with the 200 uV constant floor; the fit now inherits
+#: the floor step 6 measured on that night's dark reads (38 uV on 0907, 60 uV
+#: on 0916, 46 uV on 0929).  Reweighting the ten points of a fringe moves its
+#: phase by 0.01-0.3 deg (measured 2026-10-01 over every pair of 0916 and 0929;
+#: worst 0.305 deg on the dim pair 9), and a chained pair carries two hops'
+#: worth.  Every shift is well inside the quoted 1.4-6 deg error; a sign or
+#: pairing error would be off by tens of degrees.
+PIN_TOL = 1.2e-2
+
 _app: QtWidgets.QApplication | None = None
 _run_tmp = None
 
@@ -78,9 +90,27 @@ def setUpModule() -> None:
     from calib_fixtures import seed_run
 
     _run_tmp = _tempfile.TemporaryDirectory()
+    # step7 as well, and pointed at the 0907 sweep: Load takes ONE input now,
+    # and a section's csv pointer is how it finds the rows to re-fit.
     STEP6 = seed_run(Path(_run_tmp.name) / "run_0907", step3=STEP6_LEGACY,
-                     step6=STEP6_LEGACY)
+                     step6=STEP6_LEGACY, step7=RESULT_JSON,
+                     step7_csv=MEAS_CSV)
     _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+@contextlib.contextmanager
+def _picks(path):
+    """Answer the Load dialog with ``path``.
+
+    Load asks which calibration to re-fit rather than taking the page's field:
+    looking at another night is the usual reason to press it, and the field is
+    where a SWEEP writes.  So every Load here has to say what was picked.
+    """
+    with unittest.mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            staticmethod(lambda *a, **k: (str(path), ""))):
+        yield
+
 
 
 def tearDownModule() -> None:
@@ -101,17 +131,14 @@ class _WindowCase(unittest.TestCase):
         cls.win.close()
 
     def _load(self):
-        """Point the page at the recorded run and re-fit its CSV.
+        """Point the page at the recorded calib file and re-fit the sweep it names.
 
         The reference is deliberately NOT set here: a recorded CSV carries its
         own, and the page is supposed to take it from the file.
         """
         w = self.win
         w.tpa_phase_step6_edit.setText(str(STEP6))
-        with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getOpenFileName",
-            staticmethod(lambda *a, **k: (str(MEAS_CSV), "")),
-        ):
+        with _picks(STEP6 / "calib.json"):
             w._tpa_phase_load()
         self.assertTrue(w.tpa_phase_results, w.tpa_phase_status.text())
         return w
@@ -228,13 +255,13 @@ class StepSixInputTests(_WindowCase):
         w = self.win
         w.tpa_phase_step6_edit.setText("")
         w._tpa_phase_run()
-        self.assertIn("no run folder", w.tpa_phase_status.text())
+        self.assertIn("no calibration file", w.tpa_phase_status.text())
 
     def test_run_refuses_a_folder_that_is_not_there(self) -> None:
         w = self.win
         w.tpa_phase_step6_edit.setText(str(RUN / "no_such_run"))
         w._tpa_phase_run()
-        self.assertIn("no calib.json", w.tpa_phase_status.text())
+        self.assertIn("is not there", w.tpa_phase_status.text())
 
     def test_a_valid_run_is_described_before_the_run(self) -> None:
         w = self.win
@@ -277,23 +304,26 @@ class ResultsTableTests(_WindowCase):
         self.assertEqual(t.rowCount(), 4)
         for row in range(t.rowCount()):
             k = int(t.item(row, 0).text())
-            self.assertEqual(t.item(row, 1).text(),
-                             f"{np.degrees(RECORDED_DPHI[k]):+.2f}")
+            # Within 0.1 deg, not the same text: see PIN_TOL.
+            self.assertAlmostEqual(float(t.item(row, 1).text()),
+                                   np.degrees(RECORDED_DPHI[k]), delta=0.1)
 
     def test_the_fit_itself_reproduces_the_recorded_run(self) -> None:
-        """To 1e-12 rad, not bit-for-bit -- the archive was fitted mirrored.
+        """To PIN_TOL, not bit-for-bit -- the archive was weighted differently.
 
-        It used to be bit-identical.  The 0907 run minimised
-        ``cos(dPhi_comb - dPhi_SLM)`` and stored ``-Phi_k``; the fitter now
-        minimises ``cos(dPhi_SLM + dPhi_comb)``, the project's one convention.
-        The two cost functions are equal for all ``dPhi``, so the recovered
-        phase is the same number, but ``least_squares`` walks a mirrored
-        parameter and stops a couple of ulps away: ~2e-10 rad, or 1e-8 deg.
+        It used to be bit-identical.  Two things moved it since: the 0907 run
+        minimised ``cos(dPhi_comb - dPhi_SLM)`` and stored ``-Phi_k`` where the
+        fitter now minimises ``cos(dPhi_SLM + dPhi_comb)`` (same minimum, a
+        couple of ulps apart), and it weighted its points with the 200 uV
+        constant floor where the fit now inherits the floor step 6 measured on
+        that night's dark reads, 38 uV.  Reweighting the ten points moves the
+        phase by ~0.05 deg; the sign convention and the pairing would be wrong
+        by tens of degrees.
         """
         w = self._load()
         for k, result in w.tpa_phase_results.items():
             self.assertAlmostEqual(result.fit.dphi_comb, RECORDED_DPHI[k],
-                                   places=8)
+                                   delta=PIN_TOL)
 
     def test_the_error_is_split_into_its_two_sources(self) -> None:
         """a and b are pinned, so the fitter's own error cannot see the eta term."""
@@ -344,10 +374,7 @@ class RecordedReferenceTests(_WindowCase):
         w = self.win
         w.tpa_phase_ref.setValue(1)          # wrong: this run used 2
         w.tpa_phase_step6_edit.setText(str(STEP6))
-        with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getOpenFileName",
-            staticmethod(lambda *a, **k: (str(MEAS_CSV), "")),
-        ):
+        with _picks(STEP6 / "calib.json"):
             w._tpa_phase_load()
         self.assertEqual(sorted(w.tpa_phase_results), [3, 4, 5, 6])
         self.assertIn("vs ref 2", w.tpa_phase_status.text())
@@ -357,10 +384,7 @@ class RecordedReferenceTests(_WindowCase):
         w = self.win
         w.tpa_phase_ref.setValue(1)
         w.tpa_phase_step6_edit.setText(str(STEP6))
-        with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getOpenFileName",
-            staticmethod(lambda *a, **k: (str(MEAS_CSV), "")),
-        ):
+        with _picks(STEP6 / "calib.json"):
             w._tpa_phase_load()
         self.assertEqual(w.tpa_phase_ref.value(), REF_INDEX)
 
@@ -377,12 +401,11 @@ class RecordedReferenceTests(_WindowCase):
             stripped = Path(tmp) / "stripped.json"
             stripped.write_text(json.dumps(payload), encoding="utf-8")
             bad = seed_run(Path(tmp) / "no_reference",
-                           step3=STEP6_LEGACY, step6=stripped)
+                           step3=STEP6_LEGACY, step6=stripped,
+                           step6_csv=RUN / "calib_step6v2_meas_0907_1757.csv",
+                           step7=RESULT_JSON, step7_csv=MEAS_CSV)
             w.tpa_phase_step6_edit.setText(str(bad))
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getOpenFileName",
-                staticmethod(lambda *a, **k: (str(MEAS_CSV), "")),
-            ):
+            with _picks(bad / "calib.json"):
                 w._tpa_phase_load()
         text = w.tpa_phase_status.text()
         self.assertIn(f"reference {REF_INDEX}", text)
@@ -406,12 +429,8 @@ class SaveRoundTripTests(_WindowCase):
             run = seed_run(Path(tmp) / "run_s7", step3=STEP6_LEGACY,
                            step6=STEP6_LEGACY)
             w.tpa_phase_step6_edit.setText(str(run))
-            target = run / "calib_step7_meas_0910_2025.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_phase_save()
+            w._tpa_phase_autosave()
+            target = _written_csv(run)
 
             self.assertTrue(target.is_file(), w.tpa_phase_status.text())
             jsons = list(run.glob("*.json"))
@@ -430,13 +449,13 @@ class SaveRoundTripTests(_WindowCase):
                    for c in payload["step7"]["channels"]}
             self.assertEqual(sorted(got), sorted(RECORDED_DPHI))
             for k, want in RECORDED_DPHI.items():
-                # places=8, not equality: see
+                # PIN_TOL, not equality: see
                 # test_the_fit_itself_reproduces_the_recorded_run.
-                self.assertAlmostEqual(got[k], want, places=8)
+                self.assertAlmostEqual(got[k], want, delta=PIN_TOL)
 
             self.assertEqual(
-                len(list(run.glob("calib_step7_pair*_0910_2025.png"))), 4,
-                "one fringe PNG per target, same renderer as the page",
+                list(run.glob("*.png")), [],
+                "no PNGs: Load re-fits the CSV the section names and draws it",
             )
         w.tpa_phase_step6_edit.setText(str(STEP6))
 
@@ -444,34 +463,53 @@ class SaveRoundTripTests(_WindowCase):
         """An hour of bench time must never be lost to an unreadable input."""
         w = self._load()
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "rows_only.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_phase_save()
+            bare = Path(tmp) / "bare_run"
+            bare.mkdir()
+            w.tpa_phase_step6_edit.setText(str(bare))
+            w._tpa_phase_autosave()
+            target = _written_csv(bare)
             self.assertTrue(target.is_file())
-            self.assertFalse(list(target.parent.glob("*.json")))
-            self.assertIn("no calib.json", w.tpa_phase_status.text())
+            self.assertFalse(list(bare.glob("*.json")))
+            self.assertIn("is not there", w.tpa_phase_status.text())
         w.tpa_phase_step6_edit.setText(str(STEP6))
 
-    def test_the_saved_csv_re_fits_to_the_same_phases(self) -> None:
+    def test_the_saved_sweep_re_fits_to_the_same_phases(self) -> None:
+        """Save then Load, through the file: one calib.json carries both ends.
+
+        The sweep writes its CSV beside that file and its phases into it; Load
+        is then handed the file and finds the CSV through the pointer the save
+        left.  Nothing in between is named by hand, which is the whole of what
+        the round trip has to prove.
+        """
+        from calib_fixtures import seed_run
+
         w = self._load()
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "roundtrip.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
-                w._tpa_phase_save()
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getOpenFileName",
-                staticmethod(lambda *a, **k: (str(target), "")),
-            ):
+            run = seed_run(Path(tmp) / "roundtrip", step3=STEP6_LEGACY,
+                           step6=STEP6_LEGACY)
+            w.tpa_phase_step6_edit.setText(str(run))
+            w._tpa_phase_autosave()
+            payload = json.loads(
+                (run / "calib.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["step7"]["csv"], _written_csv(run).name)
+            with _picks(run / "calib.json"):
                 w._tpa_phase_load()
         for k, result in w.tpa_phase_results.items():
             self.assertAlmostEqual(result.fit.dphi_comb, RECORDED_DPHI[k],
-                                   places=6)
+                                   delta=PIN_TOL)
+        w.tpa_phase_step6_edit.setText(str(STEP6))
+
+
+def _written_csv(run: Path) -> Path:
+    """The step-7 CSV auto-save just wrote into ``run``.
+
+    Auto-save names the file itself, from the run folder on the page and the
+    clock, so a test asks the directory what appeared rather than dictating a
+    path through a dialog that no longer exists.
+    """
+    found = sorted(run.glob("calib_step7_meas_*.csv"))
+    assert len(found) == 1, f"expected one step-7 CSV in {run}, got {found}"
+    return found[0]
 
 
 class ProgressDialogTests(_WindowCase):
@@ -605,6 +643,15 @@ class CascadeTests(_WindowCase):
         cls.CASCADE_CSV = Path(cls._tmp.name) / "calib_step7_meas_cascade.csv"
         cls.CASCADE_CSV.write_text("\n".join(head + tail[1:]) + "\n",
                                    encoding="utf-8")
+        # A calib file whose step7 names that one stitched sweep -- what a GUI
+        # run writes today.  (The committed 0916 file names its two stage CSVs
+        # instead, the hand-merged shape; both load, see
+        # test_a_section_naming_two_sweeps_loads_as_one_run.)
+        from calib_fixtures import seed_run
+        cls.CASCADE_RUN = seed_run(
+            Path(cls._tmp.name) / "run_cascade",
+            step3=cls.STEP6_10, step6=cls.STEP6_10,
+            step7=cls.STEP6_10, step7_csv=cls.CASCADE_CSV)
         # Negated: see RECORDED_DPHI -- this archive predates the single
         # sign convention and stores -Phi_k.
         cls.MERGED_DPHI = {
@@ -662,14 +709,25 @@ class CascadeTests(_WindowCase):
 
     # ---- loading a recorded cascade ------------------------------------
     def _load_cascade(self):
+        """The 0916 cascade as one stitched sweep, through its calib file."""
         w = self._page("1-10")
-        with unittest.mock.patch.object(
-            QtWidgets.QFileDialog, "getOpenFileName",
-            staticmethod(lambda *a, **k: (str(self.CASCADE_CSV), "")),
-        ):
+        with _picks(self.CASCADE_RUN / "calib.json"):
             w._tpa_phase_load()
         self.assertTrue(w.tpa_phase_results, w.tpa_phase_status.text())
         return w
+
+    def test_a_section_naming_two_sweeps_loads_as_one_run(self) -> None:
+        """The committed 0916 step7 names one CSV per stage; it is one run.
+
+        Pooling them is what lets a hand-merged calibration be re-read at all --
+        every target comes out of the stage file that carries it.
+        """
+        w = self._page("1-10")
+        self.assertEqual(
+            len(load_calib(self.STEP6_10).csv_paths(7)), 2)
+        with _picks(self.STEP6_10):
+            w._tpa_phase_load()
+        self.assertEqual(sorted(w.tpa_phase_results), [1, 3, 4, 5, 6, 7, 8, 9, 10])
 
     def test_one_file_carrying_two_references_loads_as_one_run(self) -> None:
         w = self._load_cascade()
@@ -686,7 +744,7 @@ class CascadeTests(_WindowCase):
     def test_the_loaded_phases_are_the_hand_merged_ones(self) -> None:
         w = self._load_cascade()
         for k, chain in sorted(w.tpa_phase_chains.items()):
-            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], places=6,
+            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], delta=PIN_TOL,
                                    msg=f"pair {k}")
 
     def test_the_table_shows_the_root_referred_phase_not_the_hub_one(self) -> None:
@@ -742,7 +800,7 @@ class CascadeTests(_WindowCase):
         self.assertEqual(w.tpa_phase_chains[1].via, 5)
         self.assertEqual(w.tpa_phase_chains[4].via, 2)
         for k, chain in sorted(w.tpa_phase_chains.items()):
-            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], places=6,
+            self.assertAlmostEqual(chain.dphi, self.MERGED_DPHI[k], delta=PIN_TOL,
                                    msg=f"pair {k}")
 
     def test_a_pair_is_not_chained_onto_a_hub_that_never_fit(self) -> None:
@@ -770,12 +828,8 @@ class CascadeTests(_WindowCase):
             run = Path(tmp) / "run_0916_copy"
             run.mkdir()
             shutil.copy2(self.RUN10 / "calib.json", run / "calib.json")
-            out = run / "calib_step7_meas_x.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(out), "")),
-            ):
-                w._tpa_phase_save()
+            w.tpa_phase_step6_edit.setText(str(run))
+            w._tpa_phase_autosave()
             js = run / "calib.json"
             self.assertTrue(js.is_file(), w.tpa_phase_status.text())
             payload = json.loads(js.read_text(encoding="utf-8"))
@@ -789,7 +843,7 @@ class CascadeTests(_WindowCase):
             by_pair = {c["tgt_index"]: c["fit"] for c in step7["channels"]}
             for k, want in self.MERGED_DPHI.items():
                 self.assertAlmostEqual(by_pair[k]["dphi_comb_rad"], want,
-                                       places=6, msg=f"pair {k}")
+                                       delta=PIN_TOL, msg=f"pair {k}")
             self.assertEqual(by_pair[1]["chained"]["via"], 5)
             self.assertNotIn("chained", by_pair[4])
 
@@ -802,12 +856,11 @@ class CascadeTests(_WindowCase):
         from calibration_module.fit.phase import references_in_csv
         w = self._load_cascade()
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "calib_step7_meas_x.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(out), "")),
-            ):
-                w._tpa_phase_save()
+            run = Path(tmp) / "refs_run"
+            run.mkdir()
+            w.tpa_phase_step6_edit.setText(str(run))
+            w._tpa_phase_autosave()
+            out = _written_csv(run)
             self.assertEqual(references_in_csv(out)[1], 5)
             self.assertEqual(references_in_csv(out)[4], 2)
 
@@ -820,12 +873,7 @@ class CascadeTests(_WindowCase):
             run = seed_run(Path(tmp) / "run_plain", step3=STEP6_LEGACY,
                            step6=STEP6_LEGACY)
             w.tpa_phase_step6_edit.setText(str(run))
-            out = run / "calib_step7_meas_x.csv"
-            with unittest.mock.patch.object(
-                QtWidgets.QFileDialog, "getSaveFileName",
-                staticmethod(lambda *a, **k: (str(out), "")),
-            ):
-                w._tpa_phase_save()
+            w._tpa_phase_autosave()
             payload = json.loads((run / "calib.json").read_text("utf-8"))
             self.assertNotIn("cascade", payload["step7"])
             for ch in payload["step7"]["channels"]:
@@ -836,12 +884,10 @@ class CascadeTests(_WindowCase):
 class PmtCheckboxTests(_WindowCase):
     """The Step-7 tab has its own switch, on by default, beside its own DAQ box."""
 
-    def test_it_is_on_by_default(self) -> None:
-        self.assertTrue(self.win.tpa_phase_pmt.isChecked())
-
-    def test_it_is_not_the_step6_checkbox(self) -> None:
+    def test_it_is_its_own_switch_and_starts_on(self) -> None:
         """Step 7 has its own DAQ settings, so it has its own switch too."""
         w = self.win
+        self.assertTrue(w.tpa_phase_pmt.isChecked())
         self.assertIsNot(w.tpa_phase_pmt, w.tpa_pmt)
         w.tpa_phase_pmt.setChecked(False)
         self.assertTrue(w.tpa_pmt.isChecked())
@@ -860,6 +906,10 @@ class LiveSweepBurstTests(_WindowCase):
     BURST_RUN = REPO / "src/calib_data/run_0929"
     BURST_CSV = BURST_RUN / "calib_step7_meas_0930_0236.csv"
     BURST_S6 = BURST_RUN / "calib.json"
+    #: run_0929's step 6 predates the measured floor, and no page here names a
+    #: run, so the floor is handed in -- the same one to the live path and to
+    #: the CSV re-fit it is compared with.
+    FLOOR = (2.0e-4, "test")
 
     def _swept(self, tgt: int, ref: int):
         """The sweep as measure_target hands it over: bursts still in."""
@@ -876,7 +926,7 @@ class LiveSweepBurstTests(_WindowCase):
         w = self.win
         raw, models = self._swept(10, 2)
         n = raw.trial.size
-        failed = w._tpa_phase_fit_results({10: raw}, models, 2)
+        failed = w._tpa_phase_fit_results({10: raw}, models, 2, floor=self.FLOOR)
         self.assertEqual(failed, [])
         kept = w.tpa_phase_results[10]
         self.assertEqual(len(kept.dropped_bursts), 2)
@@ -888,10 +938,11 @@ class LiveSweepBurstTests(_WindowCase):
         from calibration_module.fit.phase import load_phase_csv
         w = self.win
         raw, models = self._swept(6, 2)
-        w._tpa_phase_fit_results({6: raw}, models, 2)
+        w._tpa_phase_fit_results({6: raw}, models, 2, floor=self.FLOOR)
         live = w.tpa_phase_results[6]
         viacsv = load_phase_csv(self.BURST_CSV, models[6], models[2],
-                                comb_only=True, single_beam_bg=True, only_tgt=6)
+                                comb_only=True, single_beam_bg=True, only_tgt=6,
+                                floor=self.FLOOR)
         self.assertAlmostEqual(live.fit.dphi_comb, viacsv.fit.dphi_comb, places=9)
         self.assertAlmostEqual(live.fit.r2, viacsv.fit.r2, places=9)
 
@@ -899,7 +950,7 @@ class LiveSweepBurstTests(_WindowCase):
         w = self.win
         raw, models = self._swept(4, 2)
         n = raw.trial.size
-        w._tpa_phase_fit_results({4: raw}, models, 2)
+        w._tpa_phase_fit_results({4: raw}, models, 2, floor=self.FLOOR)
         self.assertEqual(w.tpa_phase_results[4].dropped_bursts, [])
         self.assertEqual(w.tpa_phase_results[4].trial.size, n)
 
@@ -907,7 +958,7 @@ class LiveSweepBurstTests(_WindowCase):
         """The panel must repopulate after a sweep that dropped rows."""
         w = self.win
         raw, models = self._swept(10, 2)
-        w._tpa_phase_fit_results({10: raw}, models, 2)
+        w._tpa_phase_fit_results({10: raw}, models, 2, floor=self.FLOOR)
         w._tpa_phase_fill_table()
         w._tpa_phase_redraw()
         self.assertEqual(w.tpa_phase_table.rowCount(), 1)

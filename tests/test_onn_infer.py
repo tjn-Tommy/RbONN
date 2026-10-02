@@ -2,9 +2,10 @@
 
 Three things are load-bearing here and none of them is the optics.
 
-``read_step8_anchors`` must return the drives step 8 actually displayed, not a
-recomputation of them -- the whole point of taking a ratio on an identical SLM
-frame is that no model enters it, and a re-solved drive is a different frame.
+``build_anchors`` must hand back distinct, reproducible drives, and
+``measure_gain`` must take its first block as ``g = 1`` and every later one as
+a ratio against THOSE reads -- the whole point of taking a ratio on an
+identical SLM frame is that no model enters it.
 
 ``fit_gain`` must be a slope through the origin, and its rms must be non-zero
 when the reads are NOT a pure rescaling of the reference, because that residual
@@ -48,114 +49,254 @@ def _has_step3(path: Path) -> bool:
 
 
 # ======================================================================
-# a step-8 CSV, without a step 8
+# the anchors, solved not read
 # ======================================================================
 
-def write_step8_csv(path: Path, alphas, *, dark=-7.5e-5, kind="A") -> Path:
-    """A minimal step-8 CSV: one ladder rung per alpha, drives that differ.
-
-    The drive is a deterministic function of alpha so a test can assert that
-    what came back is the row it asked for rather than a neighbour.
-    """
-    cols = (["kind", "alpha"]
-            + [f"x_{k}" for k in PAIRS] + [f"w_{k}" for k in PAIRS]
-            + ["voltage_mean_v", "dark_v"])
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        fh.write("# step7_json,nowhere.json\n")
-        wr = csv.DictWriter(fh, fieldnames=cols)
-        wr.writeheader()
-        for a in alphas:
-            row = {"kind": kind, "alpha": f"{a:.6f}",
-                   "voltage_mean_v": f"{0.4 * a + dark:.9g}", "dark_v": f"{dark:.9g}"}
-            for j, k in enumerate(PAIRS):
-                row[f"x_{k}"] = f"{a * (j + 1) / 10:.6f}"
-                row[f"w_{k}"] = f"{a * (j + 2) / 10:.6f}"
-            wr.writerow(row)
-    return path
+def _three_pair_model(eta=0.1):
+    """A flat three-pair forward model: eta per pair, no background, phases 0."""
+    models = {k: PairModel(index=k, eta=eta, a_x=0.0, q_x=0.0,
+                           a_w=0.0, q_w=0.0, d=0.0) for k in PAIRS}
+    return models, {k: 0.0 for k in PAIRS}
 
 
 class AnchorTests(unittest.TestCase):
-    """Which rungs get picked, and whether their drives survive the trip."""
+    """``build_anchors``: what the ladder is, and that it is not yet a reference."""
+
+    def test_rungs_come_back_in_alpha_order_inside_the_band(self):
+        models, phases = _three_pair_model()
+        got = OI.build_anchors(models, phases, PAIRS, seed=3, n=6, band=(0.5, 0.9))
+        self.assertEqual(got["n"], 6)
+        self.assertTrue(np.all(np.diff(got["alpha"]) > 0))
+        self.assertGreaterEqual(got["alpha"].min(), 0.5 - 0.01)
+        self.assertLessEqual(got["alpha"].max(), 0.9 + 0.01)
+
+    def test_every_rung_is_a_different_drive(self):
+        """Ten repeats of one frame would be a mean with extra steps."""
+        models, phases = _three_pair_model()
+        got = OI.build_anchors(models, phases, PAIRS, seed=3)
+        frames = {tuple(np.r_[x, w]) for x, w in zip(got["x"], got["w"])}
+        self.assertEqual(len(frames), got["n"])
+
+    def test_the_same_seed_gives_the_same_ladder(self):
+        """The seed is written to the CSV so the frames can be rebuilt."""
+        models, phases = _three_pair_model()
+        a = OI.build_anchors(models, phases, PAIRS, seed=11)
+        b = OI.build_anchors(models, phases, PAIRS, seed=11)
+        np.testing.assert_array_equal(a["x"], b["x"])
+        np.testing.assert_array_equal(a["w"], b["w"])
+
+    def test_a_bright_model_is_capped_at_step_8_s_ceiling(self):
+        """eta = 0.25 per pair puts Y_max at 562 mV, over the 450 mV ceiling.
+
+        The band must stop at the ceiling, as step 8's does, so the brightest
+        anchor never exceeds what step 8 was willing to drive.
+        """
+        models, phases = _three_pair_model(eta=0.25)
+        got = OI.build_anchors(models, phases, PAIRS, seed=3, band=(0.5, 1.0))
+        self.assertTrue(got["capped"])
+        self.assertAlmostEqual(got["band"][1], OI.LADDER_CEILING_V / got["y_max_v"],
+                               places=9)
+        self.assertLessEqual(got["pred_v"].max(), OI.LADDER_CEILING_V * 1.01)
+
+    def test_a_dim_model_runs_the_band_as_asked(self):
+        models, phases = _three_pair_model(eta=0.1)
+        got = OI.build_anchors(models, phases, PAIRS, seed=3, band=(0.5, 0.9))
+        self.assertFalse(got["capped"])
+        self.assertEqual(got["band"], (0.5, 0.9))
+
+    def test_the_reference_volts_do_not_exist_until_read(self):
+        models, phases = _three_pair_model()
+        got = OI.build_anchors(models, phases, PAIRS, seed=3)
+        self.assertIsNone(got["v_ref"])
+
+
+class _FakeRunPatterns:
+    """``run_patterns`` as a pure function of a gain: no SLM, no DAQ.
+
+    Each rung reads ``g * v_true + dark``; ``dark_v`` is what was passed in, or
+    a fixed value when none was (the first block measures one).  Rungs are told
+    apart by the ``alpha`` their row carries, so a call for a subset of the
+    ladder (a re-read, a ladder with a rung turned off) reads the right ones.
+
+    ``spikes`` is a queue, one dict per CALL, of ``{rung: multiplier}`` applied
+    to that call's reads only -- a level shift lasting one window, which is
+    what the bench actually does (trace std stays ordinary).
+    """
+
+    def __init__(self, v_true, alphas, *, g=1.0, dark=1e-4, spikes=()):
+        self.v_true, self.alphas = np.asarray(v_true, float), np.asarray(alphas, float)
+        self.g, self.dark = g, dark
+        self.spikes = list(spikes)
+        self.calls, self.read = 0, []
+
+    def __call__(self, daq, slm, layout, blocks, x, w, models, phases, *,
+                 rows, extra, acq, y_sat, dark, log, row_hook):
+        self.calls += 1
+        spike = self.spikes.pop(0) if self.spikes else {}
+        d = self.dark if dark is None else dark
+        for e in extra[0]:
+            i = int(np.argmin(np.abs(self.alphas - float(e["alpha"]))))
+            self.read.append(i)
+            row = dict(e, mean_v=self.g * self.v_true[i] * spike.get(i, 1.0) + d,
+                       dark_v=d)
+            row_hook(row)
+            rows.append(row)
+
+
+class _CountingPMT:
+    COLUMNS = ("pmt_ohm_Ohm", "pmt_c")
+
+    def __init__(self):
+        self.reads = 0
+
+    def read(self):
+        self.reads += 1
+
+    def __call__(self, row):
+        row["pmt_c"] = "25.0"
+
+
+class MeasureGainTests(unittest.TestCase):
+    """The first block defines g = 1; every later one is a ratio against it."""
+
+    ALPHA = np.array([0.5, 0.6, 0.7, 0.8, 0.9])
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.dir = Path(self.tmp.name)
+        n = len(self.ALPHA)
+        self.v_true = np.array([0.25, 0.30, 0.35, 0.40, 0.45])
+        # the model predicts the truth to 1 % per rung: inside GAIN_TOL
+        pred = self.v_true * np.array([1.01, 0.99, 1.0, 1.01, 0.99])
+        self.anchors = {"n": n, "alpha": self.ALPHA, "pred_v": pred,
+                        "x": np.zeros((n, 3)), "w": np.zeros((n, 3)),
+                        "v_ref": None, "keep": np.ones(n, dtype=bool)}
+        self.bench = {k: None for k in ("daq", "slm", "layout", "models",
+                                        "phases", "y_sat", "acq")}
+        self.bench["pairs"] = PAIRS
 
-    def test_picks_the_nearest_rung_to_each_target(self):
-        # Ladder topping at exactly 1, so a fraction of the top IS that alpha.
-        csv_path = write_step8_csv(self.dir / "s8.csv", np.arange(0.05, 1.001, 0.05))
-        got = OI.read_step8_anchors(csv_path, PAIRS, (0.55, 0.75, 0.95))
-        np.testing.assert_allclose(got["alpha"], [0.55, 0.75, 0.95], atol=1e-6)
-        self.assertAlmostEqual(got["top"], 1.0)
+    def _fake(self, **kw):
+        return _FakeRunPatterns(self.v_true, self.ALPHA, **kw)
 
-    def test_the_drive_is_the_row_asked_for_not_a_neighbour(self):
-        """Verbatim, per column -- a ratio on a re-solved frame measures nothing."""
-        csv_path = write_step8_csv(self.dir / "s8.csv", np.arange(0.05, 1.001, 0.05))
-        got = OI.read_step8_anchors(csv_path, PAIRS, (0.85,))
-        np.testing.assert_allclose(got["x"][0], [0.085, 0.170, 0.255], atol=1e-6)
-        np.testing.assert_allclose(got["w"][0], [0.170, 0.255, 0.340], atol=1e-6)
+    def _measure(self, fake, rows, dark=None, pmt=None):
+        with mock.patch.object(OI, "run_patterns", fake):
+            return OI.measure_gain(self.bench, self.anchors, seq0=-1, t0=0.0,
+                                   rows=rows, dark=dark, pmt=pmt,
+                                   log=lambda _m: None)
 
-    def test_the_targets_follow_a_capped_ladder_down(self):
-        """Step 8 caps itself in VOLTS, so its top alpha moves with the gain.
+    def test_the_first_block_is_g_1_by_definition_and_keeps_its_volts(self):
+        rows: list[dict] = []
+        g, rms, dark = self._measure(self._fake(g=1.37), rows)
+        self.assertEqual((g, rms), (1.0, 0.0))
+        np.testing.assert_allclose(self.anchors["v_ref"], 1.37 * self.v_true)
+        self.assertTrue(self.anchors["keep"].all())
+        self.assertEqual({r["g"] for r in rows}, {"1"})
+        self.assertEqual({r["kind"] for r in rows}, {"gain"})
+        self.assertAlmostEqual(dark, 1e-4)
 
-        A ladder capped at 0.293 -- the present bench, 450 mV of a 1534 mV Y_max
-        -- has nothing at all above 0.3.  The targets have to come down with it.
-        """
-        alphas = np.linspace(0.15, 0.293, 30)
-        csv_path = write_step8_csv(self.dir / "s8.csv", alphas)
-        got = OI.read_step8_anchors(csv_path, PAIRS)
-        self.assertAlmostEqual(got["top"], 0.293, places=6)
-        self.assertEqual(got["n"], len(OI.ANCHOR_FRACTIONS))
-        self.assertEqual(len(set(got["alpha"].tolist())), len(got["alpha"]))
-        for frac, picked in zip(OI.ANCHOR_FRACTIONS, got["alpha"]):
-            self.assertAlmostEqual(picked, frac * 0.293, delta=0.01)
+    def test_a_later_block_measures_the_change_since_the_first(self):
+        rows: list[dict] = []
+        self._measure(self._fake(g=1.0), rows)
+        g, rms, _ = self._measure(self._fake(g=1.07), rows, dark=1e-4)
+        self.assertAlmostEqual(g, 1.07, places=9)
+        self.assertLess(rms, 1e-12)
+        self.assertEqual(rows[-1]["g"], f"{1.07:.9g}")
 
-    def test_a_capped_ladder_still_gives_a_slope_and_not_a_mean(self):
-        """The regression the fractions exist for.
-
-        With the old absolute targets (0.55..0.95) every one of them would land
-        above a 0.293 ladder, the nearest-rung picker would hand back the five
-        brightest rungs whatever they were, and the lever arm would collapse to
-        whatever the top of the ladder happened to span -- here 1.04x.  A slope
-        fitted over that is a mean with extra steps.
-        """
-        alphas = np.linspace(0.15, 0.293, 30)
-        csv_path = write_step8_csv(self.dir / "s8.csv", alphas)
-
-        got = OI.read_step8_anchors(csv_path, PAIRS)
-        lever = got["v_ref"].max() / got["v_ref"].min()
-        self.assertGreater(lever, 1.5)
-
-        old = OI.read_step8_anchors(csv_path, PAIRS,
-                                    [a / 0.293 for a in (0.55, 0.65, 0.75,
-                                                         0.85, 0.95)])
-        old_lever = old["v_ref"].max() / old["v_ref"].min()
-        self.assertLess(old_lever, 1.1)
-        self.assertGreater(lever, 1.5 * old_lever)
-
-    def test_reference_volts_are_dark_corrected(self):
-        csv_path = write_step8_csv(self.dir / "s8.csv", [0.75], dark=-1e-3)
-        got = OI.read_step8_anchors(csv_path, PAIRS, (0.75,))
-        self.assertAlmostEqual(float(got["v_ref"][0]), 0.4 * 0.75, places=9)
-
-    def test_a_sparse_ladder_gives_distinct_rungs_not_one_counted_five_times(self):
-        """Otherwise the slope quietly collapses back into a mean."""
-        csv_path = write_step8_csv(self.dir / "s8.csv", [0.60, 0.62, 0.64])
-        got = OI.read_step8_anchors(csv_path, PAIRS, (0.55, 0.65, 0.75, 0.85, 0.95))
-        self.assertEqual(got["n"], 3)
-        self.assertEqual(len(set(got["alpha"].tolist())), 3)
-
-    def test_rejects_a_csv_missing_a_pair_this_run_drives(self):
-        csv_path = write_step8_csv(self.dir / "s8.csv", [0.75])
+    def test_a_first_block_at_the_dark_is_refused(self):
         with self.assertRaises(SystemExit):
-            OI.read_step8_anchors(csv_path, [1, 2, 3, 9], (0.75,))
+            self._measure(_FakeRunPatterns(np.zeros(5), self.ALPHA), [])
+        self.assertIsNone(self.anchors["v_ref"])
 
-    def test_rejects_a_csv_with_no_alpha_column(self):
-        path = self.dir / "plain.csv"
-        path.write_text("block,voltage_mean_v\n0,0.1\n", encoding="utf-8")
-        with self.assertRaises(SystemExit):
-            OI.read_step8_anchors(path, PAIRS)
+    def test_the_pmt_is_read_once_per_block(self):
+        pmt = _CountingPMT()
+        rows: list[dict] = []
+        self._measure(self._fake(), rows, pmt=pmt)
+        self._measure(self._fake(), rows, dark=1e-4, pmt=pmt)
+        self.assertEqual(pmt.reads, 2)
+        self.assertTrue(all(r["pmt_c"] == "25.0" for r in rows))
+
+    # -- the +/- GAIN_TOL rule ------------------------------------------
+
+    def test_a_spiked_rung_in_a_later_block_is_dropped_from_the_fit(self):
+        """Rung 2 reads 8 % high for one window: g must not see it."""
+        rows: list[dict] = []
+        self._measure(self._fake(), rows)
+        fake = self._fake(g=1.02, spikes=[{2: 1.08}])
+        g, rms, _ = self._measure(fake, rows, dark=1e-4)
+        self.assertAlmostEqual(g, 1.02, places=9)
+        self.assertLess(rms, 1e-12)
+        block = rows[-5:]
+        self.assertEqual([r["kind"] for r in block],
+                         ["gain", "gain", "gain_drop", "gain", "gain"])
+        self.assertEqual(block[2]["g"], f"{1.02:.9g}")     # stamped, as evidence
+
+    def test_a_rung_inside_the_tolerance_is_kept(self):
+        rows: list[dict] = []
+        self._measure(self._fake(), rows)
+        self._measure(self._fake(g=1.02, spikes=[{2: 1.02}]), rows, dark=1e-4)
+        self.assertEqual({r["kind"] for r in rows[-5:]}, {"gain"})
+
+    def test_a_spiked_rung_in_the_first_block_is_re_read_once(self):
+        """Judged against the model; the re-read replaces the spike."""
+        rows: list[dict] = []
+        fake = self._fake(spikes=[{3: 1.08}])
+        g, _, _ = self._measure(fake, rows)
+        self.assertEqual(fake.calls, 2)
+        self.assertEqual(fake.read, [0, 1, 2, 3, 4, 3])
+        np.testing.assert_allclose(self.anchors["v_ref"], self.v_true)
+        self.assertTrue(self.anchors["keep"].all())
+        self.assertEqual([r["kind"] for r in rows],
+                         ["gain", "gain", "gain", "gain_drop", "gain", "gain"])
+        self.assertEqual([r["seq"] for r in rows], [-1, -2, -3, -4, -5, -6])
+
+    def test_a_rung_off_twice_in_the_first_block_leaves_the_ladder(self):
+        rows: list[dict] = []
+        fake = self._fake(spikes=[{3: 1.08}, {3: 0.92}])
+        self._measure(fake, rows)
+        np.testing.assert_array_equal(self.anchors["keep"],
+                                      [True, True, True, False, True])
+        self.assertEqual([r["kind"] for r in rows][3::2], ["gain_drop", "gain_drop"])
+        # ... and is never displayed again
+        fake2 = self._fake(g=1.03)
+        g, rms, _ = self._measure(fake2, rows, dark=1e-4)
+        self.assertEqual(fake2.read, [0, 1, 2, 4])
+        self.assertAlmostEqual(g, 1.03, places=9)
+        self.assertEqual(len(rows), 6 + 4)
+
+    def test_a_block_with_every_rung_off_is_fitted_whole(self):
+        """Five rungs scattered +/- 10 %: dropping all would leave no fit."""
+        rows: list[dict] = []
+        self._measure(self._fake(), rows)
+        wild = {0: 0.90, 1: 1.10, 2: 0.90, 3: 1.10, 4: 0.90}
+        g, rms, _ = self._measure(self._fake(spikes=[wild]), rows, dark=1e-4)
+        self.assertTrue(np.isfinite(g))
+        self.assertEqual({r["kind"] for r in rows[-5:]}, {"gain"})
+
+
+class FlagOffRungsTests(unittest.TestCase):
+
+    def test_a_pure_rescaling_flags_nothing(self):
+        ref = np.array([0.2, 0.3, 0.4, 0.5])
+        self.assertFalse(OI.flag_off_rungs(1.08 * ref, ref).any())
+
+    def test_the_rung_off_the_slope_is_the_one_flagged(self):
+        """One rung 8 % high pulls the slope ~2 %; only that rung is off."""
+        ref = np.array([0.2, 0.3, 0.4, 0.5])
+        v = ref * np.array([1.0, 1.0, 1.08, 1.0])
+        np.testing.assert_array_equal(OI.flag_off_rungs(v, ref),
+                                      [False, False, True, False])
+
+    def test_the_tolerance_is_relative_and_visible(self):
+        ref = np.array([0.2, 0.3, 0.4, 0.5, 0.6])
+        v = ref * np.array([1.0, 1.0, 1.08, 1.0, 1.0])
+        g, _ = OI.fit_gain(v, ref)
+        dev = abs(v[2] / (g * ref[2]) - 1)
+        self.assertTrue(OI.flag_off_rungs(v, ref, tol=dev - 1e-9)[2])
+        self.assertFalse(OI.flag_off_rungs(v, ref, tol=dev + 1e-9).any())
+        self.assertLess(OI.GAIN_TOL, dev)          # the default catches it
+
+    def test_a_reference_at_zero_is_off_not_a_crash(self):
+        ref = np.array([0.0, 0.3, 0.4])
+        v = np.array([0.0, 0.3, 0.4])
+        np.testing.assert_array_equal(OI.flag_off_rungs(v, ref), [True, False, False])
 
 
 # ======================================================================
@@ -376,10 +517,11 @@ class _SteppingDAQ:
     Not a clock-driven ramp.  The gain must be CONSTANT across the five rungs of
     one measurement, or "a pure gain change leaves no residual in the slope fit"
     stops being a statement about the code and becomes a race against how fast
-    the machine gets through five reads.  So it steps when a block STARTS, which
-    it recognises by the lowest anchor's drive -- ``read_step8_anchors`` returns
-    them sorted by alpha, so that frame opens every block and appears nowhere
-    else (the inference drives are random).
+    the machine gets through the reads.  So it steps when a block STARTS, which
+    it recognises by the lowest anchor's drive -- ``build_anchors`` returns them
+    sorted by alpha, so that frame opens every block and appears nowhere else
+    (the inference drives are random).  The first block is then read at g = 1,
+    which is also what it defines.
 
     Dark is constant and non-zero so a dropped dark subtraction cannot pass.
     """
@@ -453,37 +595,17 @@ class RunLoopTests(unittest.TestCase):
                  meta=json.dumps({"checkpoint": "none"}))
         return path
 
-    @classmethod
-    def _step8(cls) -> Path:
-        """Anchors whose reference volts ARE the model's linear prediction.
-
-        So a correctly measured g is exactly the fake bench's gain, and the test
-        can assert on the number rather than only on its presence.
-        """
-        path = cls.dir / "s8.csv"
-        cols = (["kind", "alpha"] + [f"x_{k}" for k in cls.pairs]
-                + [f"w_{k}" for k in cls.pairs] + ["voltage_mean_v", "dark_v"])
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            wr = csv.DictWriter(fh, fieldnames=cols)
-            wr.writeheader()
-            for a in (0.55, 0.65, 0.75, 0.85, 0.95):
-                drive = np.full(len(cls.pairs), a)
-                y = float(V.predict(cls.models, cls.phases, cls.pairs, drive, drive))
-                row = {"kind": "A", "alpha": f"{a:.6f}",
-                       "voltage_mean_v": f"{y:.9g}", "dark_v": "0"}
-                for k, d in zip(cls.pairs, drive):
-                    row[f"x_{k}"] = row[f"w_{k}"] = f"{d:.6f}"
-                wr.writerow(row)
-        return path
+    SEED = 5
 
     @classmethod
     def _run(cls) -> list[dict]:
         slm = _FakeSLM()
-        cls.daq = _SteppingDAQ(slm, cls.models, cls.phases,
-                               np.full(len(cls.pairs), 0.55))
+        # The same ladder main() will build: its lowest rung opens every block.
+        first = OI.build_anchors(cls.models, cls.phases, cls.pairs, seed=cls.SEED)
+        cls.daq = _SteppingDAQ(slm, cls.models, cls.phases, first["x"][0])
         layout = SimpleNamespace(n_channels=len(cls.pairs))
-        argv = ["onn_infer", "--npz", str(cls._npz()), "--step7", str(cls.step7),
-                "--step8-csv", str(cls._step8()), "--t-meas", "0.0",
+        argv = ["onn_infer", "--npz", str(cls._npz()), "--calib", str(cls.step7),
+                "--gain-seed", str(cls.SEED), "--no-pmt", "--t-meas", "0.0",
                 "--gain-every", "0.4", "--out", str(cls.dir)]
         patches = [
             mock.patch.object(OI, "connect_slm", return_value=slm),
@@ -513,7 +635,10 @@ class RunLoopTests(unittest.TestCase):
 
     def test_both_kinds_of_read_reach_the_csv(self):
         self.assertEqual(len(self._of("onn")), 2 * 3 * 2)
-        self.assertGreaterEqual(len(self._of("gain")), 10)   # >= 2 measurements
+        self.assertGreaterEqual(len(self._of("gain")), 2 * OI.GAIN_RUNGS)   # >= 2 blocks
+
+    def test_a_bench_that_only_drifts_drops_no_rung(self):
+        self.assertEqual(self._of("gain_drop"), [])
 
     def test_anchor_rows_never_collide_with_inference_seq(self):
         gain = [int(r["seq"]) for r in self._of("gain")]
@@ -523,9 +648,24 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(len(set(gain)), len(gain))          # all distinct
 
     def test_g_tracks_the_drifting_bench(self):
+        """The first block is 1 by definition; the bench steps 1 % per block."""
         g = [float(r["g"]) for r in self._of("gain")]
-        self.assertAlmostEqual(g[0], 1.0, places=6)
+        self.assertEqual(g[:OI.GAIN_RUNGS], [1.0] * OI.GAIN_RUNGS)
+        self.assertAlmostEqual(g[OI.GAIN_RUNGS], 1.0 + self.daq.rate, places=6)
         self.assertGreater(g[-1], g[0])
+
+    def test_the_csv_meta_records_the_reference(self):
+        """Seed, band and the g = 1 volts: enough to rebuild the frames."""
+        path = next(self.dir.glob("onn_infer_*.csv"))
+        meta = dict(ln[2:].split(",", 1) for ln in
+                    path.read_text(encoding="utf-8").splitlines()
+                    if ln.startswith("# "))
+        self.assertEqual(meta["gain_seed"], str(self.SEED))
+        self.assertEqual(meta["g_reference"], "first gain block of this run (g = 1)")
+        self.assertEqual(len(meta["g_reference_v"].split()), OI.GAIN_RUNGS)
+        self.assertEqual(meta["gain_tol"], f"{OI.GAIN_TOL:g}")
+        self.assertEqual(meta["gain_rungs_out"], "")
+        self.assertTrue(meta["calib"].endswith("calib.json"))
 
     def test_a_pure_gain_change_leaves_no_anchor_residual(self):
         """rms is the "something other than gain moved" detector; nothing did."""

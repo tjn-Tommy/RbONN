@@ -1,8 +1,15 @@
 """n-pair verification -- predict every pattern from the calibration, compare.
 
-Steps 3-7 calibrate every parameter the forward model needs.  For a block of
-``n`` pairs driven at ``(x_k, w_k)``, every other pair off, the dark-subtracted
-detector output is predicted with nothing left free::
+In:  one ``calib.json`` through :func:`load_forward_model` (steps 6 and 7 out of
+     the SAME file, which is what makes the etas and phases a matched set), plus
+     the drives to predict.
+Out: predictions from :func:`predict`, the block's ceiling from
+     :class:`FullScale`, and the fitted ``Y_sat`` from :func:`fit_y_sat`.
+     Imports no driver, so all of it runs against a saved CSV.
+
+Steps 3-7 calibrate every parameter the model needs.  For a block of ``n`` pairs
+driven at ``(x_k, w_k)`` with every other pair off, the dark-subtracted output
+is predicted with nothing left free::
 
     u_k = asin sqrt(x_k)                    v_k = asin sqrt(w_k)
     E   = sum_k  eta_k sqrt(x_k w_k) exp(i [u_k + v_k + Phi_k])
@@ -10,23 +17,21 @@ detector output is predicted with nothing left free::
 
 THE model -- there is one, it is this, and every fit in the project is taken
 under it.  ``u_k = phi_half(x_k)``: a channel's field phase is half its panel
-retardance, which is the same number that sets its amplitude, so amplitude and
-phase are welded together (see the note above :func:`support_h`).  ``Phi_k`` is
-the pair's comb phase from step 7, stored in exactly this sign -- no consumer
-negates it.  The saturation acts on the TPA field only; ``single_beam_k`` is
-detector response to each beam separately and adds outside it, linearly.
+retardance, the same number that sets its amplitude, so amplitude and phase are
+welded together (see the note above :func:`support_h`).  ``Phi_k`` is step 7's
+comb phase in exactly the stored sign -- no consumer negates it.  Saturation
+acts on the TPA field only; ``single_beam_k`` is per-beam detector response and
+adds outside it, linearly.
 
-The error is quoted against the block's FULL SCALE -- the range an n-pair
-computation has to divide into levels::
+Error is quoted against the block's FULL SCALE, the range an n-pair computation
+has to divide into levels::
 
     FS = Y_max - Y_min = Y_max
 
 ``Y_min = 0`` because a pair driven at ``x_k = 0`` contributes no field, so
 RbONN never needs the phasor polygon to close.  ``Y_max`` is the reachable
-ceiling from :func:`reachable_max`, which is NOT ``(sum_k eta_k)^2`` -- see the
-note above :func:`support_h` for why that bound is out of reach here.
-
-Imports no driver, so all of it runs against a saved CSV.
+ceiling from :func:`reachable_max`, which is NOT ``(sum_k eta_k)^2`` -- again,
+the note above :func:`support_h`.
 """
 from __future__ import annotations
 
@@ -71,15 +76,13 @@ __all__ = [
 def note_step7_moved(run, meta, log=print) -> bool:
     """Warn when a recorded CSV was driven under a different step 7 than this one.
 
-    Every run's file is now called ``calib.json``, so the old check -- compare
-    the recorded filename against the one being fitted -- could never catch this
-    again.  What identifies a step 7 is its ``ran`` stamp, which the driving run
-    writes into the CSV meta as ``step7_ran``, so that is what is compared.
+    Every file is called ``calib.json``, so a filename cannot identify a step 7;
+    its ``ran`` stamp can, and the driving run writes that into the CSV meta as
+    ``step7_ran``.
 
-    Returns True when it said something.  A CSV from before the stamp existed
-    carries no ``step7_ran`` and is passed over in silence: there is nothing to
-    compare, and inventing a warning for every historical file would train the
-    operator to ignore the one that matters.
+    Out: True when it said something.  A CSV from before the stamp carries none
+    and passes in silence -- there is nothing to compare, and warning on every
+    historical file would train the operator to ignore the one that matters.
     """
     from calibration_module.calib_file import load_calib
 
@@ -103,21 +106,19 @@ def load_forward_model(
     run: str | Path, *, pairs: Sequence[int] | None = None,
     method: str | None = None,
 ) -> tuple[dict[int, PairModel], dict[int, float], int]:
-    """``(models, phases, ref)`` for ``pairs`` out of a run's calib.json.
+    """``(models, phases, ref)`` for ``pairs`` out of one calib.json.
 
-    ``run`` is a run directory or the ``calib.json`` inside it; both the step-6
-    etas and the step-7 phases come from that one file, which is what makes them
-    a matched pair rather than two files that happen to be named alike.
+    In:  ``run``, a ``calib.json`` or the directory holding one.  The step-6
+         etas and step-7 phases both come from that ONE file, which is what
+         makes them a matched set.  ``pairs=None`` takes every pair the file
+         calibrates end to end -- the reference plus each target with a fit.
+    Out: ``phases[k]`` is ``Phi_k`` in radians exactly as :func:`predict` uses
+         it, with ``phases[ref] = 0``.
 
-    ``phases[k]`` is ``Phi_k`` in radians, exactly as :func:`predict` uses it,
-    with ``phases[ref] = 0``.  ``pairs=None`` takes every pair the file
-    calibrates end to end: the reference plus each target with a stored fit.
-
-    A stored ``dphi_comb_rad`` IS ``Phi_k``: step 7 fits
-    ``cos(dPhi_SLM + dPhi_comb)``, the one convention of this project, so this
-    reads it through untouched.  Files written before 2026-09-25 carry a
-    ``"convention": "comb-slm"`` tag and hold the NEGATED phase; they are not
-    migrated and are read as-is, so re-run step 7 rather than trusting one.
+    A stored ``dphi_comb_rad`` IS ``Phi_k``, step 7 fitting
+    ``cos(dPhi_SLM + dPhi_comb)``, so it reads through untouched.  A file
+    tagged ``"convention": "comb-slm"`` holds the NEGATED phase and is read
+    as-is, not migrated: re-run step 7 rather than trust one.
     """
     from calibration_module.calib_file import calib_path
 
@@ -144,11 +145,10 @@ def load_forward_model(
 def saturate(y, y_sat: float | None):
     """Two-photon saturation of the readout, ``Y / (1 + Y / Y_sat)``.
 
-    The atoms respond to the coherent ``|E|^2``, and the excited population stops
-    growing linearly with it: ``Y_sat`` is the ``|E|^2`` (in detector volts) at
-    which the response has fallen to half the linear one.  ``None`` or ``0`` is
-    the linear model.  Steps 6 and 7 read at most ~66 mV, where the correction is
-    ~1 %, so their fits are left as linear.
+    ``Y_sat`` is the ``|E|^2``, in detector volts, at which the response has
+    fallen to half the linear one.  ``None`` or ``0`` is the linear model, which
+    is what steps 6 and 7 use: they read at most ~66 mV, where the correction is
+    ~1%.
     """
     if not y_sat:
         return y
@@ -159,29 +159,30 @@ def fit_y_sat(y, pred, sigma=None, *, y_lo: float = 2.0, y_hi: float = 40.0,
               points: int = 20001) -> dict:
     """Fit ``Y_sat`` to reads ``y`` against LINEAR predictions ``pred``.
 
-    ``pred`` is the unsaturated model output -- :func:`predict` with
-    ``y_sat=None`` -- and ``y`` the dark- and background-subtracted read.
-    ``sigma`` weights the residuals; ``None`` weights every read equally.
-    One free parameter: the gain is pinned to 1.
+    In:  ``pred`` the unsaturated model output (:func:`predict` with
+         ``y_sat=None``), ``y`` the dark- and background-subtracted read, and
+         ``sigma`` the residual weights (``None`` weights every read equally).
+    Out: the fit and its interval.  ONE free parameter -- the gain is pinned
+         to 1.
 
-    The grid is uniform in ``1/Y_sat``, not in ``Y_sat``, because that is the
-    parameter the model is linear in -- ``1/y = 1/Y + 1/Y_sat`` -- so a uniform
-    ``Y_sat`` grid would spend most of its points where the data says nothing.
-    The quoted uncertainty is the ``Delta chi^2 = 1`` interval mapped back
-    through the inverse, which is why it comes out asymmetric in ``Y_sat``.
+    The grid is uniform in ``1/Y_sat``, the parameter the model is linear in
+    (``1/y = 1/Y + 1/Y_sat``), so a uniform ``Y_sat`` grid would spend most of
+    its points where the data says nothing.  The quoted uncertainty is the
+    ``Delta chi^2 = 1`` interval mapped back through the inverse, hence
+    asymmetric in ``Y_sat``.
 
-    THE GAIN CAVEAT, which decides what this number means.  With ``g`` pinned
-    to 1 any detector gain error is absorbed into ``Y_sat`` and levered by
-    roughly ``Y_sat / max(pred)`` -- about 12x on a sweep reaching 400 mV.  Over
-    one night of hourly runs on the unchanged 0917 bench a ``g = 1`` ``Y_sat``
-    swung 4.39..5.44 V while tracking the separately measured gain at r = 0.98;
-    with the gain left free it sat at 6.84 +- 0.20 V with no trend.  So a fitted
-    ``Y_sat`` is a property of the hour it was measured in as much as of the
-    atoms.  That is not a defect here -- it is the point.  This fit DEFINES
-    ``g = 1``, and a later run measures its gain as the ratio of its reads to
-    this run's reads on the same drives.  Re-fitting on another day gives a
-    different ``Y_sat`` without either being wrong; what must not happen is
-    mixing one day's ``Y_sat`` with another day's reads.
+    THE GAIN CAVEAT, which decides what this number means.  With ``g`` pinned at
+    1, any gain error is absorbed into ``Y_sat`` and levered by roughly
+    ``Y_sat / max(pred)``, about 12x on a sweep reaching 400 mV.  Measured
+    overnight on an unchanged bench, a ``g = 1`` ``Y_sat`` swung 4.39..5.44 V
+    while tracking the separately measured gain at r = 0.98; with the gain free
+    it sat at 6.84 +- 0.20 V with no trend.
+
+    That is the point, not a defect: this fit DEFINES ``g = 1``, and a later run
+    measures its gain as the ratio of its reads to this run's on the same
+    drives.  Re-fitting another day gives a different ``Y_sat`` without either
+    being wrong.  What must not happen is mixing one day's ``Y_sat`` with
+    another day's reads.
     """
     y = np.asarray(y, dtype=float)
     pred = np.asarray(pred, dtype=float)
@@ -243,17 +244,14 @@ def predict(models: Mapping[int, PairModel], phases: Mapping[int, float],
     """Dark-free ``Y`` for drives ``x``, ``w`` of shape ``(..., len(driven))``.
 
     Column ``i`` drives pair ``driven[i]``.  The single-beam response is detector
-    background rather than TPA field, so it adds OUTSIDE the coherent sum.
+    background rather than TPA field, so it adds OUTSIDE the coherent sum, and
+    ``y_sat`` applies :func:`saturate` to ``|E|^2`` alone.
 
-    ``coherent=True`` returns ``|E|^2`` alone, dropping that background.  That is
-    the quantity ``FS = Y_max`` is defined on (see :class:`FullScale`), so it is
-    what a level target means; the full ``Y`` is what the ADC sees, so it is what
-    a read's input range is chosen from.  Keeping the two apart matters: on the
-    0911 runs the background ramps 0.64 -> 1.14 mV across the scale, a tilt of
-    the level axis that would otherwise be read as model bias.
-
-    ``y_sat`` applies :func:`saturate` to ``|E|^2``; the background is detector
-    offset, not atoms, so it stays linear.
+    ``coherent=True`` returns ``|E|^2`` by itself.  That is what ``FS = Y_max``
+    is defined on (:class:`FullScale`) and so what a level target means, while
+    the full ``Y`` is what the ADC sees and so what an input range is chosen
+    from.  Keeping them apart matters: the background ramps with level, a tilt
+    that would otherwise read as model bias.
     """
     x = np.asarray(x, dtype=float)
     w = np.asarray(w, dtype=float)
@@ -318,10 +316,10 @@ def support_h(psi, eta: float, phase: float) -> tuple[np.ndarray, np.ndarray]:
     """``(h_k(psi), t)`` for one pair: its support, and the ``t = u + v`` attaining it.
 
     ``h_k(psi) = max_{t in [0, pi]} eta (1 - cos t)/2 cos(psi - phase - t)``,
-    maximised in closed form -- ``d/dt = 0`` gives ``t* = (pi + 2a)/3`` up to
-    ``2 pi n/3``, so every branch landing in ``[0, pi]`` is tried, plus both
-    endpoints.  ``a = psi - phase`` spans ``(-2 pi, 2 pi]``, hence ``n = -3..3``:
-    too narrow a window silently undershoots the maximum rather than failing.
+    maximised in closed form: ``d/dt = 0`` gives ``t* = (pi + 2a)/3`` up to
+    ``2 pi n/3``, so every branch landing in ``[0, pi]`` is tried along with both
+    endpoints.  ``a = psi - phase`` spans ``(-2 pi, 2 pi]``, hence ``n = -3..3``
+    -- too narrow a window undershoots the maximum silently rather than failing.
     """
     psi = np.atleast_1d(np.asarray(psi, dtype=float))
     a = psi - float(phase)
@@ -340,11 +338,11 @@ def support_h(psi, eta: float, phase: float) -> tuple[np.ndarray, np.ndarray]:
 def reachable_max(etas, phases) -> tuple[float, np.ndarray, float]:
     """``(Y_max, drive, psi)`` -- the largest ``|E|^2`` these pairs can be driven to.
 
-    ``drive[k]`` is the ``x_k = w_k`` that attains it: the optimum is symmetric
-    in x and w, since at fixed ``u + v`` the amplitude ``sin u sin v`` peaks at
-    ``u = v``.  So ``predict(models, phases, driven, drive, drive)`` reproduces
-    ``Y_max`` exactly, which is how this is tested -- :func:`predict` knows
-    nothing about the support scan.
+    ``drive[k]`` is the ``x_k = w_k`` attaining it, the optimum being symmetric
+    in x and w since ``sin u sin v`` peaks at ``u = v`` for fixed ``u + v``.  So
+    ``predict(models, phases, driven, drive, drive)`` reproduces ``Y_max``
+    exactly, which is how this is tested: :func:`predict` knows nothing about
+    the support scan.
     """
     etas = np.asarray(etas, dtype=float)
     phases = np.asarray(phases, dtype=float)
@@ -378,13 +376,13 @@ def reachable_max(etas, phases) -> tuple[float, np.ndarray, float]:
 class FullScale:
     """A block's full scale ``FS = Y_max``, the span a computation divides into levels.
 
-    ``Y_min = 0`` is always reachable, so ``FS = Y_max - Y_min = Y_max``: the
-    largest ``|E|^2`` the pairs can actually be driven to, phase and amplitude
-    coupled as they are (see the note above).  The single-beam background is not
-    part of it -- that is detector offset, not what a computation drives.
+    ``Y_min = 0`` is always reachable, so ``FS = Y_max``: the largest ``|E|^2``
+    the pairs can ACTUALLY be driven to, phase and amplitude coupled as they
+    are.  The single-beam background is not part of it, being detector offset
+    rather than what a computation drives.
 
-    :attr:`bound` is the free-phase ``S^2`` for comparison, and
-    :attr:`headroom` how much of it the measured phases actually allow.
+    :attr:`bound` is the free-phase ``S^2`` for comparison, :attr:`headroom` how
+    much of it the measured phases allow.
     """
 
     driven: tuple[int, ...]
@@ -544,16 +542,15 @@ def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapp
                      extra: Sequence[str] = ()) -> str:
     """One row per pattern; ``x_k, w_k`` for every pair, 0 for the undriven ones.
 
-    Each row mapping carries ``block, driven, x, w`` (``x``/``w`` in ``driven``
-    order) and ``dark_v, mean_v, std_v, range_v, pred_v``.  ``meta`` is written
-    as trailing ``# key,value`` lines.  The layout is step 8's with ``v``
-    dropped and ``range_v`` added, so :func:`load_verify_csv` reads both.
+    Each row mapping carries ``block, driven, x, w`` (in ``driven`` order) and
+    ``dark_v, mean_v, std_v, range_v, pred_v``; ``meta`` goes in trailing
+    ``# key,value`` lines.  The layout is step 8's with ``v`` dropped and
+    ``range_v`` added, so :func:`load_verify_csv` reads both.
 
-    ``extra`` names further per-row columns to append after ``pred_v``, taken
-    from the same row mappings and blank where a row omits one.  They are how the
-    system-accuracy run records which family a read belongs to without needing a
-    second file format -- and because the leading columns are unchanged, such a
-    CSV still loads and compares as an ordinary n-pair block.
+    ``extra`` names further per-row columns appended after ``pred_v``, blank
+    where a row omits one.  That is how the system-accuracy run records which
+    family a read belongs to without a second file format -- the leading columns
+    being unchanged, such a CSV still loads as an ordinary n-pair block.
     """
     pairs = sorted(int(k) for k in pairs)
     out = Path(path).resolve()
@@ -583,16 +580,14 @@ def write_plan_csv(path: str | Path, patterns: Sequence, preds: Sequence[float],
                    meta: Mapping[str, object]) -> str:
     """Step 8's pattern plan, written BEFORE the hardware is touched.
 
-    One row per pattern, ``x_k``/``w_k`` per pair exactly as
-    :func:`write_verify_csv` lays them out, so the plan and the reads it
-    produced line up column for column.  The scalars the plan was solved under
-    -- the step-7 stamp, the seed, ``Y_max``, the ladder geometry -- go in the
-    same trailing ``# key,value`` meta lines every other CSV here uses.
+    One row per pattern, laid out exactly as :func:`write_verify_csv` does, so
+    the plan and the reads it produced line up column for column.  The scalars
+    it was solved under -- the step-7 stamp, the seed, ``Y_max``, the ladder
+    geometry -- go in the usual trailing ``# key,value`` meta lines.
 
-    A CSV rather than the JSON this used to be: a run directory holds exactly
-    one JSON, and a list of patterns was always a table.  The ``exact`` column
-    is what it was before -- False where a pattern fell back to the
-    deterministic drive because the solver could not hit its target alpha.
+    A CSV and not a JSON: a calibration is one JSON, and a list of patterns is a
+    table.  ``exact`` is False where a pattern fell back to the deterministic
+    drive because the solver could not hit its target alpha.
     """
     pairs = sorted(int(k) for k in pairs)
     out = Path(path).resolve()
@@ -701,11 +696,11 @@ def drive_bounds(meta: Mapping[str, str], default: tuple[float, float]) -> tuple
 def check_sign(path, blocks: Sequence[VerifyBlock]) -> None:
     """Refuse a CSV whose dark-subtracted signal is negative (inverted twice).
 
-    The read inverts the TIA's negative-for-light output once, so a well-collected
-    file has ``mean - dark > 0``.  Taken as a median, so one noisy near-dark
-    pattern cannot trip it.  Against a negated measurement the model yields a
-    plausible table of large errors rather than an error, which is what this
-    catches.
+    The read inverts the TIA's negative-for-light output once, so a well
+    collected file has ``mean - dark > 0``.  Taken as a MEDIAN, so one noisy
+    near-dark pattern cannot trip it.  What this catches is that against a
+    negated measurement the model yields a plausible table of large errors
+    rather than an error.
     """
     y = np.concatenate([b.y for b in blocks])
     med = float(np.median(y))

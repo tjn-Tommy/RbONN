@@ -1,16 +1,16 @@
 """Step 6 v2 acquisition -- drive one pair's schedule, return rows.
 
-This half touches the instruments and does no fitting.  It hands back the raw
-``(repeat, x, w, mean_v, std_v)`` rows that
-:func:`calibration_module.fit.pair_v2.average_levels` turns into levels, so the
-offline script and the GUI collect data through exactly one implementation and
-differ only in what they do with the rows afterwards.
+This half touches the instruments and does no fitting.
 
-``monitor`` is anything with the ``monitor_cycle(timeout=..., single=...)``
-protocol -- a :class:`~daq_module.DAQController` in every current caller.  The
-near-rail escalation additionally wants ``last_values`` and the ``_settings``
-the controller was configured with; a monitor without them still measures, with
-autoranging skipped and said so once, rather than failing.
+In:  ``monitor``, anything with the ``monitor_cycle(timeout=..., single=...)``
+     protocol -- a :class:`~daq_module.DAQController` in every current caller.
+     The near-rail test additionally wants ``last_values`` and the
+     ``_settings`` the controller was configured with; a monitor without them
+     still measures, and says so once.
+Out: raw ``(repeat, x, w, mean_v, std_v)`` rows, which
+     :func:`calibration_module.fit.pair_v2.average_levels` turns into levels.
+     So the offline script and the GUI collect through one implementation and
+     differ only in what they do with the rows.
 """
 from __future__ import annotations
 
@@ -37,29 +37,24 @@ __all__ = [
 ]
 
 
-#: The ONE measurement window, for every read of every step.
-#:
-#: Steps 6, 7 and 8 used to run 8, 10 and a 10 -> 5 s ramp, and the all-off dark
-#: ran longer still.  Nothing was gained by that: a read's noise is the trace
-#: spread, the fit floors it at ``STD_FLOOR_V`` anyway, and every difference in
-#: window was one more reason two steps' numbers could not be compared directly.
-#: One window, dark included, so a step-7 point and the step-6 eta it is pinned
-#: against were measured the same way.
+#: The ONE measurement window, for every read of every step, dark included, so
+#: that a step-7 point and the step-6 eta it is pinned against were measured the
+#: same way.  Per-step windows gained nothing -- a read's noise is the trace
+#: spread, which the fit floors anyway -- and each one was a reason two steps'
+#: numbers could not be compared directly.
 T_MEAS_S = 8.0
 
 #: The ONE input range.  Deliberately the same number as
-#: :data:`~calibration_module.steps.calib_step8.AMP_LIMIT_V`: the transimpedance
-#: amplifier saturates at 1 V, so a read the board could only hold at +/-2 V is
-#: already an amplifier flat-top and measuring it more precisely measures
-#: nothing.  Board rail and amplifier rail coincide, which makes the near-rail
-#: peak test an amplifier-clip test for free.
+#: :data:`~calibration_module.steps.calib_step8.AMP_LIMIT_V`: the amplifier
+#: saturates at 1 V, so a read the board could only hold at +/-2 V is already an
+#: amplifier flat-top.  Board rail and amplifier rail coinciding makes the
+#: near-rail peak test an amplifier-clip test for free.
 #:
-#: Widening costs nothing.  The 0928 gain sweep switches +/-0.1 -> +/-0.2 V mid
-#: run at fixed PMT gain and the all-off trace std moves 33.78 -> 33.75 uV; the
-#: board is dither-dominated even at its most sensitive range.  On a 16-bit
-#: USB-6251 the +/-1 V LSB is 30.5 uV, which the 20 Hz low-pass takes to 1.8 uV
-#: in the reported std and 0.09 uV on the reported mean -- 2000x under
-#: ``STD_FLOOR_V``.  So the range is chosen for headroom, never for resolution.
+#: Widening costs nothing: the board is dither-dominated even at its most
+#: sensitive range, and measured across a doubled range the all-off trace std
+#: moves 0.1%.  The +/-1 V LSB on this 16-bit board lands ~2000x under
+#: ``STD_FLOOR_V`` once low-passed.  So the range is chosen for HEADROOM, never
+#: for resolution.
 RANGE_V = 1.0
 
 
@@ -72,17 +67,13 @@ class PairV2Acq:
     must not care what windows the data was taken with, while the GUI's DAQ panel
     tunes these without touching the estimator.
 
-    Named for step 6, but it is now every step's: steps 6, 7 and 8 and the ONN
-    inference loop all take :data:`DEFAULT_ACQ` unchanged.  The per-step
-    variants are gone -- see :data:`T_MEAS_S`.
+    Named for step 6 but now every step's: steps 6, 7, 8 and the ONN inference
+    loop all take :data:`DEFAULT_ACQ` unchanged.
     """
 
     #: Averaging window.  ONE field: every read of every step takes the same
-    #: one, the all-off dark included.  There used to be a ``t_single_s`` for
-    #: the dark and a ``t_both_s`` for everything else, on the argument that a
-    #: near-zero read needs more averaging -- but the dark is subtracted from
-    #: every point of a sweep, so a dark averaged differently puts its own noise
-    #: into all of them.
+    #: one, the all-off dark included.  A dark averaged differently from the
+    #: points it is subtracted from puts its own noise into all of them.
     t_meas_s: float = T_MEAS_S
     #: Wait after each SLM pattern change, before reading.
     settle_s: float = 0.25
@@ -208,36 +199,26 @@ def read_point(
 ) -> tuple[float, float, float]:
     """One read at ``acq.range_v``.  One read: no escalation, and no warning.
 
-    This used to be ``read_point_autorange``, which remeasured a near-rail read
-    one range up; then it kept the near-rail test as a log line.  Both are gone.
+    Out: ``(mean_v, std_v, range_v)``.  Inversion is applied HERE, so the mean
+    handed back is already a positive light signal (see
+    :attr:`PairV2Acq.invert`).  ``single`` no longer picks a window -- there is
+    one -- but is still passed to the monitor and still marks the read as a dark
+    or one-beam point.
 
-    Why the WARNING went too, which is less obvious than why the re-read did.
-    The test fired when the raw trace peak passed 0.95 of the range, i.e. 950 mV.
-    On this bench the peak runs ~1.22x the mean (p90 1.31), so real signal
-    cannot reach that threshold until the MEAN is around 724..780 mV -- and above
-    950 mV the mean is at the rail and reports it by itself.  So the test only
-    ever said something the mean could not in a narrow window, and
-    :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V` now stops
-    every sweep at 450 mV, a factor of 1.6 below it.  What CAN still reach
-    950 mV from a 450 mV read is a spike: the observed peak/mean tail is 1.90 at
-    p99 and 4.04 at worst.  Every firing would therefore have been a false
-    alarm -- the same mechanism that used to trip the escalation, minus the
-    re-read.
+    No near-rail warning either, which is less obvious than why the re-read
+    went.  It fired at 0.95 of the range, and with the peak running ~1.22x the
+    mean real signal cannot get there until the MEAN is ~724..780 mV, where the
+    mean reports it anyway -- while
+    :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V` stops every
+    sweep 1.6x below that.  What CAN reach it from a 450 mV read is a spike, so
+    every firing would have been a false alarm.
 
-    The peak itself is not gone and costs nothing: ``run_patterns`` still puts
-    :func:`~calibration_module.measure.patterns.peak_v` on every row as the
+    The peak itself stays and costs nothing:
+    :func:`~calibration_module.measure.patterns.peak_v` is on every row as the
     durable record, and
-    :func:`~calibration_module.steps.calib_step8.probe_verdict` still judges
-    clipping on it.  That is the one place it earns its keep, because the probe
-    is the one thing that deliberately drives up into 724..950 mV looking for
-    where the amplifier starts to compress.
-
-    ``single`` no longer picks a window (there is one) but is still passed to
-    the monitor and still marks the read as a dark / one-beam point.
-
-    Returns ``(mean_v, std_v, range_v)``.  Inversion is applied here, so the
-    mean handed back is already a positive light signal (see
-    :attr:`PairV2Acq.invert`).
+    :func:`~calibration_module.steps.calib_step8.probe_verdict` judges clipping
+    on it.  That is where it earns its keep -- the probe is the one thing that
+    deliberately drives up looking for where the amplifier compresses.
     """
     sample = monitor.monitor_cycle(timeout=timeout, single=single)
     if sample is None:

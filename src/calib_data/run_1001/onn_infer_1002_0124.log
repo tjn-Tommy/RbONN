@@ -1,0 +1,43 @@
+npz       : src\calib_data\run_1001\bench_reference_100img.npz  (100 images, 79 shots, 10 outputs, 1 bank(s))
+calib     : src\calib_data\run_1001\calib.json   pairs [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   ref 2
+y_sat     : inf
+g anchor  : 10 rungs over alpha 0.400..0.800 of Y_max = 474.5 mV   seed 1004527381   g = 1 at the first block of this run
+            alpha 0.4034    191.7149 mV predicted   A000
+            alpha 0.4472    212.5083 mV predicted   A001
+            alpha 0.4951    235.2794 mV predicted   A002
+            alpha 0.5458    259.2884 mV predicted   A003
+            alpha 0.5820    276.4809 mV predicted   A004
+            alpha 0.6159    292.5940 mV predicted   A005
+            alpha 0.6408    304.3892 mV predicted   A006
+            alpha 0.7083    336.4475 mV predicted   A007
+            alpha 0.7204    342.1493 mV predicted   A008
+            alpha 0.7902    375.2985 mV predicted   A009
+            lever arm 1.96x (191.7..375.3 mV)
+Read      : 79000 inference reads at 4.8 s + 0.25 s settle
+Gain      : 10 rungs every 20 min, ~335 measurements (3350 reads); the first defines g = 1; a rung more than 4% off its block's slope is dropped
+Dark      : one read, at the start, held for the run
+PMT       : read with every gain block
+Estimate  : 6931.1 min (115.52 h)   [nominal; the 0929 run cost ~2 s/read more than this]
+  display 1: 1920x1080 (EM2FPAB24B,ELE,0001,8011730240001)
+  display 2: 1920x1200 (LCOS-SLM,SOC,8001,2018021001)
+SLM: connected on display 2 (1920x1200)
+SLM: DVI mode set (USB device 1)
+DAQ: Dev1 (USB-6251 (BNC)) ai0 @ 1000 S/s, +/-1 V, low-pass 20 Hz -- T_both 4.8 s, T_single 4.8 s
+dark (all off, 4.8s) = -0.0001 mV
+[1/10] 1+2+3+4+5+6+7+8+9+10 #1:  194.8737 mV  pred  191.7149  diff +3.1587  [+/-1 V]
+[2/10] 1+2+3+4+5+6+7+8+9+10 #2:  216.1620 mV  pred  212.5083  diff +3.6537  [+/-1 V]
+[3/10] 1+2+3+4+5+6+7+8+9+10 #3:  247.8202 mV  pred  235.2794  diff +12.5408  [+/-1 V]
+[4/10] 1+2+3+4+5+6+7+8+9+10 #4:  265.5428 mV  pred  259.2884  diff +6.2544  [+/-1 V]
+[5/10] 1+2+3+4+5+6+7+8+9+10 #5:  287.0593 mV  pred  276.4809  diff +10.5784  [+/-1 V]
+[6/10] 1+2+3+4+5+6+7+8+9+10 #6:  289.4884 mV  pred  292.5940  diff -3.1056  [+/-1 V]
+[7/10] 1+2+3+4+5+6+7+8+9+10 #7:  312.2912 mV  pred  304.3892  diff +7.9020  [+/-1 V]
+[8/10] 1+2+3+4+5+6+7+8+9+10 #8:  335.6866 mV  pred  336.4475  diff -0.7609  [+/-1 V]
+[9/10] 1+2+3+4+5+6+7+8+9+10 #9:  355.5718 mV  pred  342.1493  diff +13.4225  [+/-1 V]
+[10/10] 1+2+3+4+5+6+7+8+9+10 #10:  384.3465 mV  pred  375.2985  diff +9.0480  [+/-1 V]
+  g = 1 by definition: 10 of 10 rungs kept, 194.874..384.347 mV above dark
+
+--- reads 0..236 of 79000  (g = 1.00000) ---
+[1/237] 1+2+3+4+5+6+7+8+9+10 #1:   14.1298 mV  pred   14.1188  diff +0.0110  [+/-1 V]
+[2/237] 1+2+3+4+5+6+7+8+9+10 #2:   26.7776 mV  pred   26.5036  diff +0.2740  [+/-1 V]
+[3/237] 1+2+3+4+5+6+7+8+9+10 #3:   13.6944 mV  pred   14.3472  diff -0.6528  [+/-1 V]
+[4/237] 1+2+3+4+5+6+7+8+9+10 #4:    9.5548 mV  pred   10.4085  diff -0.8536  [+/-1 V]

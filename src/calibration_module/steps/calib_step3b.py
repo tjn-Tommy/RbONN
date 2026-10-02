@@ -1,21 +1,24 @@
 """Step 3b -- per-channel transfer curves on the OSA, channels swept in groups.
 
-Needs the OSA and the SLM.  ``--step2`` is required: a step-2 JSON, or a
-coordinate -> wavelength CSV (its min/max levels are then ``CSV_MIN_MAX``)::
+Legacy; step 3 on the DAQ replaced it (see the README).  Needs the OSA and the
+SLM::
 
     python src/calibration_module/steps/calib_step3b.py --step2 calib_step2_0910_1737.json
     python src/calibration_module/steps/calib_step3b.py --step2 FILE --width 20 --gap 30
     python src/calibration_module/steps/calib_step3b.py --step2 FILE --out DIR
 
-Measures the target window once to find the column the OSA puts
-``TARGET_NM`` at (``FINE_TUNE_CENTER``), tiles ``CHANNELS_PER_SIDE`` mirror-
-symmetric channels around it skipping ``GUARD_BANDS_NM``, then sweeps
-``LEVELS`` on several non-neighbouring channels per OSA trace.  Writes
-``calib_step3b_MMDD_HHMM.json`` and ``.csv``.
+In:  ``--step2`` (required), a step-2 JSON or a coordinate -> wavelength CSV,
+     whose min/max levels are then ``CSV_MIN_MAX``.
+Out: ``calib_step3b_MMDD_HHMM.json`` and ``.csv``.
 
-This is the runner only: the sweep is
+Measures the target window once to find the column the OSA puts ``TARGET_NM`` at
+(``FINE_TUNE_CENTER``), tiles ``CHANNELS_PER_SIDE`` mirror-symmetric channels
+around it skipping ``GUARD_BANDS_NM``, then sweeps ``LEVELS`` on several
+non-neighbouring channels per OSA trace.
+
+The runner only: the sweep is
 :func:`calibration_module.measure.slm_response.run_step3b`, the same call the
-GUI's Step 3b tab makes.  The constants below are that tab's defaults.
+GUI's Step 3b tab makes, and the constants below are that tab's defaults.
 """
 
 from __future__ import annotations

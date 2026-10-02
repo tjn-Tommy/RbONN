@@ -1,85 +1,68 @@
 """Step 7 v2 -- comb phase dPhi_comb per pair, ONE free parameter.
 
-Needs real hardware for the sweep; the refit path is offline.  Either way
-``--run``, ``--targets`` and ``--ref`` are required and have no default::
+Needs real hardware for the sweep; the refit path is offline.  ``--calib``,
+``--targets`` and ``--ref`` are required and have no default::
 
-    S="--run src/calib_data/run_0930 --targets 2,3,4,5,6 --ref 2"
+    S="--calib src/calib_data/run_0930/calib.json --targets 2,3,4,5,6 --ref 2"
     python src/calibration_module/steps/calib_step7_v2.py $S
     python src/calibration_module/steps/calib_step7_v2.py $S --meas
     python src/calibration_module/steps/calib_step7_v2.py $S some.csv
 
-A sweep fits the CSV it just wrote (``--meas`` stops after the CSV).  Either way
-the fit writes the ``{Phi_k}`` spectrum back into the run's ``calib.json`` as its
-``step7`` section, beside the ``step3`` layout it was driven through and the
-``step6`` etas its amplitudes are pinned to.
+In:  one ``calib.json`` -- its ``step3`` section IS the channel layout driven,
+     its ``step6`` section is what the fringe amplitudes are pinned to -- plus
+     the target list and the reference.  A positional CSV re-fits that sweep
+     offline; ``--meas`` stops after writing the CSV.  Nothing has a default:
+     running against the wrong file does not fail, it reports a phase measured
+     under a different aperture.
+Out: ``calib_step7v2_meas_<MMDD_HHMM>.csv`` in that file's folder, and the
+     file's ``step7`` section -- the ``{Phi_k}`` spectrum, beside the step-3
+     layout and step-6 etas it was measured against.
 
-``--run`` is a run DIRECTORY holding one ``calib.json``.  There is deliberately
-no default, for the same reason step 6 has none: the path used to be a constant
-edited by hand, so the file it named drifted out from under the script every time
-a run was filed away.  That one file decides both what is driven (its step-3
-section IS the channel layout) and what the fringe amplitudes are pinned to, so
-running against the wrong one does not fail -- it reports a phase measured under
-a different aperture.  The targets and the reference are required for the same
-reason: as constants they silently measured whichever pairs the last edit left
-in them.
+Each target pair carries a fixed comb-phase offset relative to a common
+reference pair, which defines ``Phi = 0``.  Driving the two at once makes them
+interfere, and the fringe encodes that offset; every target gives the spectrum.
 
-What changed vs :mod:`calib_step7_v1`
--------------------------------------
-1. **Nothing floats but the phase.**  ``a = eta_ref*g_ref``, ``b = eta_tgt``,
-   the single-beam response and the dark are ALL taken from step 6 / the
-   measured all-off read, so ``dPhi_comb`` is the ONLY free parameter.
-2. **Both arms stop below 1.0** (0904 on).  See :class:`PhaseV2Config`.
-3. **The reads are inverted at the source.**  The transimpedance amplifier
-   outputs a NEGATIVE voltage for positive light, so ``ACQ.invert`` records a
-   positive light signal and the CSV on disk already holds one.  v1's ``--flip``
-   post-processing is gone with it.
-
-What it measures.  Each target pair carries a fixed comb-phase offset
-``dPhi_comb`` relative to a common reference pair (the reference defines
-``Phi = 0``).  Driving the two pairs at once makes them interfere; the fringe
-encodes ``dPhi_comb``.  Running every target builds the phase spectrum
-``{Phi_k}``.
-
-The drive.  The reference pair is held at ``x_r = w_r = CONFIG.ref_level``; the
+The drive.  The reference is held at ``x_r = w_r = CONFIG.ref_level``; the
 target's TWO channels are swept TOGETHER (``x_t = w_t = v``) over the ramp.  A
-channel at intensity ``v`` sits at panel phase ``theta = 2*asin(sqrt(v))`` with
-field ``sqrt(v)*exp(i theta/2)``, so the target field amplitude is
-``g = sqrt(x_t w_t) = sin^2(theta/2)``, the reference's is ``g_ref``, and
+channel at intensity ``v`` sits at panel phase ``theta = 2 asin(sqrt(v))`` with
+field ``sqrt(v) exp(i theta/2)``, so ``g = sqrt(x_t w_t) = sin^2(theta/2)`` and
 ``dPhi_SLM = theta - theta_ref``::
 
     Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb)
         + step-6 single-beam background
 
-Sweeping ``v`` 0.1 -> 0.9 sweeps ``theta`` over ~37..143 deg, tracing most of
-the half fringe.
+Sweeping ``v`` 0.1 -> 0.9 traces most of the half fringe (~37..143 deg).
 
-The fit lives in :mod:`calibration_module.fit.phase`
-(:func:`~calibration_module.fit.phase.fit_phase_fixed`): weighted nonlinear
-least squares in the single parameter ``dPhi_comb``, errors from the weighted
-Jacobian as-is (no chi2/dof, no Birge rescaling).  The drive and the reads live
-in :mod:`calibration_module.measure.phase_v2`.  This file is the runner:
-it loads the step-6 JSON, drives the sweep, then fits, reports, plots and saves.
-Everything tunable is the block of constants below -- the drive's half in
-``CONFIG``, the acquisition's in ``ACQ``.  Both are plain values the GUI builds
-too, so the two front ends run the same fit over the same sweep.
+What changed vs :mod:`calib_step7_v1`
+-------------------------------------
+1. **Nothing floats but the phase.**  ``a = eta_ref*g_ref``, ``b = eta_tgt``,
+   the single-beam response and the dark are ALL taken from step 6 and the
+   measured all-off read, so ``dPhi_comb`` is the only free parameter.
+2. **Both arms stop below 1.0.**  See :class:`PhaseV2Config`.
+3. **The reads are inverted at the source.**  The transimpedance amplifier
+   outputs a NEGATIVE voltage for positive light, so ``ACQ.invert`` records a
+   positive signal and the CSV on disk already holds one; v1's ``--flip``
+   post-processing is gone with it.
 
-Each point is one fixed-duration ``daq_module`` acquisition like step 6:
-``t_meas_s`` for every read, the all-off dark included (one window is what
-makes a sweep point comparable to the step-6 eta it is pinned against),
-low-passed at the ``DAQMonitorSettings`` bandwidth.  Every CSV row records the
-mean, its trace std and the std ratio (std/|mean|).
+The fit is :func:`~calibration_module.fit.phase.fit_phase_fixed` -- weighted
+nonlinear least squares in the one parameter, errors from the weighted Jacobian
+as-is -- and the drive and reads are in
+:mod:`calibration_module.measure.phase_v2`.  This file is the runner.
+Everything tunable is the constants below: the drive in ``CONFIG``, the
+acquisition in ``ACQ``, both plain values the GUI builds too.
 
-PMT temperature
----------------
-Every row also carries the PMT thermistor (Keithley 2400, ohms and TH10K
-degrees) in ``pmt_ohm_Ohm`` and ``pmt_c``, and the CSV brackets itself with a
-start and end reading in its ``# key,value`` meta.  A step-7 run is ~20 minutes
-of bench time in which the reference amplitude is assumed constant, so what the
-detector's temperature did while it ran is worth having on the same rows.  ON by
-default (``--no-pmt`` turns it off), re-read at most every ``--pmt-period``
-seconds (default 60) with the rows in between repeating the last reading.  A
-missing or failing 2400 blanks the two columns rather than ending the run.  One
-GPIB, one 2400: do NOT run ``drafts/daq_pmt_monitor.py`` alongside a sweep.
+Each point is one fixed-duration acquisition, as in step 6: ``t_meas_s`` for
+every read including the all-off dark, since one window is what makes a sweep
+point comparable to the step-6 eta it is pinned against.  Every row records the
+mean, its trace std and the ratio of the two.
+
+``--pmt`` (on by default) logs the PMT thermistor beside every row and brackets
+the CSV with a start and end reading.  A step-7 run is ~20 minutes in which the
+reference amplitude is ASSUMED CONSTANT, so what the detector's temperature did
+meanwhile is worth having on the same rows.  Re-read at most every
+``--pmt-period`` seconds; a failing 2400 blanks the columns rather than ending
+the run.  One GPIB, one 2400: do NOT run ``drafts/daq_pmt_monitor.py``
+alongside a sweep.
 """
 
 from __future__ import annotations
@@ -98,8 +81,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from calibration_module.fit.phase import (  # noqa: E402
     PhaseFit,
     PhaseResult,
+    darks_in_csv,
     load_pair_models,
     load_phase_csv,
+    median_dark_without,
     references_in_csv,
     save_step7_section,
     targets_in_csv,
@@ -112,9 +97,8 @@ from calibration_module.fit.cascade import (  # noqa: E402
     plan_cascade,
     plan_lines,
 )
-from calibration_module.fit.report import plot_fringe  # noqa: E402
 from calibration_module.fit.outliers import BURST_K  # noqa: E402
-from calibration_module.fit.sigma import STD_FLOOR_V  # noqa: E402
+from calibration_module.fit.pair_v2 import step6_floor  # noqa: E402
 from calibration_module.measure.bench import connect_daq, connect_slm  # noqa: E402
 from calibration_module.measure.phase_v2 import (  # noqa: E402
     DEFAULT_ACQ,
@@ -128,13 +112,11 @@ from calibration_module.measure.pmt_temp import (  # noqa: E402
     PmtTemperature,
     open_pmt,
 )
-from calibration_module.calib_file import load_calib  # noqa: E402
+from calibration_module.calib_file import calib_path, load_calib  # noqa: E402
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "src/calib_data"   # the run directory; --run sets it
-
-# Neither the run directory nor the pairs are here -- they are the required
-# --run, --targets and --ref arguments.  See the module docstring for why they
+# Neither the calib file nor the pairs are here -- they are the required
+# --calib, --targets and --ref arguments.  See the module docstring for why they
 # have no default.  Left empty, so code that imports this module and sweeps
 # without setting the list fails before touching the hardware.
 TGT_INDICES: list[int] = []
@@ -180,16 +162,14 @@ DAQ_CHANNEL = "ai0"
 # inputs  (layout + step-6 models, both out of the one combined JSON)
 # ======================================================================
 
-def _load_layout(run: Path):
-    """Channel layout from the run's step-3 section.
+def _load_layout(calib_file: Path):
+    """Channel layout from the file's step-3 section.
 
-    One directory, one calib.json: the layout this run drives sits beside the
-    step-6 etas in the same file, and writing a new step 3 drops the step 6, so
-    the two cannot describe different apertures.  There is one encoding
-    convention -- the fitted sin^2 inversion -- so there is nothing left to read
-    back and disagree about either.
+    The layout this run drives sits beside the step-6 etas in the same file, and
+    writing a new step 3 drops the step 6, so the two cannot describe different
+    apertures.
     """
-    layout = load_calib(run).layout()
+    layout = load_calib(calib_file).layout()
     for name, idx in ([("ref_index", CONFIG.ref_index)]
                       + [("TGT_INDICES", k) for k in TGT_INDICES]):
         if not (0 <= CONFIG.slot(idx) < layout.n_channels):
@@ -201,20 +181,20 @@ def _load_layout(run: Path):
     return layout
 
 
-def _load_models(run: Path, targets, *, ref: int | None = None):
+def _load_models(calib_file: Path, targets, *, ref: int | None = None):
     """Step-6 pair models; require the reference and every requested target.
 
     ``ref`` defaults to ``CONFIG.ref_index`` -- a sweep is about to drive it --
     but a re-fit passes the reference the CSV itself records instead.
     """
     ref = CONFIG.ref_index if ref is None else ref
-    models = load_pair_models([load_calib(run).path])
+    models = load_pair_models([load_calib(calib_file).path])
     needed = [("reference", ref)] + [("target", k) for k in targets]
     for role, idx in needed:
         if idx not in models:
             raise ValueError(
                 f"no step-6 model for {role} pair index {idx}; found "
-                f"{sorted(models)} in {load_calib(run).path}"
+                f"{sorted(models)} in {load_calib(calib_file).path}"
             )
     print(f"Step 6: eta[ref {ref}] = {models[ref].eta:.4g} ; "
           + " ".join(f"eta[{k}]={models[k].eta:.4g}" for k in targets))
@@ -264,47 +244,29 @@ def report(fit: PhaseFit, tgt: int, ref: int) -> None:
     print(f"  max |pull| on std alone = "
           f"{float(np.max(np.abs(fit.residuals / fit.std))):.2f}   "
           f"(measurement only -- overstates, the eta error is not in it; "
-          f"std includes the {STD_FLOOR_V*1e3:.3f} mV systematic floor)")
+          f"std includes the run's sigma floor, inherited from step 6)")
     print(f"  R^2 = {fit.r2:.4f}")
-
-
-def save_plot(fit: PhaseFit, tgt: int, path) -> None:
-    """Measured Y(dPhi_SLM) with the fitted model curve + pulls, as a PNG.
-
-    The figure itself is :func:`calibration_module.fit.report.plot_fringe`, the
-    same renderer the GUI draws into, so a fringe reviewed on screen and one
-    archived beside the JSON are the same picture.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")  # headless: write a PNG rather than open a window
-    import matplotlib.pyplot as plt
-
-    fig = plt.figure(figsize=(12, 5))
-    plot_fringe(fig, fit, tgt)
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
 
 
 # ======================================================================
 # the run
 # ======================================================================
 
-def _run_sweep(run: Path, fit_after: bool, *,
+def _run_sweep(calib_file: Path, fit_after: bool, *,
                pmt: "PmtTemperature | None" = None) -> None:
     """Sweep every target pair back to the reference; write one raw CSV.
 
-    Not necessarily against it.  A pair adjacent to the reference cannot be
-    measured against it at all, so :func:`~calibration_module.fit.cascade.plan_cascade`
-    splits the run into stages, each with its own reference, and the fit chains
-    the far ones back.  One reference and no neighbours is the one-stage case,
-    which is what this always did.
+    Back to, not necessarily against: a pair adjacent to the reference cannot be
+    measured against it at all, so
+    :func:`~calibration_module.fit.cascade.plan_cascade` splits the run into
+    stages with their own references and the fit chains the far ones back.  One
+    reference and no neighbours is the one-stage case.
     """
     if not TGT_INDICES:
         raise ValueError("no target pairs -- pass --targets, e.g. --targets 2,3,4,5,6")
-    layout = _load_layout(run)
+    layout = _load_layout(calib_file)
     # The whole chain, stamps and all, before the laser is asked for anything.
-    load_calib(run).print_chain()
+    load_calib(calib_file).print_chain()
     drive = build_xw_sweep(CONFIG)
     secs = run_seconds(drive, ACQ)
     values = [x for x, _, _, _ in drive]
@@ -361,37 +323,44 @@ def _run_sweep(run: Path, fit_after: bool, *,
             meta.update({f"{k}_end": v for k, v in pmt.read().items()})
 
     stamp = time.strftime("%m%d_%H%M")
-    csv_path = write_meas_csv(results, CALIB_PATH / f"calib_step7_meas_{stamp}.csv",
-                              meta=meta)
+    csv_path = write_meas_csv(
+        results, calib_file.parent / f"calib_step7_meas_{stamp}.csv", meta=meta)
     n_rows = sum(r.trial.size for r in results)
     print(f"\nSaved {n_rows} rows to {csv_path}")  # raw rows on disk BEFORE fitting
     if not fit_after:
-        print(f"Fit with:  python {Path(__file__).name} --run {run} {csv_path}")
+        print(f"Fit with:  python {Path(__file__).name} "
+              f"--calib {calib_file} {csv_path}")
         return
-    fit_csv(csv_path, run)
+    fit_csv(csv_path, calib_file)
 
 
-def fit_csv(path: str | Path, run: Path) -> None:
+def fit_csv(path: str | Path, calib_file: Path, *,
+            dark: dict[int, float | None] | None = None) -> None:
     """Re-fit an already-recorded CSV offline (no hardware).
 
-    Needs two inputs: this CSV plus the combined step-6 JSON for each pair's
-    eta + single-beam background.  The CSV may carry several target pairs -- a
-    collected file records every target vs the shared reference -- so every
-    target present that has a step-6 model is fit separately against the
-    reference and gets its own PNG.
+    In:  this CSV plus the calib file, whose step-6 section gives each pair's
+         eta and single-beam background.  One collected CSV carries several
+         targets against the shared reference, and every one with a step-6 model
+         is fitted separately.  ``dark`` repairs a glitched all-off read:
+         ``{pair: volts}`` pins that pair's dark, ``{pair: None}`` takes the
+         other targets' median
+         (:func:`~calibration_module.fit.phase.median_dark_without`).
+    Out: the file's step7 section, REPLACING what was there -- to keep the old
+         one, re-fit against a copy, the file being the calibration.  No
+         pictures: the GUI's Load draws the fringe from these same rows.
 
-    Everything is persisted into ONE combined ``calib_step7_result_*.json``
-    (:func:`~calibration_module.fit.phase.save_comb_phase_json`), under a fresh
-    timestamp so a refit never clobbers an earlier result.
+    A dark override leaves the drive rows untouched -- it exists because the
+    dark is ONE unguarded acquisition and the sweep around it can be perfectly
+    good -- and is recorded in the section, so a repaired run never reads as a
+    clean one.
     """
     targets = targets_in_csv(path, TGT_INDICES)
-    # The CSV knows its own reference(s) -- every row records one -- so it wins
-    # over CONFIG, which describes the NEXT sweep and has no business
-    # deciding how an existing one is read.  Without this, re-fitting a file
-    # recorded against a different reference asks step 6 for a pair that was
-    # never the reference, and every target fails for a reason that looks
-    # like arithmetic.  A cascaded run records TWO, one per stage; the root is
-    # the one nothing else measured (self-rows do not count as measuring).
+    # The CSV knows its own reference(s), so it wins over CONFIG, which
+    # describes the NEXT sweep: otherwise re-fitting a file recorded against a
+    # different reference asks step 6 for a pair that was never the reference,
+    # and every target fails for a reason that looks like arithmetic.  A
+    # cascaded run records one per stage, and the root is the one nothing else
+    # measured (self-rows do not count).
     recorded = references_in_csv(path)
     measured = {k for k, r in recorded.items() if k != r}
     roots = sorted(set(recorded.values()) - measured)
@@ -406,7 +375,7 @@ def fit_csv(path: str | Path, run: Path) -> None:
               f"{roots[0]}; using that, not CONFIG's {CONFIG.ref_index}")
     ref_of = {k: recorded.get(k, ref) for k in targets}
     models = _load_models(
-        run, sorted({k for k in targets if k != ref}
+        calib_file, sorted({k for k in targets if k != ref}
                       | {r for k, r in ref_of.items() if k != ref}),
         ref=ref)
     fittable = [k for k in targets
@@ -424,22 +393,46 @@ def fit_csv(path: str | Path, run: Path) -> None:
         for line in plan_lines(stages, ref):
             print(f"  as recorded: {line}")
 
-    stamp = time.strftime("%m%d_%H%M")
     fits: dict[int, PhaseFit] = {}
     bursts: dict[int, list[dict]] = {}
+    floor = _step6_floor(calib_file)
+    print(f"Sigma floor: {floor[0]*1e6:.1f} uV [{floor[1]}]")
+    darks = dict(dark or {})
+    if darks and not set(darks) <= set(fittable):
+        raise ValueError(
+            f"--dark names pair(s) {sorted(set(darks) - set(fittable))}, which "
+            f"this CSV does not fit (fittable: {fittable})"
+        )
+    repaired: dict[str, dict] = {}
     for k in fittable:
         print(f"\n=== pair {k} vs reference {ref_of[k]} ===")
+        dark_k = darks[k] if k in darks else None
+        if k in darks:
+            was = darks_in_csv(path).get(k)
+            if dark_k is None:
+                dark_k = median_dark_without(path, k)
+            # Loud for the same reason a burst is: the bench misbehaved, and a
+            # repair that only lives in a shell history is a repair nobody can
+            # audit six weeks from now.
+            print(f"!! DARK OVERRIDE: recorded {was*1e3:+.4f} mV -> "
+                  f"{dark_k*1e3:+.4f} mV (drive rows untouched)")
+            repaired[str(k)] = {"recorded_v": was, "used_v": float(dark_k)}
         result = load_phase_csv(path, models[k], models[ref_of[k]],
                                 comb_only=True, single_beam_bg=SINGLE_BEAM_BG,
-                                only_tgt=k)
+                                only_tgt=k, dark=dark_k, floor=floor)
+        for key, entry in result.dark_overrides.items():
+            # The automatic ceiling fired; --dark did not have to be asked for.
+            print(f"!! DARK OVER CEILING: pair {key} recorded "
+                  f"{entry['recorded_v']*1e3:+.4f} mV -> "
+                  f"{entry['used_v']*1e3:+.4f} mV (drive rows untouched)")
+            repaired[key] = entry
         dts = result.per_trial_darks()
         drift = f" +/- {dts.std(ddof=1)*1e3:.4f} drift" if dts.size > 1 else ""
         print(f"Loaded {result.trial.size} rows, "
               f"dark = {result.dark*1e3:.4f}{drift} mV")
-        # Loud, because a burst is a BENCH fault, not a statistical nuisance: the
-        # trace jumped mid-acquisition.  The 1/std^2 weighting means dropping it
-        # barely moves dPhi_comb, so the ONLY way this reaches a human is here --
-        # stay quiet and a glitching bench reads as a clean run.
+        # Loud, because a burst is a BENCH fault and not a statistical
+        # nuisance.  The 1/std^2 weighting means dropping it barely moves
+        # dPhi_comb, so this print is the only way it reaches a human.
         if result.dropped_bursts:
             bursts[k] = result.dropped_bursts
             print(f"!! {len(result.dropped_bursts)} BURST acquisition(s) dropped "
@@ -450,9 +443,6 @@ def fit_csv(path: str | Path, run: Path) -> None:
                       f"{b['voltage_mean_v']*1e3:+.4f} mV with a "
                       f"{b['voltage_std_v']*1e3:.4f} mV trace std")
         report(result.fit, result.tgt_index, result.ref_index)
-        plot_path = CALIB_PATH / f"step7_pair{k}_{stamp}.png"
-        save_plot(result.fit, result.tgt_index, plot_path)
-        print(f"Plot saved to {plot_path}")
         fits[k] = result.fit
 
     # Refer every fit back to the ROOT reference.  A one-stage run is the
@@ -469,14 +459,10 @@ def fit_csv(path: str | Path, run: Path) -> None:
                   f"{np.degrees(c.dphi_raw - fits[k].dphi_comb):+.2f} deg (hub) "
                   f"-> {c.dphi_deg:+.2f} +/- {np.degrees(c.err_total):.2f} deg")
 
-    # Persist the fitted spectrum {Phi_k} as ONE combined JSON (step3 + step6
-    # carried over verbatim from --step6) -- the single input for downstream
-    # consumers.  A stored dphi_comb_rad IS Phi_k in the forward model
-    # E = sum_k eta_k sqrt(x_k w_k) exp(i[u_k + v_k + Phi_k]); nothing negates
-    # it on the way out or on the way back in.
-    # Recorded per target so a result can always be traced back to the rows that
-    # made it, and so a run whose bench was glitching cannot later be mistaken
-    # for a clean one.  Written whether or not the run cascaded.
+    # A stored dphi_comb_rad IS Phi_k in the forward model
+    # E = sum_k eta_k sqrt(x_k w_k) exp(i[u_k + v_k + Phi_k]) -- nothing negates
+    # it either way.  Bursts are recorded per target so a result traces back to
+    # the rows that made it, cascaded or not.
     extra: dict = {}
     if chained:
         extra["cascade"] = {
@@ -486,21 +472,38 @@ def fit_csv(path: str | Path, run: Path) -> None:
         }
     if bursts:
         extra["dropped_bursts"] = {str(k): v for k, v in bursts.items()}
+    if repaired:
+        extra["dark_overrides"] = repaired
+    extra["sigma_floor_v"] = float(floor[0])
+    extra["sigma_floor_source"] = str(floor[1])
     calib = save_step7_section({(k, METHOD): f for k, f in fits.items()},
-                               run, ref_index=ref, csv=Path(path),
+                               calib_file, ref_index=ref, csv=Path(path),
                                single_beam_bg=SINGLE_BEAM_BG,
                                chains=chains,
                                extra=extra or None)
     print(f"\nStep-7 spectrum -> {calib.path}")
 
 
+def _step6_floor(calib_file: Path) -> tuple[float, str]:
+    """The sigma floor to weight this step-7 fit by, from the file's step 6.
+
+    Step 7 has no dark level of its own -- one all-off read per target and ten
+    drive rows is too few to take a quiet-point median from -- while the step 6
+    in the same file measured it properly, on a commanded dark level with
+    repeats across every pair, through the same detector on the same night.  So
+    it is inherited, and marked inherited.  A section predating the recorded
+    floor has it measured from its CSV, never a constant
+    (:func:`~calibration_module.fit.pair_v2.step6_floor`).
+    """
+    return step6_floor(calib_file)
+
+
 def _stages_from_refs(ref_of: dict[int, int], fittable, root: int) -> list[Stage]:
     """Rebuild the stage list from what the CSV recorded, root-first.
 
     A re-fit does not re-plan: the file says which reference each target was
-    swept against, and that is the truth about it however the run was planned.
-    Ordering by depth is what lets :func:`chain_fits` resolve a hub before
-    whatever hangs off it.
+    swept against, whatever the run intended.  Root-first is what lets
+    :func:`chain_fits` resolve a hub before what hangs off it.
     """
     by_ref: dict[int, list[int]] = {}
     for k in sorted(fittable):
@@ -531,20 +534,43 @@ def _index_list(text: str) -> list[int]:
     return out
 
 
+def _dark_override(text: str) -> tuple[int, float | None]:
+    """``"4"`` -> ``(4, None)`` (the other pairs' median); ``"4=-6e-5"`` -> ``(4, -6e-5)``.
+
+    Pair-scoped on purpose.  A glitched all-off read belongs to one target, and
+    a blanket scalar would quietly move every other pair's phase to fix one.
+    """
+    pair, _, volts = text.partition("=")
+    try:
+        k = int(pair)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected PAIR or PAIR=VOLTS, got {text!r}") from None
+    if not volts:
+        return k, None
+    try:
+        return k, float(volts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{volts!r} is not a voltage (pair {k})") from None
+
+
 def main(argv: list[str] | None = None) -> int:
-    global TGT_INDICES, CONFIG, CALIB_PATH
+    global TGT_INDICES, CONFIG
     parser = argparse.ArgumentParser(
         prog="calib_step7_v2.py",
         description="Step 7 v2 -- comb phase dPhi_comb per pair (one free parameter).",
-        epilog="--run, --targets and --ref have no default.  --run decides both what is "
-               "driven (its embedded step-3 calibration IS the layout) and what "
+        epilog="--calib, --targets and --ref have no default.  --calib decides "
+               "both what is driven (its step-3 section IS the layout) and what "
                "the fringe amplitudes are pinned to, so running against the "
                "wrong one reports a phase measured under a different aperture.",
     )
     parser.add_argument(
-        "--run", required=True, type=Path, metavar="DIR",
-        help="run directory holding calib.json: its step3 section is the "
-             "layout and its step6 section the pinned etas (required)",
+        "--calib", required=True, type=Path, metavar="FILE",
+        help="calib.json whose step3 section is the layout and whose step6 "
+             "section is the pinned etas; the CSV lands beside it and the "
+             "step7 section goes in it; a directory means its calib.json "
+             "(required)",
     )
     parser.add_argument(
         "--targets", required=True, type=_index_list, metavar="2,3,4",
@@ -557,6 +583,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "csv", nargs="?", type=Path,
         help="re-fit this recorded measurement CSV offline instead of sweeping",
+    )
+    parser.add_argument(
+        "--dark", action="append", type=_dark_override, default=None,
+        metavar="PAIR[=VOLTS]",
+        help="re-fit PAIR with a repaired all-off dark: bare PAIR takes the "
+             "other targets' median, PAIR=VOLTS pins it.  Offline re-fit only; "
+             "the override is recorded in the step-7 section",
     )
     parser.add_argument(
         "--meas", "-m", action="store_true",
@@ -580,13 +613,14 @@ def main(argv: list[str] | None = None) -> int:
 
     TGT_INDICES = args.targets
     CONFIG = replace(CONFIG, ref_index=args.ref)
-    CALIB_PATH = args.run
-    Path(CALIB_PATH).mkdir(parents=True, exist_ok=True)
+    calib_file = calib_path(args.calib)
 
     if args.csv is not None:            # offline re-fit, no hardware
-        fit_csv(args.csv, args.run)
+        fit_csv(args.csv, calib_file, dark=dict(args.dark or []))
         return 0
-    _run_sweep(args.run, fit_after=not args.meas,
+    if args.dark:
+        parser.error("--dark repairs a recorded CSV; pass one to re-fit")
+    _run_sweep(calib_file, fit_after=not args.meas,
                pmt=open_pmt(args.pmt_resource, args.pmt_period,
                             enabled=args.pmt))
     return 0

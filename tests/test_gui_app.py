@@ -516,11 +516,53 @@ class FakePSUDriver:
 class PSUPageTests(unittest.TestCase):
     """The PMT Gain page: constant voltage into the gain-control input."""
 
+    #: Everything setUp has to blank, so a stale label cannot pass a later test.
+    _LABELS = ("psu_page_status", "psu_readout", "psu_mode_label",
+               "psu_prot_label", "psu_output_label")
+
     @classmethod
     def setUpClass(cls) -> None:
         from PyQt5 import QtWidgets
 
+        from gui.app import MainWindow
+
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        # One window for the whole class: building and closing one costs ~1.2 s,
+        # which was most of this file's runtime. setUp below puts the page back
+        # to disconnected-and-blank, so the tests stay independent.
+        cls.win = MainWindow()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._drain(cls.win, cls.app)
+        cls.win.close()
+        cls.app.processEvents()
+
+    @staticmethod
+    def _drain(window, app) -> None:
+        """Let any worker still in flight finish.
+
+        _run_task delivers its result through a queued signal, so a worker still
+        in flight when the window is destroyed lands in freed memory and takes
+        the interpreter down in whichever test happens to pump events next.
+        """
+        deadline = time.time() + 5.0
+        while time.time() < deadline and window._workers:
+            app.processEvents()
+
+    def setUp(self) -> None:
+        w = self.win
+        w.psu_stop_event = None
+        w._psu_disconnect_pending = False
+        w._psu_busy = False
+        if w.psu_controller is not None:
+            w._psu_do_disconnect()      # the direct path: no monitor to unwind
+        self._drain(w, self.app)
+        w.psu_vset.setValue(0.0)
+        w.psu_iset.setValue(0.0)
+        for name in self._LABELS:
+            getattr(w, name).setText("")
+        w._psu_refresh_buttons()
 
     def _window(self):
         from gui.app import MainWindow
@@ -547,184 +589,146 @@ class PSUPageTests(unittest.TestCase):
             self.app.processEvents()
         self.assertTrue(done(), "the PSU task did not finish in time")
 
-    def _close(self, window) -> None:
-        """Let this test's workers finish before the window goes away.
-
-        _run_task delivers its result through a queued signal, so a worker still
-        in flight when the window is destroyed lands in freed memory and takes
-        the interpreter down in whichever test happens to pump events next.
-        """
-        deadline = time.time() + 5.0
-        while time.time() < deadline and window._workers:
-            self.app.processEvents()
-        window.close()
-        self.app.processEvents()
-
     def test_the_page_starts_idle_and_capped_at_the_pmt_spec(self) -> None:
-        window = self._window()
-        try:
-            self.assertEqual(window.psu_vset.maximum(), 1.1)
-            self.assertEqual(window.psu_iset.maximum(), 0.05)
-            window.psu_vset.setValue(2.0)          # the spinbox will not go past
-            self.assertEqual(window.psu_vset.value(), 1.1)
-            for button in (window.psu_apply_button, window.psu_on_button,
-                           window.psu_off_button, window.psu_monitor_button,
-                           window.psu_monitor_stop_button):
-                self.assertFalse(button.isEnabled())
-        finally:
-            self._close(window)
+        window = self.win
+        self.assertEqual(window.psu_vset.maximum(), 1.1)
+        self.assertEqual(window.psu_iset.maximum(), 0.05)
+        window.psu_vset.setValue(2.0)          # the spinbox will not go past
+        self.assertEqual(window.psu_vset.value(), 1.1)
+        for button in (window.psu_apply_button, window.psu_on_button,
+                       window.psu_off_button, window.psu_monitor_button,
+                       window.psu_monitor_stop_button):
+            self.assertFalse(button.isEnabled())
 
     def test_connecting_adopts_the_supplys_own_setpoints(self) -> None:
         # The PMT may already be running at a gain someone chose; the page must
         # show that, not overwrite it with a default.
-        window = self._window()
-        try:
-            window.psu_vset.setValue(0.200)
-            self._connected(window, VSET=0.750, ISET=0.030)
-            self.assertAlmostEqual(window.psu_vset.value(), 0.750)
-            self.assertAlmostEqual(window.psu_iset.value(), 0.030)
-            self.assertIn("0.750 V", window.psu_page_status.text())
-            self.assertTrue(window.psu_apply_button.isEnabled())
-        finally:
-            self._close(window)
+        window = self.win
+        window.psu_vset.setValue(0.200)
+        self._connected(window, VSET=0.750, ISET=0.030)
+        self.assertAlmostEqual(window.psu_vset.value(), 0.750)
+        self.assertAlmostEqual(window.psu_iset.value(), 0.030)
+        self.assertIn("0.750 V", window.psu_page_status.text())
+        self.assertTrue(window.psu_apply_button.isEnabled())
 
     def test_apply_sets_the_limit_before_the_voltage(self) -> None:
-        window = self._window()
-        try:
-            _, driver = self._connected(window)
-            driver.written.clear()
-            window.psu_vset.setValue(0.850)
-            window.psu_iset.setValue(0.020)
-            window._psu_apply()
-            self._pump(lambda: not window._psu_busy)
-            self.assertEqual(driver.written, ["ISET:0.020", "VSET:0.850"])
-            self.assertAlmostEqual(driver.levels["VSET"], 0.850)
-            self.assertIn("0.850 V", window.psu_page_status.text())
-        finally:
-            self._close(window)
+        window = self.win
+        _, driver = self._connected(window)
+        driver.written.clear()
+        window.psu_vset.setValue(0.850)
+        window.psu_iset.setValue(0.020)
+        window._psu_apply()
+        self._pump(lambda: not window._psu_busy)
+        self.assertEqual(driver.written, ["ISET:0.020", "VSET:0.850"])
+        self.assertAlmostEqual(driver.levels["VSET"], 0.850)
+        self.assertIn("0.850 V", window.psu_page_status.text())
 
     def test_output_on_is_gated_by_the_confirmation(self) -> None:
         from PyQt5 import QtWidgets
 
-        window = self._window()
-        try:
-            _, driver = self._connected(window)
-            with patch.object(QtWidgets.QMessageBox, "question",
-                              return_value=QtWidgets.QMessageBox.No):
-                window._psu_output_on()
-            self.assertFalse(driver.out)
-            self.assertIn("left off", window.psu_page_status.text())
+        window = self.win
+        _, driver = self._connected(window)
+        with patch.object(QtWidgets.QMessageBox, "question",
+                          return_value=QtWidgets.QMessageBox.No):
+            window._psu_output_on()
+        self.assertFalse(driver.out)
+        self.assertIn("left off", window.psu_page_status.text())
 
-            with patch.object(QtWidgets.QMessageBox, "question",
-                              return_value=QtWidgets.QMessageBox.Yes):
-                window._psu_output_on()
-                self._pump(lambda: not window._psu_busy)
-            self.assertTrue(driver.out)
-            self.assertIn("Output: ON", window.psu_output_label.text())
-        finally:
-            self._close(window)
+        with patch.object(QtWidgets.QMessageBox, "question",
+                          return_value=QtWidgets.QMessageBox.Yes):
+            window._psu_output_on()
+            self._pump(lambda: not window._psu_busy)
+        self.assertTrue(driver.out)
+        self.assertIn("Output: ON", window.psu_output_label.text())
 
     def test_the_confirmation_warns_about_an_ovp_below_the_setpoint(self) -> None:
         # The supply shipped with OVP 0.5 V under a 1.0 V setpoint, which would
         # trip the moment the output went live.
         from PyQt5 import QtWidgets
 
-        window = self._window()
-        try:
-            self._connected(window, VSET=1.000, OVP=0.500)
-            self.assertIn("would trip", window.psu_prot_label.text())
-            with patch.object(QtWidgets.QMessageBox, "question",
-                              return_value=QtWidgets.QMessageBox.No) as ask:
-                window._psu_output_on()
-            self.assertIn("OVP is 0.500 V", ask.call_args[0][2])
-        finally:
-            self._close(window)
+        window = self.win
+        self._connected(window, VSET=1.000, OVP=0.500)
+        self.assertIn("would trip", window.psu_prot_label.text())
+        with patch.object(QtWidgets.QMessageBox, "question",
+                          return_value=QtWidgets.QMessageBox.No) as ask:
+            window._psu_output_on()
+        self.assertIn("OVP is 0.500 V", ask.call_args[0][2])
 
     def test_the_confirmation_flags_an_unapplied_spinbox(self) -> None:
         from PyQt5 import QtWidgets
 
-        window = self._window()
-        try:
-            self._connected(window, VSET=0.400)
-            window.psu_vset.setValue(0.900)       # typed but never applied
-            with patch.object(QtWidgets.QMessageBox, "question",
-                              return_value=QtWidgets.QMessageBox.No) as ask:
-                window._psu_output_on()
-            text = ask.call_args[0][2]
-            self.assertIn("0.400 V", text)         # what will actually be applied
-            self.assertIn("not applied", text)
-        finally:
-            self._close(window)
+        window = self.win
+        self._connected(window, VSET=0.400)
+        window.psu_vset.setValue(0.900)       # typed but never applied
+        with patch.object(QtWidgets.QMessageBox, "question",
+                          return_value=QtWidgets.QMessageBox.No) as ask:
+            window._psu_output_on()
+        text = ask.call_args[0][2]
+        self.assertIn("0.400 V", text)         # what will actually be applied
+        self.assertIn("not applied", text)
 
     def test_cc_is_reported_as_a_fault(self) -> None:
         # A high-impedance control input in CC means shorted or mis-wired.
-        window = self._window()
-        try:
-            psu, driver = self._connected(window, load_ohms=1.0)   # short
-            driver.levels["VSET"] = 0.500
-            driver.out = True
-            window._psu_show_state(psu.read_state())
-            self.assertIn("CC", window.psu_mode_label.text())
-            self.assertEqual(window.psu_mode_label.property("status"), "error")
-        finally:
-            self._close(window)
+        window = self.win
+        psu, driver = self._connected(window, load_ohms=1.0)   # short
+        driver.levels["VSET"] = 0.500
+        driver.out = True
+        window._psu_show_state(psu.read_state())
+        self.assertIn("CC", window.psu_mode_label.text())
+        self.assertEqual(window.psu_mode_label.property("status"), "error")
 
     def test_a_poll_never_moves_a_spinbox_the_user_is_editing(self) -> None:
-        window = self._window()
-        try:
-            psu, driver = self._connected(window, VSET=0.400)
-            window.psu_vset.setValue(0.900)        # user is mid-edit
-            driver.out = True
-            window._on_psu_sample(psu.read_state())
-            self.assertAlmostEqual(window.psu_vset.value(), 0.900)
-            self.assertIn("0.400 V", window.psu_readout.text())  # but the readout
-        finally:                                                  # shows the truth
-            self._close(window)
+        window = self.win
+        psu, driver = self._connected(window, VSET=0.400)
+        window.psu_vset.setValue(0.900)        # user is mid-edit
+        driver.out = True
+        window._on_psu_sample(psu.read_state())
+        self.assertAlmostEqual(window.psu_vset.value(), 0.900)
+        self.assertIn("0.400 V", window.psu_readout.text())  # but the readout
+                                                             # shows the truth
 
     def test_setpoints_stay_usable_while_the_monitor_runs(self) -> None:
         # The port is locked per exchange, so a poll cannot swallow a set.
-        window = self._window()
-        try:
-            self._connected(window)
-            window.psu_stop_event = threading.Event()
-            window._psu_refresh_buttons()
-            self.assertTrue(window.psu_apply_button.isEnabled())
-            self.assertTrue(window.psu_on_button.isEnabled())
-            self.assertTrue(window.psu_monitor_stop_button.isEnabled())
-            self.assertFalse(window.psu_monitor_button.isEnabled())
-            self.assertFalse(window.psu_period.isEnabled())
+        window = self.win
+        self._connected(window)
+        window.psu_stop_event = threading.Event()
+        window._psu_refresh_buttons()
+        self.assertTrue(window.psu_apply_button.isEnabled())
+        self.assertTrue(window.psu_on_button.isEnabled())
+        self.assertTrue(window.psu_monitor_stop_button.isEnabled())
+        self.assertFalse(window.psu_monitor_button.isEnabled())
+        self.assertFalse(window.psu_period.isEnabled())
 
-            window._psu_monitor_stop()
-            self.assertTrue(window.psu_stop_event.is_set())
-            window._psu_monitor_done()
-            self.assertIsNone(window.psu_stop_event)
-            self.assertTrue(window.psu_monitor_button.isEnabled())
-            self.assertFalse(window.psu_monitor_stop_button.isEnabled())
-        finally:
-            self._close(window)
+        window._psu_monitor_stop()
+        self.assertTrue(window.psu_stop_event.is_set())
+        window._psu_monitor_done()
+        self.assertIsNone(window.psu_stop_event)
+        self.assertTrue(window.psu_monitor_button.isEnabled())
+        self.assertFalse(window.psu_monitor_stop_button.isEnabled())
 
     def test_disconnect_waits_for_the_monitor_to_unwind(self) -> None:
-        window = self._window()
-        try:
-            self._connected(window)
-            window.psu_stop_event = threading.Event()
-            window._disconnect_psu()
-            self.assertTrue(window.psu_stop_event.is_set())
-            self.assertIsNotNone(window.psu_controller)   # not yet: the loop owns it
+        window = self.win
+        self._connected(window)
+        window.psu_stop_event = threading.Event()
+        window._disconnect_psu()
+        self.assertTrue(window.psu_stop_event.is_set())
+        self.assertIsNotNone(window.psu_controller)   # not yet: the loop owns it
 
-            window._psu_monitor_done()                    # loop finished
-            self.assertIsNone(window.psu_controller)
-            self.assertTrue(window.psu_connect_button.isEnabled())
-            self.assertIn("left exactly as it was", window.psu_page_status.text())
-        finally:
-            self._close(window)
+        window._psu_monitor_done()                    # loop finished
+        self.assertIsNone(window.psu_controller)
+        self.assertTrue(window.psu_connect_button.isEnabled())
+        self.assertIn("left exactly as it was", window.psu_page_status.text())
 
     def test_closing_the_window_stops_the_monitor(self) -> None:
+        # Its own window: it is the close itself that is under test.
         window = self._window()
         stop = threading.Event()
         window.psu_stop_event = stop
-        self._close(window)
+        self._drain(window, self.app)
+        window.close()
+        self.app.processEvents()
         self.assertTrue(stop.is_set())
+
 
 class Step8ProbeTests(unittest.TestCase):
     """The Step 8 tab's sweep band, its levels read-out and its one-level probe.
@@ -769,30 +773,6 @@ class Step8ProbeTests(unittest.TestCase):
     def test_the_button_is_dead_until_a_step_7_is_named(self) -> None:
         self.assertFalse(self.win.step8_probe_button.isEnabled())
 
-    def test_the_old_headroom_button_is_gone(self) -> None:
-        """It could only drive alpha = 1, which now clips by construction."""
-        self.assertFalse(hasattr(self.win, "step8_headroom_button"))
-        self.assertFalse(hasattr(self.win, "step8_headroom_note"))
-
-    def test_the_page_shows_no_prose(self) -> None:
-        """The tab carries numbers, and nothing that is not a number.
-
-        Every caption here was one somebody had to scroll past on every visit.
-        The reasoning still exists -- in calib_step8's docstring and in this
-        page's own comments -- where it costs no screen.
-        """
-        self.assertEqual(self.win.step8_levels_note.text(), "")
-        self.assertEqual(self.win.step8_probe_pred.text(), "")
-        self.assertEqual(self.win.step8_result_text.placeholderText(), "")
-        self.assertEqual(self.win.step8_plot_label.text(), "")
-        self.assertFalse(hasattr(self.win, "step8_daq_note"))
-        self.assertFalse(hasattr(self.win, "step8_step7_note"))
-
-    def test_the_button_says_it_reads(self) -> None:
-        """It displays the pattern AND takes a reading; the label must say so."""
-        self.assertIn("Read", self.win.step8_probe_button.text())
-        self.assertIn("Display", self.win.step8_probe_button.text())
-
     def test_the_alpha_box_spans_the_whole_scale(self) -> None:
         box = self.win.step8_probe_alpha
         self.assertAlmostEqual(box.minimum(), 0.0)
@@ -808,49 +788,44 @@ class Step8ProbeTests(unittest.TestCase):
             bad.write_text(json.dumps({"hello": "world"}), encoding="utf-8")
             self.win.step8_step7_edit.setText(str(bad))
             self.assertFalse(self.win.step8_probe_button.isEnabled())
-            # Feedback goes to the status line; the note stays numeric.
             self.assertIn("Cannot read the forward model",
                           self.win.step8_status.text())
-            self.assertEqual(self.win.step8_levels_note.text(), "")
 
     def test_a_real_step_7_enables_it_and_quotes_y_max(self) -> None:
+        """The file's one line goes beside the title, Y_max included."""
         if self.step7 is None:
             self.skipTest("no step-7 result in the tree")
         self.win.step8_step7_edit.setText(str(self.step7))
         self.assertTrue(self.win.step8_probe_button.isEnabled())
-        note = self.win.step8_levels_note.text()
-        self.assertIn("Y_max", note)
-        self.assertIn("4-bit step", note)
+        said = self.win.step8_status.text()
+        self.assertIn("Y_max", said)
+        self.assertIn("4-bit step", said)
+        self.assertIn("pairs", said)
 
-    def test_the_note_matches_the_module(self) -> None:
-        """The panel must not compute its own Y_max -- one number, one owner."""
+    def test_the_status_line_matches_the_module(self) -> None:
+        """The page must not compute its own Y_max -- one number, one owner."""
         if self.step7 is None:
             self.skipTest("no step-7 result in the tree")
         from calibration_module.fit.verify import full_scale, load_forward_model
-        from calibration_module.steps import calib_step8 as STEP8
 
         models, phases, _ = load_forward_model(self.step7)
         fs = full_scale(models, phases, sorted(models)).fs
         self.win.step8_step7_edit.setText(str(self.step7))
         self.assertAlmostEqual(self.win.step8_y_max, fs)
-        note = self.win.step8_levels_note.text()
-        self.assertIn(f"{fs * 1e3:.1f} mV", note)
-        lv = STEP8.ladder_levels(fs)
-        self.assertIn(f"{lv['cap']:.4f}", self.win.step8_sweep_max_alpha.text())
+        self.assertIn(f"{fs * 1e3:.1f} mV", self.win.step8_status.text())
+        # The band's top in mV, which is the panel's derived column.
+        hi = self.win._step8_alphas()["alpha_hi"]
+        self.assertIn(f"{hi * fs * 1e3:.1f} mV",
+                      self.win.step8_alpha_hi_mv.text())
 
-    def test_the_default_alpha_is_the_ladders_own_cap(self) -> None:
+    def test_the_default_alpha_is_the_bands_own_top(self) -> None:
         """The brightest read the sweep will take is the one worth probing."""
         if self.step7 is None:
             self.skipTest("no step-7 result in the tree")
-        from calibration_module.fit.verify import full_scale, load_forward_model
-        from calibration_module.steps import calib_step8 as STEP8
-
-        models, phases, _ = load_forward_model(self.step7)
-        fs = full_scale(models, phases, sorted(models)).fs
         self.win.step8_step7_edit.setText(str(self.step7))
-        self.assertAlmostEqual(self.win.step8_probe_alpha.value(),
-                               round(STEP8.ladder_levels(fs)["cap"], 4),
-                               places=4)
+        self.assertAlmostEqual(
+            self.win.step8_probe_alpha.value(),
+            round(self.win._step8_alphas()["alpha_hi"], 4), places=4)
 
     def test_the_predicted_millivolts_are_shown_before_the_press(self) -> None:
         """alpha IS the fraction of Y_max, so this needs no solve and no bench.
@@ -866,15 +841,20 @@ class Step8ProbeTests(unittest.TestCase):
         models, phases, _ = load_forward_model(self.step7)
         fs = full_scale(models, phases, sorted(models)).fs
         self.win.step8_step7_edit.setText(str(self.step7))
+        top = self.win._step8_alphas()["alpha_hi"]
         for alpha in (0.05, 0.25, 0.5, 1.0):
             self.win.step8_probe_alpha.setValue(alpha)
             text = self.win.step8_probe_pred.text()
             self.assertIn(f"{alpha * fs * 1e3:.1f} mV", text)
-            v = alpha * fs
-            if v > STEP8.AMP_LIMIT_V:
-                self.assertIn("OVER", text)
-            elif v > STEP8.LADDER_CEILING_V:
-                self.assertIn("above Sweep max", text)
+            peak = alpha * fs * STEP8.PEAK_OVER_MEAN
+            if peak >= STEP8.AMP_LIMIT_V:
+                # The peak is what rails; the mean is averaged back under it.
+                self.assertIn("raw peak", text)
+                self.assertIn("flat-top", text)
+            elif peak > 0.85 * STEP8.AMP_LIMIT_V:
+                self.assertIn("raw peak", text)
+            elif alpha > top:
+                self.assertIn("above alpha max", text)
 
     def test_a_running_sweep_takes_the_probe_away(self) -> None:
         if self.step7 is None:
@@ -896,133 +876,117 @@ class Step8ProbeTests(unittest.TestCase):
         """One owner for the defaults: a GUI copy is a second place to be wrong."""
         from calibration_module.steps import calib_step8 as STEP8
 
-        for box, volts in ((self.win.step8_sweep_max, STEP8.LADDER_CEILING_V),
-                           (self.win.step8_band_floor, STEP8.LADDER_FLOOR_V),
-                           (self.win.step8_sweep_min, STEP8.LADDER_LOW_V)):
-            self.assertAlmostEqual(box.value(), volts * 1e3, places=3)
-            self.assertIn("mV", box.suffix())
-        # and no box can ask for more than the amplifier can hold
-        self.assertAlmostEqual(self.win.step8_sweep_max.maximum(),
-                               STEP8.AMP_LIMIT_V * 1e3, places=3)
+        self.assertAlmostEqual(self.win.step8_alpha_lo.value(), STEP8.ALPHA_LO,
+                               places=4)
+        self.assertAlmostEqual(self.win.step8_points.value(), STEP8.LADDER)
+        # Both ends are alphas, so neither box can ask past full scale.
+        for box in (self.win.step8_alpha_lo, self.win.step8_alpha_hi):
+            self.assertAlmostEqual(box.maximum(), 1.0, places=6)
+            self.assertGreater(box.minimum(), 0.0)
 
-    def test_the_alpha_column_is_blank_until_a_step_7_is_loaded(self) -> None:
-        """alpha is mV / Y_max, and there is no Y_max before the file."""
-        for cap in (self.win.step8_sweep_max_alpha,
-                    self.win.step8_band_floor_alpha,
-                    self.win.step8_sweep_min_alpha):
+    def test_the_millivolt_column_is_blank_until_a_calib_is_loaded(self) -> None:
+        """The mV are alpha x Y_max, and there is no Y_max before the file."""
+        for cap in (self.win.step8_alpha_hi_mv, self.win.step8_alpha_lo_mv):
             self.assertEqual(cap.text(), "")
 
-    def test_the_alpha_column_follows_the_boxes(self) -> None:
+    def test_the_millivolt_column_follows_the_boxes(self) -> None:
         if self.step7 is None:
             self.skipTest("no step-7 result in the tree")
         from calibration_module.steps import calib_step8 as STEP8
 
         self.win.step8_step7_edit.setText(str(self.step7))
         fs = self.win.step8_y_max
+        saved = self.win.step8_alpha_hi.value()
         try:
-            for mv in (450.0, 300.0, 700.0):
-                self.win.step8_sweep_max.setValue(mv)
-                lv = STEP8.ladder_levels(fs, ceiling_v=mv / 1e3,
-                                         floor_v=self.win.step8_band_floor.value() / 1e3,
-                                         low_v=self.win.step8_sweep_min.value() / 1e3)
-                self.assertIn(f"{lv['cap']:.4f}",
-                              self.win.step8_sweep_max_alpha.text())
+            for alpha in (0.10, 0.20, 0.2945):
+                self.win.step8_alpha_hi.setValue(alpha)
+                self.assertIn(f"{alpha * fs * 1e3:.1f} mV",
+                              self.win.step8_alpha_hi_mv.text())
         finally:
-            self.win.step8_sweep_max.setValue(1e3 * STEP8.LADDER_CEILING_V)
+            self.win.step8_alpha_hi.setValue(saved)
 
-    def test_a_clamped_box_says_what_will_actually_be_driven(self) -> None:
-        """ladder_levels clamps rather than refuses, so the clamp has to show.
+    def test_a_band_top_near_the_rail_says_so_without_refusing(self) -> None:
+        """The peak is what reaches the rail, and the mean cannot show it.
 
-        A band floor above the ceiling is not an error -- it is 30 rungs at a
-        level nobody asked for, and a box that still reads 900 mV.
+        Said in the caption rather than in a dialog: where this amplifier starts
+        to compress has never been measured, so it is a judgement call about the
+        electronics and the recorded peak_v is what settles it afterwards.
         """
-        if self.step7 is None:
-            self.skipTest("no step-7 result in the tree")
         from calibration_module.steps import calib_step8 as STEP8
 
-        self.win.step8_step7_edit.setText(str(self.step7))
-        fs = self.win.step8_y_max
+        saved_fs = getattr(self.win, "step8_y_max", None)
+        saved = self.win.step8_alpha_hi.value()
         try:
-            self.win.step8_band_floor.setValue(900.0)
-            text = self.win.step8_band_floor_alpha.text()
-            lv = STEP8.ladder_levels(fs, floor_v=0.900)
-            self.assertLess(lv["floor"] * fs, 0.900)          # it was clamped
-            self.assertIn(f"{lv['floor'] * fs * 1e3:.1f} mV", text)
-            self.assertIn("clamped", text)
-        finally:
-            self.win.step8_band_floor.setValue(1e3 * STEP8.LADDER_FLOOR_V)
-
-    def test_a_dim_model_is_not_called_clamped_at_the_ceiling(self) -> None:
-        """Under the ceiling the atoms own the top; that is not a clamp.
-
-        Y_max is set directly because no step-7 in the tree is dim enough: at
-        the present gain it is ~1 V, past the amplifier, which is the whole
-        reason the ceiling exists.
-        """
-        saved = getattr(self.win, "step8_y_max", None)
-        try:
-            self.win.step8_y_max = 0.300
+            self.win.step8_y_max = 1.534
+            self.win.step8_alpha_hi.setValue(0.6)      # 920 mV mean, 1.2 V peak
             self.win._step8_refresh_levels()
-            text = self.win.step8_sweep_max_alpha.text()
-            self.assertIn("1.0000", text)
-            self.assertIn("Y_max is below it", text)
-            self.assertNotIn("clamped", text)
-            self.assertIn("not capped", self.win.step8_levels_note.text())
+            text = self.win.step8_alpha_hi_mv.text()
+            peak = 0.6 * 1.534 * STEP8.PEAK_OVER_MEAN
+            self.assertGreater(peak, STEP8.AMP_LIMIT_V)
+            self.assertIn("raw peak", text)
+            self.assertIn(f"{peak * 1e3:.0f} mV", text)
+            # a band well under the rail says nothing about it
+            self.win.step8_alpha_hi.setValue(0.2945)
+            self.win._step8_refresh_levels()
+            self.assertNotIn("raw peak", self.win.step8_alpha_hi_mv.text())
         finally:
-            self.win.step8_y_max = saved
+            self.win.step8_alpha_hi.setValue(saved)
+            self.win.step8_y_max = saved_fs
             self.win._step8_refresh_levels()
 
-    def test_clearing_the_path_takes_the_alphas_with_it(self) -> None:
-        """A stale alpha beside a live box is the one thing this cannot show.
+    def test_an_empty_band_says_so(self) -> None:
+        """alpha_lo above alpha_hi is a typo, and build() refuses it."""
+        saved_fs = getattr(self.win, "step8_y_max", None)
+        saved = self.win.step8_alpha_lo.value()
+        try:
+            self.win.step8_y_max = 1.534
+            self.win.step8_alpha_lo.setValue(0.9)
+            self.win._step8_refresh_levels()
+            self.assertIn("above alpha max", self.win.step8_alpha_lo_mv.text())
+        finally:
+            self.win.step8_alpha_lo.setValue(saved)
+            self.win.step8_y_max = saved_fs
+            self.win._step8_refresh_levels()
 
-        Blanking the note is not enough: alpha is mV / Y_max, so dropping Y_max
-        drops the whole column.
+    def test_clearing_the_path_takes_the_millivolts_with_it(self) -> None:
+        """A stale mV beside a live box is the one thing this cannot show.
+
+        Blanking the note is not enough: the mV are alpha x Y_max, so dropping
+        Y_max drops the whole column.
         """
         if self.step7 is None:
             self.skipTest("no step-7 result in the tree")
         self.win.step8_step7_edit.setText(str(self.step7))
-        self.assertNotEqual(self.win.step8_sweep_max_alpha.text(), "")
+        self.assertNotEqual(self.win.step8_alpha_hi_mv.text(), "")
         self.win.step8_step7_edit.setText("")
         self.assertIsNone(self.win.step8_y_max)
-        for cap in (self.win.step8_sweep_max_alpha,
-                    self.win.step8_band_floor_alpha,
-                    self.win.step8_sweep_min_alpha):
+        for cap in (self.win.step8_alpha_hi_mv, self.win.step8_alpha_lo_mv):
             self.assertEqual(cap.text(), "")
-        self.assertEqual(self.win.step8_levels_note.text(), "")
-
-    def test_sweep_min_goes_away_with_the_model_checks(self) -> None:
-        """It is the checks' floor; with no checks it bounds nothing."""
-        from calibration_module.steps import calib_step8 as STEP8
-
-        try:
-            self.win.step8_low.setValue(0)
-            self.assertFalse(self.win.step8_sweep_min.isEnabled())
-            self.assertEqual(self.win.step8_sweep_min_alpha.text(), "")
-            self.win.step8_low.setValue(STEP8.LADDER_LOW)
-            self.assertTrue(self.win.step8_sweep_min.isEnabled())
-        finally:
-            self.win.step8_low.setValue(STEP8.LADDER_LOW)
+        self.assertIn("No calibration file", self.win.step8_status.text())
 
     def test_a_running_sweep_freezes_the_band(self) -> None:
         self.win._step8_set_running(True)
         try:
-            for box in (self.win.step8_ladder, self.win.step8_low,
-                        self.win.step8_sweep_max, self.win.step8_band_floor,
-                        self.win.step8_sweep_min):
+            for box in (self.win.step8_points, self.win.step8_alpha_lo,
+                        self.win.step8_alpha_hi):
                 self.assertFalse(box.isEnabled())
         finally:
             self.win._step8_set_running(False)
-        self.assertTrue(self.win.step8_sweep_max.isEnabled())
+        self.assertTrue(self.win.step8_alpha_hi.isEnabled())
 
-    def test_the_volts_reach_the_module_as_the_module_spells_them(self) -> None:
-        """_step8_levels_v is what build() and probe_verdict are given."""
+    def test_the_alphas_reach_the_module_as_the_module_spells_them(self) -> None:
+        """_step8_alphas is what build() is given, splatted."""
+        from calibration_module.fit.verify import load_forward_model
         from calibration_module.steps import calib_step8 as STEP8
 
-        volts = self.win._step8_levels_v()
-        self.assertEqual(set(volts), {"ceiling_v", "floor_v", "low_v"})
-        self.assertAlmostEqual(volts["ceiling_v"], STEP8.LADDER_CEILING_V)
+        alphas = self.win._step8_alphas()
+        self.assertEqual(set(alphas), {"alpha_lo", "alpha_hi"})
+        self.assertAlmostEqual(alphas["alpha_lo"], STEP8.ALPHA_LO, places=4)
+        if self.step7 is None:
+            self.skipTest("no step-7 result in the tree")
         # spelled so they can be splatted straight into the module's own call
-        STEP8.ladder_levels(1.0, **volts)
+        models, phases, _ = load_forward_model(self.step7)
+        STEP8.build(models, phases, sorted(models), seed=1, n=4, **alphas)
 
     def test_a_zero_alpha_is_refused_without_touching_the_bench(self) -> None:
         """A zero drive is the dark, which every read already takes first."""
@@ -1033,19 +997,54 @@ class Step8ProbeTests(unittest.TestCase):
         self.win._step8_probe()
         self.assertIn("above 0", self.win.step8_status.text())
 
+    def test_display_is_refused_at_zero_too(self) -> None:
+        """Same drive, same objection -- there is nothing to put on the panel."""
+        if self.step7 is None:
+            self.skipTest("no step-7 result in the tree")
+        self.win.step8_step7_edit.setText(str(self.step7))
+        self.win.step8_probe_alpha.setValue(0.0)
+        self.win._step8_display()
+        self.assertIn("above 0", self.win.step8_status.text())
 
-class Step8SaveTests(unittest.TestCase):
+    def test_display_needs_only_the_slm(self) -> None:
+        """Its whole point: a known level on the panel before the DAQ is up.
+
+        The probe asks for the DAQ first; display must not, so the only thing
+        left to complain about is the SLM.
+        """
+        if self.step7 is None:
+            self.skipTest("no step-7 result in the tree")
+        self.win.step8_step7_edit.setText(str(self.step7))
+        self.win.step8_probe_alpha.setValue(0.2)
+        self.win._step8_display()
+        self.assertIn("SLM", self.win.step8_status.text())
+        self.assertNotIn("DAQ", self.win.step8_status.text())
+
+    def test_display_is_live_with_the_probe(self) -> None:
+        if self.step7 is None:
+            self.skipTest("no step-7 result in the tree")
+        self.win.step8_step7_edit.setText(str(self.step7))
+        self.assertTrue(self.win.step8_display_button.isEnabled())
+        self.win._step8_set_running(True)
+        try:
+            self.assertFalse(self.win.step8_display_button.isEnabled())
+        finally:
+            self.win._step8_set_running(False)
+        self.assertTrue(self.win.step8_display_button.isEnabled())
+
+
+class Step8WritesItselfTests(unittest.TestCase):
     """Where a step-8 sweep goes, and when.
 
-    Steps 6 and 7 write nothing until Save.  Step 8 used to write its CSV, its
-    result JSON and its plot into ``calib_data`` on every press, which left a
-    run somebody abandoned indistinguishable from one they meant to keep.  It
-    stages instead, and Save is the only thing that reaches a directory anybody
-    chose.
+    It used to stage itself in a temp directory and wait for a Save, because
+    the page had no way of knowing which run it belonged to.  It does now: the
+    calib file is named before the bench is touched, and it is the forward model
+    this Y_sat measures -- so a finished sweep writes itself beside it, and Save
+    is gone.  A Load, the other way round, writes nothing at all.
 
     The fit is not re-tested here -- ``test_calib_step8`` owns it.  What is
-    tested is the contract this page hands it: which CSV, which step-7 model,
-    and which directory.
+    tested is the contract this page hands it: which CSV, which calib file, and
+    which directory.
     """
 
     REPO = Path(__file__).resolve().parents[1]
@@ -1058,9 +1057,11 @@ class Step8SaveTests(unittest.TestCase):
 
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         cls.win = MainWindow()
+        cls._tmp = tempfile.TemporaryDirectory()
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
         cls.win.close()
 
     def setUp(self) -> None:
@@ -1076,238 +1077,305 @@ class Step8SaveTests(unittest.TestCase):
         """A fit, with every key the page reads off one."""
         stem = csv.stem.replace("calib_step8_", "")
         return {"y_sat_v": 5.06, "sigma_v": 0.12, "lo_v": 4.9, "hi_v": 5.2,
-                "unbounded": False, "n": 38, "n_ladder": 30,
+                "unbounded": False, "n": 30, "n_ladder": 30,
                 "rmse_v": 2.0e-3, "rmse_linear_v": 8.0e-3,
-                "gain_lever": 15.0, "full_scale": {},
+                "gain_lever": 15.0, "y_max_pred_v": 1.534,
                 "png": str(csv.with_name(f"{csv.stem}_ysat.png")),
                 "result_json": str(csv.with_name(
                     f"calib_step8_result_{stem}.json"))}
 
-    def _payload(self, csv: Path, step7: Path | None = None) -> dict:
-        return {"status": "complete", "csv": csv,
-                "step7": Path("step7.json") if step7 is None else step7,
+    def _payload(self, csv: Path, *, written: bool,
+                 step7: Path | None = None) -> dict:
+        return {"status": "complete", "csv": csv, "written": written,
+                "step7": Path("calib.json") if step7 is None else step7,
                 "result": self._result(csv)}
 
-    def _staged(self, name: str = "calib_step8_0930_1209.csv") -> Path:
-        """A CSV sitting in staging, as a finished sweep leaves one."""
-        csv = self.win._step8_staging() / name
+    def _sweep_csv(self, name: str = "calib_step8_0930_1209.csv") -> Path:
+        """A CSV where a finished sweep leaves one: beside the calib file."""
+        csv = Path(self._tmp.name) / name
         csv.write_text("block,driven,mean_v\n0,(1, 2),0.42\n", encoding="utf-8")
         return csv
 
-    # ---- the buttons ---------------------------------------------------
-    def test_the_refit_button_became_a_load_button(self) -> None:
-        """Re-fitting a CSV is loading one; steps 6 and 7 already call it that."""
-        self.assertFalse(hasattr(self.win, "step8_refit_button"))
-        self.assertFalse(hasattr(self.win, "_step8_refit"))
-        self.assertIn("Load", self.win.step8_load_button.text())
-        self.assertIn("Save", self.win.step8_save_button.text())
+    # ---- what a finished run says --------------------------------------
+    def test_a_sweep_says_what_it_wrote(self) -> None:
+        """There is no Save, so the status line is where "kept" is said."""
+        self.win._step8_finished(self._payload(self._sweep_csv(), written=True))
+        text = self.win.step8_status.text()
+        self.assertIn("Y_sat = 5.0600", text)
+        self.assertIn("wrote step8 + calib_step8_0930_1209.csv", text)
 
-    def test_save_is_dead_until_a_sweep_has_been_fitted(self) -> None:
-        self.assertFalse(self.win.step8_save_button.isEnabled())
-        self.win._step8_finished(self._payload(self._staged()))
-        self.assertTrue(self.win.step8_save_button.isEnabled())
+    def test_a_load_says_it_wrote_nothing(self) -> None:
+        """Looking at a recorded sweep must not read as having re-filed it."""
+        self.win._step8_finished(self._payload(self._sweep_csv(), written=False))
+        text = self.win.step8_status.text()
+        self.assertIn("re-fit calib_step8_0930_1209.csv", text)
+        self.assertIn("nothing written", text)
 
-    def test_a_running_sweep_takes_save_away(self) -> None:
-        self.win._step8_finished(self._payload(self._staged()))
-        self.win._step8_set_running(True)
-        self.assertFalse(self.win.step8_save_button.isEnabled())
-        self.assertFalse(self.win.step8_load_button.isEnabled())
-        self.win._step8_set_running(False)
-        self.assertTrue(self.win.step8_save_button.isEnabled())
-
-    def test_a_run_that_read_nothing_leaves_nothing_to_save(self) -> None:
+    def test_a_run_that_read_nothing_leaves_nothing(self) -> None:
         self.win._step8_finished({"status": "partial (stopped)", "csv": None})
         self.assertIsNone(self.win.step8_last)
-        self.assertFalse(self.win.step8_save_button.isEnabled())
         self.assertIn("nothing written", self.win.step8_status.text())
 
-    # ---- staging -------------------------------------------------------
-    def test_the_staging_directory_is_outside_the_repo(self) -> None:
-        """A run nobody kept must not have to be recognised and deleted later."""
-        from calibration_module.steps import calib_step8 as STEP8
+    def test_a_running_sweep_takes_load_away(self) -> None:
+        self.win._step8_set_running(True)
+        self.assertFalse(self.win.step8_load_button.isEnabled())
+        self.win._step8_set_running(False)
 
-        out = self.win._step8_staging()
+    # ---- Load ----------------------------------------------------------
+    def test_the_render_directory_is_outside_the_repo(self) -> None:
+        """A Load draws a PNG to look at; that is not a calibration artefact."""
+        out = self.win._step8_render_dir()
         self.assertTrue(out.is_dir())
-        self.assertNotEqual(out.resolve(), Path(STEP8.OUT_DIR).resolve())
+        self.assertNotEqual(out.resolve(),
+                            self.win._default_calib_dir().resolve())
         self.assertNotIn(self.REPO.resolve(), out.resolve().parents)
 
-    def test_a_finished_run_says_it_was_only_staged(self) -> None:
-        self.win._step8_finished(self._payload(self._staged()))
-        text = self.win.step8_status.text()
-        self.assertIn("staged as calib_step8_0930_1209.csv", text)
-        self.assertIn("press Save", text)
+    def test_load_re_fits_the_csv_the_section_names_and_writes_nothing(self) -> None:
+        """ONE input: the calib file. Its step8 section says which sweep."""
+        import calibration_module.fit.step8_report as REPORT
 
-    def test_a_csv_from_anywhere_else_is_not_called_staged(self) -> None:
-        """A loaded file is already somewhere; only a fresh sweep is staged."""
-        with tempfile.TemporaryDirectory() as tmp:
-            csv = Path(tmp) / "calib_step8_0101_0101.csv"
-            csv.write_text("x\n", encoding="utf-8")
-            self.win._step8_finished(self._payload(csv))
-        text = self.win.step8_status.text()
-        self.assertIn("calib_step8_0101_0101.csv", text)
-        self.assertNotIn("staged", text)
-
-    def test_a_load_fits_into_staging_and_not_beside_the_csv(self) -> None:
-        """Opening a CSV is not permission to write next to it."""
-        from calibration_module.steps import calib_step8 as STEP8
+        run = self.REPO / "src/calib_data/run_0930"
+        if not (run / "calib.json").is_file():          # pragma: no cover
+            self.skipTest("run_0930 is not in this checkout")
+        from calibration_module.calib_file import load_calib
+        wanted = load_calib(run).csv_path(8)
+        before = sorted(p.name for p in run.iterdir())
 
         seen: dict = {}
 
-        def fake_fit(csv, step7, *, out_dir=None, log=print, **kw):
-            seen.update(csv=Path(csv), step7=Path(step7), out_dir=Path(out_dir))
+        def fake_report(csv, calib, *, out_dir=None, log=print, **kw):
+            seen.update(csv=Path(csv), calib=Path(calib), out_dir=Path(out_dir))
             return self._result(Path(csv))
 
+        # Load ASKS which calibration to re-fit; the page's own field is where
+        # a sweep would write and must not decide what gets looked at.
+        self.win.step8_step7_edit.setText("")
+        with patch("PyQt5.QtWidgets.QFileDialog.getOpenFileName",
+                   return_value=(str(run / "calib.json"), "")), \
+             patch.object(REPORT, "report_csv", fake_report), \
+             patch.object(self.win, "_run_task",
+                          lambda _l, work, done, _f: done(work())):
+            self.win._step8_load()
+
+        self.assertEqual(seen["csv"], wanted)
+        self.assertEqual(seen["calib"], (run / "calib.json"))
+        self.assertEqual(seen["out_dir"].resolve(),
+                         self.win._step8_render_dir().resolve())
+        self.assertEqual(sorted(p.name for p in run.iterdir()), before,
+                         "a Load leaves the calibration exactly as it was")
+        self.assertIn("nothing written", self.win.step8_status.text())
+
+    def test_load_without_a_step8_section_says_which_step_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            step7 = Path(tmp) / "calib_step7_result_0101_0101.json"
-            step7.write_text("{}", encoding="utf-8")
-            csv = Path(tmp) / "calib_step8_0101_0101.csv"
-            csv.write_text("x\n", encoding="utf-8")
-            self.win.step8_step7_edit.setText(str(step7))
+            run = Path(tmp) / "run_thin"
+            run.mkdir()
+            (run / "calib.json").write_text(
+                '{"schema": "rbonn_calib_v3"}', encoding="utf-8")
             with patch("PyQt5.QtWidgets.QFileDialog.getOpenFileName",
-                       return_value=(str(csv), "")), \
-                 patch.object(STEP8, "fit_and_write", fake_fit), \
-                 patch.object(self.win, "_run_task",
-                              lambda _l, work, done, _f: done(work())):
+                       return_value=(str(run / "calib.json"), "")):
                 self.win._step8_load()
-            self.assertEqual(seen["csv"], csv)
-            self.assertEqual(seen["step7"], step7)
-            self.assertEqual(seen["out_dir"].resolve(),
-                             self.win._step8_staging().resolve())
-            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),
-                             sorted([csv.name, step7.name]))
+        text = self.win.step8_status.text()
+        self.assertIn("Load failed", text)
+        self.assertIn("step8", text)
 
-    # ---- the save ------------------------------------------------------
-    def test_save_copies_the_csv_and_writes_the_fit_beside_it(self) -> None:
-        """The JSON is WRITTEN at the destination, not copied from staging.
+    def test_a_cancelled_load_does_nothing_at_all(self) -> None:
+        """Dismissing the dialog is not an error, and is not a fit either."""
+        self.win.step8_status.setText("Idle")
+        with patch("PyQt5.QtWidgets.QFileDialog.getOpenFileName",
+                   return_value=("", "")):
+            self.win._step8_load()
+        self.assertEqual(self.win.step8_status.text(), "Idle")
 
-        It records the CSV and the PNG it came from by absolute path, so a
-        copied one would point back into a temp directory.
+
+class AcquisitionPanelTests(unittest.TestCase):
+    """The four acquisition settings steps 6, 7 and 8 actually show.
+
+    The panel used to carry nine controls on steps 6 and 7, of which five have
+    had the same value on every run this bench has taken.  They are still live
+    widgets -- the sweep reads them, and a hidden one that stopped carrying its
+    default would change what a run measures without showing it -- so these
+    pin both halves: what is on the panel, and what the hidden ones hold.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PyQt5 import QtWidgets
+
+        from gui.app import MainWindow
+
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        cls.win = MainWindow()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.win.close()
+
+    def _daq_panel(self, edit):
+        """The DAQ group box of the page holding ``edit``."""
+        from PyQt5 import QtWidgets
+
+        col = edit
+        while not isinstance(col.parentWidget(), QtWidgets.QSplitter):
+            col = col.parentWidget()
+        for i in range(col.layout().count()):
+            panel = col.layout().itemAt(i).widget()
+            if isinstance(panel, QtWidgets.QGroupBox) and \
+                    panel.title().startswith("DAQ"):
+                return panel
+        raise AssertionError("no DAQ panel on this page")
+
+    def _visible_rows(self, panel):
+        from PyQt5 import QtWidgets
+
+        out = []
+        lay = panel.layout()
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is None or w.isHidden():
+                continue
+            if isinstance(w, QtWidgets.QCheckBox):
+                out.append(w.text())
+            elif isinstance(w, QtWidgets.QLabel):
+                out.append(w.text())
+        return out
+
+    def test_every_page_shows_the_same_four(self) -> None:
+        for name, edit in (("step 6", self.win.tpa_step3_edit),
+                           ("step 7", self.win.tpa_phase_step6_edit),
+                           ("step 8", self.win.step8_step7_edit)):
+            with self.subTest(page=name):
+                self.assertEqual(
+                    self._visible_rows(self._daq_panel(edit)),
+                    ["Channel", "Range", "T_meas", "Invert sign (TIA)"])
+
+    def test_the_hidden_ones_still_carry_the_bench_defaults(self) -> None:
+        """Hidden is not dropped: the sweep still reads every one of these."""
+        w = self.win
+        for name, widget in (("step6 rate", w.tpa_daq_rate),
+                             ("step7 rate", w.tpa_phase_daq_rate),
+                             ("step8 rate", w.step8_daq_rate)):
+            with self.subTest(widget=name):
+                self.assertTrue(widget.isHidden())
+                self.assertEqual(widget.value(), 1000.0)
+        for name, widget in (("step6 low-pass", w.tpa_daq_fcut),
+                             ("step7 low-pass", w.tpa_phase_daq_fcut),
+                             ("step8 low-pass", w.step8_daq_fcut)):
+            with self.subTest(widget=name):
+                self.assertTrue(widget.isHidden())
+                self.assertEqual(widget.value(), 20.0)
+        for name, widget in (("step6 settle", w.tpa_settle),
+                             ("step7 settle", w.tpa_phase_settle)):
+            with self.subTest(widget=name):
+                self.assertTrue(widget.isHidden())
+                self.assertEqual(widget.value(), 0.25)
+        # The PMT log is on for steps 6 and 7 and off for step 8, which is what
+        # each page came up with before it was hidden.
+        self.assertTrue(w.tpa_pmt.isHidden())
+        self.assertTrue(w.tpa_pmt.isChecked())
+        self.assertTrue(w.tpa_phase_pmt.isHidden())
+        self.assertTrue(w.tpa_phase_pmt.isChecked())
+        self.assertTrue(w.step8_pmt.isHidden())
+        self.assertFalse(w.step8_pmt.isChecked())
+
+    def test_a_hidden_settle_still_reaches_the_sweep(self) -> None:
+        """The proof that these are controls and not decoration."""
+        w = self.win
+        self.assertEqual(w._tpa_acq().settle_s, 0.25)
+        w.tpa_settle.setValue(0.5)
+        try:
+            self.assertEqual(w._tpa_acq().settle_s, 0.5)
+        finally:
+            w.tpa_settle.setValue(0.25)
+
+    def test_step8_reads_its_own_page_not_a_module_constant(self) -> None:
+        """Step 8 declared no acquisition of its own; now it does.
+
+        It took the window, the range and the sign from STEP8.ACQ, which made
+        the one step whose fit is a saturation curve the one step that could
+        not say what it read at.
         """
-        from calibration_module.steps import calib_step8 as STEP8
+        from calibration_module.measure.pair_v2 import DEFAULT_ACQ
 
-        src = self._staged()
-        self.win._step8_finished(self._payload(src, step7=Path("model.json")))
-        seen: dict = {}
+        w = self.win
+        self.assertEqual(w._step8_acq(), DEFAULT_ACQ)       # untouched == CLI
 
-        def fake_fit(csv, step7, *, out_dir=None, log=print, **kw):
-            seen.update(csv=Path(csv), step7=Path(step7), out_dir=Path(out_dir))
-            return self._result(Path(csv))
+        w.step8_tmeas.setValue(2.0)
+        w.step8_invert.setChecked(False)
+        try:
+            acq = w._step8_acq()
+            self.assertEqual(acq.t_meas_s, 2.0)
+            self.assertFalse(acq.invert)
+            # and the run-time estimate is quoted under the page, not the module
+            self.assertIn("2 s every read", w.step8_estimate.text())
+        finally:
+            w.step8_tmeas.setValue(DEFAULT_ACQ.t_meas_s)
+            w.step8_invert.setChecked(DEFAULT_ACQ.invert)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = Path(tmp) / "run_0930" / src.name
-            with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                       return_value=(str(dest), "")), \
-                 patch.object(STEP8, "fit_and_write", fake_fit):
-                self.win._step8_save()
-            self.assertTrue(dest.is_file())
-            self.assertEqual(dest.read_text(encoding="utf-8"),
-                             src.read_text(encoding="utf-8"))
-            self.assertEqual(seen["csv"], dest)
-            self.assertEqual(seen["out_dir"], dest.parent)
-            # not whatever the box holds -- the model this fit was made against
-            self.assertEqual(seen["step7"], Path("model.json"))
-            text = self.win.step8_status.text()
-            self.assertIn("Saved", text)
-            stamp = dest.stem.replace("calib_step8_", "")
-            for name in (dest.name, f"calib_step8_result_{stamp}.json",
-                         f"{dest.stem}_ysat.png"):
-                self.assertIn(name, text)
+    def test_no_control_column_scrolls(self) -> None:
+        """A setting you have to scroll to find is a setting you will not check."""
+        from PyQt5 import QtWidgets
 
-    def test_save_ignores_a_step_7_box_edited_after_the_fit(self) -> None:
-        """What was fitted is what gets recorded, whatever the box says now."""
-        from calibration_module.steps import calib_step8 as STEP8
+        for name, edit in (("step 6", self.win.tpa_step3_edit),
+                           ("step 7", self.win.tpa_phase_step6_edit),
+                           ("step 8", self.win.step8_step7_edit)):
+            with self.subTest(page=name):
+                w = edit
+                while w is not None:
+                    self.assertNotIsInstance(w, QtWidgets.QScrollArea)
+                    w = w.parentWidget()
 
-        src = self._staged()
-        self.win._step8_finished(self._payload(src, step7=Path("fitted.json")))
-        self.win.step8_step7_edit.setText("something_else.json")
-        seen: dict = {}
 
-        def fake_fit(csv, step7, *, out_dir=None, log=print, **kw):
-            seen["step7"] = Path(step7)
-            return self._result(Path(csv))
+class PageStatusLineTests(unittest.TestCase):
+    """One line of feedback, beside the page title, with no history."""
 
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                       return_value=(str(Path(tmp) / src.name), "")), \
-                 patch.object(STEP8, "fit_and_write", fake_fit):
-                self.win._step8_save()
-        self.assertEqual(seen["step7"], Path("fitted.json"))
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PyQt5 import QtWidgets
 
-    def test_a_second_save_copies_nothing_because_it_is_already_there(self) -> None:
-        """After a save the run LIVES at the destination; staging is history."""
-        from calibration_module.steps import calib_step8 as STEP8
+        from gui.app import MainWindow
 
-        src = self._staged()
-        self.win._step8_finished(self._payload(src))
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        cls.win = MainWindow()
 
-        def fake_fit(csv, step7, *, out_dir=None, log=print, **kw):
-            return self._result(Path(csv))
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.win.close()
 
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = Path(tmp) / src.name
-            with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                       return_value=(str(dest), "")), \
-                 patch.object(STEP8, "fit_and_write", fake_fit):
-                self.win._step8_save()
-                self.assertEqual(Path(self.win.step8_last["csv"]), dest)
-                src.unlink()                  # the staged copy is gone now
-                self.win._step8_save()        # and this must still work
-            self.assertIn("Saved", self.win.step8_status.text())
-            self.assertTrue(dest.is_file())
+    def _statuses(self):
+        return (("step 6", self.win.tpa_status),
+                ("step 7", self.win.tpa_phase_status),
+                ("step 8", self.win.step8_status))
 
-    def test_a_staged_run_is_offered_calib_data(self) -> None:
-        """Where a sweep goes if nobody says otherwise."""
-        from calibration_module.steps import calib_step8 as STEP8
+    def test_it_sits_in_the_title_row(self) -> None:
+        from gui.app import StatusLine
 
-        src = self._staged()
-        self.win._step8_finished(self._payload(src))
-        with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                   return_value=("", "")) as dialog:
-            self.win._step8_save()
-        self.assertEqual(Path(dialog.call_args[0][2]),
-                         Path(STEP8.OUT_DIR) / src.name)
+        for name, status in self._statuses():
+            with self.subTest(page=name):
+                self.assertIsInstance(status, StatusLine)
+                header = status.parentWidget().layout().itemAt(0).layout()
+                # item 0 is the page title, item 1 is this
+                self.assertEqual(header.indexOf(status), 1)
 
-    def test_a_run_that_already_lives_somewhere_is_offered_back_there(self) -> None:
-        """A loaded CSV saves beside itself, not into calib_data."""
-        with tempfile.TemporaryDirectory() as tmp:
-            csv = Path(tmp) / "calib_step8_0101_0101.csv"
-            csv.write_text("x\n", encoding="utf-8")
-            self.win._step8_finished(self._payload(csv))
-            with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                       return_value=("", "")) as dialog:
-                self.win._step8_save()
-            self.assertEqual(Path(dialog.call_args[0][2]), csv)
+    def test_it_keeps_the_whole_sentence_however_narrow_the_window(self) -> None:
+        """It is painted elided, not stored elided.
 
-    def test_a_cancelled_save_writes_nothing(self) -> None:
-        from calibration_module.steps import calib_step8 as STEP8
+        What the page said is not a function of how wide the window happens to
+        be -- and every reader of it, the tests included, wants the sentence.
+        """
+        long = "Loaded run_0930/calib.json \N{MIDDLE DOT} " + "x" * 400
+        for name, status in self._statuses():
+            with self.subTest(page=name):
+                status.setText(long)
+                self.assertEqual(status.text(), long)
+                self.assertEqual(status.toolTip(), long)
 
-        self.win._step8_finished(self._payload(self._staged()))
-
-        def fail(*_a, **_kw):
-            raise AssertionError("a cancelled dialog must not write")
-
-        with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                   return_value=("", "")), \
-             patch.object(STEP8, "fit_and_write", fail):
-            self.win._step8_save()
-        self.assertTrue(self.win.step8_save_button.isEnabled())
-
-    def test_a_failed_save_says_so_and_leaves_the_button_alive(self) -> None:
-        """A full disk or a read-only folder must not swallow the run."""
-        from calibration_module.steps import calib_step8 as STEP8
-
-        self.win._step8_finished(self._payload(self._staged()))
-
-        def boom(*_a, **_kw):
-            raise OSError("no space left on device")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("PyQt5.QtWidgets.QFileDialog.getSaveFileName",
-                       return_value=(str(Path(tmp) / "x.csv"), "")), \
-                 patch.object(STEP8, "fit_and_write", boom):
-                self.win._step8_save()
-        self.assertIn("Save failed", self.win.step8_status.text())
-        self.assertTrue(self.win.step8_save_button.isEnabled())
+    def test_it_is_one_line_and_keeps_nothing(self) -> None:
+        for name, status in self._statuses():
+            with self.subTest(page=name):
+                self.assertFalse(status.wordWrap())
+                status.setText("first")
+                status.setText("second")
+                self.assertEqual(status.text(), "second")
 
 
 if __name__ == "__main__":

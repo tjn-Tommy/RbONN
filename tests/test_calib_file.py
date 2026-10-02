@@ -1,4 +1,4 @@
-"""The run directory's one calib.json: sections, stamps, and what a write drops."""
+"""The one calib.json: sections, stamps, and what a write drops."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from calibration_module.calib_file import (  # noqa: E402
 
 
 class _TempRun(unittest.TestCase):
-    """A throwaway run directory per test."""
+    """A throwaway folder with one calib.json per test."""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="rbonn_calib_"))
@@ -68,17 +68,34 @@ class PathTests(_TempRun):
         named = self.run / "calib.json"
         self.assertEqual(calib_path(named), named)
 
+    def test_a_variant_name_in_the_same_folder_is_its_own_calibration(self) -> None:
+        # The file is the unit, so two of them share a folder and its CSVs
+        # without sharing a single section.
+        variant = self.run / "calib_noYsat.json"
+        self.assertEqual(calib_path(variant), variant)
+        self.quiet(variant, 3, {"marker": "variant"})
+        self.quiet(self.run, 3, {"marker": "main"})
+        self.assertEqual(load_calib(variant).section(3)["marker"], "variant")
+        self.assertEqual(load_calib(self.run).section(3)["marker"], "main")
+
+    def test_beside_names_a_sibling_of_the_file(self) -> None:
+        self.quiet(self.run, 3, {"marker": "x"})
+        calib = load_calib(self.run)
+        self.assertEqual(calib.folder, self.run)
+        self.assertEqual(calib.beside("step3_0931_1802.csv"),
+                         self.run / "step3_0931_1802.csv")
+
 
 class LoadTests(_TempRun):
     def test_missing_file_raises_with_the_way_out(self) -> None:
         with self.assertRaises(CalibNotFound) as caught:
             load_calib(self.run)
-        self.assertIn("no calib.json", str(caught.exception))
+        self.assertIn("create it with step 1", str(caught.exception))
 
     def test_missing_ok_gives_an_empty_one(self) -> None:
         calib = load_calib(self.run, missing_ok=True)
         self.assertEqual(calib.steps(), [])
-        self.assertEqual(calib.run_dir, self.run)
+        self.assertEqual(calib.folder, self.run)
 
     def test_pre_v3_result_is_refused_by_name(self) -> None:
         # What every existing run directory holds: a nested per-step result.

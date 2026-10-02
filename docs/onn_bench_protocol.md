@@ -63,16 +63,32 @@ Y = (V - dark) / g  -  SUM_k ( a_x,k * x_k  +  a_w,k * w_k )
 bench side. The simulation carries none of them — it produces the `Y` that
 comes out of this step.
 
-`g` is **measured during the run**, not carried from the calibration. Five
-step-8 ladder rungs above `alpha = 0.5` are replayed every 15 minutes and `g` is
-the slope of `(V_now - dark)` against `(V_step8 - dark_step8)` through the
-origin; identical SLM frames on both sides, so `eta`, `Phi` and `Y_sat` all
+`g` is **measured during the run**, anchored to the run's own first minute.
+`onn_infer` solves ten ladder rungs over `alpha = 0.5..1` of `Y_max` with step
+8's own builder (top capped at step 8's 450 mV ceiling), reads them right after
+the dark — that block *defines* `g = 1` — and replays the same drives every 20
+minutes; `g` is the slope of `(V_now - dark)` against `(V_first - dark)` through
+the origin. Identical SLM frames on both sides, so `eta`, `Phi` and `Y_sat` all
 cancel. Each inference read is then corrected with `g` interpolated in time
-between the two measurements that bracket it. It matters: on the 0929 run, which
-had no anchor, the best-fit scale wandered 0.939..1.064 over 14 h and removing it
+between the two blocks that bracket it.
+
+Each anchor block is checked on its own: a rung more than `GAIN_TOL` (4 %) off
+the block's fitted slope is dropped from that fit and written as
+`kind=gain_drop`. The first block judges against the model's prediction, re-reads
+what it drops once, and a rung off twice leaves the ladder for the run; later
+blocks judge against the g = 1 volts. This exists because run_1001 showed single
+anchor reads 4–6 % high with an ordinary trace std — a level shift lasting the
+whole window, invisible to the step-6/7 trace guards. Inference reads are never
+checked.
+
+It matters: on the 0929 run, which had
+no anchor, the best-fit scale wandered 0.939..1.064 over 14 h and removing it
 per 2 h bin took the residual from 4.71 mV to ~3.9 mV. A common scale does not
 change a per-image argmax, so this buys the residual and absolute `Y`, not the
-accuracy number.
+accuracy number. What it does *not* measure is the gain change between the
+step-7 fit and the start of the run; without a step 8 that stays in the residual
+as a multiplicative tilt. The PMT thermistor is read with every gain block and
+stamped on every row until the next (`--no-pmt` to skip).
 
 `dark` is read once, at the start, and held. Over that same 14 h run it moved
 0.034 mV with a 0.026 mV warm-up transient, against a 4.7 mV residual, and it is

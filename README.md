@@ -40,23 +40,23 @@ running. Nothing marked **legacy** or **dead** should be imported from new code.
 |------|------|
 | `src/calibration_module/fit/` | calibration physics — models, fits, file formats. Imports no driver, so it can be run against saved CSVs with the bench powered down. |
 | `src/calibration_module/measure/` | acquisition — drives the SLM, DAQ and OSA and returns rows. Does no fitting. |
-| `src/calibration_module/calib_file.py` | **the one calibration file per run directory** — `load_calib` / `write_section`, the step sections, their `ran` stamps and relative CSV pointers, and the rule that writing a section drops the ones below it. Holds the container only; each section's payload belongs to the fit that defines it. See [Calibration file](#calibration-file). |
+| `src/calibration_module/calib_file.py` | **the one calibration file every step appends to** — `load_calib` / `write_section`, the step sections, their `ran` stamps and relative CSV pointers, and the rule that writing a section drops the ones below it. Holds the container only; each section's payload belongs to the fit that defines it. See [Calibration file](#calibration-file). |
 | `src/calibration_module/fit/slm_response.py` | steps 1–3 data — `CalibrationResult`, the `step1/2/3_section` builders that put it in `calib.json`, the step-3 channel grid, peak centroids, the usable-band clip. Driver-free. Beside it, `fit/transfer.py` is the per-channel sin² curve the encoder inverts and `fit/outliers.py` the post-sweep re-measure flags. |
 | `src/calibration_module/measure/slm_response.py` | steps 1–3 acquisition — the OSA/DAQ sweeps, plus one `run_step1/2/3b/3c` per step. The GUI's Step 1/2/3 tabs and the step scripts both call the runner, so a step's sequence is written once. (`run_step3b` is legacy — see below.) |
-| `src/calibration_module/steps/calib_step{1,2,3}.py` | the step 1–3 runners — constants (the GUI tabs' defaults), then `measure.slm_response.run_step*` → a section of `calib.json` (+ a CSV for 2 and 3). All three take `--run DIR`; step 3 also takes `--width`/`--gap`. `calib_step3.py` was `calib_step3c.py`. |
+| `src/calibration_module/steps/calib_step{1,2,3}.py` | the step 1–3 runners — constants (the GUI tabs' defaults), then `measure.slm_response.run_step*` → a section of `calib.json` (+ a CSV for 2 and 3). All three take `--calib FILE`; step 2 also takes `--min-max`, step 3 `--width`/`--gap`. `calib_step3.py` was `calib_step3c.py`. |
 | `src/calibration_module/fit/pair_v2.py` | **current** step 6 estimator — the difference fit (`D(w) = Y(1,w) − Ŷ(0,w) = η²w + a_x + q_x`) over 31 acquisitions on 10 repeated levels, plus 6 verification levels. Driver-free: `tests/test_pair_v2.py` runs the whole estimator off a committed CSV with no fake instrument. `PairV2Config` carries what a fit was specified with, so two configurations can coexist in one process. |
 | `src/calibration_module/measure/pair_v2.py` | step 6 acquisition — one pair's interleaved schedule, the near-rail ±0.1 → ±0.2 V escalation and the TIA sign convention. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
-| `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner — constants, then load the layout out of the run's step-3 section → `measure.pair_v2` → `fit.pair_v2` → the CSV, the `step6` section and the PNGs. Holds no physics. `--run` and `--pairs` are required and have no default. |
+| `src/calibration_module/steps/calib_step6_v2.py` | the step 6 runner — constants, then load the layout out of the file's step-3 section → `measure.pair_v2` → `fit.pair_v2` → the CSV and the `step6` section. Holds no physics. `--calib` and `--pairs` are required and have no default. |
 | `src/calibration_module/fit/phase.py` | **current** step 7 fit — the fringe `Y = a² + b²g² + 2abg·cos(ΔΦ_SLM + ΔΦ_comb)` with `a`, `b`, the single-beam background and the dark ALL pinned to step 6, so `ΔΦ_comb` is the one free parameter. That cosine argument is the project's ONE sign convention, so a stored `dphi_comb_rad` IS Φₖ in the forward model — nothing negates it. Also owns the phase CSV/JSON formats. Driver-free. |
 | `src/calibration_module/measure/phase_v2.py` | step 7 acquisition — one target pair swept against the held reference, the all-off dark, and step 6's near-rail escalation reused rather than retyped. `PhaseV2Config` is the drive (reference, ramp, levels); `PhaseV2Acq` the timing and input range. Takes the monitor as an argument and accepts `progress_callback`/`stop_event`, so the script and the GUI share it. |
-| `src/calibration_module/steps/calib_step7_v2.py` | the step 7 runner — constants, then load the run's step-3 + step-6 sections → `measure.phase_v2` → `fit.phase` → the CSV, the `step7` section and the PNGs. Holds no physics. `--run`, `--targets` and `--ref` are required and have no default. |
-| `src/calibration_module/steps/calib_step8.py` | step 8 — the capped ladder that fits `Y_sat` and anchors `g = 1`. `--run` is required. Writes `step8_patterns_*.csv` (the plan, before the hardware is touched), the reads CSV, the `step8` section and the report PNG. |
+| `src/calibration_module/steps/calib_step7_v2.py` | the step 7 runner — constants, then load the file's step-3 + step-6 sections → `measure.phase_v2` → `fit.phase` → the CSV and the `step7` section. Holds no physics. `--calib`, `--targets` and `--ref` are required and have no default. |
+| `src/calibration_module/steps/calib_step8.py` | step 8 — the capped ladder that fits `Y_sat` and anchors `g = 1`. `--calib` is required. Writes `step8_patterns_*.csv` (the plan, before the hardware is touched), the reads CSV, the `step8` section and the report PNG. |
 | `src/calibration_module/fit/verify.py` | the n-pair check — predicts `Y = |Σ η√(xw)·e^{i(φ½(x)+φ½(w)+Φ)}|² + background` for any drive with nothing free, and quotes the error against each block's full scale `FS = Y_max − Y_min = Y_max` — the ceiling the pairs can actually be driven to, found by a 1-D support scan over the projection axis ψ. The free-phase `S² = (Σ_k η_k)²` is *not* it: a pair only reaches `|z_k| = η_k` with its phase pinned to `Φ_k`, so `S²` over-predicts by 54–67 % on the 0908–0911 runs. Also the verify CSV, which reads old step-8 CSVs too. Driver-free. |
-| `src/calibration_module/steps/calib_npair_verify.py` | the n-pair accuracy check — `--n` pairs at a time: every C(N, n) block of the calibrated pairs, 8 random `(x, w)` patterns each, error as `rms(meas − pred) / FS`. Its `--step7` now takes a run directory (or its `calib.json`) like everything else, though the flag still carries the old name; slated for deprecation in favour of `calib_step8.py`. |
+| `src/calibration_module/steps/calib_npair_verify.py` | the n-pair accuracy check — `--n` pairs at a time: every C(N, n) block of the calibrated pairs, 8 random `(x, w)` patterns each, error as `rms(meas − pred) / FS`. Its `--step7` now takes a `calib.json` (or the directory holding one) like everything else, though the flag still carries the old name; slated for deprecation in favour of `calib_step8.py`. |
 | `src/calibration_module/fit/pair.py` | step 6 **v1** — the joint 6-parameter grid fit `pair_v2` replaced. GUI Step 6 moved off it; only `calib_step6_v1.py` and `calib_synth_v1.py` still reach it, kept so a historical CSV can be re-fit both ways. |
 | `src/calibration_module/steps/calib_step{6,7,8}_v1.py` | the v1 chain — dispatch to SLM + DAQ, collect, fit, plot. Kept for the estimator comparison and to re-fit historical CSVs. |
 | `src/calibration_module/measure/bench.py` | SLM/DAQ connection helpers shared by the step scripts |
-| `src/onn_module/` | the ONN as a trainable torch module, and the bench handover. `params.py` turns a run directory into the layer's (eta, Phi, Y_sat) with `ONNParams.from_run` -- through `fit/verify.py`, never by parsing the JSON itself, so the phase-sign convention has one definition; `layer.py` is the same forward model in torch, held to `verify.predict` at 1e-12 by `tests/test_onn_layer.py`; `finetune.py` carries a trained head onto a fresh calibration (and can still train from scratch); `bench_reference.py` writes the `.npz` the bench consumes; `onn_infer.py` is the bench run itself -- replays those drives, measures the gain against step 8's `g = 1` anchor, and reports whether the optics picked the right digit. Two envs: everything but `onn_infer` runs in **`rbonn-ml`** (`src/onn_module/requirements.txt`, torch, no drivers); `onn_infer` runs in **`rbonn`** (drivers, no torch). The `.npz` is the seam -- see `docs/onn_bench_protocol.md`. |
+| `src/onn_module/` | the ONN as a trainable torch module, and the bench handover. `params.py` turns a `calib.json` into the layer's (eta, Phi, Y_sat) with `ONNParams.from_run` -- through `fit/verify.py`, never by parsing the JSON itself, so the phase-sign convention has one definition; `layer.py` is the same forward model in torch, held to `verify.predict` at 1e-12 by `tests/test_onn_layer.py`; `finetune.py` carries a trained head onto a fresh calibration (and can still train from scratch); `bench_reference.py` writes the `.npz` the bench consumes; `onn_infer.py` is the bench run itself -- takes the run's `calib.json` (`--calib`), replays those drives, tracks the detector gain against its own first anchor block (ten step-8-style ladder rungs read at the start, replayed every 20 min with the PMT temperature; a rung more than 4 % off its block's fitted slope is dropped from that block), and reports whether the optics picked the right digit. Two envs: everything but `onn_infer` runs in **`rbonn-ml`** (`src/onn_module/requirements.txt`, torch, no drivers); `onn_infer` runs in **`rbonn`** (drivers, no torch). The `.npz` is the seam -- see `docs/onn_bench_protocol.md`. |
 | `src/{daq,osa,scope,heater}_module/`, `src/slm_module/{controller,driver,encoding,generator}` | instrument drivers and pattern encoding |
 | `src/gui/` | the PyQt5 control suite (entry point `src/main.py`). It drives every instrument, not just the SLM, which is why it sits beside them rather than inside `slm_module/`. |
 | `src/drafts/monitor_lib.py` + `daq_osa_monitor.py` / `daq_pmt_monitor.py` | overnight drift monitors |
@@ -72,7 +72,7 @@ once its GUI page is rebuilt.
 |------|---------------|
 | `src/calibration_module/measure/center.py` | TPA centre scan — [app.py:6471](src/gui/app.py#L6471) only |
 | `src/calibration_module/steps/calib_step3b.py`, `measure.slm_response.run_step3b` | the OSA grouped-channel sweep. Step 3 on this bench is the DAQ scan (`calib_step3.py`), and 3b's GUI tab is built but no longer added to the tab bar, so nothing routine reaches it. It still writes the pre-v3 standalone JSON, which `load_calib` will not read. |
-| `src/calibration_module/steps/calib_step{6,7}_v1.py` | the v1 predecessors. They write the pre-v3 nested result and have not been moved onto `--run`; keep them for reading history, not for running. |
+| `src/calibration_module/steps/calib_step{6,7}_v1.py` | the v1 predecessors. They write the pre-v3 nested result and have not been moved onto `--calib`; keep them for reading history, not for running. |
 | `src/calibration_module/fit/legacy_intensity.py` | the old sin² transfer-curve fit (was `slm_module/calibration/calibration.py`). Step 3 is `fit/slm_response.py` + `measure/slm_response.py`; only `intensity_model` (used by `fit/outliers.py`) and one GUI "load a calibration CSV" path at [app.py:8119](src/gui/app.py#L8119) still reach it. `phase_for_level` and `predict_intensity` are exported and called nowhere at all — not in `src/`, not in the tests. |
 
 ### Dead — nothing imports these
@@ -138,24 +138,29 @@ Kept for provenance; they answered their question and are not maintained.
 
 ## Calibration file
 
-**One run directory, one JSON.** Every step reads `<run>/calib.json`, replaces
-its own section and writes it back; no step copies another step's payload, so the
+**One file, every step.** Every step takes `--calib FILE`, reads it, replaces its
+own section and writes it back; no step copies another step's payload, so the
 step-3 channel layout exists once instead of once per downstream result. The raw
-readings stay in the sibling CSVs — several per directory is normal, one per
+readings stay in the CSVs beside it — several per calibration is normal, one per
 acquisition — and the JSON keeps only what was fitted from them plus a relative
-pointer back.
+pointer back. A directory is accepted anywhere a calib file is, as shorthand for
+the `calib.json` inside it, which is all a "run folder" ever was.
 
 ```
 run_0930/
-  calib.json              step2 + step3 + step6 + step7 + step8
+  calib.json              step1 .. step8
   step2_0928_1744.csv     px -> nm
   step3_0929_1802.csv     per-channel transfer sweep
-  step6_meas_*.csv        per-pair TPA sweep
-  step7_meas_*.csv        comb-phase sweep
-  step8_patterns_*.csv    the ladder plan, written before the hardware
-  step8_*.csv             the ladder reads
-  *.png
+  calib_step6v2_meas_*.csv   per-pair TPA sweep
+  calib_step7_meas_*.csv     comb-phase sweep
+  calib_step8_patterns_*.csv the ladder plan, written before the hardware
+  calib_step8_*.csv          the ladder reads + the Y_sat report PNG
 ```
+
+Steps 6 and 7 write no pictures. The fit is in the section and the rows are in
+the CSV it points at, so the GUI's **Load** re-fits either from the one file and
+draws it on demand — which is the only way a fringe was ever looked at. Step 8
+keeps its report PNG, because that page displays one.
 
 Each section carries `ran` (a full local ISO timestamp of when that step
 executed) and `csv` (relative to the JSON, so the directory can be copied or
@@ -163,10 +168,13 @@ moved whole). Before v3 the chain was cumulative: a step-7 result embedded a cop
 of step 3 and step 6, a step-8 result pointed at its step 7 by absolute path, and
 `run_0929` held 615 KB across seven JSONs where it now holds 110 KB in one.
 
-**Inheriting an older calibration is a filesystem operation.** Copy the directory
-— or just its `calib.json` and the CSVs worth keeping — to a new name and run the
-step you want to redo. There is no `--inherit` flag and no provenance field:
-what you copied is what the file says, and you did it with your own hands.
+**Inheriting an older calibration is a filesystem operation.** Copy the
+`calib.json` and the CSVs worth keeping to a new folder and run the step you want
+to redo. There is no `--inherit` flag and no provenance field: what you copied is
+what the file says, and you did it with your own hands. An **offline re-fit is
+the same move** — copy the JSON and that step's meas CSV, then fit against the
+copy. Nothing ever writes a fit back over the file a GUI was pointed at to look
+at, so the first opinion survives the second.
 
 **Writing a section drops the sections below it.** A fresh step 3 means a new
 channel grid, so the step-6 etas and step-7 phases in that file were measured
@@ -177,12 +185,12 @@ directory they were copied from still has them. The step order is 1 < 2 < 3 < 6 
 
 Nothing enforces the stamps. A hand-assembled file can hold a step 6 older than
 its step 3, and `Calib.stale()` finds it while `Calib.chain_lines()` says so —
-printed by every runner before it touches the bench and shown on the GUI's run
-folder pill. A note, not a refusal: whether it matters is the operator's call,
+printed by every runner before it touches the bench and shown under every GUI
+page's calib file field. A note, not a refusal: whether it matters is the operator's call,
 but it will not be a surprise.
 
 ```
-$ python src/calibration_module/steps/calib_step7_v2.py --run src/calib_data/run_0930 --targets 1,3,4 --ref 2
+$ python src/calibration_module/steps/calib_step7_v2.py --calib src/calib_data/run_0930/calib.json --targets 1,3,4 --ref 2
 src/calib_data/run_0930/calib.json
   step2  2026-09-28 17:44
   step3  2026-09-29 18:02
@@ -190,8 +198,8 @@ src/calib_data/run_0930/calib.json
 ```
 
 Everything downstream — steps 6, 7 and 8, `fit/verify.load_forward_model`,
-`ONNParams.from_run` — takes the run directory (or the `calib.json` inside it)
-and reads what it needs out of that one file. `tools/migrate_calib_v3.py`
+`ONNParams.from_run` — takes the `calib.json` (or the directory holding it) and
+reads what it needs out of that one file. `tools/migrate_calib_v3.py`
 converted the twelve directories that predate the schema; the frozen runs under
 `src/calib_data/archive/` were deliberately left in the old shape, so
 `load_calib` refuses them by name.

@@ -163,13 +163,22 @@ class AttenuatedDriveTests(unittest.TestCase):
 
 
 class LadderTests(unittest.TestCase):
-    """Block A."""
+    """Block A.
 
-    def setUp(self):
-        self.models, self.phases, self.pairs = real()
-        self.scale = full_scale(self.models, self.phases, self.pairs)
-        self.pats = levels.level_patterns(self.models, self.phases, self.pairs,
-                                          32, seed=11)
+    Built once for the class: ``level_patterns`` solves 32 strata and takes
+    seconds, and nothing below mutates it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models, cls.phases, cls.pairs = real()
+        cls.scale = full_scale(cls.models, cls.phases, cls.pairs)
+        cls.pats = levels.level_patterns(cls.models, cls.phases, cls.pairs,
+                                         32, seed=11)
+        # Seeding is a property of the RNG, not of the stratum count, so the two
+        # seed tests below share one small plan rather than re-solving 32.
+        cls.few = levels.level_patterns(cls.models, cls.phases, cls.pairs,
+                                        8, seed=11)
 
     def test_one_pattern_per_stratum(self):
         width = 0.995 / 32
@@ -200,14 +209,14 @@ class LadderTests(unittest.TestCase):
         self.assertEqual(len({tuple(row) for row in x}), len(self.pats))
 
     def test_seed_reproduces_the_run(self):
-        again = levels.level_patterns(self.models, self.phases, self.pairs, 32, seed=11)
-        for a, b in zip(self.pats, again):
+        again = levels.level_patterns(self.models, self.phases, self.pairs, 8, seed=11)
+        for a, b in zip(self.few, again):
             np.testing.assert_array_equal(a.x, b.x)
             np.testing.assert_array_equal(a.w, b.w)
 
     def test_a_different_seed_does_not(self):
-        other = levels.level_patterns(self.models, self.phases, self.pairs, 32, seed=12)
-        same = sum(np.array_equal(a.x, b.x) for a, b in zip(self.pats, other))
+        other = levels.level_patterns(self.models, self.phases, self.pairs, 8, seed=12)
+        same = sum(np.array_equal(a.x, b.x) for a, b in zip(self.few, other))
         self.assertEqual(same, 0)
 
     def test_drives_stay_in_range(self):
@@ -219,12 +228,13 @@ class LadderTests(unittest.TestCase):
 class RepeatTests(unittest.TestCase):
     """Block B."""
 
-    def setUp(self):
-        self.models, self.phases, self.pairs = real()
-        self.scale = full_scale(self.models, self.phases, self.pairs)
-        self.alphas = (0.1, 0.5, 1.0)
-        self.pats = levels.repeat_patterns(self.models, self.phases, self.pairs,
-                                           self.alphas, 4, seed=5)
+    @classmethod
+    def setUpClass(cls):
+        cls.models, cls.phases, cls.pairs = real()
+        cls.scale = full_scale(cls.models, cls.phases, cls.pairs)
+        cls.alphas = (0.1, 0.5, 1.0)
+        cls.pats = levels.repeat_patterns(cls.models, cls.phases, cls.pairs,
+                                          cls.alphas, 4, seed=5)
 
     def test_one_drive_per_level_repeated(self):
         self.assertEqual(len(self.pats), len(self.alphas) * 4)

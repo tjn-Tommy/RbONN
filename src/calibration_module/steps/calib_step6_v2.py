@@ -1,72 +1,52 @@
 """Step 6 v2 -- per-pair TPA efficiency eta from the DIFFERENCE estimator.
 
-Needs real hardware for the sweep; the refit path is offline.  Either way
-``--run`` and ``--pairs`` are required and have no default::
+Needs real hardware for the sweep; the refit path is offline.  ``--calib`` and
+``--pairs`` are required and have no default::
 
-    S="--run src/calib_data/run_0930 --pairs 2,3,4,5,6"
+    S="--calib src/calib_data/run_0930/calib.json --pairs 2,3,4,5,6"
     python src/calibration_module/steps/calib_step6_v2.py $S
     python src/calibration_module/steps/calib_step6_v2.py $S --meas
     python src/calibration_module/steps/calib_step6_v2.py $S some.csv
-    python src/calibration_module/steps/calib_step6_v2.py $S some.csv --anchor
 
-``--run`` is a run DIRECTORY holding one ``calib.json``.  Its ``step3`` section
-is the calibration every level here is *encoded through*, and the CSV and PNGs
-land beside it; the fit is written back into the same file as its ``step6``
-section, replacing whatever was there.  There is deliberately no default: the
-path used to be a constant edited by hand, which meant the file it named drifted
-out from under the script every time a run was filed away, and a run against the
-wrong calibration does not fail, it silently calibrates a different aperture.
-The pair list is required for the same reason -- as a constant it silently
-calibrated whichever pairs the last edit left in it.
+In:  one ``calib.json``, whose ``step3`` section is the calibration every level
+     here is ENCODED THROUGH, plus the pair list.  A positional CSV re-fits that
+     sweep offline instead of driving the bench.  Neither argument has a
+     default: as constants they drifted out from under the script whenever a run
+     was filed away, and a sweep against the wrong calibration does not fail --
+     it silently calibrates a different aperture.
+Out: ``calib_step6v2_meas_<MMDD_HHMM>.csv`` in that file's folder, and the
+     file's own ``step6`` section: ``a_x, q_x, a_w, q_w, d`` and ``eta`` per
+     pair (a q that was not fitted written as an exact zero), in the schema
+     step 7 reads through ``PairModel.from_json_channel``.
 
-The underlying physics is unchanged from v1::
+The physics is unchanged from v1::
 
     Y(x, w) = eta^2*(x*w) + a_x*x + q_x*x^2 + a_w*w + q_w*w^2 + d
 
-What changes is how eta is *extracted*.
+What changes is how eta is EXTRACTED.  The estimator -- the difference, the GLS
+covariance that ties the two fits together, the verification -- lives with its
+code in :mod:`calibration_module.fit.pair_v2`; this file is the runner.
+Everything tunable is the constants below: the sweep's levels in ``CONFIG``, the
+acquisition's in ``ACQ``, both plain values the GUI builds too, so the two front
+ends run the same estimator over the same schedule.  The fit takes nothing from
+either -- it reads the levels off the rows, so a re-fit of a recorded CSV is
+fitted exactly as it was swept.
 
-The estimator itself -- how the difference is formed, the GLS covariance that
-ties the two fits together, the four verification checks and where the
-uncertainties come from -- lives with the code it describes, in
-:mod:`calibration_module.fit.pair_v2`.  This file is the runner: it loads the
-Step-3 calibration, drives the schedule through
-:mod:`calibration_module.measure.pair_v2`, then fits, reports, plots and saves.
-Everything tunable is the block of constants below -- the fit's half in
-``CONFIG``, the acquisition's in ``ACQ``.  Both are plain values the GUI builds
-too, so the two front ends run the same estimator over the same schedule.
-
-Acquisition order
------------------
-Repeats are interleaved: the schedule runs round-robin passes over the grid
+Acquisition order.  Repeats are interleaved, round-robin passes over the grid
 rather than n back-to-back reads of one level, so a slow drift cannot
-masquerade as a slope.  Within each pass levels run brightest first, so
-``(1, 1.0)`` is the very first acquisition and a dead or blocked beam shows
-immediately.
+masquerade as a slope.  Within a pass levels run brightest first, so a dead or
+blocked beam shows on the very first acquisition.
 
-The CSV keeps v1's column layout, so the same data can be re-fit with v1's
-joint 6-parameter estimator for comparison::
+The CSV keeps v1's column layout, so the same rows can be re-fit with v1's joint
+6-parameter estimator -- the cross-check that justifies the change.
 
-    python src/calibration_module/steps/calib_step6_v1.py <a_v2_meas.csv>
-
-That is the cross-check that justifies the change: same rows, two estimators.
-
-PMT temperature
----------------
-Every row carries the PMT thermistor (Keithley 2400, ohms and TH10K degrees) in
-``pmt_ohm_Ohm`` and ``pmt_c``, and the CSV brackets itself with a start and end
-reading in its ``# key,value`` meta -- so a drifting eta can be read against the
-detector's own temperature rather than against the room's.  It is ON by default
-(``--no-pmt`` turns it off); the 2400 is re-read at most every ``--pmt-period``
-seconds (default 60) and the rows in between repeat the last reading, since the
-bead's time constant is minutes and a per-row GPIB round trip would add ~90 s to
-a sweep and measure nothing extra.  A missing or failing 2400 blanks the two
-columns rather than ending the run.  One GPIB, one 2400: do NOT run
+``--pmt`` (on by default) logs the PMT thermistor (Keithley 2400, ohms and TH10K
+degrees) beside every row and brackets the CSV with a start and end reading, so
+a drifting eta can be read against the detector's own temperature rather than
+the room's.  Re-read at most every ``--pmt-period`` seconds, the bead's time
+constant being minutes; a missing or failing 2400 blanks the two columns rather
+than ending the run.  One GPIB, one 2400: do NOT run
 ``drafts/daq_pmt_monitor.py`` alongside a sweep.
-
-Output is one ``calib_step6v2_result_MMDD_HHMM.json`` embedding the input
-Step-3 calibration, and carrying ``a_x, q_x, a_w, q_w, d`` and ``eta`` per pair
-(a q that was not fitted is written out as an exact zero)
-in the schema step 7 already reads (``PairModel.from_json_channel``).
 """
 
 from __future__ import annotations
@@ -85,15 +65,14 @@ from calibration_module.fit.pair_v2 import (  # noqa: E402
     PairV2Config,
     PairV2Fit,
     average_levels,
+    sweep_floor,
     burst_rows,
     fit_pair,
     load_meas_csv,
     report,
-    save_plot,
     save_step6_section,
     write_meas_csv,
 )
-from calibration_module.fit.sigma import STD_FLOOR_V, floor_std  # noqa: E402,F401
 from calibration_module.measure.bench import connect_daq, connect_slm  # noqa: E402
 from calibration_module.measure.pair_v2 import (  # noqa: E402
     DEFAULT_ACQ,
@@ -106,20 +85,23 @@ from calibration_module.measure.pmt_temp import (  # noqa: E402
     PmtTemperature,
     open_pmt,
 )
-from calibration_module.calib_file import CalibFileError, load_calib  # noqa: E402
+from calibration_module.calib_file import (  # noqa: E402
+    CalibFileError,
+    calib_path,
+    load_calib,
+)
 from calibration_module.fit.outliers import BURST_K_REPEAT  # noqa: E402
 
 # ---- Edit these to match your setup ----
-CALIB_PATH = REPO_ROOT / "src/calib_data"   # the run directory; --run sets it
 
-# Neither the run directory nor the pair list is here -- they are the required
-# --run and --pairs arguments.  See the module docstring for why they have no
+# Neither the calib file nor the pair list is here -- they are the required
+# --calib and --pairs arguments.  See the module docstring for why they have no
 # default.  Left empty, so code that imports this module and sweeps without
 # setting the list fails before touching the hardware.
 PAIR_INDICES: list[int] = []
 
-# The estimator's setup.  Every field has the validated default (see
-# PairV2Config); name one here only to change it.  Keep pair_index_base in step
+# The sweep's levels.  Every field has the validated default (see
+# PairV2Config); name one here only to change it.  The fit does not read it.  Keep pair_index_base in step
 # with calib_step7_v2.PAIR_INDEX_BASE -- step 7 reads this script's pair labels
 # straight out of the step6 section.
 CONFIG = PairV2Config(
@@ -144,19 +126,16 @@ DAQ_CHANNEL = "ai0"
 # inputs
 # ======================================================================
 
-def _load_layout(run: Path):
+def _load_layout(calib_file: Path):
     """The run's step-3 section -> channel layout, validating PAIR_INDICES.
 
-    The Step-3b/3c rows ARE the channels, so the layout is loaded verbatim (the
-    same ``channel_layout_from_calibration`` the GUI encoding page uses) -- no
-    re-tiling, so pair indices here mean the same thing as in the UI.
-
-    Step 3 records only a wavelength per channel, never an index -- a channel's
-    identity IS its position in that list -- so the pair label is positional
-    too: pair ``i`` is the ``CONFIG.slot(i)``-th channel of the Step-3
-    calibration.
+    The step-3 rows ARE the channels, so the layout is loaded verbatim -- no
+    re-tiling, and a pair index here means what it means in the GUI.  Step 3
+    records a wavelength per channel and never an index, a channel's identity
+    being its POSITION in that list, so the pair label is positional too: pair
+    ``i`` is the ``CONFIG.slot(i)``-th channel.
     """
-    layout = load_calib(run).layout()
+    layout = load_calib(calib_file).layout()
     for pi in PAIR_INDICES:
         if not (0 <= CONFIG.slot(pi) < layout.n_channels):
             raise ValueError(
@@ -169,11 +148,10 @@ def _load_layout(run: Path):
 def _pair_wavelengths(layout, index: int) -> tuple[float, float, float]:
     """Wavelengths of a pair's two channels, or NaN if the layout lacks that slot.
 
-    ``index`` is a pair LABEL; ``CONFIG.slot`` maps it into the Step-3 layout.
-    A CSV may carry pair labels the loaded layout does not cover (a synthetic
-    file, or a layout from a different run); the wavelengths are cosmetic --
-    only the JSON/plot labels use them -- so fall back to NaN rather than
-    killing the fit.
+    ``index`` is a pair LABEL, which ``CONFIG.slot`` maps into the layout.  A
+    CSV may carry labels the loaded layout does not cover (a synthetic file, or
+    another run's layout); these are cosmetic -- only the JSON and plot labels
+    use them -- so NaN rather than killing the fit.
     """
     nan = float("nan")
     slot = CONFIG.slot(index)
@@ -189,16 +167,16 @@ def _pair_wavelengths(layout, index: int) -> tuple[float, float, float]:
 # the run
 # ======================================================================
 
-def _run_sweep(run: Path, fit_after: bool, *, include_anchor: bool = False,
+def _run_sweep(calib_file: Path, fit_after: bool, *,
                pmt: "PmtTemperature | None" = None) -> None:
     """Drive every pair's interleaved schedule; optionally fit, plot and save."""
     if not PAIR_INDICES:
         raise ValueError("no pairs to calibrate -- pass --pairs, e.g. --pairs 2,3,4,5,6")
-    layout = _load_layout(run)
-    # The whole chain in the file, stamps and all, before the laser is asked for
-    # anything: a step 3 older than you think is the one failure that does not
-    # announce itself later.
-    load_calib(run).print_chain()
+    layout = _load_layout(calib_file)
+    # The whole chain in the file, stamps and all, before the laser is asked
+    # for anything: a step 3 older than you think is the one failure that does
+    # not announce itself later.
+    load_calib(calib_file).print_chain()
     schedule = build_schedule(CONFIG)
     secs = run_seconds(schedule, ACQ)
     n_verify = len(CONFIG.verify_grid) if CONFIG.verify_enabled else 0
@@ -251,22 +229,32 @@ def _run_sweep(run: Path, fit_after: bool, *, include_anchor: bool = False,
 
     stamp = time.strftime("%m%d_%H%M")
     csv_path = write_meas_csv(rows_by_pair,
-                              CALIB_PATH / f"calib_step6v2_meas_{stamp}.csv",
+                              calib_file.parent / f"calib_step6v2_meas_{stamp}.csv",
                               meta=meta)
     n_rows = sum(len(v) for v in rows_by_pair.values())
     print(f"\nSaved {n_rows} rows to {csv_path}")  # raw rows on disk BEFORE fitting
     if not fit_after:
         return
-    _fit_and_save(rows_by_pair, stamp, run, csv_path, layout=layout,
-                  include_anchor=include_anchor)
+    _fit_and_save(rows_by_pair, calib_file, csv_path, layout=layout)
 
 
-def _fit_and_save(rows_by_pair: dict[int, list], stamp: str, run: Path,
-                  csv_path: Path, *, layout=None,
-                  include_anchor: bool = False) -> None:
-    """Fit every pair, print the report, write the step6 section and the plots."""
+def _fit_and_save(rows_by_pair: dict[int, list], calib_file: Path,
+                  csv_path: Path, *, layout=None) -> None:
+    """Fit every pair, print the report and write the step6 section.
+
+    No pictures: the fit is in the section and the rows are in the CSV it points
+    at, so the GUI's Load redraws any of it on demand, which a PNG cannot.
+
+    The fit reads only the rows -- which levels are the cross line, and so what
+    range eta is the slope over, comes from the file and never from ``CONFIG``,
+    which describes the NEXT sweep.
+    """
     fits: list[PairV2Fit] = []
     bursts: dict[int, list[dict]] = {}
+    # Once, over the whole sweep: the floor is a property of the detector, and
+    # two dark acquisitions are an anecdote where twenty are not.
+    floor = sweep_floor(rows_by_pair)
+    print(f"\nSigma floor: {floor[0]*1e6:.1f} uV [{floor[1]}]")
     for index in sorted(rows_by_pair):
         rows = list(rows_by_pair[index])
         # Loud, because a burst is a BENCH fault, not a statistical nuisance: the
@@ -291,9 +279,9 @@ def _fit_and_save(rows_by_pair: dict[int, list], stamp: str, run: Path,
                       f"{b['voltage_mean_v']*1e3:+.4f} mV with a "
                       f"{b['voltage_std_v']*1e3:.4f} mV trace std "
                       f"({b['voltage_std_v']/quiet:.0f}x the quietest repeat)")
-        levels = average_levels(rows)
+        levels = average_levels(rows, floor=floor)
         try:
-            fit = fit_pair(index, levels, CONFIG, include_anchor=include_anchor)
+            fit = fit_pair(index, levels)
         except (ValueError, np.linalg.LinAlgError) as exc:
             print(f"\n=== pair {index} ===\n  fit FAILED: {exc}")
             continue
@@ -308,37 +296,32 @@ def _fit_and_save(rows_by_pair: dict[int, list], stamp: str, run: Path,
         return
 
     center_wl = float(getattr(layout, "center_wl", 0.0)) if layout is not None else 0.0
-    calib = save_step6_section(fits, run, center_wl=center_wl,
+    calib = save_step6_section(fits, calib_file, center_wl=center_wl,
                                dropped_bursts=bursts, csv=csv_path)
     print(f"\nStep-6 v2 fits -> {calib.path}")
-    for fit in fits:
-        plot_path = Path(run) / f"step6_pair{fit.index}_{stamp}.png"
-        save_plot(fit, plot_path)
-        print(f"Plot saved to {plot_path}")
 
 
-def fit_csv(path: str | Path, run: Path, *, include_anchor: bool = False) -> None:
+def fit_csv(path: str | Path, calib_file: Path) -> None:
     """Re-fit an already-recorded v2 CSV offline (no hardware).
 
-    Writes the step6 section and the per-pair PNGs the hardware run would,
-    REPLACING whatever step 6 the run already held -- one directory, one
-    calibration, and the CSV this came from is recorded in the section.  ``run``
-    is required even here: the fit itself needs only the CSV, but the wavelength
-    labels come from the layout, and a step-3 section that fails to load still
-    leaves the fit runnable with NaN wavelengths.
+    Writes the step6 section the hardware run would, REPLACING whatever that
+    file held, and records the CSV it came from.  To keep the old fit, re-fit
+    against a COPY of the calib.json: the file is the calibration, so copying it
+    is how you get a second opinion without losing the first.
+
+    ``--calib`` is required even here.  The fit needs only the CSV, but the
+    wavelength labels come from the layout -- and a step-3 section that fails to
+    load still leaves the fit runnable, with NaN wavelengths.
     """
     rows_by_pair = load_meas_csv(path)
     n = sum(len(v) for v in rows_by_pair.values())
     print(f"Loaded {path}: {len(rows_by_pair)} pair(s), {n} acquisitions")
-    if include_anchor:
-        print("Anchor: D(0) included as a fitted point (intercept pinned on data).")
     try:
-        layout = _load_layout(run)
+        layout = _load_layout(calib_file)
     except (CalibFileError, FileNotFoundError, ValueError) as exc:
         print(f"(layout unavailable, wavelengths left as NaN: {exc})")
         layout = None
-    _fit_and_save(rows_by_pair, time.strftime("%m%d_%H%M"), run, Path(path),
-                  layout=layout, include_anchor=include_anchor)
+    _fit_and_save(rows_by_pair, calib_file, Path(path), layout=layout)
 
 
 def _index_list(text: str) -> list[int]:
@@ -354,18 +337,19 @@ def _index_list(text: str) -> list[int]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global PAIR_INDICES, CALIB_PATH
+    global PAIR_INDICES
     parser = argparse.ArgumentParser(
         prog="calib_step6_v2.py",
         description="Step 6 v2 -- per-pair TPA efficiency eta (difference estimator).",
-        epilog="--run and --pairs have no default: every level is encoded "
-               "through that run's step-3 section, so running against the wrong "
+        epilog="--calib and --pairs have no default: every level is encoded "
+               "through that file's step-3 section, so running against the wrong "
                "one calibrates a different aperture without failing.",
     )
     parser.add_argument(
-        "--run", required=True, type=Path, metavar="DIR",
-        help="run directory holding calib.json; its step3 section is the "
-             "layout, and the CSV, PNGs and step6 section land there (required)",
+        "--calib", required=True, type=Path, metavar="FILE",
+        help="calib.json whose step3 section is the layout; the CSV and PNGs "
+             "land beside it and the step6 section goes in it; a directory "
+             "means its calib.json (required)",
     )
     parser.add_argument(
         "--pairs", required=True, type=_index_list, metavar="2,3,4",
@@ -378,10 +362,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--meas", "-m", action="store_true",
         help="sweep and write the raw CSV only; do not fit",
-    )
-    parser.add_argument(
-        "--anchor", action="store_true",
-        help="put the measured D(0) into the fit, pinning the intercept on data",
     )
     parser.add_argument(
         "--no-pmt", dest="pmt", action="store_false",
@@ -400,13 +380,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     PAIR_INDICES = args.pairs
-    CALIB_PATH = args.run
-    Path(CALIB_PATH).mkdir(parents=True, exist_ok=True)
+    calib_file = calib_path(args.calib)
 
     if args.csv is not None:            # offline re-fit, no hardware
-        fit_csv(args.csv, args.run, include_anchor=args.anchor)
+        fit_csv(args.csv, calib_file)
         return 0
-    _run_sweep(args.run, fit_after=not args.meas, include_anchor=args.anchor,
+    _run_sweep(calib_file, fit_after=not args.meas,
                pmt=open_pmt(args.pmt_resource, args.pmt_period,
                             enabled=args.pmt))
     return 0

@@ -1,22 +1,21 @@
-"""Drive a list of multi-pair patterns and read each one -- the measurement loop
-steps that verify a forward model share.
+"""Drive a list of multi-pair patterns and read each one.
+
+The measurement loop the steps that verify a forward model share.
+
+In:  a layout, the blocks' commanded ``x``/``w`` arrays, and the forward model.
+Out: one row appended per read to the caller's ``rows`` list, so an interrupted
+     run keeps what it read.
 
 Sibling to :mod:`~calibration_module.measure.pair_v2` (step 6) and
-:mod:`~calibration_module.measure.phase_v2` (step 7), and the same split: the
-*step* file owns its run design, its output format and its fit, while the drive
-loop, the input-range policy and the layout lookup live here, where more than
-one step can reach them.
+:mod:`~calibration_module.measure.phase_v2` (step 7), on the same split: the
+STEP file owns its run design, output format and fit, while the drive loop, the
+input-range policy and the layout lookup live here, where more than one step can
+reach them.
 
-This used to live inside ``steps/calib_npair_verify.py``, which made the step
-file that hosted it a library every later step had to import as ``S8``.  That
-file is gone: its n-pair block verification was superseded by the level sweep
-in :mod:`~calibration_module.steps.calib_step8`, and only this plumbing was
-worth keeping.
-
-Sign.  There is no ``flip`` here, and there must not be: the TIA's
+Sign.  There is no ``flip`` here and there must not be: the TIA's
 negative-for-light output is inverted once, at the read (``acq.invert``).
-:func:`run_patterns` aborts on the first bright pattern that reads below the
-dark rather than hand back a run nothing can be compared against.
+:func:`run_patterns` aborts on the first bright pattern reading below the dark
+rather than hand back a run nothing can be compared against.
 """
 from __future__ import annotations
 
@@ -60,17 +59,16 @@ class PatternsAborted(Exception):
 class PatternsProgress:
     """One read of a sweep -- announced when it starts, again when it lands.
 
-    Announced first because a read IS an averaging window: ten seconds at the
-    bottom of a step-8 ladder, and the opening dark is ten more.  A UI told only
-    about finished reads sits blank through the first fifteen seconds of every
-    run and cannot tell that from a hang, which is the whole reason this exists.
-    ``mean_v`` is ``None`` on the announcement and carries the read's inverted
-    mean once it lands.
+    Announced first because a read IS an averaging window, seconds long, and the
+    opening dark is one more: a UI told only about finished reads sits blank
+    through the start of every run and cannot tell that from a hang.
+    ``mean_v`` is ``None`` on the announcement and carries the inverted mean
+    once the read lands.
 
     ``step`` counts pattern reads FINISHED -- 0 through the opening dark,
     ``total`` once the last pattern lands -- so a bar can be driven off it
-    without knowing that darks are not part of the count.  ``dark_v`` is the
-    dark those reads are measured against, and is 0 on a dark's own events, so
+    without knowing darks are not in the count.  ``dark_v`` is the dark those
+    reads are measured against and is 0 on a dark's own events, so
     :attr:`net_v` is the light signal for a pattern and the dark itself for a
     dark.  ``row`` is the row just appended, extras included, so a caller can
     read back labels this function never interpreted.
@@ -105,10 +103,9 @@ class PatternsProgress:
 ProgressCallback = Callable[[PatternsProgress], None]
 
 
-#: The bench acquisition, re-exported.  A pattern sweep used to declare its own
-#: (10 s dark, 5 s patterns, +/-0.1 V, per-read autoranging); it now takes step
-#: 6's and step 7's, unchanged, because comparing their numbers to this step's
-#: only means anything if they were measured the same way.
+#: The bench acquisition, re-exported: step 6's and step 7's unchanged, because
+#: comparing their numbers to this step's only means anything if they were
+#: measured the same way.
 DEFAULT_ACQ = BENCH_ACQ
 
 
@@ -207,53 +204,43 @@ def run_patterns(daq, slm, layout, blocks, x, w, models, phases, *, rows: list,
                  progress_callback: ProgressCallback | None = None) -> None:
     """Drive every block's patterns; append one row per read to ``rows``.
 
-    ``x`` and ``w`` are ``(len(blocks), patterns, n)``.  ``rows`` is the caller's
-    list, filled as the run goes, so an interrupted run keeps what it read.
-    ``encode`` defaults to ``encode_to_pattern``.
+    In:  ``x`` and ``w`` of shape ``(len(blocks), patterns, n)``, and ``rows``,
+         the caller's list, filled as the run goes.  ``encode`` defaults to
+         ``encode_to_pattern``.  ``y_sat`` is passed to :func:`predict`, so a
+         logged diff and ``pred_v`` use the saturated model; ``None`` keeps it
+         linear.
+    Out: nothing; everything lands in ``rows``, each row carrying ``peak_v``,
+         the raw trace peak, which reaches a CSV only if the caller names it in
+         ``extra``.
 
-    ``extra``, if given, is ``(len(blocks), patterns)`` of mappings merged into
-    each row, so a caller can label its reads without this function knowing what
-    the labels mean.
+    ``extra`` is ``(len(blocks), patterns)`` of mappings merged into each row,
+    so a caller can label its reads without this function knowing what the
+    labels mean.  ``row_hook(row)`` is called with each finished row just before
+    it is appended, for columns that can only be measured DURING the run; it
+    runs between the DAQ read and the next SLM frame, so a slow instrument
+    stretches the run but never overlaps an acquisition.
+    ``progress_callback(p)`` is called TWICE per read -- once when it starts,
+    with ``p.mean_v`` None, and once when it lands -- so a UI can say what it is
+    waiting for instead of going quiet for a whole averaging window; the darks
+    are announced the same way.  Neither callback may raise, and both run on
+    this thread.
 
-    ``row_hook(row)``, if given, is called with each finished row just before it
-    is appended, so a caller can add columns it can only measure *during* the
-    run -- unlike ``extra``, which is fixed before the first read.  It runs
-    between the DAQ read and the next SLM frame, so a slow instrument there
-    stretches the run but never overlaps an acquisition.  It must not raise.
-
-    ``progress_callback(p)``, if given, is called TWICE per read -- once when it
-    starts, with ``p.mean_v`` None, and once when it lands -- so a UI can say
-    what it is waiting for instead of going quiet for a whole averaging window.
-    The all-off darks are announced the same way and carry ``single``.  Like
-    ``row_hook`` it must not raise, and it is called on this thread.
-
-    ``stop_event``, if given, is checked between reads: set it and the loop
-    raises :class:`PatternsAborted` with ``rows`` holding everything read so
-    far.  Between reads, not during one -- a half-finished acquisition is not a
-    reading, and the caller keeps a CSV of whole rows either way.
-
-    Every row also carries ``peak_v``, the raw trace peak of its read -- see
-    :func:`peak_v`.  It reaches a CSV only if the caller names it in ``extra``.
-
-    ``y_sat`` is passed to :func:`predict`, so a pattern's logged diff and
-    ``pred_v`` use the saturated model; ``None`` (the default) keeps it linear.
+    ``stop_event`` is checked BETWEEN reads: set it and the loop raises
+    :class:`PatternsAborted` with ``rows`` holding everything read so far.
+    Between, not during -- a half-finished acquisition is not a reading.
 
     Every read takes the SAME window, the one the caller configured the monitor
-    with.  There used to be a ``t_both_of(pred_v)`` hook that re-configured the
-    DAQ per read so step 8 could run a short window at the bright end of its
-    ladder; it is gone, along with the per-read range change, because a sweep
-    whose points were each measured differently cannot be compared point to
-    point -- which is the whole job of a ladder.
+    with, and the same range.  A sweep whose points were each measured
+    differently cannot be compared point to point, which is a ladder's whole job.
 
     ``dark``, if given, is USED as the all-off level and none is ever read --
-    not the opening one and not the :data:`DARK_EVERY_S` refresh.  It is for a
-    caller that spans many calls to this function and wants one dark for the
-    lot, the way a single-sweep step gets one for free.  :mod:`onn_module.onn_infer`
-    is that caller: it drives its pattern list in ~60 chunks, so the default
-    costs it ~130 dark reads to track a level that moved 0.03 mV over a 14 h run
-    and cancels exactly in a per-image argmax.
+    neither the opening one nor the :data:`DARK_EVERY_S` refresh.  It is for a
+    caller spanning many calls that wants one dark for the lot, the way a
+    single-sweep step gets one for free; :mod:`onn_module.onn_infer` drives its
+    patterns in ~60 chunks, where the default would cost ~130 dark reads to
+    track a level that barely moves and cancels in a per-image argmax.
 
-    Steps 6, 7 and 8 leave it ``None``.  Step 6 in particular must: there the
+    Steps 6, 7 and 8 leave it ``None``.  Step 6 in particular MUST: there the
     all-off read is not an offset to subtract but a fitted point of the
     background block, the same magnitude as the ``a_x``/``a_w`` it anchors.
     """

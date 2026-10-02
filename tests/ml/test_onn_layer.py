@@ -14,8 +14,11 @@ layer deliberately does not model them (they are subtracted on the bench before
 Y is read).  What is compared is |E|^2 through the saturation, which is the whole
 of what the layer claims to compute.
 
-Runs in the ``rbonn-ml`` env; skipped where torch is absent, which includes the
-``rbonn`` hardware env.
+Runs in the ``rbonn-ml`` env only -- torch is absent from the ``rbonn``
+hardware env, where every test here would skip. That is why this file sits in
+``tests/ml/`` and not in ``tests/``: ``unittest discover -s tests`` does not
+recurse into it, so the hardware suite is not padded with 17 skipped rows.
+Run it with ``python -m unittest discover -s tests/ml`` under ``rbonn-ml``.
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
 from calibration_module.fit.phase import PairModel, phi_half  # noqa: E402

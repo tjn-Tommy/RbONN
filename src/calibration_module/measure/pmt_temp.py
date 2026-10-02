@@ -32,26 +32,24 @@ __all__ = ["PMT_PERIOD_S", "PmtTemperature", "open_pmt"]
 class PmtTemperature:
     """The PMT thermistor on the Keithley 2400, as a per-read row hook.
 
-    The instrument configuration is *not* redefined here: it is imported from
+    Out: the two cells in :attr:`COLUMNS`.  :meth:`sample` returns them, for
+    callers building rows as tuples (steps 6 and 7), and ``__call__(row)``
+    stamps a row dict in place, for callers with a dict row hook.
+
+    The instrument configuration is NOT redefined here -- it is imported from
     ``drafts/daq_pmt_monitor.py``, which owns it, so the temperature logged
-    beside an accuracy run and the one logged by the long-term monitor can
-    never come from two different setups.  The read itself is
-    ``monitor_lib.read_ohm_2400``: a fresh GPIB session per reading with the
-    output ON only while it measures, so the bead is not self-heated in
-    between.
+    beside a run and the one logged by the long-term monitor cannot come from
+    two different setups.  Each read is a fresh GPIB session with the output on
+    only while it measures, so the bead is not self-heated in between.
 
-    Readings are cached for ``period_s``.  A step-6 sweep is ~350 reads but the
-    PMT's thermal time constant is minutes, so sampling once a minute costs
-    ~20 GPIB reads instead of 350 and adds seconds, not minutes, to a sweep.
-    Each sample fills the row it lands on and every row until the next one.
+    Readings are cached for ``period_s``: the PMT's thermal time constant is
+    minutes, so sampling once a minute turns a sweep's ~350 reads into ~20 and
+    adds seconds rather than minutes.  Each sample fills the row it lands on and
+    every row until the next.
 
-    Two ways to use it: :meth:`sample` returns the cells (for callers that build
-    rows as tuples, like steps 6 and 7), and ``__call__(row)`` stamps a row dict
-    in place (for callers with a dict row hook, like the accuracy run).
-
-    Never raises: the 2400 failing blanks the two cells and prints why, once
-    per failure streak, and the run goes on without it -- losing the
-    temperature must not lose the night.
+    Never raises.  A failing 2400 blanks the cells and prints why, once per
+    failure streak, and the run goes on: losing the temperature must not lose
+    the night.
     """
 
     COLUMNS = ("pmt_ohm_Ohm", "pmt_c")
