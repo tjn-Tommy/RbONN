@@ -50,7 +50,7 @@ except ImportError:                                   # the rbonn hardware env
     HAVE_TORCH = False
 
 #: A step-7 run with all ten pairs calibrated end to end.
-STEP7 = REPO / "src" / "calib_data" / "calib_0917_1617" / "calib.json"
+STEP7 = REPO / "src" / "calib_data" / "archive" / "2026-09" / "calib_0917_1617" / "calib.json"
 
 needs_torch = unittest.skipUnless(HAVE_TORCH, "torch not installed (rbonn-ml env only)")
 

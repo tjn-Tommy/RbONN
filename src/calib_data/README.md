@@ -3,8 +3,12 @@
 Measured calibration and accuracy data, one folder per run. The CSV and JSON
 are tracked; **PNGs are gitignored** (`.gitignore`: `src/calib_data/**/*.png`)
 because every one of them is regenerable from the CSV/JSON beside it via the
-step's own `save_plot`. That is why the folder is ~75 MB on disk but only
-~13 MB in git.
+step's own `save_plot`.
+
+Only the run in progress sits at the top level. Everything earlier lives under
+`archive/<YYYY-MM>/` by the month it started, moved with `git mv` so history
+follows it, and with its PNGs deleted (regenerate any you need from the CSV
+beside it). The whole folder is ~55 MB on disk.
 
 ## Naming
 
@@ -46,17 +50,26 @@ not free — see below.
 
 ## Do not move these without updating the tests
 
-Six runs are fixtures for the test suite. Renaming or archiving one breaks
+These runs are fixtures for the test suite. Renaming or archiving one breaks
 tests with a path error, not an assertion, so it is easy to misread:
 
 | folder | used by |
 |---|---|
-| `calib_0917_1617/` | `tests/test_system_accuracy.py` |
-| `run_0911_10pairs_w20g30/` | `tests/test_system_accuracy.py`, `tests/test_levels.py` |
-| `run_0916_10pairs_w15g35/` | `tests/test_gui_step7.py`, `tests/test_cascade.py` |
+| `archive/2026-09/calib_0917_1617/` | `tests/test_calib_step8.py`, `tests/ml/test_onn_layer.py`, `onn_module/finetune.py` (default calib) |
+| `archive/2026-09/run_0911_10pairs_w20g30/` | `tests/test_calib_step8.py`, `tests/test_levels.py`, `tests/test_gui_app.py` |
+| `archive/2026-09/run_0916_10pairs_w15g35/` | `tests/test_cascade.py`, `tests/test_gui_step7.py`, `tests/test_gui_app.py` |
+| `archive/2026-09/run_0928/` | `tests/test_gui_app.py` |
+| `archive/2026-09/run_0929/` | `tests/test_pair_v2.py`, `tests/test_phase_report.py`, `tests/test_gui_step7.py` |
+| `archive/2026-09/run_0930/` | `tests/test_sigma_floor.py`, `tests/test_gui_calib_json.py`, `tests/test_gui_app.py`, `tests/test_step123_cli.py` |
+| `archive/2026-09/run_0930_noYsat/` | `tests/test_sigma_floor.py` |
 | `archive/2026-09/run_0907_1724/` | `tests/test_pair_v2.py`, `tests/test_gui_step6.py`, `tests/test_gui_step7.py` |
 | `archive/2026-09/run_0908_1300/` | `tests/test_npair_verify.py` |
 | `archive/2026-09/run_0908_1444/` | `tests/test_step67_cli.py`, `tests/test_gui_step6.py` |
+
+A test must assert on the CSVs, never on a run's `calib.json` section: the
+bench rewrites that section every time a step is re-run on the folder
+(`run_0930_noYsat`'s step 7 was, on 10-01, and a test that read the section
+broke for a week).
 
 To re-check the list:
 

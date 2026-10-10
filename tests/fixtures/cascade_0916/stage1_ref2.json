@@ -1,9 +1,9 @@
 {
   "step7": {
     "ref_index": 2,
-    "csv": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\run_0916_10pairs_w15g35\\calib_step7_meas_0916_2015.csv",
+    "csv": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\archive\\2026-09\\run_0916_10pairs_w15g35\\calib_step7_meas_0916_2015.csv",
     "single_beam_bg": true,
-    "step6_json": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\run_0916_10pairs_w15g35\\calib_step6v2_result_0916_1958.json",
+    "step6_json": "C:\\Users\\weishan\\Desktop\\RbONN\\src\\calib_data\\archive\\2026-09\\run_0916_10pairs_w15g35\\calib_step6v2_result_0916_1958.json",
     "channels": [
       {
         "tgt_index": 4,

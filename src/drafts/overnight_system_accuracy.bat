@@ -8,7 +8,7 @@ setlocal EnableDelayedExpansion
 cd /d "C:\Users\weishan\Desktop\RbONN"
 
 set "PY=C:\Users\weishan\.conda\envs\rbonn\python.exe"
-set "STEP7=.\src\calib_data\calib_0917_1617\calib_step7_result_0917_1831.json"
+set "STEP7=.\src\calib_data\archive\2026-09\calib_0917_1617\calib_step7_result_0917_1831.json"
 rem OUT is stamped with THIS batch's start time, so a night of accuracy
 rem runs can never land in the calibration folder it was built from.
 for /f %%d in ('powershell -NoProfile -Command "Get-Date -Format MMdd_HHmm"') do set "OUT=.\src\calib_data\accuracy_%%d"

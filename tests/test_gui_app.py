@@ -747,9 +747,9 @@ class Step8ProbeTests(unittest.TestCase):
 
     REPO = Path(__file__).resolve().parents[1]
     CANDIDATES = (
-        "src/calib_data/run_0928/calib.json",
-        "src/calib_data/run_0916_10pairs_w15g35/calib.json",
-        "src/calib_data/run_0911_10pairs_w20g30/calib.json",
+        "src/calib_data/archive/2026-09/run_0928/calib.json",
+        "src/calib_data/archive/2026-09/run_0916_10pairs_w15g35/calib.json",
+        "src/calib_data/archive/2026-09/run_0911_10pairs_w20g30/calib.json",
     )
 
     @classmethod
@@ -1134,7 +1134,7 @@ class Step8WritesItselfTests(unittest.TestCase):
         """ONE input: the calib file. Its step8 section says which sweep."""
         import calibration_module.fit.step8_report as REPORT
 
-        run = self.REPO / "src/calib_data/run_0930"
+        run = self.REPO / "src/calib_data/archive/2026-09/run_0930"
         if not (run / "calib.json").is_file():          # pragma: no cover
             self.skipTest("run_0930 is not in this checkout")
         from calibration_module.calib_file import load_calib

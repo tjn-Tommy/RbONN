@@ -1,40 +1,32 @@
 """
 Differentiable optical-neural-network layer (RbONN forward model).
 
-Per channel k the two SLM arms encode x_k, w_k in [0, 1] as half-phases
-u_k = asin(sqrt(x_k)) and v_k = asin(sqrt(w_k)), and the K channels interfere
-coherently on one detector:
+In:  a feature vector, and `ONNParams` (eta, Phi, Y_sat) from
+     `onn_module.params`.  This file parses no calibration.
+Out: O outputs.  The hardware has one detector, so O outputs means re-using the
+     same K channels with O weight vectors, eta/Phi being a channel property.
+     More than K inputs runs as `n_tiles` shots of K whose readings are ADDED:
+     coherent within a shot, incoherent between.
+
+The model.  Per channel k the two SLM arms encode x_k, w_k in [0, 1] as
+half-phases u_k = asin(sqrt(x_k)) and v_k = asin(sqrt(w_k)), and the K channels
+interfere coherently on one detector:
 
     E = sum_k  eta_k sqrt(x_k w_k) exp( i [ s*(u_k + v_k) + Phi_k ] )
     Y = |E|^2 / (1 + |E|^2 / Y_sat)
 
 `s` is `phase_sign`: +1 is the project convention, -1 the `exp(j(Phi - u - v))`
-of rbonn_3pair_sweep.py.  A fitted Phi_k means nothing without the sign it was
-fitted under, so it is explicit and never guessed.  The single-beam backgrounds
-and the dark are NOT modelled -- the bench subtracts them before Y is read, so
-the layer works in those same units.
+of rbonn_3pair_sweep.py.  The single-beam backgrounds and the dark are not
+modelled; the bench subtracts them before Y is read.
 
-In:  a feature vector, and `ONNParams` (eta, Phi, Y_sat) from
-     `onn_module.params`.  This file parses no calibration and holds no sign
-     convention of its own.
-Out: O outputs.  The hardware has ONE detector, so O outputs means re-using the
-     same K channels with O weight vectors, eta/Phi being a channel property.
-     More than K inputs runs as `n_tiles` shots of K whose readings are ADDED:
-     coherent within a shot, incoherent between, which is a genuinely different
-     (weaker) operator than one wide coherent sum, and is what the hardware can
-     actually do.
+How `forward()` evaluates it: the closed form
+sqrt(x) e^{iu} = sqrt(x(1-x)) + i x factorises E into a complex matrix product,
+with no asin.  `forward_reference()` evaluates the equations literally,
+`--selftest` checks the two agree, and `tests/ml/test_onn_layer.py` pins
+`forward()` against `calibration_module.fit.verify.predict` to 1e-12.
 
-`forward()` uses the closed form sqrt(x) e^{iu} = sqrt(x(1-x)) + i x, which
-factorises E into a complex matrix product -- no asin, and no 1/sqrt(x(1-x))
-blow-up from differentiating it.  `forward_reference()` evaluates the equations
-literally, `--selftest` checks the two agree, and `tests/ml/test_onn_layer.py`
-pins `forward()` against `calibration_module.fit.verify.predict`, the numpy
-original, to 1e-12 -- that test is what makes this a port of the project's one
-forward model rather than a second one.
-
-The calibration is registered NON-persistent, so it never travels in a
-checkpoint: a checkpoint carrying eta/Phi would silently restore the calibration
-it was trained under and make `--calib` a no-op on every load.
+The calibration is registered non-persistent, so it never travels in a
+checkpoint and `--calib` sets it on every load.
 
 CLI
     python layer.py --template onn_params.json
@@ -71,24 +63,23 @@ class ONNLayer(nn.Module):
         weight_parametrization: "phase" (default) trains the SLM half-phase,
                       w = sin^2((pi/2) sigmoid(theta)), so w stays in (0, 1) and
                       nothing is clamped; "direct" trains w itself, clamped to
-                      [eps, 1-eps], whose gradients die at the bounds.
+                      [eps, 1-eps].
         n_tiles:      this many successive K-channel shots, readings summed; the
                       layer then accepts n_tiles * K features, each tile with its
                       own weights.
         input_map:    squash features into [0, 1] -- "clamp" (already in range),
                       "sigmoid" (smooth, but 0 -> 0.5, i.e. half on), "tanh"
                       (0 -> 0, negatives off, for post-ReLU conv features).
-        input_gain:   learnable per-channel scale+shift before input_map, the
-                      digital stand-in for laser power / SLM drive trim.
-        differential: two weight banks, Y = Y_plus - Y_minus -- how a signed
-                      weight is realised where Y is otherwise non-negative.
+        input_gain:   learnable per-channel scale+shift before input_map.
+        differential: two weight banks, Y = Y_plus - Y_minus, for signed weights
+                      on a detector where Y is otherwise non-negative.
         readout:      "none", "scale" (per-output gain, no bias; see
                       :meth:`calibrate_readout`), "affine" (gain and bias).
         trainable_calibration: let eta/Phi drift during training.  Off by
-                      default -- they are measurements, not weights.
+                      default.
         drive_bits:   quantize BOTH arms to 2**bits settings per channel, what an
-                      N-bit SLM drive can display.  None is continuous, i.e.
-                      optimistic.  See :meth:`_quantize`.
+                      N-bit SLM drive can display.  None is continuous.  See
+                      :meth:`_quantize`.
         drive_levels: the x values each channel can actually produce, (K, L),
                       overriding drive_bits' uniform grid.  Fill it from the
                       step-3c transfer fits.
@@ -129,13 +120,9 @@ class ONNLayer(nn.Module):
         self.phase_sign = params.phase_sign
         self.channels = params.channels
 
-        # persistent=False: the calibration must NOT travel in a checkpoint.
-        # A buffer is in state_dict() by default, so load_state_dict would put
-        # the eta/Phi the run was trained under back over the ones just loaded
-        # from --calib -- silently, and strict=True would not complain because
-        # the keys match.  Every recalibration would then be a no-op on any
-        # model that was ever saved.  eta and Phi are measurements; the
-        # calibration file is their only home.
+        # persistent=False keeps the calibration out of state_dict(), so
+        # load_state_dict cannot put the eta/Phi a run was trained under back
+        # over the ones --calib just loaded.
         kind = nn.Parameter if trainable_calibration else (lambda t: t)
         for name in ("eta", "phi"):
             t = getattr(params, name).clone()
@@ -163,12 +150,10 @@ class ONNLayer(nn.Module):
         else:
             grid, self.drive_bits = None, None
         if grid is not None:
-            # Held off the hard ends for the same reason _input_arm clamps: the
-            # arms are sqrt(x) and sqrt(1-x), whose derivative is infinite at 0.
-            # A grid built on [0, 1] therefore has a level that produces a NaN
-            # gradient as soon as any channel snaps to it -- and the off level is
-            # the one a dark channel snaps to constantly.  eps is 1e-6 against a
-            # 4-bit step of 0.067, so nothing physical moves.
+            # Off the hard ends, as _input_arm clamps: the arms are sqrt(x) and
+            # sqrt(1-x), whose derivative is infinite at 0, so a grid level at
+            # 0 or 1 gives a NaN gradient to any channel that snaps to it.  eps
+            # is 1e-6 against a 4-bit step of 0.067.
             grid = grid.clamp(eps, 1.0 - eps)
         self.register_buffer("drive_levels", None if grid is None else grid.contiguous(),
                              persistent=False)
@@ -206,15 +191,11 @@ class ONNLayer(nn.Module):
 
     @torch.no_grad()
     def clamp_(self, limit: float = 4.0) -> None:
-        """Keep the raw weights inside the range where gradients survive.
+        """Clamp the raw weights to +/-4.  Call after every optimizer step.
 
-        Call after every optimizer step.  With w = sin^2((pi/2) sigmoid(theta)),
-        a theta that runs off to -30 saturates sigmoid: the channel is dark,
-        every output collapses to the same value, softmax goes uniform, and
-        sigmoid' ~ 0 leaves no gradient to climb back out.  Cross-entropy reaches
-        that plateau the moment the quickest way down is to stop predicting at
-        all, so it is not a rare accident.  +/-4 still spans w in [8e-4, 0.9992],
-        wider than any real SLM's contrast, so nothing physical is given up.
+        That spans w in [8e-4, 0.9992], wider than any real SLM's contrast, and
+        keeps theta out of sigmoid saturation, where the channel is dark and
+        sigmoid' ~ 0 leaves no gradient.
         """
         if self.weight_parametrization == "phase":
             self.raw_weight.clamp_(-limit, limit)
@@ -229,9 +210,8 @@ class ONNLayer(nn.Module):
     def _weight_arm(self):
         """(sin v, cos v) = (sqrt(w), sqrt(1-w)).
 
-        The weight arm is displayed on the same panel as the input arm, so it is
-        quantized on the same grid -- a 4-bit bench gives 16 settings for w as
-        well as for x, and w is the arm a training run is free to place.
+        Quantized on the same grid as the input arm, both being displayed on the
+        same panel.
         """
         if self.weight_parametrization == "phase":
             v = HALF_PI * torch.sigmoid(self.raw_weight)
@@ -245,11 +225,9 @@ class ONNLayer(nn.Module):
     def _drive_raw(self, x: Tensor) -> Tensor:
         """Scale, shift and squash -- every digital step but the final clamp.
 
-        Kept separate because the clamp is a hard gradient wall: once a
-        channel's tanh has gone negative the clamp pins it at eps and
-        d(output)/d(in_scale) is exactly 0, so no loss term can pull it back.
-        Before the clamp that same channel reads negative, which is where its
-        gradient still lives.  See drive_headroom.
+        Separate from :meth:`drive` so :meth:`drive_headroom` can read a channel
+        before the clamp, which is a hard gradient wall: past it a negative tanh
+        is pinned at eps and d(output)/d(in_scale) is exactly 0.
         """
         if self.in_scale is not None:
             x = x * self.in_scale + self.in_shift
@@ -263,31 +241,24 @@ class ONNLayer(nn.Module):
         """Snap a drive to the values the panel can actually display.
 
         In:  ``drive_levels``, the x values one channel can produce, (K, L).
-        Out: the drive snapped onto that grid, STRAIGHT-THROUGH -- the rounding
+        Out: the drive snapped onto that grid, straight-through -- the rounding
              is subtracted back out of the graph, so the forward pass sees the
-             quantized drive and the backward pass the gradient of the continuous
-             one.  Without that d(round)/dx = 0 and the input gain would have no
-             gradient at all.
+             quantized drive and the backward pass the gradient of the
+             continuous one.
 
-        The SLM takes an integer grayscale level, so leaving this out makes every
-        simulated accuracy optimistic: a 4-bit drive is 16 settings per channel,
-        and the interference is a coherent sum, so the error does not average away
-        over 79 shots the way an incoherent one would.  A grid from
-        ``drive_bits`` alone is uniform in x, which the hardware is NOT -- it is
-        uniform in grayscale LEVEL, and x = sin^2(retardance/2) is not linear in
-        level.  Pass the real per-channel grid (a step-3c
-        ``TransferFit.intensity`` over its encoding window) to remove that.
+        A grid from ``drive_bits`` alone is uniform in x; the hardware is uniform
+        in grayscale LEVEL, and x = sin^2(retardance/2) is not linear in level.
+        Pass a step-3c ``TransferFit.intensity`` over its encoding window for the
+        real per-channel grid.
         """
         grid = self.drive_levels                      # (K, L)
         # |x - level| over the grid, nearest wins.  x is (..., K); unsqueeze a
         # level axis so the comparison broadcasts against (K, L).
         j = (x.unsqueeze(-1) - grid).abs().argmin(dim=-1)
         snapped = torch.gather(grid.expand(*x.shape, -1), -1, j.unsqueeze(-1)).squeeze(-1)
-        # `snapped + (x - x.detach())`, not `x + (snapped - x).detach()`: the
-        # second is only snapped to within a rounding error, so the drive would
-        # take a few more distinct values than the panel has levels.  Here
+        # `snapped + (x - x.detach())`, not `x + (snapped - x).detach()`:
         # x - x.detach() is exactly 0.0, so the forward value is bit-for-bit a
-        # grid point while the gradient is still 1.
+        # grid point.  The second form snaps only to within a rounding error.
         return snapped.detach() + (x - x.detach())
 
     def _input_arm(self, x: Tensor):
@@ -305,12 +276,10 @@ class ONNLayer(nn.Module):
                              f"({self.n_tiles} tiles x {self.in_features}), "
                              f"got {x.shape[-1]}")
         if x.shape[-1] < self.features:
-            # Padded with 0, but NOT dark: in_scale/in_shift are applied after
-            # this, so a pad channel is driven at tanh(in_shift[k]) -- measured
-            # up to 0.758 on a trained onn784.  They are image-independent, so
-            # they act as a fixed reference beam interfering with the real
-            # channels of the last tile.  Any bench reconstruction needs their
-            # drive values, not just the real features.
+            # Padded with 0, but NOT dark: in_scale/in_shift run after this, so
+            # a pad channel is displayed at tanh(in_shift[k]) and interferes
+            # with the last tile's real channels.  A bench reconstruction needs
+            # these drive values, not just the real features.
             x = torch.nn.functional.pad(x, (0, self.features - x.shape[-1]))
         return x.view(-1, self.n_tiles, self.in_features)
 
@@ -318,31 +287,21 @@ class ONNLayer(nn.Module):
     def drive(self, x: Tensor) -> Tensor:
         """The SLM transmissions this input asks for: (batch, n_tiles, K).
 
-        Everything in front of this -- in_scale, in_shift, input_map, the
-        clamp -- is digital preprocessing that happens in the computer before
-        any light is modulated.  `drive` is the handover point: these numbers,
-        in [0, 1], are what the modulator is told to display.
+        The handover point: these numbers, in [0, 1], are what the modulator is
+        told to display.  in_scale, in_shift, input_map and the clamp all run in
+        front of it, in the computer.
         """
         return self._input_arm(self._tiles(x))[0]
 
     def drive_headroom(self, x: Tensor, top_frac: float = 0.01) -> Tensor:
         """Per channel, how far the bright tail falls short of full scale.
 
-        Out: a penalty for the loss, which is what pays for drive.  Cross-entropy
-        has no SNR term, so nothing else stops the learned input gain parking a
-        channel in the dark, contributing nothing while still being shot n_tiles
-        times.
+        Out: a penalty for the loss, which pays for drive.  Two-sided: each
+        channel's top pulled to 1 AND its bottom held at 0.
 
-        Two-sided, and it has to be: the target is each channel's TOP pulled to 1
-        AND its BOTTOM held at 0.  tanh(x * in_scale + in_shift) can raise its top
-        by in_scale, lifting the bright features, or by in_shift, lifting
-        everything -- and the second is the cheaper gradient, so a one-sided
-        reward takes it and the contrast goes.  Holding the bottom at 0 closes
-        that route, and costs nothing at initialisation, where in_shift = 0.
-
-        Measured BEFORE the clamp, so a channel that has already gone dark still
-        has a gradient (see :meth:`_drive_raw`).  That also lets the value exceed
-        1, and the reported drive = 1 - sqrt(headroom) go negative.
+        Measured on ``_drive_raw``, before the clamp, so a channel that has gone
+        dark still has a gradient.  The value can therefore exceed 1, and the
+        reported ``drive = 1 - sqrt(headroom)`` go negative.
         """
         d = self._drive_raw(self._tiles(x))                  # (B, T, K)
         per_chan = d.permute(2, 0, 1).reshape(self.in_features, -1)
@@ -394,21 +353,13 @@ class ONNLayer(nn.Module):
                           only_if_below: Optional[float] = None) -> float:
         """Set the detector gain from one batch.  Returns the spread it found.
 
-        Y is an intensity of order eta^2 and tiling stacks n_tiles of them, so
-        every output sits on a large common mode with only a small variation
-        between outputs -- typically ~0.03 V.  Softmax ignores the common mode,
-        so that spread is what matters, and a softmax over 0.03 V cannot put more
-        than 1/n_out plus a few percent on any class: cross-entropy sits at
-        log(n_out) and the gradients never grow enough to escape.  One rescaling
-        of the bias-free gain fixes it -- detector gain, the same knob as the
-        bench's transimpedance amplifier, adding no offset, so a logit is still
-        nothing but the coherent quadratic sum.
+        How: rescale the bias-free readout gain so the spread ACROSS outputs
+        reaches ``target``.  That spread, not the common mode softmax ignores, is
+        what a logit needs, and it runs ~0.03 V untouched -- under a softmax
+        that is a flat 1/n_out and cross-entropy sits at log(n_out).
 
-        ``only_if_below`` makes this a one-sided automatic gain control: the gain
-        is raised only once the spread has fallen below that floor, the one
-        situation the head cannot recover from by itself.  Called once per epoch
-        it costs one batch and makes "turn every channel off" a dead end rather
-        than an absorbing state.
+        ``only_if_below`` rescales only once the spread has fallen under that
+        floor, making this a one-sided automatic gain control.
         """
         if self.readout == "none":
             return 0.0
@@ -448,15 +399,12 @@ def onn_linear(in_features: int, out_features: int,
                params: Optional[ONNParams] = None, **kw) -> ONNLayer:
     """nn.Linear(in_features, out_features) -> ONNLayer, tiled to fit the bench.
 
-    ``in_features`` is how many features the layer must swallow; the channel
-    count comes from the calibration, and the layer is tiled into however many
-    shots that needs.  ``out_features`` must fit within K: the O weight vectors
-    are multiplexed onto the same channels and read one at a time off the single
-    detector, so a sample costs ``n_tiles * O`` measurements.
+    In:  ``in_features``, how many features the layer must swallow.  The channel
+         count K comes from the calibration.  ``out_features`` must fit within K.
+    Out: the layer, tiled into as many shots as ``in_features`` needs.  A sample
+         then costs ``n_tiles * O`` measurements.
 
-    Y is a non-negative intensity of order eta^2, so a bare ONNLayer makes a poor
-    logit head; ``readout="scale"`` gives it a trainable detector gain (no bias --
-    the logit stays a pure coherent quadratic sum).
+    ``readout="scale"`` gives it a trainable detector gain, no bias.
     """
     k = (params or ONNParams.ideal(in_features)).n_channels
     if out_features > k:

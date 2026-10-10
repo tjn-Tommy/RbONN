@@ -1,5 +1,12 @@
 """MNIST CNN with a digital or an optical classifier head.
 
+In:  MNIST, and ``--calib`` for the eta/Phi to train against.  ``--finetune
+     CKPT`` starts from a trained head instead of from scratch, which is what
+     this is for on the bench PC: one short fine-tune after a recalibration.
+Out: ``runs/<model>/`` -- config.json, metrics.csv (written every epoch),
+     result.json, model.pt and PNGs -- plus the same numbers to trackio unless
+     ``--no-trackio``.
+
 The convolutional trunk is identical in all three models; only the head that
 turns 16x7x7 feature maps into 10 logits changes.
 
@@ -8,31 +15,18 @@ turns 16x7x7 feature maps into 10 logits changes.
            bench has 10 channels and holds a 10x10 weight block at a time, so
            784 inputs run as 79 successive shots whose readings are summed.
   onn49    mean over the 16 channels -> Flatten(49) -> ONN(49 -> 10).  The same
-           map in 5 shots.  Averaging over channels is exactly the big Linear
-           with its weights tied across channels: 16x cheaper, and it throws
-           away WHICH kernel fired at a pixel while keeping WHERE.
+           map in 5 shots.  Averaging over channels is the big Linear with its
+           weights tied across channels.
 
-In:  MNIST, and ``--calib`` for the eta/Phi to train against.  What this exists
-     for on the bench PC is one short fine-tune after a recalibration --
-     ``--finetune CKPT`` carries a trained head onto fresh optics, the checkpoint
-     holding weights only -- and ``--model all`` still trains all three from
-     scratch, which is how that checkpoint was made.
-Out: ``runs/<model>/`` -- config.json, metrics.csv (written every epoch, so it
-     survives a crash), result.json, model.pt and PNGs -- plus the same numbers
-     to trackio unless ``--no-trackio``.
+Two consequences of going optical.  NO BIAS: a logit is the weighted coherent
+quadratic sum, and the only digital step after the detector is a per-output gain
+(readout "scale").  NO NEGATIVE WEIGHTS: w lives in [0, 1] so Y >= 0, and
+``--onn-differential`` runs each shot twice and subtracts (Y+ - Y-).
 
-Two consequences of going optical, both deliberate.  NO BIAS: a logit is nothing
-but the weighted coherent quadratic sum, and the only digital step after the
-detector is a per-output gain (readout "scale"), because Y is of order
-eta^2 ~ 0.1 V and a softmax over that spread cannot train.  NO NEGATIVE WEIGHTS:
-w lives in [0, 1] so Y >= 0 always, and ``--onn-differential`` runs each shot
-twice and subtracts (Y+ - Y-), which is how a signed weight is realised on the
-bench.
-
-``--noise`` adds Gaussian noise of that std to every image, train and test alike,
-after ToTensor and before clamping back to [0, 1]; the final table reports clean
-and noisy accuracy both.  Runs in the ``rbonn-ml`` conda env (torch, torchvision,
-sklearn), not ``rbonn``.
+``--noise`` adds Gaussian noise of that std to every image, train and test
+alike, after ToTensor and before clamping back to [0, 1]; the final table
+reports clean and noisy accuracy both.  Runs in the ``rbonn-ml`` conda env
+(torch, torchvision, sklearn), not ``rbonn``.
 
     python src/onn_module/finetune.py --model all --epochs 15 --noise 0.1
     python src/onn_module/finetune.py --model onn784 --tag recal --epochs 3
@@ -73,7 +67,7 @@ LEGACY_WEIGHTS = str(REPO_ROOT / "runs" / "checkpoints" / "part2.pt")
 #: The calibration a run defaults to.  Point --calib at a run's calib.json; its
 #: step-6/7 sections give eta and Phi, and a step-8 section the fitted Y_sat
 #: (see onn_module.params).  A file with no step 8 runs unsaturated.
-DEFAULT_CALIB = str(REPO_ROOT / "src" / "calib_data" / "calib_0917_1617"
+DEFAULT_CALIB = str(REPO_ROOT / "src" / "calib_data" / "archive" / "2026-09" / "calib_0917_1617"
                     / "calib.json")
 
 MODELS = ("bench", "onn784", "onn49")
@@ -102,10 +96,8 @@ class AddGaussianNoise:
 def make_transforms(noise=0.0):
     """(train, eval) transforms.  Augmentation is train-only; noise is on both.
 
-    RandomAffine works on the PIL image, so it has to run before ToTensor.
-    Validation and test must see un-augmented digits, otherwise the score
-    measures the augmentation rather than the model -- but they *do* get the
-    noise, since noise is part of the task we are measuring robustness to.
+    RandomAffine works on the PIL image, so it runs before ToTensor.  Noise is
+    part of the task being measured, so the eval transform keeps it.
     """
     train = transforms.Compose([
         transforms.RandomAffine(
@@ -130,10 +122,9 @@ def load_test_set(noise=0.0):
 def load_train_val(noise=0.0, n_subset=None, val_frac=0.1):
     """Split MNIST's 60k training images into a train part and a validation part.
 
-    Two dataset objects over the *same* files, because the two splits need
-    different transforms: the training part gets augmented, the validation
-    part must not be.  Each then gets a disjoint slice of one seeded
-    permutation, so no image appears in both.
+    How: two dataset objects over the same files, so each split can carry its
+    own transform (the train part augmented, the validation part not), each
+    taking a disjoint slice of one seeded permutation.
     """
     train_tf, eval_tf = make_transforms(noise)
     train_pool = datasets.MNIST(root=DATA_ROOT, train=True, download=True,
@@ -152,11 +143,10 @@ def load_train_val(noise=0.0, n_subset=None, val_frac=0.1):
 
 # ----------------------------------------------------------------- model ----
 class ChannelMean(nn.Module):
-    """(B, 16, 7, 7) -> (B, 1, 7, 7).  784 features become 49.
+    """(B, 16, 7, 7) -> (B, 1, 7, 7).  784 features become 49, so 5 optical
+    shots instead of 79.
 
-    Equivalent to the full Linear(784, 10) with its weights tied across the
-    channel axis, so nothing is gained that the big layer could not already
-    do -- the point is that 49 inputs is 5 optical shots instead of 79.
+    Equivalent to Linear(784, 10) with its weights tied across the channel axis.
     """
 
     def forward(self, x):
@@ -176,18 +166,13 @@ def build_model(kind="bench", p_conv=0.15, p_fc=0.3, p_head=None,
         <head>                       -> 10 class scores
 
     The convs use bias=False, BatchNorm erasing any bias straight after and
-    adding its own shift.  Dropout2d drops whole channels, not pixels:
-    neighbouring pixels in a feature map are correlated enough that dropping
-    them singly removes almost no information.
+    adding its own shift.  Dropout2d drops whole channels, not pixels.
     """
     if kind not in MODELS:
         raise ValueError(f"model: {kind!r}, expected one of {MODELS}")
-    # Dropout in front of an ONN head is not the same operation as dropout in
-    # front of a Linear one.  Inverted dropout divides the survivors by 1-p so
-    # that the *linear* sum keeps its mean; the ONN output is |sum|^2, and the
-    # same rescaling leaves it at ~0.79x its eval value.  The head then trains
-    # under one gain and is evaluated under another, which is enough to tip it
-    # into the all-channels-dark collapse.  So p_head defaults to 0.
+    # p_head defaults to 0: inverted dropout divides the survivors by 1-p to
+    # keep a LINEAR sum's mean, and the ONN output is |sum|^2, which the same
+    # rescaling leaves at ~0.79x its eval value.
     p_head = p_fc if p_head is None else p_head
 
     layers = [
@@ -216,10 +201,8 @@ def build_model(kind="bench", p_conv=0.15, p_fc=0.3, p_head=None,
 def lr_scale(args):
     """How much to soften the learning rates.  1.0 for a fresh run.
 
-    A fine-tune restarts the cosine schedule at its peak, and the peak is sized
-    for a randomly initialised head.  Applied to an already-trained one it is a
-    large step in epoch 1 -- the same thing --grad-clip and --onn-clamp exist to
-    survive -- and what it destroys is the model being fine-tuned.
+    A fine-tune restarts the cosine schedule at its peak, and that peak is sized
+    for a randomly initialised head.
     """
     return args.finetune_lr_scale if args.finetune else 1.0
 
@@ -241,10 +224,9 @@ def param_groups(model, args):
 def calibrate_readout(model, loader, device, target_std=1.0, floor=None):
     """Give an ONN head a detector gain that a softmax can actually use.
 
-    Runs one batch through the frozen trunk, catches what reaches the head,
-    and rescales the head's bias-free output gain so the spread across the 10
-    logits is ~target_std.  Without this the ONN heads sit at chance forever:
-    see ONNLayer.calibrate_readout.
+    How: run one batch through the frozen trunk, catch what reaches the head,
+    and rescale the head's bias-free output gain so the spread across the 10
+    logits is ~``target_std``.  See :meth:`ONNLayer.calibrate_readout`.
     """
     head = model[-1]
     if not isinstance(head, ONNLayer) or head.readout == "none":
@@ -269,11 +251,9 @@ def calibrate_readout(model, loader, device, target_std=1.0, floor=None):
 def load_checkpoint(model, path, device, kind, missing=None):
     """Load weights into `model`, reporting what the file did and did not carry.
 
-    A checkpoint holds weights only: the calibration is registered non-persistent
-    (see :meth:`ONNLayer.__init__`), so eta and Phi always come from ``--calib``
-    and never from the file, which is what makes fine-tuning against a fresh
-    step 6/7 mean anything.  The eta actually in force is printed, because "did
-    my recalibration take effect" is the first question a fine-tune raises.
+    A checkpoint holds weights only -- the calibration is registered
+    non-persistent (see :meth:`ONNLayer.__init__`), so eta and Phi come from
+    ``--calib``.  The eta actually in force is printed.
     """
     if not os.path.exists(path):
         raise SystemExit(missing or f"--finetune {path} not found")
@@ -456,10 +436,7 @@ def train_one(kind, args, device, onn_params, data):
     ckpt = os.path.join(out, "model.pt")
 
     # Both generators: torch.manual_seed does NOT reseed the MPS device RNG,
-    # and that is the one Dropout draws from on a Mac.  Without this line a
-    # run's dropout stream depends on whatever ran before it in the same
-    # process, so --model all and --model onn784 are different experiments and
-    # --seed does not actually vary anything.
+    # which is the one Dropout draws from on a Mac.
     torch.manual_seed(args.seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(args.seed)
@@ -487,9 +464,8 @@ def train_one(kind, args, device, onn_params, data):
     if isinstance(head, ONNLayer):
         config.update(n_tiles=head.n_tiles, n_channels=head.in_features,
                       # One detector: the O weight vectors share the K
-                      # channels and are measured one after another, so a
-                      # sample costs n_tiles * out_features readings, not
-                      # n_tiles.
+                      # channels and are read one after another, so a sample
+                      # costs n_tiles * out_features readings.
                       shots_per_sample=head.n_tiles * head.out_features
                                        * (2 if head.differential else 1))
     write_json(os.path.join(out, "config.json"), config)
@@ -519,22 +495,17 @@ def train_one(kind, args, device, onn_params, data):
                     f"training would overwrite the file it started from.\n"
                     f"Pass a different --tag (the run directory is {out}).")
             load_checkpoint(model, args.finetune, device, kind)
-        # AFTER any load, and that ordering is the point: a recalibration moves
-        # eta, Y scales as eta^2, and the out_scale saved in the checkpoint was
-        # fitted to the old one.  Re-running the one-shot gain calibration is
-        # exactly what a fine-tune against a new step 6/7 needs.
+        # AFTER any load: a recalibration moves eta, Y scales as eta^2, and the
+        # out_scale in the checkpoint was fitted to the old one.
         calibrate_readout(model, train_loader, device, args.onn_logit_std)
         loss_fn = nn.CrossEntropyLoss()
-        # AdamW, not Adam: it applies weight decay as true decay rather than
-        # folding it into the gradient, which is what "decay" should mean.
-        #
-        # The ONN head gets its own, larger learning rate.  Its weights are
-        # SLM phases, and w = sin^2((pi/2) sigmoid(theta)) compresses the
-        # gradient by dw/dtheta <= 0.2, so at the trunk's rate the head
-        # converges several times slower than the conv stack it sits on.
-        # The penalty needs the head's *input*, which model(images) does not
-        # hand back.  A pre-hook stashes the live tensor, so the drive is
-        # recomputed on the same graph and the gradient reaches in_scale.
+        # AdamW, not Adam: weight decay as true decay, not folded into the
+        # gradient.  The ONN head gets its own, larger learning rate -- its
+        # weights are SLM phases, and w = sin^2((pi/2) sigmoid(theta))
+        # compresses the gradient by dw/dtheta <= 0.2.
+        # The penalty needs the head's INPUT, which model(images) does not hand
+        # back, so a pre-hook stashes the live tensor: the drive is recomputed
+        # on the same graph and the gradient reaches in_scale.
         drive_on = isinstance(head, ONNLayer)
         captured = {}
         if drive_on:
@@ -551,12 +522,9 @@ def train_one(kind, args, device, onn_params, data):
         for epoch in range(args.epochs):
             spread = None
             if args.onn_agc > 0:
-                # One-sided gain control, once per epoch.  Cross-entropy can
-                # descend into "predict nothing": every channel dark, every
-                # logit equal, loss pinned at ln(10) -- which is *worse* than
-                # where it came from, so it is an overshoot that it then
-                # cannot undo.  Raising the gain when the spread collapses
-                # gives the phases a gradient again.
+                # One-sided gain control, once per epoch: raise the gain when
+                # the logit spread collapses, which gives the phases a gradient
+                # again instead of leaving the loss pinned at ln(10).
                 spread = calibrate_readout(model, train_loader, device,
                                            args.onn_logit_std,
                                            floor=args.onn_agc * args.onn_logit_std)

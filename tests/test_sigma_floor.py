@@ -17,7 +17,11 @@ rows underneath it.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,6 +48,7 @@ from calibration_module.fit.phase import (  # noqa: E402
     load_pair_models,
     load_phase_csv,
 )
+from calibration_module.steps.calib_step7_v2 import fit_csv  # noqa: E402
 from calibration_module.fit.sigma import (  # noqa: E402
     STD_FLOOR_V,
     FloorSource,
@@ -51,8 +56,8 @@ from calibration_module.fit.sigma import (  # noqa: E402
     measured_floor,
 )
 
-NOYSAT = REPO / "src/calib_data/run_0930_noYsat"
-BRIGHT = REPO / "src/calib_data/run_0930"
+NOYSAT = REPO / "src/calib_data/archive/2026-09/run_0930_noYsat"
+BRIGHT = REPO / "src/calib_data/archive/2026-09/run_0930"
 S6_DIM = NOYSAT / "calib_step6v2_meas_0930_2041.csv"
 S6_BRIGHT = BRIGHT / "calib_step6v2_meas_0930_1325.csv"
 S7_DIM = NOYSAT / "calib_step7_meas_0930_2112.csv"
@@ -222,12 +227,40 @@ class RecordedInTheSectionTests(unittest.TestCase):
                          FloorSource.INHERITED.value)
 
     def test_the_repaired_dark_is_on_the_record(self) -> None:
-        """A repaired run must never read as a clean one."""
+        """A repaired run must never read as a clean one.
+
+        Re-fits the 21:12 sweep into a COPY of the run: the committed
+        ``calib.json`` holds whatever step 7 ran last on that bench (a clean
+        10-01 re-run, as it happens), so the section on disk is not the
+        evidence -- what ``fit_csv`` writes from the railed sweep is.  That
+        re-run also left step-6 models for pairs 2, 4 and 6 only, so the copy
+        of the sweep keeps just those targets: pair 4 with its railed dark and
+        pair 6 to lend it a replacement.
+        """
+        import csv as csvmod
         import json
 
-        payload = json.loads((NOYSAT / "calib.json").read_text(encoding="utf-8"))
-        overrides = payload["step7"]["dark_overrides"]
-        self.assertIn("4", overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run"
+            run.mkdir()
+            shutil.copy(NOYSAT / "calib.json", run / "calib.json")
+            csv = run / S7_DIM.name
+            with open(S7_DIM, newline="", encoding="utf-8") as src:
+                lines = src.readlines()
+            rows = csvmod.DictReader(ln for ln in lines if not ln.startswith("#"))
+            keep = {"4", "6"}
+            with open(csv, "w", newline="", encoding="utf-8") as dst:
+                dst.writelines(ln for ln in lines if ln.startswith("#"))
+                out = csvmod.DictWriter(dst, fieldnames=rows.fieldnames)
+                out.writeheader()
+                out.writerows(r for r in rows if r["tgt_index"] in keep)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fit_csv(csv, run / "calib.json")
+            payload = json.loads((run / "calib.json").read_text(encoding="utf-8"))
+        section = payload["step7"]
+        self.assertEqual(section["csv"], S7_DIM.name)
+        overrides = section["dark_overrides"]
+        self.assertEqual(list(overrides), ["4"])
         self.assertAlmostEqual(overrides["4"]["recorded_v"], 0.345741872, places=9)
         self.assertIn("ceiling", overrides["4"]["reason"])
 

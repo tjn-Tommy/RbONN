@@ -1545,7 +1545,8 @@ class LegacyIntensityFitTests(unittest.TestCase):
     """What is left of the old sin^2 fit.
 
     ``legacy_intensity`` is still reachable: ``fit.outliers`` uses its model and
-    one GUI page loads a CSV through it. Its loader is already exercised by
+    the v1 scripts re-fit historical CSVs through it.  No GUI page does any
+    more -- Step 3 fits the live transfer model.  Its loader is exercised by
     ``test_write_intensity_calibration_csv_matches_legacy_loader`` above; these
     two cover the rest of it, and are all that survived ``tests/test_calibration.py``.
     """

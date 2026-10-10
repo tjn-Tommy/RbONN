@@ -64,19 +64,23 @@ bench side. The simulation carries none of them — it produces the `Y` that
 comes out of this step.
 
 `g` is **measured during the run**, anchored to the run's own first minute.
-`onn_infer` solves ten ladder rungs over `alpha = 0.5..1` of `Y_max` with step
-8's own builder (top capped at step 8's 450 mV ceiling), reads them right after
-the dark — that block *defines* `g = 1` — and replays the same drives every 20
-minutes; `g` is the slope of `(V_now - dark)` against `(V_first - dark)` through
-the origin. Identical SLM frames on both sides, so `eta`, `Phi` and `Y_sat` all
-cancel. Each inference read is then corrected with `g` interpolated in time
-between the two blocks that bracket it.
+`onn_infer` solves ten ladder rungs over `GAIN_BAND` of `Y_max` with step 8's
+own builder (top capped at step 8's 450 mV ceiling) and reads them right after
+the dark. That first block fits `g0`, the slope of `(V - dark)` against the
+model's linear prediction through the origin, so `g` is in the model's units
+from the start (run_1001 defined `g = 1` there instead and carried its +2.3 %
+gap to the model through the whole run). The same drives are replayed every 20
+minutes and `g = g0 * s`, with `s` the slope of `(V_now - dark)` against
+`(V_first - dark)` through the origin: identical SLM frames on both sides, so
+`eta`, `Phi` and `Y_sat` all cancel and no model enters the ratio. Each
+inference read is then corrected with `g` interpolated in time between the two
+blocks that bracket it.
 
 Each anchor block is checked on its own: a rung more than `GAIN_TOL` (4 %) off
 the block's fitted slope is dropped from that fit and written as
 `kind=gain_drop`. The first block judges against the model's prediction, re-reads
 what it drops once, and a rung off twice leaves the ladder for the run; later
-blocks judge against the g = 1 volts. This exists because run_1001 showed single
+blocks judge against the first block's volts. This exists because run_1001 showed single
 anchor reads 4–6 % high with an ordinary trace std — a level shift lasting the
 whole window, invisible to the step-6/7 trace guards. Inference reads are never
 checked.

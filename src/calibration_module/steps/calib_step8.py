@@ -16,10 +16,9 @@ Out: into that file's folder, and its ``step8`` section --
          stopped.
      ``calib_step8_<MMDD_HHMM>_ysat.png``      the three-panel report.
 
-Steps 6 and 7 read at most ~66 mV, where the atoms are linear to ~1%, so both
-are fitted linear.  Neither can see the one thing that matters once a real
-computation drives the full scale: the readout is ``|E|^2 / (1 + |E|^2/Y_sat)``,
-not ``|E|^2``.  This step measures that one constant and nothing else.
+Steps 6 and 7 read at most ~66 mV and are both fitted linear.  Once a real
+computation drives the full scale the readout is ``|E|^2 / (1 + |E|^2/Y_sat)``,
+not ``|E|^2``; this step measures that one constant and nothing else.
 
 The sweep
 ---------
@@ -27,31 +26,25 @@ ONE band: ``n`` rungs stratified over ``alpha_lo``..``alpha_hi``, where alpha is
 the fraction of ``Y_max``, the reachable ceiling of ``|E|^2``.  Each rung is a
 fresh random drive found by least-move projection onto its level set
 (:mod:`calibration_module.fit.levels`), and the band is shuffled before it is
-driven -- level order would alias slow drift straight onto the level axis, the
-axis being measured.  30 rungs is about five minutes.
+driven, so level order cannot alias slow drift onto the level axis.  30 rungs is
+about five minutes.
 
 The band is a per-run setting (``--alpha-lo``, ``--alpha-hi``, ``--n``, or the
-GUI's two alpha boxes).  ``--max-mv`` spells ``--alpha-hi`` in MILLIVOLTS for
-when the amplifier is what you are thinking about, converted through this
-model's ``Y_max`` by :func:`alpha_for_volts`.  Alpha is what gets stored either
-way, together with the millivolts it meant and the ``Y_max`` connecting them: a
-bare alpha is not interpretable after a gain change, because alpha follows the
-PMT gain and the amplifier does not.
+GUI's two alpha boxes).  ``--max-mv`` spells ``--alpha-hi`` in MILLIVOLTS,
+converted through this model's ``Y_max`` by :func:`alpha_for_volts`.  Alpha is
+what gets stored either way, together with the millivolts it meant and the
+``Y_max`` connecting them -- alpha follows the PMT gain and the amplifier does
+not, so a bare alpha is not interpretable after a gain change.
 
 PLACE THE BAND HIGH.  A rung's information about ``1/Y_sat`` goes as
-``(Y^2/sigma)^2``, so the bottom of the scale carries essentially none of it;
-thirty rungs over the bright end return ``Y_sat`` to ~4%, against the ~11% it
-would have to be wrong by before it cost as much as the per-pattern model error
-beside it.
-
-But not to full scale.  :data:`LADDER_CEILING_V` is 450 mV against a ``Y_max``
-of ~1534 mV, for two reasons, neither about the atoms: the amplifier rails at
-:data:`AMP_LIMIT_V` and COMPRESSES somewhere below that, which bends the top of
-the ladder down exactly the way saturation does and which the one-parameter fit
-cannot tell apart; and nothing downstream goes there anyway, an inference run's
-brightest read being ~400 mV.  The fitted form ``1/y = 1/Y + 1/Y_sat`` is fixed,
-not a local expansion, so a ``Y_sat`` levered at 450 mV is just as valid at 260.
-What matters is that the ladder BRACKETS the range the machine uses.
+``(Y^2/sigma)^2``, so thirty rungs over the bright end return ``Y_sat`` to ~4%.
+But not to full scale: :data:`LADDER_CEILING_V` is 450 mV against a ``Y_max`` of
+~1534 mV, because the amplifier rails at :data:`AMP_LIMIT_V` and COMPRESSES
+below it, which bends the top of the ladder down the way saturation does and
+which the one-parameter fit cannot tell apart.  The fitted form
+``1/y = 1/Y + 1/Y_sat`` is exact, not a local expansion, so what matters is that
+the ladder BRACKETS the range the machine uses -- an inference run's brightest
+read is ~400 mV.
 
 Every prediction here -- ``pred_v``, the input range, the read window -- is the
 LINEAR model: fitting a saturation constant from a sweep that already assumed
@@ -61,63 +54,60 @@ range it picks is always wide enough.
 The gain anchor
 ---------------
 The fit has one free parameter: the detector gain is pinned to ``g = 1``, which
-is a DEFINITION, not a claim that the gain is 1.  Any gain error is absorbed
-into ``Y_sat``, levered by ``Y_sat / Y_max``, about 12x here.  So this run's
-``Y_sat`` and this run's reads are ONE OBJECT.  Downstream, a computation
-re-drives a handful of this sweep's own ladder patterns -- row by row in the
-CSV, seed in the JSON -- and the ratio of its reads to this run's on the same
-drives IS ``g``, free of ``Y_sat``, ``eta`` and the phases, the SLM frame being
-identical.  The prediction is then::
+is a DEFINITION.  Any gain error is absorbed into ``Y_sat``, levered by
+``Y_sat / Y_max``, about 12x here, so this run's ``Y_sat`` and this run's reads
+are ONE OBJECT.  Downstream, a computation re-drives a handful of this sweep's
+own ladder patterns -- row by row in the CSV, seed in the JSON -- and the ratio
+of its reads to this run's on the same drives IS ``g``, free of ``Y_sat``,
+``eta`` and the phases, the SLM frame being identical.  The prediction is then::
 
     Y_pred = g * Y / (1 + Y / Y_sat)
 
-Gain outside the saturation, on physical grounds: the atoms saturate on the
-light they receive and the PMT amplifies afterwards.
+Gain outside the saturation: the atoms saturate on the light they receive and
+the PMT amplifies afterwards.
 
 RUN THIS IMMEDIATELY AFTER STEP 7, in the same sitting.  ``pred_v`` is step
 6/7's ``eta`` in step 6/7's VOLTS and nothing here floats a scale, so any gain
-drift between the two is absorbed entirely into ``Y_sat``, levered ~15x: a 1%
-drift moves it 28%, a 2% drift 72%, and the rmse barely moves either way -- the
-fit looks clean while it is wrong.  Only past ~5% does ``unbounded`` fire.  The
-gain wanders ~1%/h, so every hour of staleness costs ~15% of ``Y_sat``.
+drift between the two goes entirely into ``Y_sat``, levered ~15x: a 1% drift
+moves it 28%, a 2% drift 72%, and the rmse barely moves either way.  Only past
+~5% does ``unbounded`` fire.  The gain wanders ~1%/h.
 
 One range and one window
 ------------------------
 :data:`~calibration_module.measure.pair_v2.RANGE_V` and
 :data:`~calibration_module.measure.pair_v2.T_MEAS_S`, for every read including
-the darks -- the same ones steps 6 and 7 use.  A per-read range puts the board's
-per-range offset difference into every dark subtraction that crosses a boundary;
-a window that varies along the level axis puts a window-dependent systematic on
-exactly the axis :func:`~calibration_module.fit.verify.fit_y_sat` reads.
-``range_v`` records the one range and ``peak_v`` the raw trace peak, so a
-flat-top is visible after the fact.
+the darks -- the same ones steps 6 and 7 use.  A per-read range would put the
+board's per-range offset difference into every dark subtraction that crosses a
+boundary, and a window that varied along the level axis would put a
+window-dependent systematic on the axis
+:func:`~calibration_module.fit.verify.fit_y_sat` reads.  ``range_v`` records the
+one range and ``peak_v`` the raw trace peak, so a flat-top is visible after the
+fact.
 
 Alpha is coherent, and single_beam is subtracted
 ------------------------------------------------
 ``FS = Y_max`` excludes the single-beam background, so every level is on
-``|E|^2`` alone and the fit subtracts the model's background from each read.
-It is small but it RAMPS with level, and a ramp coherent with level is exactly
-what a saturation fit looks for, so leaving it in would bias ``Y_sat``.  Raw
-``voltage_mean_v`` and ``dark_v`` are never touched -- ``sb_pred_v`` is a column
-and the subtraction happens in the fit.
+``|E|^2`` alone and the fit subtracts the model's background from each read.  It
+is small but it RAMPS with level, and a ramp coherent with level is what a
+saturation fit looks for.  Raw ``voltage_mean_v`` and ``dark_v`` are never
+touched: ``sb_pred_v`` is a column and the subtraction happens in the fit.
 
 The probe
 ---------
 :func:`probe_verdict` and :func:`print_probe` display ONE level, read it once
 and write nothing, reporting it against the linear model and against
 :data:`AMP_LIMIT_V`.  :func:`display_alpha` is the same level with the read left
-off -- SLM, no DAQ -- for looking at the frame, or at what the frame does to
-something this detector is not measuring.
+off -- SLM, no DAQ.
 
 That is the tool for the question :data:`LADDER_CEILING_V` answers: walk alpha
 up and watch for the read falling behind the linear prediction faster than one
 constant can explain, or the raw peak approaching the rail.  Re-run it after any
-change in optical power or PMT gain, since ``Y_max`` scales with both and the
+change in optical power or PMT gain, ``Y_max`` scaling with both while the
 amplifier does not.
 
 ``--pmt`` logs the PMT thermistor (Keithley 2400, ohms and TH10K degrees) beside
-every read, cached for ``--pmt-period`` seconds since the bead's time constant
-is minutes.  A 2400 that fails blanks the columns rather than ending the run.
+every read, cached for ``--pmt-period`` seconds.  A 2400 that fails blanks the
+columns rather than ending the run.
 
 Not a unittest (it needs real hardware) -- run it directly.
 """
@@ -244,11 +234,10 @@ def run_seconds(n_reads: int, acq: PairV2Acq = ACQ) -> float:
 def alpha_for_volts(y_max_v: float, volts: float = LADDER_CEILING_V) -> float:
     """``volts`` as a fraction of ``Y_max`` -- the mV spelling of an alpha.
 
-    The numbers that decide a band are voltages (the rail, the compression
-    point, how bright an inference run reads) and none of them move when the PMT
-    gain does, while alpha does -- so a figure argued in volts is converted
-    against the forward model in hand, not typed in once as an alpha and left to
-    drift.  Clamped to 1: a model dimmer than ``volts`` cannot reach it.
+    Converted against the forward model in hand, the voltages that decide a band
+    (the rail, the compression point, how bright an inference run reads) not
+    moving with the PMG gain while alpha does.  Clamped to 1: a model dimmer
+    than ``volts`` cannot reach it.
     """
     fs = float(y_max_v)
     if not fs > 0:
@@ -261,10 +250,9 @@ def pattern_for_alpha(models, phases, pairs, alpha: float, *, seed: int,
     """One solved drive at ``alpha`` -- a rung, or the frame to display.
 
     At ``alpha == 1`` the level set is a single point, which
-    :func:`full_scale_pattern` has in closed form; below that the set has
-    diversity and this is an ordinary solved rung.  That is what makes it right
-    for :func:`display_alpha` and the probe: what goes on the panel is a drive
-    the sweep could have chosen.
+    :func:`full_scale_pattern` has in closed form; below that it is an ordinary
+    solved rung, so what :func:`display_alpha` and the probe put on the panel is
+    a drive the sweep could have chosen.
     """
     if alpha >= 1.0 - 1e-9:
         return replace(full_scale_pattern(models, phases, pairs, label=label),
@@ -396,11 +384,9 @@ def _drive(calib_file, pairs, patterns, preds, coh, models, phases, *,
            pmt: "PmtTemperature | None" = None):
     """Display every pattern in read order and write the CSV, partial or not.
 
-    ``extra_of(i, pattern)`` adds per-read columns beyond the standard ones;
-    ``columns`` names them, in CSV order.  Every read takes ``ACQ.t_meas_s``.
-
-    ``pmt``, if given, adds its two columns to every read and brackets the run
-    with a reading in the meta.
+    ``extra_of(i, pattern)`` adds per-read columns beyond the standard ones and
+    ``columns`` names them in CSV order.  Every read takes ``ACQ.t_meas_s``.
+    ``pmt`` adds its two columns and brackets the run with a reading in the meta.
     """
     x = np.stack([p.x for p in patterns])[None]      # (1 block, P, n)
     w = np.stack([p.w for p in patterns])[None]
@@ -471,11 +457,9 @@ def display_alpha(slm, layout, models, phases, pairs, alpha: float, *,
     """Solve the drive for one ``alpha`` and put it on the panel.  Nothing else.
 
     No DAQ, no read, nothing written -- the whole difference from
-    :func:`probe_verdict`.  For looking at the frame, or at what the frame does
-    to something this detector is not measuring, or for leaving a known level up
-    while the bench is adjusted.
+    :func:`probe_verdict`.
 
-    Out: the pattern, so a caller can report what was ACHIEVED -- the projection
+    Out: the pattern, so a caller can report what was ACHIEVED; the projection
     lands near the requested alpha, not exactly on it.
     """
     from slm_module.encoding import encode_to_pattern
@@ -516,19 +500,17 @@ def probe_verdict(*, alpha: float, y_max_v: float, coherent_v: float,
     """One displayed level and one read: what the bench did with it.
 
     In:  ``coherent_v`` and ``sb_pred_v``, the LINEAR predictions for the drive
-         displayed -- :func:`~calibration_module.fit.verify.predict` with
-         ``coherent=True``, and the single-beam background it leaves out -- plus
+         displayed (:func:`~calibration_module.fit.verify.predict` with
+         ``coherent=True``, and the single-beam background it leaves out), plus
          the read itself.
     Out: a dict of verdicts, including an indicative ``Y_sat`` from inverting
-         the one read.  Saturation acts on the coherent part alone, the
-         background being per-beam detector response rather than TPA field::
+         the one read.  Saturation acts on the coherent part alone::
 
              Y_sat = coh * m / (coh - m),    m = (mean - dark) - sb
 
-    ONE read: a preview of what the sweep will fit, not a replacement, and
-    meaningless if the read was clipped.  Clipping is called on the RAW trace
-    peak, never the mean -- the 20 Hz low-pass pulls a flat top back under the
-    rail, so a clipped read still reports a reasonable mean.
+    A preview of what the sweep will fit, not a replacement, and meaningless if
+    the read was clipped.  Clipping is called on the RAW trace peak, never the
+    mean: the 20 Hz low-pass pulls a flat top back under the rail.
     """
     coh = float(coherent_v)
     meas = float(mean_v) - float(dark_v)

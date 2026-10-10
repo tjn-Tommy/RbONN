@@ -21,7 +21,7 @@ from calibration_module.fit import levels  # noqa: E402
 from calibration_module.fit.phase import PairModel  # noqa: E402
 from calibration_module.fit.verify import full_scale, predict  # noqa: E402
 
-RUN = ROOT / "src" / "calib_data" / "run_0911_10pairs_w20g30"
+RUN = ROOT / "src" / "calib_data" / "archive" / "2026-09" / "run_0911_10pairs_w20g30"
 STEP7 = RUN / "calib.json"
 
 

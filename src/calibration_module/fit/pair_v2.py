@@ -2,8 +2,8 @@
 
 In:  arrays of commanded levels and measured volts -- live from
      :mod:`calibration_module.measure.pair_v2`, or from a saved measurement CSV
-     through :func:`load_meas_csv`, which is what lets the whole estimator
-     re-run with the bench powered down.
+     through :func:`load_meas_csv`, which re-runs the whole estimator with the
+     bench powered down.
 Out: a :class:`PairV2Fit` per pair (``eta`` and its error, the background
      parameters, the product check), written as the run's ``step6`` section by
      :func:`save_step6_section`.
@@ -18,30 +18,24 @@ Along the cross line x = 1, subtract the w-only background::
 
     D(w) = Y(1, w) - Bhat(w) = eta^2 w + (a_x + q_x)
 
-``a_w``, ``q_w`` and ``d`` cancel identically, so they play no part in eta, and
-``a_x``/``q_x`` survive only as their sum.  eta is then the slope of a
-two-parameter straight line, needing no assumption about the shape of the
-single-beam background.  That is what makes it immune to v1's joint
-6-parameter fit, where misfit on the x-only line leaked through the shared
-``d`` into the cross line's slope/intercept split.
+``a_w``, ``q_w`` and ``d`` cancel identically, and ``a_x``/``q_x`` survive only
+as their sum, so eta is the slope of a two-parameter straight line and needs no
+assumption about the shape of the single-beam background.
 
 ``Bhat(w) = a_w w + d`` is FITTED, not measured: the w-only block sits at
 w in {0.5, 1} and the cross block at w in {0.2, 0.45, 0.7, 0.9}, so no
 point-by-point partner exists.  Every D therefore shares the background
-parameters and the D points are CORRELATED -- the background covariance is
+parameters and the D points are CORRELATED, so the background covariance is
 propagated into a full covariance for D and the slope is a GLS solution against
-it, not an ordinary one.  Treating them as independent re-introduces the very
-leak this estimator removes.
+it.
 
 The q columns are off by default (:attr:`PairV2Config.fit_q`): with two drive
-levels per arm plus dark they saturate the background block, and a saturated
-block splits one measured curve between ``a`` and ``q`` arbitrarily, routinely
-landing on a negative one or the other.  Dropped, ``a_x x + a_w w + d`` has
-2 dof and the residual is printed with every fit.
+levels per arm plus dark they saturate the background block.  Dropped,
+``a_x x + a_w w + d`` has 2 dof and the residual is printed with every fit.
 
 There is no separate fit window -- the window IS the ramp the sweep drove, so a
-re-fit needs nothing but the CSV.  The fitted w range is reported, since the
-cross line is not exactly straight and eta is the slope over THAT range.
+re-fit needs nothing but the CSV.  The fitted w range is reported, the cross
+line not being exactly straight.
 
 Verification
 ------------
@@ -49,10 +43,9 @@ One check, printed with every fit and feeding nothing.  The model says ``Y``
 depends on the drives only through ``x*w``, so two levels sharing a product but
 splitting the drive differently must leave the same TPA residue.  The groups are
 found in the data (:func:`product_groups`), so a recorded CSV carries its own
-check.  A split does not mean the estimator is wrong -- it means the pair has NO
-single eta, which would invalidate the one-number-per-pair model steps 7 and 8
-are built on.  The slope fit cannot catch it: a drive-split tilt is nearly
-linear in w along x = 1 and is absorbed into the slope and intercept.
+check.  A split means the pair has NO single eta, which would invalidate the
+one-number-per-pair model steps 7 and 8 are built on; the slope fit cannot catch
+it, a drive-split tilt being nearly linear in w along x = 1.
 
 ``verify_enabled=False`` gives the bare grid, and the check then reports itself
 as not measured rather than silently passing.
@@ -64,13 +57,11 @@ measures ENCODING repeatability and not just detector jitter::
 
     sigma = hypot(max(rep_std, trace_std) / sqrt(n_repeats), floor)
 
-``trace_std`` is a floor only, so two repeats that happen to agree cannot
-manufacture an infinite weight.  ``floor`` is the sweep's own systematic floor
--- the median trace std of its dark acquisitions, pooled over every pair
-(:func:`sweep_floor`) -- so it is a voltage and follows the detection gain.
-Repeats average down statistical noise but not a systematic, so it goes on
-AFTER the ``/sqrt(n)``.  A sweep with no dark level cannot be fitted: there is
-nothing to measure the floor from and no constant stands in.
+``trace_std`` is a floor only.  ``floor`` is the sweep's own systematic floor --
+the median trace std of its dark acquisitions, pooled over every pair
+(:func:`sweep_floor`) -- so it is a voltage and follows the detection gain, and
+it goes on AFTER the ``/sqrt(n)``.  A sweep with no dark level cannot be fitted:
+there is nothing to measure the floor from and no constant stands in.
 """
 
 from __future__ import annotations
@@ -159,16 +150,13 @@ DEFAULT_VERIFY_GRID: tuple[tuple[float, float, int], ...] = (
 class PairV2Config:
     """The sweep's specification -- what to drive, and the two fit switches.
 
-    The grid is what a SWEEP drives; a re-fit never needs it, reading the levels
-    off the rows instead, so a recorded CSV is fitted the way it was measured
-    whatever this says.  Carried on every :class:`PairV2Fit` for ``params_bg``
-    and the pair-label convention.
+    The grid is what a SWEEP drives; a re-fit reads the levels off the rows
+    instead.  Carried on every :class:`PairV2Fit` for ``params_bg`` and the
+    pair-label convention.
 
-    Only the FIT's parameters live here.  Acquisition timing belongs to
-    :class:`~calibration_module.measure.pair_v2.PairV2Acq`, and the sigma floor
-    deliberately does not appear at all: it has one owner, in
-    :mod:`calibration_module.fit.sigma`, and a per-run override would make
-    published eta_err values incomparable.
+    Only the FIT's parameters live here: acquisition timing is on
+    :class:`~calibration_module.measure.pair_v2.PairV2Acq` and the sigma floor
+    in :mod:`calibration_module.fit.sigma`.
     """
 
     #: Levels the sweep drives for the estimator.  See :data:`DEFAULT_GRID`.
@@ -196,16 +184,13 @@ class PairV2Config:
                   **kw) -> "PairV2Config":
         """Rebuild the grid with an evenly spaced cross-line ramp.
 
-        Only the cross line is replaced -- the part eta is the slope of.  The
-        single-beam block is the five levels :func:`fit_background` needs, and
-        the verification block is defined by its product, so a ramp changes
-        neither.  The fit then uses exactly these levels: the window IS the
-        ramp.  Four repeats per level, six on the last, where the slope has the
-        most leverage.
+        Only the cross line is replaced, the part eta is the slope of; the
+        single-beam block stays the five levels :func:`fit_background` needs and
+        the verification block is defined by its product.  Four repeats per
+        level, six on the last.  The fit then uses exactly these levels.
 
         A DIFFERENT grid from :data:`DEFAULT_GRID`, whose cross levels are not
-        evenly spaced, so results on the two are not identical.  A re-fit of an
-        existing CSV sees neither, only the CSV's own levels.
+        evenly spaced.  A re-fit of an existing CSV sees only the CSV's levels.
         """
         lo, hi, n = float(sweep_min), float(sweep_max), int(points)
         if n < 2:
@@ -361,22 +346,15 @@ def burst_rows(rows, *, k: float = BURST_K_REPEAT,
                rail_v: float = BURST_MAX_V) -> np.ndarray:
     """Boolean mask of ``rows`` that are bursts, not measurements.
 
-    Each row is judged against the other repeats of its OWN ``(x, w)`` cell
+    How: each row is judged against the other repeats of its OWN ``(x, w)`` cell
     (:func:`~calibration_module.fit.outliers.flag_burst_repeats`), not against
-    the sweep: the sweep spans dark to full scale, so its trace stds vary ~100x
-    and it reads an honest full-scale point as a burst.  Repeats of one cell
-    agree to 1.6x at the 99th percentile across every run on disk.
+    the sweep, whose trace stds vary ~100x from dark to full scale.
 
-    Never empties a cell -- if every repeat of one is flagged, all are kept.  A
-    level with no acquisitions drops out of the design matrix and changes which
-    model is fitted, which is worse than a known-bad level the caller was warned
-    about.
-
-    That reprieve does NOT extend to the absolute ceiling
-    (:func:`~calibration_module.fit.outliers.flag_over_range`): a read past
-    :data:`~calibration_module.fit.outliers.BURST_MAX_V` is a railed detector,
-    and keeping the matrix square by re-admitting it would fit the model to the
-    rail.  Such a cell is dropped and ``fit_pair`` says so.
+    Never empties a cell: if every repeat of one is flagged, all are kept.  The
+    absolute ceiling is the exception
+    (:func:`~calibration_module.fit.outliers.flag_over_range`) -- past
+    :data:`~calibration_module.fit.outliers.BURST_MAX_V` the detector is
+    railed, so the cell is dropped and ``fit_pair`` says so.
     """
     rows = list(rows)
     if not rows:
@@ -398,17 +376,12 @@ def burst_rows(rows, *, k: float = BURST_K_REPEAT,
 def sweep_floor(rows_by_pair) -> tuple[float, str]:
     """This step-6 sweep's sigma floor, from its own all-off acquisitions.
 
-    Out: ``(volts, source)``.  The grid's dark level is commanded with both arms
-    off, so what it still fluctuates by is the additive electronics term and
-    nothing else.
+    Out: ``(volts, source)`` -- the median trace std of the ``(0, 0)`` rows,
+    pooled across every pair, the floor being a property of the detector.
 
-    Pooled across every pair, not per pair: two repeats is an anecdote, twenty
-    is a measurement, and the floor is a property of the detector.  Selected by
-    COMMANDED drive, never by voltage, so a sweep sitting on a stray-light
-    pedestal still reports the noise its points actually carry.
-
-    Every real grid has the dark level.  A file with no ``(0, 0)`` rows raises:
-    there is nothing to measure from, and no constant stands in.
+    Rows are selected by COMMANDED drive, never by voltage, so a sweep sitting
+    on a stray-light pedestal still reports the noise its points carry.  A file
+    with no ``(0, 0)`` rows raises: no constant stands in.
     """
     means: list[float] = []
     stds: list[float] = []
@@ -439,11 +412,9 @@ def sweep_floor(rows_by_pair) -> tuple[float, str]:
 def step6_floor(run) -> tuple[float, str]:
     """A run's step-6 sigma floor, for the steps that inherit it (step 7).
 
-    Out: ``(volts, INHERITED)``.  Normally the section's own
-    ``sigma_floor_v``; an older step 6 recorded none but still names its CSV,
-    which holds the dark rows, so the floor is measured now the way
-    :func:`sweep_floor` would have.  A run with neither raises -- there is no
-    constant to fall back on.
+    Out: ``(volts, INHERITED)`` -- the section's own ``sigma_floor_v``, or, for
+    an older step 6 that recorded none, measured from the CSV it names the way
+    :func:`sweep_floor` would have.  A run with neither raises.
     """
     from calibration_module.calib_file import CalibFileError, load_calib
 
@@ -476,16 +447,12 @@ def average_levels(rows, *, drop_bursts: bool = True,
     """Group raw ``(rep, x, w, mean_v, std_v)`` rows into repeat-averaged levels.
 
     Rows may carry the two PMT-thermistor cells after ``std_v``; only the first
-    five fields are read.
-
-    Bursts (:func:`burst_rows`) go first, because :attr:`Level.mean` is a PLAIN
-    mean over repeats -- one burst repeat can carry a cell several times off and
-    blow up its :attr:`Level.rep_std` with it.
+    five fields are read.  Bursts (:func:`burst_rows`) go first,
+    :attr:`Level.mean` being a plain mean over repeats.
 
     ``floor`` is :func:`sweep_floor`'s ``(volts, source)``, measured over the
-    WHOLE sweep and so passed by the caller, the only one holding every pair's
-    rows.  Omitted, it is measured from this pair's own dark repeats, which is
-    right for a one-pair file and raises for rows with no dark level.
+    WHOLE sweep and so passed by the caller.  Omitted, it is measured from this
+    pair's own dark repeats, and raises for rows with no dark level.
     """
     rows = list(rows)
     if drop_bursts and rows:
@@ -625,12 +592,10 @@ def fit_background(
 
     Uses the dark, x-only and w-only levels: five settings for the
     :attr:`PairV2Config.params_bg` parameters.  With
-    :attr:`PairV2Config.fit_q` that is five for five -- saturated, so the a/q
+    :attr:`PairV2Config.fit_q` that is five for five, saturated, so the a/q
     split is interpolation; without it, three parameters and 2 dof, whose
-    residual is a real check (:meth:`PairV2Fit.bg_residuals`).
-
-    Either way the covariance comes entirely from the level sigmas, which is
-    what makes the propagation into D honest.
+    residual is a check (:meth:`PairV2Fit.bg_residuals`).  The covariance comes
+    entirely from the level sigmas.
     """
     used = [L for L in levels if L.block != "cross"]
     if len(used) < len(cfg.params_bg):
@@ -662,9 +627,8 @@ def fit_difference(
 
         Cov(D) = diag(sigma_Y^2) + G Cov(bg) G^T
 
-    with ``G`` the gradient of ``Bhat(w)``, and the slope solved against that
-    full matrix.  Treating the points as independent would bias the
-    slope/intercept split -- the very thing this estimator exists to avoid.
+    with ``G`` the gradient of ``Bhat(w)``.  The slope is solved against that
+    full matrix.
     """
     used = [L for L in levels if L.on_cross_line()]
     if len(used) < 2:
@@ -759,19 +723,14 @@ def product_groups(levels: list[Level], *, decimals: int = 3) -> list[list[Level
 def verify_product(fit: "PairV2Fit") -> list[dict]:
     """``Y`` must depend on the drives only through the product ``x*w``.
 
-    Within a :func:`product_groups` group every member shares ``x*w`` but
-    splits the drive differently -- ``(0.95, 0.263)`` pushes the x side hard,
-    ``(0.5, 0.5)`` splits it evenly.  Subtract the full single-beam background
-    and what is left is the TPA term, which the model says is ``eta^2*(x*w)``
-    and so identical across the group.
+    How: within a :func:`product_groups` group every member shares ``x*w`` but
+    splits the drive differently (``(0.95, 0.263)`` hard on x, ``(0.5, 0.5)``
+    even).  Subtract the full single-beam background and the TPA residue left is
+    ``eta^2*(x*w)``, identical across the group.  Both residues come from the
+    same fitted background, so the difference propagates
+    ``(g_a - g_b) C (g_a - g_b)^T`` rather than adding in quadrature.
 
-    A split is not a problem with this estimator: it means the pair has no
-    single eta at all, which would invalidate the one-number-per-pair model
-    steps 7 and 8 are built on.
-
-    Both residues come from the same fitted background and are correlated, so
-    the difference propagates ``(g_a - g_b) C (g_a - g_b)^T`` rather than adding
-    the two errors in quadrature.
+    A split means the pair has no single eta at all.
     """
     cfg = fit.cfg
     out: list[dict] = []
@@ -922,19 +881,17 @@ def report_verification(fit: PairV2Fit) -> None:
 
 
 def make_plot(fig, fit: PairV2Fit) -> None:
-    """Six panels drawn into ``fig`` -- a Matplotlib Figure the caller owns.
-
-    Taking the figure rather than making one is what lets the GUI draw this on a
-    canvas and the offline script save the identical PNG from one
-    implementation; :func:`save_plot` is the headless wrapper.
+    """Six panels drawn into ``fig`` -- a Matplotlib Figure the caller owns, so
+    the GUI canvas and the headless PNG (:func:`save_plot`) share one
+    implementation.
 
     Top-left, the single-beam block with its background curves and the shared
     dark point.  Top-right, THE ESTIMATOR: ``D(w)`` with the GLS line and the
     fitted range shaded.  Bottom-left, pulls against the +/-1 sigma band.
     Bottom-right, repeatability -- each level's repeat scatter beside its trace
-    noise, where a bar above the diagonal means rewriting the SLM moves the
-    reading more than the detector does.  The other two are the product check
-    and its summary text.
+    noise, a bar above the diagonal meaning the SLM rewrite moves the reading
+    more than the detector does.  The other two are the product check and its
+    summary text.
     """
     cfg = fit.cfg
     lo, hi = fit.fit_w_range
@@ -1133,16 +1090,13 @@ def save_plot(fit: PairV2Fit, path: str | Path) -> Path:
 # ======================================================================
 def write_meas_csv(rows_by_pair: dict[int, list], path: str | Path,
                    *, meta: Mapping[str, object] | None = None) -> Path:
-    """Raw rows, v1's column layout (``trial`` carries the repeat index).
-
-    v1's columns, so the same file can be re-fit with v1's joint 6-parameter
-    estimator and the two compared on identical data.
+    """Raw rows, v1's column layout (``trial`` carries the repeat index), so the
+    same file can be re-fit with v1's joint 6-parameter estimator.
 
     A row is ``(rep, x, w, mean_v, std_v)``, optionally plus the two
     PMT-thermistor cells; without them those columns are blank, so one sweep's
-    file has one shape whether or not the 2400 was there.  ``meta`` is appended
-    as trailing ``# key,value`` lines, where a run brackets itself with a start
-    and end temperature.
+    file has one shape either way.  ``meta`` is appended as trailing
+    ``# key,value`` lines.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1237,18 +1191,12 @@ def save_step6_section(fits: list[PairV2Fit], run: str | Path,
 
     ``channels[].fit.{eta, eta_err, params.{a_x,q_x,a_w,q_w,d}.value}`` is the
     contract :meth:`calibration_module.fit.phase.PairModel.from_json_channel`
-    parses, so step 7 consumes this with no change; the v2-specific numbers
-    ride alongside.  ``grid`` is the levels AS MEASURED -- what the CSV holds,
-    not what a sweep was asked for.
+    parses, so step 7 consumes this unchanged; the v2-specific numbers ride
+    alongside.  ``grid`` is the levels AS MEASURED, what the CSV holds.
 
     ``csv`` is the sweep this came from, stored relative to the run directory.
     ``dropped_bursts`` maps a pair index to the burst acquisitions left out of
-    its fit, so a result traces back to the rows that made it and a glitching
-    bench cannot later be mistaken for a clean one.
-
-    Step 3 is not copied in: it is the ``step3`` section of the same file, and
-    writing a new one drops this section, so the layout a result was measured
-    through cannot drift from the layout the file reports.
+    its fit.  Step 3 is not copied in, being a section of the same file.
     """
     from calibration_module.calib_file import load_calib, write_section
 

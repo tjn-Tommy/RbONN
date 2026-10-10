@@ -3,9 +3,9 @@
 Three things are load-bearing here and none of them is the optics.
 
 ``build_anchors`` must hand back distinct, reproducible drives, and
-``measure_gain`` must take its first block as ``g = 1`` and every later one as
-a ratio against THOSE reads -- the whole point of taking a ratio on an
-identical SLM frame is that no model enters it.
+``measure_gain`` must fit its first block against the model (``g0``) and every
+later one as a ratio against THOSE reads -- the whole point of taking a ratio
+on an identical SLM frame is that no model enters it.
 
 ``fit_gain`` must be a slope through the origin, and its rms must be non-zero
 when the reads are NOT a pure rescaling of the reference, because that residual
@@ -157,7 +157,7 @@ class _CountingPMT:
 
 
 class MeasureGainTests(unittest.TestCase):
-    """The first block defines g = 1; every later one is a ratio against it."""
+    """The first block fits g0 to the model; every later one is a ratio to it."""
 
     ALPHA = np.array([0.5, 0.6, 0.7, 0.8, 0.9])
 
@@ -176,29 +176,48 @@ class MeasureGainTests(unittest.TestCase):
     def _fake(self, **kw):
         return _FakeRunPatterns(self.v_true, self.ALPHA, **kw)
 
+    def _g0(self, g: float = 1.0, keep=None) -> float:
+        """What the first block must report: the origin slope of its volts
+        against ``pred_v`` over the rungs it kept."""
+        pred = self.anchors["pred_v"]
+        k = np.ones(len(pred), dtype=bool) if keep is None else np.asarray(keep)
+        return OI.fit_gain(g * self.v_true[k], pred[k])[0]
+
     def _measure(self, fake, rows, dark=None, pmt=None):
         with mock.patch.object(OI, "run_patterns", fake):
             return OI.measure_gain(self.bench, self.anchors, seq0=-1, t0=0.0,
                                    rows=rows, dark=dark, pmt=pmt,
                                    log=lambda _m: None)
 
-    def test_the_first_block_is_g_1_by_definition_and_keeps_its_volts(self):
+    def test_the_first_block_fits_g0_to_the_model_and_keeps_its_volts(self):
         rows: list[dict] = []
         g, rms, dark = self._measure(self._fake(g=1.37), rows)
-        self.assertEqual((g, rms), (1.0, 0.0))
+        g0 = self._g0(1.37)
+        self.assertAlmostEqual(g, g0, places=12)
+        self.assertAlmostEqual(g / 1.37, 1.0, delta=0.01)   # the model is good to 1 %
+        self.assertGreater(rms, 0.0)                         # ... and not perfect
+        self.assertEqual(self.anchors["g0"], g)
         np.testing.assert_allclose(self.anchors["v_ref"], 1.37 * self.v_true)
         self.assertTrue(self.anchors["keep"].all())
-        self.assertEqual({r["g"] for r in rows}, {"1"})
+        self.assertEqual({r["g"] for r in rows}, {f"{g0:.9g}"})
         self.assertEqual({r["kind"] for r in rows}, {"gain"})
         self.assertAlmostEqual(dark, 1e-4)
 
+    def test_a_first_block_that_reads_the_model_exactly_is_g0_1(self):
+        self.anchors["pred_v"] = self.v_true.copy()
+        g, rms, _ = self._measure(self._fake(g=1.0), [])
+        self.assertAlmostEqual(g, 1.0, places=12)
+        self.assertLess(rms, 1e-12)
+
     def test_a_later_block_measures_the_change_since_the_first(self):
+        """g = g0 * ratio: the ratio sees the bench, g0 the model."""
         rows: list[dict] = []
         self._measure(self._fake(g=1.0), rows)
+        g0 = self._g0()
         g, rms, _ = self._measure(self._fake(g=1.07), rows, dark=1e-4)
-        self.assertAlmostEqual(g, 1.07, places=9)
+        self.assertAlmostEqual(g, 1.07 * g0, places=9)
         self.assertLess(rms, 1e-12)
-        self.assertEqual(rows[-1]["g"], f"{1.07:.9g}")
+        self.assertEqual(rows[-1]["g"], f"{1.07 * g0:.9g}")
 
     def test_a_first_block_at_the_dark_is_refused(self):
         with self.assertRaises(SystemExit):
@@ -221,12 +240,12 @@ class MeasureGainTests(unittest.TestCase):
         self._measure(self._fake(), rows)
         fake = self._fake(g=1.02, spikes=[{2: 1.08}])
         g, rms, _ = self._measure(fake, rows, dark=1e-4)
-        self.assertAlmostEqual(g, 1.02, places=9)
+        self.assertAlmostEqual(g, 1.02 * self._g0(), places=9)
         self.assertLess(rms, 1e-12)
         block = rows[-5:]
         self.assertEqual([r["kind"] for r in block],
                          ["gain", "gain", "gain_drop", "gain", "gain"])
-        self.assertEqual(block[2]["g"], f"{1.02:.9g}")     # stamped, as evidence
+        self.assertEqual(block[2]["g"], f"{g:.9g}")        # stamped, as evidence
 
     def test_a_rung_inside_the_tolerance_is_kept(self):
         rows: list[dict] = []
@@ -243,6 +262,7 @@ class MeasureGainTests(unittest.TestCase):
         self.assertEqual(fake.read, [0, 1, 2, 3, 4, 3])
         np.testing.assert_allclose(self.anchors["v_ref"], self.v_true)
         self.assertTrue(self.anchors["keep"].all())
+        self.assertAlmostEqual(g, self._g0(), places=12)   # fitted on the re-read
         self.assertEqual([r["kind"] for r in rows],
                          ["gain", "gain", "gain", "gain_drop", "gain", "gain"])
         self.assertEqual([r["seq"] for r in rows], [-1, -2, -3, -4, -5, -6])
@@ -254,11 +274,14 @@ class MeasureGainTests(unittest.TestCase):
         np.testing.assert_array_equal(self.anchors["keep"],
                                       [True, True, True, False, True])
         self.assertEqual([r["kind"] for r in rows][3::2], ["gain_drop", "gain_drop"])
+        # g0 is fitted over the four rungs that stayed
+        self.assertAlmostEqual(self.anchors["g0"],
+                               self._g0(keep=self.anchors["keep"]), places=12)
         # ... and is never displayed again
         fake2 = self._fake(g=1.03)
         g, rms, _ = self._measure(fake2, rows, dark=1e-4)
         self.assertEqual(fake2.read, [0, 1, 2, 4])
-        self.assertAlmostEqual(g, 1.03, places=9)
+        self.assertAlmostEqual(g, 1.03 * self.anchors["g0"], places=9)
         self.assertEqual(len(rows), 6 + 4)
 
     def test_a_block_with_every_rung_off_is_fitted_whole(self):
@@ -521,7 +544,7 @@ class _SteppingDAQ:
     it recognises by the lowest anchor's drive -- ``build_anchors`` returns them
     sorted by alpha, so that frame opens every block and appears nowhere else
     (the inference drives are random).  The first block is then read at g = 1,
-    which is also what it defines.
+    and since this bench IS the model, that is also the g0 it fits.
 
     Dark is constant and non-zero so a dropped dark subtraction cannot pass.
     """
@@ -648,20 +671,23 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(len(set(gain)), len(gain))          # all distinct
 
     def test_g_tracks_the_drifting_bench(self):
-        """The first block is 1 by definition; the bench steps 1 % per block."""
+        """The bench is the model at g = 1, so g0 = 1; it steps 1 % per block."""
         g = [float(r["g"]) for r in self._of("gain")]
-        self.assertEqual(g[:OI.GAIN_RUNGS], [1.0] * OI.GAIN_RUNGS)
+        self.assertEqual(len(set(g[:OI.GAIN_RUNGS])), 1)
+        self.assertAlmostEqual(g[0], 1.0, places=9)
         self.assertAlmostEqual(g[OI.GAIN_RUNGS], 1.0 + self.daq.rate, places=6)
         self.assertGreater(g[-1], g[0])
 
     def test_the_csv_meta_records_the_reference(self):
-        """Seed, band and the g = 1 volts: enough to rebuild the frames."""
+        """Seed, band, g0 and the first block's volts: enough to rebuild it."""
         path = next(self.dir.glob("onn_infer_*.csv"))
         meta = dict(ln[2:].split(",", 1) for ln in
                     path.read_text(encoding="utf-8").splitlines()
                     if ln.startswith("# "))
         self.assertEqual(meta["gain_seed"], str(self.SEED))
-        self.assertEqual(meta["g_reference"], "first gain block of this run (g = 1)")
+        self.assertEqual(meta["g_reference"],
+                         "first gain block of this run, fitted to the model (g0)")
+        self.assertAlmostEqual(float(meta["g0"]), 1.0, places=9)
         self.assertEqual(len(meta["g_reference_v"].split()), OI.GAIN_RUNGS)
         self.assertEqual(meta["gain_tol"], f"{OI.GAIN_TOL:g}")
         self.assertEqual(meta["gain_rungs_out"], "")

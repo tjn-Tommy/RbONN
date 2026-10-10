@@ -342,6 +342,32 @@ def fit_transfer_curve(
     to absorb one.  Outliers are judged against the FINAL model, so a curved
     sweep's smooth mismatch is not read as bad points at the ends.
     """
+    fit, _dropped = fit_transfer_curve_clipped(
+        levels, values, robust=robust, curvature=curvature, clip=clip
+    )
+    return fit
+
+
+def fit_transfer_curve_clipped(
+    levels: np.ndarray,
+    values: np.ndarray,
+    *,
+    robust: bool = True,
+    curvature: bool = True,
+    clip: float = _CLIP_SIGMA,
+) -> tuple[TransferFit, np.ndarray]:
+    """:func:`fit_transfer_curve`, plus WHICH points the clip dropped.
+
+    Out: the same fit, and a boolean mask over the input arrays -- True where a
+    measured point was taken out of the fit, so a plot can mark the cells the
+    stored calibration was built without.
+
+    The mask comes out of the clip itself rather than being re-derived from the
+    returned fit, which cannot be done reliably: once a point is out, both its
+    residual and the MAD move, so judging it against the fit that resulted
+    disagrees with ``n_clipped`` on the marginal cases.  ``n_clipped`` and this
+    mask are therefore always the same points.
+    """
     levels = np.asarray(levels, dtype=float)
     values = np.asarray(values, dtype=float)
     if levels.shape != values.shape or levels.ndim != 1:
@@ -355,12 +381,15 @@ def fit_transfer_curve(
     lv = levels[finite]
     val = values[finite]
 
+    dropped = np.zeros(levels.shape, dtype=bool)
     fit = _fit_points(lv, val, robust=robust, curvature=curvature)
     if clip <= 0.0:
-        return fit
-    return _clip_and_refit(
+        return fit, dropped
+    fit, keep = _clip_and_refit(
         lv, val, fit, robust=robust, curvature=curvature, clip=float(clip)
     )
+    dropped[np.flatnonzero(finite)[~keep]] = True
+    return fit, dropped
 
 
 def _fit_points(
@@ -448,8 +477,12 @@ def _clip_and_refit(
     robust: bool,
     curvature: bool,
     clip: float,
-) -> TransferFit:
+) -> tuple[TransferFit, np.ndarray]:
     """Drop points past ``clip`` robust sigmas and refit, until nothing is found.
+
+    Out: the fit and the mask of points it kept, so a caller that wants to show
+    the dropped cells does not have to guess at them (see
+    :func:`fit_transfer_curve_clipped`).
 
     Each pass measures the residual scale with a MAD, so the points being judged
     cannot inflate their own threshold the way an rms would, floored at
@@ -494,7 +527,7 @@ def _clip_and_refit(
         keep, fit = candidate, refit
 
     n_clipped = int(lv.size - keep.sum())
-    return fit if n_clipped == 0 else replace(fit, n_clipped=n_clipped)
+    return (fit if n_clipped == 0 else replace(fit, n_clipped=n_clipped)), keep
 
 
 def _refine_curvature(

@@ -2,7 +2,7 @@
 
 Needs the DAQ and the SLM::
 
-    python src/calibration_module/steps/calib_step3.py --calib src/calib_data/run_0930/calib.json
+    python src/calibration_module/steps/calib_step3.py --calib src/calib_data/archive/2026-09/run_0930/calib.json
     python src/calibration_module/steps/calib_step3.py --calib FILE --width 20 --gap 30
 
 In:  ``--calib`` (required), whose ``step2`` section gives the px -> nm line.

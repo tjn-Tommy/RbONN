@@ -3,7 +3,7 @@
 Needs real hardware for the sweep; the refit path is offline.  ``--calib``,
 ``--targets`` and ``--ref`` are required and have no default::
 
-    S="--calib src/calib_data/run_0930/calib.json --targets 2,3,4,5,6 --ref 2"
+    S="--calib src/calib_data/archive/2026-09/run_0930/calib.json --targets 2,3,4,5,6 --ref 2"
     python src/calibration_module/steps/calib_step7_v2.py $S
     python src/calibration_module/steps/calib_step7_v2.py $S --meas
     python src/calibration_module/steps/calib_step7_v2.py $S some.csv

@@ -625,6 +625,74 @@ def write_intensity_calibration_csv(
     return path
 
 
+def load_intensity_calibration_csv(
+    csv_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A step-3 sweep CSV back as ``(coordinates, wavelengths, levels, curves)``.
+
+    The inverse of :func:`write_intensity_calibration_csv`, and the one reader
+    for that file: the GUI's step-3 Load and
+    ``drafts/plot_step3_transfer.py`` both re-fit through this, so a sweep is
+    read the same way wherever it is re-fitted.
+
+    Channels come back in coordinate order and levels ascending, so
+    ``curves[i]`` lines up with ``levels`` and is exactly what
+    :func:`~calibration_module.fit.transfer.fit_transfer_curve` takes.  A
+    (coordinate, level) pair the file never recorded becomes NaN, which the
+    fitter already reads as "not measured" -- an interrupted sweep is still
+    re-fittable.
+
+    ``raw_intensity_w`` is not returned: on the DAQ path it is a copy of
+    ``intensity`` and nothing fits it.
+    """
+    path = Path(csv_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Step-3 CSV not found: {path}")
+
+    values: dict[float, dict[int, float]] = {}
+    wavelength: dict[float, float] = {}
+    with open(path, "r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None:
+            raise ValueError(f"{path.name} is empty")
+        normalized = {name.strip(): name for name in reader.fieldnames}
+        required = ("coordinate_px", "wavelength_nm", "level", "intensity")
+        missing = [column for column in required if column not in normalized]
+        if missing:
+            raise ValueError(
+                f"{path.name} is not a step-3 sweep: missing "
+                + ", ".join(missing)
+            )
+        for row_number, row in enumerate(reader, start=2):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            try:
+                coordinate = float(row[normalized["coordinate_px"]])
+                level = int(float(row[normalized["level"]]))
+                intensity = float(row[normalized["intensity"]])
+                wavelength_nm = float(row[normalized["wavelength_nm"]])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path.name} row {row_number}: {exc}"
+                ) from exc
+            values.setdefault(coordinate, {})[level] = intensity
+            wavelength[coordinate] = wavelength_nm
+
+    if not values:
+        raise ValueError(f"{path.name} has no measurements in it")
+
+    coordinates = np.array(sorted(values), dtype=float)
+    levels = np.array(
+        sorted({level for row in values.values() for level in row}), dtype=float)
+    curves = np.full((coordinates.size, levels.size), np.nan)
+    for index, coordinate in enumerate(coordinates):
+        measured = values[coordinate]
+        for level_index, level in enumerate(levels):
+            curves[index, level_index] = measured.get(int(level), np.nan)
+    wavelengths = np.array([wavelength[c] for c in coordinates], dtype=float)
+    return coordinates, wavelengths, levels, curves
+
+
 def save_calibration_result(
     calibration_results: CalibrationResult,
     path: str | Path,

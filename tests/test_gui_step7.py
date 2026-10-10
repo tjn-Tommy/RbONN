@@ -626,7 +626,7 @@ class CascadeTests(_WindowCase):
     -- the numbers here are checked against it.
     """
 
-    RUN10 = REPO / "src/calib_data/run_0916_10pairs_w15g35"
+    RUN10 = REPO / "src/calib_data/archive/2026-09/run_0916_10pairs_w15g35"
     STEP6_10 = RUN10 / "calib.json"
     MERGED = RUN10 / "calib.json"
 
@@ -903,7 +903,7 @@ class LiveSweepBurstTests(_WindowCase):
     another way when refit from the CSV it had just written.
     """
 
-    BURST_RUN = REPO / "src/calib_data/run_0929"
+    BURST_RUN = REPO / "src/calib_data/archive/2026-09/run_0929"
     BURST_CSV = BURST_RUN / "calib_step7_meas_0930_0236.csv"
     BURST_S6 = BURST_RUN / "calib.json"
     #: run_0929's step 6 predates the measured floor, and no page here names a

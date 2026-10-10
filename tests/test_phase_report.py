@@ -132,8 +132,8 @@ class Step7BurstTests(unittest.TestCase):
 
     REPO = Path(__file__).resolve().parents[1]
     #: run_0929 step 7: five bursts across targets 1, 6 and 10.
-    CSV = REPO / "src/calib_data/run_0929/calib_step7_meas_0930_0236.csv"
-    S6 = REPO / "src/calib_data/run_0929/calib.json"
+    CSV = REPO / "src/calib_data/archive/2026-09/run_0929/calib_step7_meas_0930_0236.csv"
+    S6 = REPO / "src/calib_data/archive/2026-09/run_0929/calib.json"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -195,8 +195,8 @@ class LiveSweepBurstTests(unittest.TestCase):
     """
 
     REPO = Path(__file__).resolve().parents[1]
-    CSV = REPO / "src/calib_data/run_0929/calib_step7_meas_0930_0236.csv"
-    S6 = REPO / "src/calib_data/run_0929/calib.json"
+    CSV = REPO / "src/calib_data/archive/2026-09/run_0929/calib_step7_meas_0930_0236.csv"
+    S6 = REPO / "src/calib_data/archive/2026-09/run_0929/calib.json"
 
     @classmethod
     def setUpClass(cls) -> None:

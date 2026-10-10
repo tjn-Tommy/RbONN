@@ -3,26 +3,16 @@
 In:  a ``calib.json``, or the directory holding one, or a flat template.
 Out: :class:`ONNParams` -- ``eta``, ``Phi`` and ``Y_sat`` as torch tensors.
 
-The bridge between the calibration chain and the torch layer, and deliberately
-the only place the two meet.  It parses no calibration JSON of its own: ``eta``
-and ``Phi`` come from
-:func:`calibration_module.fit.verify.load_forward_model`, the one reader that
-defines this project's phase-sign convention, so there is exactly one answer in
-the repo to "what is Phi_k".
-
-That convention: a stored ``dphi_comb_rad`` IS ``Phi_k`` in
+How: ``eta`` and ``Phi`` come from
+:func:`calibration_module.fit.verify.load_forward_model`; this module parses no
+calibration JSON itself.  A stored ``dphi_comb_rad`` IS ``Phi_k`` in
 
     E = sum_k eta_k sqrt(x_k w_k) exp(i [u_k + v_k + Phi_k])
 
-so every loader here sets ``phase_sign = +1`` and that is not a choice.  The
-field survives on :class:`ONNParams` only so the flat template can express
-``rbonn_3pair_sweep.py``'s ``exp(i[Phi - u - v])`` for a side-by-side
-comparison and the layer's selftest can exercise both branches; nothing reading
-a real calibration should set it.
+so every loader here sets ``phase_sign = +1``.  The flat template can also set
+``rbonn_3pair_sweep.py``'s ``exp(i[Phi - u - v])`` convention, ``phase_sign = -1``.
 
-There is no default saturation level, on purpose: an explicit ``y_sat=None`` (no
-saturation) is better than a hardcoded 5 V that silently disagrees with the run
-it is quoted against.
+There is no default saturation level: ``y_sat=None`` runs unsaturated.
 """
 from __future__ import annotations
 
@@ -67,8 +57,7 @@ class ONNParams:
     """Fitted hardware calibration for K channels.
 
     ``channels`` holds the bench pair indices in the same order as ``eta`` and
-    ``phi``, so a fit can always be traced back to the pair it was measured on.
-    ``reference`` is the step-7 reference pair, the one with ``Phi = 0``.
+    ``phi``.  ``reference`` is the step-7 reference pair, the one with ``Phi = 0``.
     """
 
     eta: Tensor                       # (K,) field coupling, |E| scale
@@ -144,11 +133,11 @@ class ONNParams:
     @staticmethod
     def from_json(path: str | Path, channels: Sequence[int] | None = None,
                   y_sat: float | None = None) -> "ONNParams":
-        """A ``calib.json``, or a hand-written template.
+        """A ``calib.json``, or a hand-written template -- either, without the
+        caller knowing which.
 
-        Kept as the one entry point that does not make the caller know which it
-        has.  The test is the ``schema`` key, not the shape of the payload: a v3
-        calib.json says what it is.
+        How: :meth:`from_run` first, falling back to :meth:`from_template` on
+        ``CalibFileError``.  The test is the ``schema`` key, not the payload.
         """
         from calibration_module.calib_file import CalibFileError
 
@@ -187,9 +176,9 @@ class ONNParams:
     def tile_to(self, k: int) -> "ONNParams":
         """Repeat the calibration cyclically to fill k channels.
 
-        For trying a layer wider than the bench (8 fitted pairs -> 784 inputs).
-        Physically this pretends the same K pairs exist many times over; it is
-        a simulation convenience, not a measured device.
+        For simulating a layer wider than the bench (8 fitted pairs -> 784
+        inputs).  The result is not a measured device: it pretends the same K
+        pairs exist many times over.
         """
         n = self.n_channels
         if k == n:

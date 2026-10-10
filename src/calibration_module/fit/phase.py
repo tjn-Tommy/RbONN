@@ -1,14 +1,20 @@
 """Comb-phase (dPhi_comb) calibration of each pair against a common reference.
 
-Step 6 calibrates each pair's TPA efficiency ``eta`` in isolation, one pair at
-a time, so absolute optical phase never enters.  This step drives TWO pairs at
-once and uses their coherent TPA interference to recover the fixed comb phase a
-target pair carries relative to a reference pair, which defines ``Phi = 0``.
+Step 6 calibrates each pair's TPA efficiency ``eta`` one pair at a time, so
+absolute optical phase never enters.  This step drives TWO pairs at once and
+recovers, from their coherent TPA interference, the fixed comb phase a target
+pair carries relative to a reference pair, which defines ``Phi = 0``.
 
-Geometry.  A channel commanded at normalised intensity ``x`` in [0, 1] sits at
+In:  a :class:`PhaseResult` -- raw rows from
+     :mod:`calibration_module.measure.phase_v2`, or a CSV through
+     :func:`load_phase_csv` -- plus one :class:`PairModel` per pair from step 6.
+Out: a :class:`PhaseFit` per target, stored as the run's ``step7`` section by
+     :func:`save_step7_section`.  The rows round-trip through
+     :func:`write_meas_csv` for an offline re-fit.
+
+The model.  A channel commanded at normalised intensity ``x`` in [0, 1] sits at
 panel phase ``phi = 2 asin(sqrt(x))`` with field ``sqrt(x) exp(i phi/2)``, so
-``x = 1`` reaches ``phi = pi`` -- a half turn, enough to sweep one fringe
-against a fully-on reference.  Per fitted point::
+``x = 1`` reaches ``phi = pi``, one half turn.  Per fitted point::
 
     g        = sqrt(x_t w_t)                        target field amplitude
     dPhi_SLM = phi_half(x_t) + phi_half(w_t) - phi_half(x_r) - phi_half(w_r)
@@ -17,26 +23,17 @@ against a fully-on reference.  Per fitted point::
 
 ``a``/``b`` are the reference/target amplitudes (step 6's etas).  ``g`` and
 ``dPhi_SLM`` come per row from the commanded intensities, so the fit is
-geometry-general: it does not care how the sweep was built.
-
-In:  a :class:`PhaseResult` -- raw rows from
-     :mod:`calibration_module.measure.phase_v2`, or a CSV through
-     :func:`load_phase_csv` -- plus one :class:`PairModel` per pair from step 6.
-Out: a :class:`PhaseFit` per target, stored as the run's ``step7`` section by
-     :func:`save_step7_section`.  The rows round-trip through
-     :func:`write_meas_csv`, so a run can be re-fit offline.
+geometry-general.  The SLM phase ADDS to the comb phase
+(:func:`fringe_arg`): the one convention in this project, used by every fitter,
+so a stored ``dPhi_comb`` IS ``Phi_k`` with no sign for a consumer to undo.
 
 Three fitters, tightening in turn: :func:`fit_phase` (all four parameters free,
-closed form, diagnostics only), :func:`fit_phase_ratio` (``a:b`` locked to the
-step-6 eta ratio, one shared scale floating) and :func:`fit_phase_fixed` --
-step 7 v2 -- where ``dPhi_comb`` is the ONLY free parameter, so a step-6 error
-cannot hide in a nuisance term and shows up as a bad ``R^2`` instead.
+closed form), :func:`fit_phase_ratio` (``a:b`` locked to the step-6 eta ratio,
+one shared scale floating) and :func:`fit_phase_fixed` -- step 7 v2 -- where
+``dPhi_comb`` is the only free parameter, so a step-6 error shows up as a bad
+``R^2`` instead of hiding in a nuisance term.
 
-The SLM phase ADDS to the comb phase (:func:`fringe_arg`): the one convention
-in this project, used by every fitter, so a stored ``dPhi_comb`` IS ``Phi_k``
-with no sign for a consumer to undo.
-
-Fitting and IO only, no instrument -- the sweep is in
+Fitting and IO only, no instrument: the sweep is in
 :mod:`calibration_module.measure.phase_v2`, the runner in
 ``steps/calib_step7_v2.py``.
 """
@@ -107,9 +104,7 @@ class PairModel:
         """Build from a :class:`calibration_module.fit.pair_v2.PairV2Fit`.
 
         The v2 estimator drops the quadratic columns, so ``q_x``/``q_w`` are
-        absent from ``fit.bg`` rather than fitted to zero.  They default to an
-        exact 0.0 here, as on disk, so a model built from a live fit and one
-        read back from its JSON are the same object.
+        absent from ``fit.bg`` and default to an exact 0.0 here, as on disk.
         """
         p = {k: v[0] for k, v in fit.bg.items()}
         return cls(
@@ -135,11 +130,10 @@ class PairModel:
 def load_pair_models(paths, *, layout=None) -> dict[int, PairModel]:
     """Load per-pair step-6 models from JSON summaries and/or raw CSVs.
 
-    In:  ``paths``, one path or a sequence.  ``.json`` is step-6 output, either
-         a bare summary (``channels`` at the top level) or a combined result
-         (pairs under ``step6``); any other extension is a raw step-6 CSV,
-         re-fit through :mod:`slm_module.tpa_pair` so the fit is identical to
-         step 6's.  ``layout`` is needed for CSVs only.
+    In:  ``paths``, one or a sequence.  ``.json`` is step-6 output (a bare
+         summary or a combined result); any other extension is a raw step-6 CSV,
+         re-fit through :mod:`slm_module.tpa_pair`, for which ``layout`` is
+         needed.
     Out: ``{pair index: PairModel}``.  Later paths win on collisions.
     """
     if isinstance(paths, (str, Path)):
@@ -192,10 +186,9 @@ def intensity_for_phase(phi_rad) -> np.ndarray:
 def fringe_arg(dphi_slm, dphi_comb) -> np.ndarray:
     """Cosine argument of the interference term: ``dPhi_SLM + dPhi_comb``.
 
-    The SLM phase ADDS to the comb phase, because a pair's field is
-    ``eta sqrt(x w) exp(i[phi_half(x) + phi_half(w) + Phi_k])``.  The ONLY
-    convention in the project: every fitter fits this argument, so a stored
-    ``dPhi_comb`` IS ``Phi_k`` as
+    The SLM phase ADDS, a pair's field being
+    ``eta sqrt(x w) exp(i[phi_half(x) + phi_half(w) + Phi_k])``.  Every fitter
+    fits this argument, so a stored ``dPhi_comb`` IS ``Phi_k`` as
     :func:`calibration_module.fit.verify.predict` uses it.
     """
     dphi_slm = np.asarray(dphi_slm, dtype=float)
@@ -220,16 +213,12 @@ def slm_phase_diff(x_t, w_t, x_r, w_r) -> np.ndarray:
 class PhaseFit:
     """Recovery of dPhi_comb (+ pair amplitudes a, b) from the measured Y.
 
-    Model per fitted point, with ``g = sqrt(x_t w_t)`` and ``dPhi_SLM`` from
-    :func:`slm_phase_diff`::
-
         Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb)
           + fixed step-6 single-beam background + offset
 
-    ``a``/``b`` are the reference/target amplitudes, centred on step 6's etas and
-    boxed to ``+/- bound_frac`` where they float at all; ``a_at_bound``/
-    ``b_at_bound`` flag a box that bound.  ``bg0/bg1/bg2`` re-express the
-    background as a polynomial in ``g``, for reference only.
+    with ``g = sqrt(x_t w_t)`` and ``dPhi_SLM`` from :func:`slm_phase_diff`.
+    ``a``/``b`` are the reference/target amplitudes, boxed to ``+/- bound_frac``
+    where they float; ``a_at_bound``/``b_at_bound`` flag a box that bound.
     """
 
     dphi_comb: float           # radians, wrapped to (-pi, pi]
@@ -273,9 +262,8 @@ class PhaseFit:
     dphi_deta_ref: float = 0.0        # d(dPhi_comb)/d(eta_ref), rad per unit eta
     dphi_deta_tgt: float = 0.0        # d(dPhi_comb)/d(eta_tgt)
     # The same sensitivities PER POINT, on the model: dm_j/d(eta) in volts per
-    # unit eta.  They turn the step-6 eta error into :attr:`std_total`, the
-    # denominator a pull should be taken against.  None when a/b floated (the
-    # amplitude error is then already in the residuals' own scatter).
+    # unit eta.  They turn the step-6 eta error into :attr:`std_total`.  None
+    # when a/b floated.
     dm_deta_ref: np.ndarray | None = field(default=None, repr=False)
     dm_deta_tgt: np.ndarray | None = field(default=None, repr=False)
 
@@ -297,9 +285,8 @@ class PhaseFit:
     def dphi_comb_err_total(self) -> float:
         """Fringe noise and the pinned-eta term in quadrature (rad).
 
-        This is the honest single-pair error bar.  It is NOT the whole story
-        across pairs: eta_ref is shared, so the eta_ref part is correlated
-        between targets -- see :func:`phase_covariance`.
+        The single-pair error bar.  Across pairs the eta_ref part is correlated,
+        eta_ref being shared -- see :func:`phase_covariance`.
         """
         return float(np.hypot(self.dphi_comb_err, self.dphi_comb_err_eta))
 
@@ -307,13 +294,10 @@ class PhaseFit:
     def std_model_eta(self) -> np.ndarray:
         """Per-point MODEL error from the pinned step-6 etas (volts).
 
-        ``a`` and ``b`` are held at eta_ref / eta_tgt, so the fitted curve is
-        only as well known as those two numbers are::
-
             sigma_m,j = hypot(dm_j/d(eta_ref) * eta_ref_err,
                               dm_j/d(eta_tgt) * eta_tgt_err)
 
-        All zeros when the fit floated a/b, or when step 6 quoted no eta error.
+        All zeros when the fit floated a/b, or step 6 quoted no eta error.
         """
         if self.dm_deta_ref is None or self.dm_deta_tgt is None:
             return np.zeros_like(self.std)
@@ -324,15 +308,10 @@ class PhaseFit:
     def std_total(self) -> np.ndarray:
         """Per-point sigma to judge a residual against: measurement (+) eta.
 
-        ``std`` is how well the POINT is known and says nothing about how well
-        the CURVE is known -- with a/b pinned, the curve carries step 6's eta
-        error bodily.  Judging a residual by ``std`` alone charges the fit for
-        an uncertainty it was never free to absorb, which is what makes a good
-        fringe read 3 sigma out.
-
-        Display only: :func:`fit_phase_fixed` still WEIGHTS by ``std``, because
-        the eta term is one number per pair and tilts the whole curve
-        coherently.  Folding it into the weights would misdescribe it as
+        ``std`` is how well the POINT is known; with a/b pinned the CURVE also
+        carries step 6's eta error, which this adds.  Display only:
+        :func:`fit_phase_fixed` still WEIGHTS by ``std``, the eta term being one
+        number per pair.  Folding it into the weights would misdescribe it as
         independent noise.  For the same reason :attr:`pulls` move together and
         should be read as a set.
         """
@@ -357,15 +336,11 @@ def fit_phase(
 ) -> PhaseFit:
     """Weighted LS fit of ``Y = a^2 + b^2 g^2 + 2ab g cos(dPhi_SLM+dPhi_comb) + d``.
 
-    In:  ``dphi_slm``, ``g = sqrt(x_t w_t)``, the measured ``y`` and its ``std``,
-         all per point.
-    Out: a :class:`PhaseFit` with all four parameters free.
+    In:  ``dphi_slm``, ``g``, ``y`` and ``std``, all per point.
+    Out: a :class:`PhaseFit`, all four parameters free.
 
-    Linear in the coefficients of ``[1, g^2, g cos(dPhi_SLM), g sin(dPhi_SLM)]``
-    (``c0 = a^2+d``, ``c1 = b^2``, ``c2 = 2ab cos(dPhi_comb)``,
-     ``c3 = -2ab sin(dPhi_comb)``), so the physical parameters follow in closed
-    form.  ``a`` is fixed by the interference and target self terms, which is
-    what separates it from the baseline and hence from the dark ``d``.
+    Closed form: linear in the coefficients of
+    ``[1, g^2, g cos(dPhi_SLM), g sin(dPhi_SLM)]``.
     """
     dphi_slm = np.asarray(dphi_slm, dtype=float)
     g = np.asarray(g, dtype=float)
@@ -490,12 +465,11 @@ class PhaseResult:
 def burst_mask(trace_stds, groups=None) -> np.ndarray:
     """Which acquisitions are bursts, grouped by target.
 
-    Per TARGET, not per file: a collected CSV holds every target against the
-    shared reference, and a dim pair's honest points look like nothing beside a
-    bright pair's.  ``groups`` is the per-row target (None = one sweep).
-
-    A group that is ALL bursts is left alone -- there is no honest scale left to
-    judge it against, and emptying it would hide a sweep worth throwing out.
+    In:  ``groups``, the per-row target (None = one sweep).  Judged per TARGET,
+         not per file: a collected CSV holds every target against the shared
+         reference, and a dim pair's honest points look like nothing beside a
+         bright pair's.
+    Out: the mask.  A group that is ALL bursts is left alone.
     """
     s = np.asarray(trace_stds, dtype=float)
     mask = np.zeros(s.size, dtype=bool)
@@ -515,18 +489,10 @@ def burst_mask(trace_stds, groups=None) -> np.ndarray:
 def drop_bursts(result: PhaseResult) -> list[dict]:
     """Strip burst acquisitions from a PhaseResult in place; return what went.
 
-    For the path that never touches a CSV -- a live GUI sweep fits the
-    :class:`PhaseResult` directly, and without this would keep bursts that the
-    same sweep refit from its own CSV would drop.  :func:`load_phase_csv`
-    shares :func:`burst_mask` instead of calling this, its rows still being
-    tuples with several targets in flight.
-
-    Appends to :attr:`PhaseResult.dropped_bursts`, so a second call cannot lose
-    the first round's record.  Applies the absolute ceiling too
-    (:data:`~calibration_module.fit.outliers.BURST_MAX_V`): a read can be far
-    too high with a calm trace, when the rail latched before the window opened.
-    The DARK is not a row and is not reached from here -- see
-    :func:`guard_darks`.
+    For the live path; :func:`load_phase_csv` shares :func:`burst_mask` instead.
+    Appends to :attr:`PhaseResult.dropped_bursts` and applies the absolute
+    ceiling (:data:`~calibration_module.fit.outliers.BURST_MAX_V`).  The DARK is
+    not reached from here -- see :func:`guard_darks`.
     """
     keep = ~(burst_mask(result.voltage_std_v)
              | flag_over_range(result.voltage_mean_v))
@@ -551,18 +517,12 @@ def drop_bursts(result: PhaseResult) -> list[dict]:
 def guard_darks(results: dict, *, limit: float = BURST_MAX_V) -> dict:
     """Replace any railed all-off dark with the median of the other targets'.
 
-    For the live path, which has no CSV yet to call
-    :func:`median_dark_without` on.
+    For the live path, which has no CSV yet for :func:`median_dark_without`.
 
-    In:  ``results``, ``{target index: PhaseResult}``.  Each dark is constant
-         within its target, so one value per target is tested against ``limit``.
-    Out: ``{tgt: {...}}`` for what was replaced, empty on a clean sweep; the
-         same is recorded on each :attr:`PhaseResult.dark_overrides`.
-
-    The sweep is what makes this judgeable: one all-off read has no repeat, but
-    nine taken minutes apart under the same condition are a population.  Does
-    nothing when EVERY target is over the ceiling -- that is a bench with the
-    lights on, and inventing a dark would hide the fault.
+    In:  ``results``, ``{target index: PhaseResult}``; one dark per target,
+         tested against ``limit``.
+    Out: ``{tgt: {...}}`` for what was replaced, also recorded on each
+         :attr:`PhaseResult.dark_overrides`.  Nothing when EVERY target is over.
     """
     darks: dict[int, float] = {}
     for k, r in results.items():
@@ -591,23 +551,13 @@ def guard_darks(results: dict, *, limit: float = BURST_MAX_V) -> dict:
 def _average_points(result: PhaseResult, dark_override: float | None = None):
     """Per-row dark-subtract, then average repeated trials per cell.
 
-    Out: ``(x_t, w_t, x_r, w_r, y, std)``, one entry per cell, ``y`` already
-    dark-subtracted.
+    Out: ``(x_t, w_t, x_r, w_r, y, std)`` per cell, ``y`` dark-subtracted.  The
+    one place step 7 forms its weights.
 
-    Each row's dark (from its trial's start) is removed BEFORE averaging, so
-    per-trial drift is taken out row-by-row rather than as one constant;
-    ``dark_override`` replaces it uniformly.
-
-    ``std`` is the across-trial standard deviation -- as measured, NOT divided
-    by sqrt(n).  A cell measured ONCE has none and falls back to that row's
-    ``voltage_std_v``, which keeps a weighted fit meaningful at
-    ``n_trials == 1``; a cell with neither inherits the median positive std.
-
-    Every cell then gets the sweep's sigma floor
-    (:attr:`PhaseResult.sigma_floor_v`) in quadrature: trace spread scales as
-    sqrt(signal), so without it a point near a fringe null is the quietest in
-    the sweep and takes the fit on a small error bar rather than any phase
-    information.  This is the one place step 7 forms its weights.
+    Each row's dark comes off BEFORE averaging (``dark_override`` replaces it).
+    ``std`` is the across-trial standard deviation, NOT divided by sqrt(n),
+    falling back to the row's ``voltage_std_v`` and then the median positive
+    std, plus the sweep's :attr:`PhaseResult.sigma_floor_v` in quadrature.
     """
     y_raw = np.asarray(result.voltage_mean_v, dtype=float)
     if dark_override is None:
@@ -672,18 +622,12 @@ def fit_phase_ratio(
         Y = s^2 (A^2 + B^2 g^2 + 2 A B g cos(dPhi_SLM + dPhi_comb))
             + fixed_bg + d
 
-    Boxing ``a`` and ``b`` independently let them trade off -- one collapsing
-    while the other railed at its box, dragging ``a/b`` off the step-6 ratio --
-    so the RATIO is pinned and only ``s`` floats, boxed to
-    ``[max(0,1-frac), 1+frac]``: ``frac=1`` allows a 0..2x common gain drift
-    between steps 6 and 7 with the relative efficiencies preserved.  Three free
-    parameters; ``fixed_bg`` is the per-row step-6 single-beam background, which
-    the amplitudes do NOT scale.
-
-    ``frac = 0`` pins ``s`` at 1, so ``a``/``b`` are the step-6 etas verbatim
-    and only ``dPhi_comb`` and ``d`` float; ``a_err``/``b_err`` are then 0 and
-    the eta uncertainties are NOT in ``dphi_comb_err``.  ``eta_ref_err``/
-    ``eta_tgt_err`` are accepted for API symmetry and do not enter this fit.
+    Three free parameters: ``s`` is boxed to ``[max(0,1-frac), 1+frac]``, so
+    ``frac=1`` allows a 0..2x common gain drift between steps 6 and 7 with the
+    relative efficiencies preserved, and ``frac=0`` pins it at 1, leaving only
+    ``dPhi_comb`` and ``d`` free and ``a_err``/``b_err`` at 0.  ``fixed_bg`` is
+    the per-row step-6 single-beam background, which the amplitudes do NOT
+    scale.  ``eta_ref_err``/``eta_tgt_err`` do not enter this fit.
     """
     from scipy.optimize import least_squares
 
@@ -799,26 +743,13 @@ def fit_phase_fixed(
         Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb) + fixed_bg
 
     ``g_ref = sqrt(x_r w_r)`` is the reference's own field amplitude, 1 when it
-    is held fully on and what keeps ``a`` honest when it is driven below 1 to
-    stay inside the range step 6 fitted.  The ``dphi_slm`` passed in already
-    carries the matching ``-phi_half(x_r) - phi_half(w_r)``.
-
-    Because nothing but the phase can move, a step-6 amplitude or background
-    error cannot hide in a nuisance parameter -- it shows up as a bad ``R^2`` or
-    a non-zero mean residual.  ``a_err``/``b_err``/``amp_err`` and
-    ``offset``/``offset_err`` are 0 by construction: they are not fitted.
-
-    So ``dphi_comb_err`` is the FRINGE's error only.  Pass step 6's
-    ``eta_ref_err``/``eta_tgt_err`` for the sensitivities
-    ``dphi_deta_ref``/``dphi_deta_tgt``, which
-    :attr:`PhaseFit.dphi_comb_err_total` adds back in; skipping them does not
-    make the phase more precise, only its quoted error smaller.  The lever is
-    ~15 rad per unit eta, so a 0.1% eta is a few tenths of a degree.
-
-    The same error sits on the CURVE at every point, as
-    ``dm_deta_ref``/``dm_deta_tgt`` and hence :attr:`PhaseFit.std_total`.  The
-    WEIGHTS stay ``1/std``: the eta term is one number per pair, coherent across
-    the sweep, not per-point noise.
+    is held fully on; the ``dphi_slm`` passed in already carries the matching
+    ``-phi_half(x_r) - phi_half(w_r)``.  ``a_err``/``b_err``/``amp_err`` and
+    ``offset``/``offset_err`` are 0, not being fitted, so ``dphi_comb_err`` is
+    the FRINGE's error only.  Pass step 6's ``eta_ref_err``/``eta_tgt_err`` for
+    the sensitivities ``dphi_deta_ref``/``dphi_deta_tgt``, which
+    :attr:`PhaseFit.dphi_comb_err_total` and :attr:`PhaseFit.std_total` add back
+    in.  The WEIGHTS stay ``1/std``.
     """
     from scipy.optimize import least_squares
 
@@ -865,8 +796,7 @@ def fit_phase_fixed(
     #
     #     dphi/dA = -(J_phi^T W J_A) / (J_phi^T W J_phi)
     #
-    # The denominator is the Fisher information that sets dphi_err above, so
-    # this costs three dot products and no extra fit.
+    # The denominator is the Fisher information that sets dphi_err above.
     psi = fringe_arg(dphi_slm, dphi)
     # d/d(eta_ref) carries the chain factor g_ref, since a = eta_ref g_ref.
     j_phi = -2.0 * Aeff * B * g * np.sin(psi)                        # dm/d(dPhi_comb)
@@ -937,16 +867,15 @@ def fit_result(
 ) -> PhaseFit:
     """Fit ``a``, ``b`` and ``dPhi_comb`` to the dark-subtracted Y.
 
-    The driver: dark-subtracts and averages repeats (:func:`_average_points`),
-    then picks a fitter.
+    The driver: dark-subtract, average repeats (:func:`_average_points`), pick a
+    fitter.
 
     In:  a :class:`PhaseResult`.  ``frac=None`` (default) takes the
-         unconstrained closed-form :func:`fit_phase`; a number locks ``a:b`` to
-         the step-6 eta ratio and floats a shared scale boxed to ``+/- frac``
+         unconstrained :func:`fit_phase`; a number locks ``a:b`` to the step-6
+         eta ratio and floats a shared scale boxed to ``+/- frac``
          (:func:`fit_phase_ratio`, ``frac=0`` pinning it exactly), where
-         ``single_beam_bg`` also folds both pairs' step-6 single-beam response
-         in as a FIXED background so the fringe cannot absorb the ramp.
-         ``comb_only=True`` overrides ``frac`` and runs step 7 v2's
+         ``single_beam_bg`` folds both pairs' step-6 single-beam response in as
+         a fixed background.  ``comb_only=True`` overrides ``frac`` and runs
          :func:`fit_phase_fixed`.  ``dark`` overrides the per-row dark.
     Out: a :class:`PhaseFit`.
     """
@@ -991,18 +920,15 @@ def fit_result(
 def swap_invariance(result: PhaseResult):
     """Table-2 diagnostic: |Z(x=a,w=b) - Z(x=b,w=a)| for each swap pair.
 
-    Runs on the CLEAN interference term, so the fitted self terms and the step-6
-    background come out first (``fit.known`` holds them)::
+    Out: ``(x_t, w_t, z, z_swapped, abs_diff, std)`` for the off-diagonal cells,
+    or raw Y with no fit attached.  A difference well above the combined std is
+    a channel asymmetry or crosstalk.
+
+    On the CLEAN interference term, ``fit.known`` holding the self terms and the
+    step-6 background::
 
         Z(x,w) = Y(x,w) - [a^2 + b^2 (x w) + sb_ref + sb_tgt] - d
                = 2 a b sqrt(x w) cos(dPhi_SLM + dPhi_comb)
-
-    ``sqrt(x w)`` and ``dPhi_SLM`` (a channel SUM) are swap-symmetric under the
-    bilinear model, so ``Z`` must be too; a difference well above the combined
-    std is a channel asymmetry or crosstalk.
-
-    Out: ``(x_t, w_t, z, z_swapped, abs_diff, std)`` for the off-diagonal cells,
-    or raw Y if no fit is attached.
     """
     x_t, w_t, x_r, w_r, y, std = _average_points(result)   # y already dark-subtracted
     fit = result.fit
@@ -1084,13 +1010,9 @@ def write_meas_csv(results: Sequence[PhaseResult], path: str | Path,
     """Raw rows for one or more target pairs, in a single CSV.
 
     :func:`write_phase_csv`'s columns plus a trailing ``std_ratio``
-    (std/|mean|), concatenating several :class:`PhaseResult` objects so every
-    row carries its own ``tgt_index`` beside the shared ``ref_index``.  That is
-    what makes one file a whole step-7 run: both the offline refit and the GUI's
-    Load read each target back out with :func:`load_phase_csv`'s ``only_tgt``.
-
-    ``meta`` is appended as trailing ``# key,value`` lines, which is where a run
-    brackets itself with a start and end PMT temperature.
+    (std/|mean|), every row carrying its own ``tgt_index`` beside the shared
+    ``ref_index`` and read back with :func:`load_phase_csv`'s ``only_tgt``.
+    ``meta`` is appended as trailing ``# key,value`` lines.
     """
     out = Path(path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1145,11 +1067,9 @@ def targets_in_csv(path: str | Path, default=()) -> list[int]:
 def reference_in_csv(path: str | Path) -> int | None:
     """The reference pair a recorded run was swept against, from its own rows.
 
-    Every row carries ``ref_index``, so the file knows its own reference and no
-    caller has to supply it -- supplying it is how a re-fit silently asks step 6
-    for a pair that was never the reference.  None when the column is absent
-    (an old CSV); raises when the rows disagree, which means several runs were
-    concatenated and no single reference describes the file.
+    Every row carries ``ref_index``, so no caller has to supply it.  None when
+    the column is absent (an old CSV); raises when the rows disagree, which
+    means several runs were concatenated.
     """
     seen: set[int] = set()
     with open(Path(path), newline="", encoding="utf-8") as f:
@@ -1170,16 +1090,9 @@ def reference_in_csv(path: str | Path) -> int | None:
 def references_in_csv(path: str | Path) -> dict[int, int]:
     """``{tgt_index: ref_index}`` -- which reference EACH target was swept against.
 
-    The cascaded form of :func:`reference_in_csv`.  One cascaded measurement
-    carries two or more references in one file: the root for the pairs it could
-    reach directly, a hub for the neighbours it could not.
-    :func:`reference_in_csv` rightly refuses such a file, so a caller that
-    understands cascades asks this and feeds :func:`load_phase_csv` the right
-    ``ref_model`` per target.
-
-    Raises if one target appears against two references: that is two runs
-    concatenated, not a cascade, and fitting the first would report a phase
-    against a reference nobody chose.
+    The cascaded form of :func:`reference_in_csv`, which refuses such a file.
+    Feed the result to :func:`load_phase_csv` as the right ``ref_model`` per
+    target.  Raises if one target appears against two references.
     """
     out: dict[int, int] = {}
     with open(Path(path), newline="", encoding="utf-8") as f:
@@ -1199,15 +1112,9 @@ def references_in_csv(path: str | Path) -> dict[int, int]:
 def darks_in_csv(path: str | Path) -> dict[int, float]:
     """``{tgt_index: dark_v}`` -- the all-off read each target was corrected by.
 
-    Step 7 takes ONE dark per target and subtracts it from every row of that
-    target, and it is the only quantity in a sweep with neither a repeat nor a
-    burst guard (:func:`burst_mask` sees only the drive rows' spread), so one
-    glitched all-off read biases ten points by its full size.  One sweep shares
-    one all-off condition, so the other targets' darks are the comparison that
-    says whether a given one is credible -- see :func:`median_dark_without`.
-
-    Raises if one target carries two different darks: the column is constant
-    within a target by construction, so that is two runs concatenated.
+    One dark per target, subtracted from every row of it.  It has no repeat and
+    no burst guard of its own, so the other targets' darks are what judge it --
+    see :func:`median_dark_without`.  Raises if one target carries two.
     """
     out: dict[int, float] = {}
     with open(Path(path), newline="", encoding="utf-8") as f:
@@ -1225,11 +1132,9 @@ def darks_in_csv(path: str | Path) -> dict[int, float]:
 
 
 def median_dark_without(path: str | Path, pair: int) -> float:
-    """Median of every OTHER target's dark in ``path`` -- the honest stand-in.
+    """Median of every OTHER target's dark in ``path`` -- the stand-in.
 
-    ``pair`` is excluded so a glitched read cannot vote on its own replacement.
-    Darks drift by tens of uV across a sweep, far under the sigma floor, so the
-    median is as good as an interpolation without pretending to know the order.
+    ``pair`` is excluded, so a glitched read cannot vote on its own replacement.
     """
     others = [v for k, v in darks_in_csv(path).items() if k != int(pair)]
     if not others:
@@ -1256,26 +1161,19 @@ def load_phase_csv(
     """Load a raw phase-sweep CSV and re-fit dPhi_comb against step-6 models.
 
     In:  ``path`` and the two :class:`PairModel` objects.  ``only_tgt`` keeps
-         just that ``tgt_index``, which is how one collected file yields one
-         target at a time (None loads every row).  ``frac``,
-         ``single_beam_bg`` and ``comb_only`` are forwarded to
-         :func:`fit_result`.  ``floor`` is the ``(volts, source)`` sigma floor
-         to weight by -- normally the run's step-6 one, which was measured on a
-         dark level with repeats; omitted, the sweep's own quietest drive points
-         are used, and failing those the fallback constant.
+         just that ``tgt_index`` (None loads every row).  ``frac``,
+         ``single_beam_bg`` and ``comb_only`` go to :func:`fit_result`.
+         ``floor`` is the ``(volts, source)`` sigma floor to weight by,
+         normally the run's step-6 one; omitted, the sweep's own quietest drive
+         points are used, then the fallback constant.
     Out: a fitted :class:`PhaseResult`.
 
     The dark comes from the per-row ``dark_v`` column, else the
     ``# dark_mean_v`` comment, else the step-6 mean; a scalar ``dark`` wins.
-
-    ``drop_bursts`` (default on) discards burst acquisitions and lists them in
-    :attr:`PhaseResult.dropped_bursts`; a sweep that is ALL bursts is left
-    alone, there being nothing to calibrate against.  The absolute ceiling
-    (:data:`~calibration_module.fit.outliers.BURST_MAX_V`) also reaches the
-    DARK, which no other guard sees and which is subtracted from every row of
-    its target: over the ceiling it is replaced by
-    :func:`median_dark_without` and recorded in
-    :attr:`PhaseResult.dark_overrides`.
+    ``drop_bursts`` (default on) discards bursts into
+    :attr:`PhaseResult.dropped_bursts`, leaving an all-burst sweep alone, and
+    the absolute ceiling also reaches the DARK, replacing it from
+    :func:`median_dark_without` into :attr:`PhaseResult.dark_overrides`.
     """
     file_dark: float | None = None
     with open(Path(path), newline="", encoding="utf-8") as f:
@@ -1419,17 +1317,10 @@ def phase_fit_payload(fit: PhaseFit) -> dict:
 def _chained_fit_payload(fit: PhaseFit, chain, root: int) -> dict:
     """:func:`phase_fit_payload`, with the phase referred to ``root`` if it hopped.
 
-    The fit keeps describing the hop that was MEASURED -- amplitudes, residual,
-    R^2 -- because that is what says whether the fringe was any good, and
-    rewriting it would hide a bad hop behind good arithmetic.  Only the phase
-    and its error bars move, the file's contract being that ``dphi_comb_rad``
-    is the phase against ``ref_index``.
-
-    ``dphi_deta_ref`` becomes the sensitivity to the ROOT's eta and
-    ``dphi_deta_tgt`` the target's own.  The hub's -- the coherent sum of its
-    two roles, and why a chained error is not two bars in quadrature -- has no
-    slot in the flat schema, so it lives in the ``chained`` block with the rest
-    of the path.  ``chain=None`` returns the payload unchanged.
+    Only the phase and its error bars move; the amplitudes, residual and R^2
+    keep describing the hop as MEASURED.  ``dphi_deta_ref`` becomes the
+    sensitivity to the ROOT's eta, and the hub's goes in the ``chained`` block
+    with the rest of the path.  ``chain=None`` returns the payload unchanged.
     """
     payload = phase_fit_payload(fit)
     if chain is None or not chain.chained:
@@ -1485,25 +1376,19 @@ def save_step7_section(
 ):
     """Write the comb-phase spectrum as the run's ``step7`` section.
 
-    In:  ``fits``, mapping ``(tgt_index, method)`` to a :class:`PhaseFit` --
-         ``method`` is the driver's free-form amplitude-handling label
-         (``"bounded"``, ``"fix"``), and a target may carry one per method.
-         ``extra`` keys are merged into the section (v2 puts its cascade plan
-         under ``"cascade"``).  ``chains``
-         (:func:`~calibration_module.fit.cascade.chain_fits`) is what makes this
-         the saver for a CASCADED run.
+    In:  ``fits``, mapping ``(tgt_index, method)`` to a :class:`PhaseFit`,
+         ``method`` being the driver's amplitude-handling label (``"bounded"``,
+         ``"fix"``).  ``extra`` keys are merged into the section (v2 puts its
+         cascade plan under ``"cascade"``).  ``chains``
+         (:func:`~calibration_module.fit.cascade.chain_fits`) makes this the
+         saver for a CASCADED run.
     Out: the written section, via
          :func:`calibration_module.calib_file.write_section`.
 
-    With ``chains``, every stored ``dphi_comb_*`` is the phase referred to the
-    root ``ref_index`` whichever hub produced it, because that is what every
-    downstream consumer assumes of this file; a hopped pair also carries a
-    ``"chained"`` block holding the hop as measured, so a merged spectrum can be
-    taken apart again.  Without ``chains`` the fits are stored as fitted.
-
-    Step 3 and step 6 are not copied forward -- they are sections of the same
-    file, and a new step 6 drops this section rather than leaving it describing
-    phases measured against etas that have moved.
+    With ``chains``, every stored ``dphi_comb_*`` is referred to the root
+    ``ref_index`` whichever hub produced it, and a hopped pair also carries a
+    ``"chained"`` block holding the hop as measured.  Step 3 and step 6 are not
+    copied forward, being sections of the same file.
     """
     from calibration_module.calib_file import load_calib, write_section
 
@@ -1571,23 +1456,18 @@ def load_comb_phase_json(
 def phase_covariance(fits, pairs) -> np.ndarray:
     """Covariance of the fitted ``dPhi_comb`` across targets, step-6 eta included.
 
-    In:  ``fits``, ``{target index: PhaseFit}`` from :func:`fit_phase_fixed` --
-         the only fitter that PINS the etas and so fills the sensitivities --
-         and ``pairs``, the target order to build in.
+    In:  ``fits``, ``{target index: PhaseFit}`` from :func:`fit_phase_fixed`, the
+         only fitter that pins the etas and so fills the sensitivities, and
+         ``pairs``, the target order to build in.
     Out: the covariance matrix.  Three contributions, for targets ``i``, ``j``::
 
         fringe noise    diag(dphi_comb_err_i^2)                    independent
         eta_tgt,i       diag((dphi_deta_tgt,i * eta_tgt_err_i)^2)  independent
         eta_ref         dphi_deta_ref_i * dphi_deta_ref_j * s^2    COMMON
 
-    The last term is rank 1 and it is the whole point: every target is pinned to
-    the SAME reference amplitude, so an ``eta_ref`` error slides the spectrum
-    together instead of scattering it, and independent sigmas would charge that
-    one common shift once per target.  Whiten residuals with the Cholesky factor
-    before judging them.
-
-    The diagonal is :attr:`PhaseFit.dphi_comb_err_total` squared, so per-pair
-    error bars agree with the step-7 report; only the off-diagonal is new.
+    The last term is rank 1, every target being pinned to the same reference
+    amplitude.  Whiten residuals with the Cholesky factor before judging them;
+    the diagonal is :attr:`PhaseFit.dphi_comb_err_total` squared.
     """
     pairs = list(pairs)
     if not pairs:
@@ -1624,10 +1504,9 @@ def build_phase_sweep(
 ) -> list[tuple[float, float, float, float]]:
     """Symmetric target phase sweep vs a fixed reference (half fringe).
 
-    The target is driven symmetrically ``phi^x = phi^w = phi`` over
-    ``[phi_start_deg, phi_stop_deg]`` -- 0..180 deg is the full reachable half
-    turn -- with the reference fixed at ``ref_phase_deg`` on both channels
-    (180 deg == intensity 1, fully on).
+    The target is driven ``phi^x = phi^w = phi`` over
+    ``[phi_start_deg, phi_stop_deg]`` (0..180 deg is the reachable half turn)
+    with the reference fixed at ``ref_phase_deg`` on both channels.
 
     Out: commanded intensity tuples ``(x_t, w_t, x_r, w_r)``, target first, with
     ``x = sin(phi/2)^2``, so ``dPhi_SLM = phi - ref_phase`` sweeps the fringe.

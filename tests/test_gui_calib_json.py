@@ -35,7 +35,7 @@ from calibration_module.fit.slm_response import (  # noqa: E402
 )
 
 #: A committed run with every section, step 2 through step 8.
-RUN = REPO / "src/calib_data/run_0930"
+RUN = REPO / "src/calib_data/archive/2026-09/run_0930"
 
 _app: QtWidgets.QApplication | None = None
 

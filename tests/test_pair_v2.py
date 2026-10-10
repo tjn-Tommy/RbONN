@@ -231,7 +231,7 @@ class BurstRowTests(unittest.TestCase):
     """average_levels drops burst acquisitions before they reach Level.mean."""
 
     #: run_0929 pair 10 x=1 w=0.9: one burst repeat among six.
-    BURST_CSV = REPO / "src/calib_data/run_0929/calib_step6v2_meas_0930_0215.csv"
+    BURST_CSV = REPO / "src/calib_data/archive/2026-09/run_0929/calib_step6v2_meas_0930_0215.csv"
 
     def _rows(self):
         self.assertTrue(self.BURST_CSV.is_file(), f"missing: {self.BURST_CSV}")

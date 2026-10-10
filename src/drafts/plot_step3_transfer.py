@@ -18,9 +18,9 @@ Draws one PNG next to the CSV: a panel per channel with both curves and both
 residuals, four trend axes across the array, and a table.
 
 Spiked cells are dropped by the production fitter, which does this on its own
-now -- ``--clip`` is passed straight through to ``fit_transfer_curve`` and the
-markers on the plot are recovered from the fit it returns, so the red points are
-the ones the stored JSON was actually built without.  ``--exclude`` drops points
+now -- ``--clip`` is passed straight through to ``fit_transfer_curve_clipped``,
+which hands back the mask of what it took, so the red points are exactly the
+ones the stored JSON was built without.  ``--exclude`` drops points
 by hand on top of that, and ``--no-clip`` turns the automatic pass off::
 
     python src/drafts/plot_step3_transfer.py
@@ -46,7 +46,6 @@ and the ``contrast`` column just mean volts here.
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -62,10 +61,14 @@ REPO_SRC = Path(__file__).resolve().parents[1]
 if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
+from calibration_module.fit.slm_response import (  # noqa: E402
+    load_intensity_calibration_csv as load_step3_csv,
+)
 from calibration_module.fit.transfer import (  # noqa: E402
     TransferFit,
     TransferFitError,
     fit_transfer_curve,
+    fit_transfer_curve_clipped,
 )
 
 CALIB_DIR = REPO_SRC / "calib_data"
@@ -74,37 +77,6 @@ C_USED = "#1f77b4"
 C_LIN = "#ff7f0e"
 C_QUAD = "#2ca02c"
 C_DROP = "#d62728"
-
-
-# --------------------------------------------------------------------- load
-
-
-def load_step3_csv(path: Path):
-    """-> (coordinates, wavelengths, levels, curves[channel, level]).
-
-    Channels come back in coordinate order, levels ascending, and a
-    (coordinate, level) pair the file never recorded becomes NaN -- which is
-    what the fitter already treats as "not measured".
-    """
-    values: dict[float, dict[int, float]] = defaultdict(dict)
-    wavelength: dict[float, float] = {}
-    with path.open(newline="") as handle:
-        for row in csv.DictReader(handle):
-            coord = float(row["coordinate_px"])
-            values[coord][int(row["level"])] = float(row["intensity"])
-            wavelength[coord] = float(row["wavelength_nm"])
-
-    if not values:
-        raise SystemExit(f"{path.name}: no rows")
-
-    coords = np.array(sorted(values), dtype=float)
-    levels = np.array(sorted({lv for d in values.values() for lv in d}), dtype=float)
-    curves = np.full((coords.size, levels.size), np.nan)
-    for i, coord in enumerate(coords):
-        for j, level in enumerate(levels):
-            curves[i, j] = values[coord].get(int(level), np.nan)
-    waves = np.array([wavelength[c] for c in coords], dtype=float)
-    return coords, waves, levels, curves
 
 
 def parse_exclusions(specs: list[str], coords: np.ndarray) -> dict[int, set[int]]:
@@ -158,43 +130,11 @@ def command_error(lin: TransferFit, quad: TransferFit):
     return float(diff[worst]), float(v[worst]), float(np.sqrt(np.nanmean(diff ** 2)))
 
 
-def dropped_by(pre: TransferFit, levels, curve, used, clip: float, expect: int):
-    """-> boolean mask (over all levels) of the points the clip took.
-
-    ``fit_transfer_curve`` reports *how many* points it dropped, not which.
-    Recover them by re-running the decision it made: residual against the
-    UNCLIPPED fit ``pre``, MAD for the scale, floored at 0.1% of contrast.
-
-    It has to be the unclipped fit.  Judging against the clipped one gets the
-    obvious cases right and the marginal ones wrong, because once a point is
-    out of the fit its residual and the MAD both move -- 0907 channel 0's
-    dropped endpoint reads 6.06 sigma against the fit that dropped it and 5.01
-    against the fit that resulted, so the plot would have silently disagreed
-    with the ``n_clipped`` beside it.
-
-    Exact whenever the clip converged in one pass, which is every channel seen
-    so far; ``expect`` cross-checks that and an empty mask is returned if it
-    does not hold, since a marker that contradicts ``n_clipped`` is worse than
-    no marker.
-    """
-    out = np.zeros(levels.shape, dtype=bool)
-    if not expect or clip <= 0:
-        return out
-    resid = curve[used] - pre.intensity(levels[used])
-    sigma = 1.4826 * float(np.median(np.abs(resid - np.median(resid))))
-    sigma = max(sigma, 1e-3 * pre.contrast)
-    bad = np.abs(resid) > clip * sigma
-    if int(bad.sum()) != expect:
-        return out
-    out[np.flatnonzero(used)[bad]] = True
-    return out
-
-
 def fit_channel(levels, curve, *, clip: float, forced: set[int], quadratic: bool):
     """-> (linear fit, curved fit or None, mask of points used, note).
 
     Outlier removal is the production fitter's now, so this passes ``clip``
-    through and asks afterwards which points it took.  Both models are then
+    through and takes back the mask of what it dropped.  Both models are then
     refitted on that surviving set with clipping off, so the linear-vs-curved
     comparison in the table is over identical points -- otherwise each model
     would clip its own and the rms columns would not be comparable.
@@ -210,22 +150,17 @@ def fit_channel(levels, curve, *, clip: float, forced: set[int], quadratic: bool
 
     note = ""
     try:
-        pre = fit_transfer_curve(
-            levels[used], curve[used], clip=0, curvature=quadratic
-        )
-        best = fit_transfer_curve(
+        best, taken = fit_transfer_curve_clipped(
             levels[used], curve[used], clip=clip, curvature=quadratic
         )
     except TransferFitError as exc:
         return None, None, used, f"FIT FAILED: {exc}"
 
     if best.n_clipped:
-        bad = dropped_by(pre, levels, curve, used, clip, best.n_clipped)
-        if bad.any():
-            note = "clipped " + ",".join(str(int(v)) for v in levels[bad])
-            used &= ~bad
-        else:
-            note = f"clipped {best.n_clipped} (levels not identified)"
+        bad = np.zeros(levels.shape, dtype=bool)
+        bad[np.flatnonzero(used)[taken]] = True
+        note = "clipped " + ",".join(str(int(v)) for v in levels[bad])
+        used &= ~bad
 
     try:
         lin = fit_transfer_curve(levels[used], curve[used], curvature=False, clip=0)

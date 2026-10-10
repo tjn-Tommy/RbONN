@@ -1,29 +1,22 @@
 """The .npz the bench side consumes: what to display, and what Y to expect.
 
-The handover between the two halves of the project: the training env
-(``rbonn-ml``) writes it, the bench env (``rbonn``) reads it with numpy alone.
+In:  a trained checkpoint, and ``--images``, which sets the bench cost at
+     ``N * 79 * 10`` reads (10 images is 7,900; 512 is 404,480).  Default 10.
+Out: the npz, in the units the bench works in.  Drives are commanded
+     intensities in [0, 1], ready for ``slm_module.encoding``; ``y_block`` is
+     dark-free, background-free detector volts -- what
+     ``fit.verify.predict(..., coherent=True)`` returns.
 
-In:  a trained checkpoint, and ``--images``, which is the only thing that sets
-     the bench cost -- ``N * 79 * 10`` reads, so 10 images is 7,900 and the 512
-     the protocol quotes is 404,480.  Default 10: the first question is whether
-     the bench reproduces ``y_block`` at all.
-Out: the npz, in the units the bench works in.  Drives are commanded intensities
-     in [0, 1], ready for ``slm_module.encoding``; ``y_block`` is dark-free,
-     background-free detector volts -- what ``fit.verify.predict(...,
-     coherent=True)`` returns and what the bench post-processing produces.
+How the bench replays it.  For image ``n``, shot ``t``, output ``o``: display
+``x[n].reshape(79, 10)[t]`` on the input arm and ``W[o].reshape(79, 10)[t]`` on
+the weight arm, read, subtract dark and the single-beam background, compare
+against ``y_block[n, o, t]``.  Summing over ``t`` gives ``y_sum[n, o]``, times
+the readout gain in ``meta`` for the logit.
 
-For image ``n``, shot ``t``, output ``o``: display ``x[n].reshape(79, 10)[t]`` on
-the input arm and ``W[o].reshape(79, 10)[t]`` on the weight arm, read, subtract
-dark and the single-beam background, compare against ``y_block[n, o, t]``.
-Summing over ``t`` gives ``y_sum[n, o]``, times the readout gain in ``meta`` for
-the logit.
-
-THE PADDING IS NOT DARK.  784 features over 79 shots of 10 leaves 6 channels of
-the last shot with no data, padded with zero BEFORE the learned input gain, so
-they are driven at ``tanh(in_shift[k])`` -- image-independent, and interfering
-coherently with that shot's 4 real channels.  So ``x`` ships 790 columns, shot 78
-must display all ten, and a reconstruction from the 784 real features alone will
-not reproduce it.
+``x`` ships 790 columns, not 784: 79 shots of 10 leaves 6 channels of the last
+shot with no data, and they are padded with zero BEFORE the learned input gain,
+so they are displayed at ``tanh(in_shift[k])``, not dark.  Shot 78 must display
+all ten.
 """
 from __future__ import annotations
 
@@ -62,11 +55,11 @@ def _head(model) -> ONNLayer:
 def dump(model, dataset, idx, *, calib_source: str, checkpoint: str) -> dict:
     """Run `idx` of `dataset` and collect everything the bench needs.
 
-    Returns the dict that is saved as the npz.  The drives are captured at the
-    layer's own handover point (``ONNLayer.drive``), not recomputed here: the
-    digital chain in front of it -- in_scale, in_shift, tanh, the clamp and any
-    drive quantization -- is part of the model, and a second implementation of
-    it is a second thing to get wrong.
+    Out: the dict saved as the npz.
+
+    How: the drives are captured at the layer's own handover point
+    (``ONNLayer.drive``), after in_scale, in_shift, tanh, the clamp and any
+    drive quantization, rather than recomputed here.
     """
     head = _head(model)
     model.eval()
@@ -141,10 +134,9 @@ def dump(model, dataset, idx, *, calib_source: str, checkpoint: str) -> dict:
 def describe(d: dict) -> str:
     """The magnitudes bench_protocol.md quotes, recomputed from this dump.
 
-    Worth printing every time: the per-measurement percentiles say what input
-    range to read on, and the pedestal-to-contrast ratio says how much of the
-    signal is actually class-discriminative -- which is what sets the noise
-    budget, because the shots add as sqrt(n_tiles).
+    Out: the per-measurement percentiles (the input range to read on), the
+    pedestal-to-contrast ratio (how much of the signal is class-discriminative)
+    and the resulting noise budget, the shots adding as sqrt(n_tiles).
     """
     y = np.asarray(d["y_block"], dtype=float)
     if y.ndim == 4:                      # differential: report both banks together

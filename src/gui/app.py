@@ -71,12 +71,12 @@ from psu_module.controller import (
     PSUState,
     SET_TOL_V,
 )
-from calibration_module.fit.legacy_intensity import CalibrationFit, fit_calibration, load_calibration_csv
 from calibration_module.fit.slm_response import (
     load_step2_map,
     CalibrationResult,
     calibration_result_from_dict,
     load_calibration_result,
+    load_intensity_calibration_csv,
     load_wavelength_map_csv,
     save_calibration_result,
     step1_section,
@@ -84,6 +84,11 @@ from calibration_module.fit.slm_response import (
     step3_section,
     write_intensity_calibration_csv,
     write_wavelength_map_csv,
+)
+from calibration_module.fit.transfer import (
+    TransferFit,
+    TransferFitError,
+    fit_transfer_curve_clipped,
 )
 from calibration_module.measure.slm_response import (
     CalibrationAborted,
@@ -624,7 +629,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._workers: set[FunctionWorker] = set()
         self.slm_size = (1920, 1200)
-        self.calibration_fits: dict[float, CalibrationFit] = {}
+        # What the Step-3 page is showing: the sweep and the fits drawn from
+        # it.  Filled by a finished run -- with the very fits that went into the
+        # calib file, not a second fit of them -- or by Load.
+        self.step3_coords: np.ndarray | None = None
+        self.step3_waves: np.ndarray | None = None
+        self.step3_levels: np.ndarray | None = None
+        self.step3_curves: np.ndarray | None = None
+        self.step3_fits: list[TransferFit | None] = []
+        self.step3_clipped: list[np.ndarray] = []
         self.osa_controller: OSAController | None = None
         self.calibration_result: CalibrationResult | None = None
         self.calibration_stop_event: threading.Event | None = None
@@ -1040,12 +1053,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._build_step2_tab(), "Step 2 · Wavelength")
         # Step 3a (the per-coordinate sweep) is gone: the channel-grid DAQ scan
         # covers it, and that is what the encoder and steps 6-8 read.  Its
-        # "Run All (1->2->3)" button and channel-map preview went with it.  The
-        # fit/plot widgets it used to host did not: _on_step_finished feeds every
-        # CSV-producing step into that flow, so the container is still built,
-        # just with no page to sit on.
-        self._fit_backing = self._build_step3_fit_backing()
-        self._fit_backing.setVisible(False)
+        # "Run All (1->2->3)" button and channel-map preview went with it, and so
+        # did the legacy Fit-from-CSV panel it hosted -- the Step 3 tab draws its
+        # own fits now, through the transfer model the encoder actually uses.
         # The OSA-based 3b is built but NOT tabbed, the way 4b and 6b are: the
         # DAQ scan below is the step 3 this bench runs, and two tabs for one step
         # is how a sweep ends up done through the wrong one.  See the README's
@@ -1129,10 +1139,11 @@ class MainWindow(QtWidgets.QMainWindow):
     #: thing already obvious from the field having a path in it -- and it said so
     #: in the loudest place on the page, every time, forever.  The status line is
     #: where a page's newest line of feedback goes, and what a file holds is
-    #: feedback about loading it.  Only these three have one; steps 1-3 keep the
-    #: pill, which is also the only place they report a file that is missing.
+    #: feedback about loading it.  Steps 1 and 2 keep the pill, which is also
+    #: the only place they report a file that is missing.
     _STEP_STATUS: dict[int | str, str] = {
-        6: "tpa_status", 7: "tpa_phase_status", 8: "step8_status",
+        "3c": "step3_status", 6: "tpa_status", 7: "tpa_phase_status",
+        8: "step8_status",
     }
 
     #: The per-page Run buttons each step's file gates, by attribute name.
@@ -1675,73 +1686,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._toggle_fast_channel_source()
         return page
 
-    def _build_step3_fit_backing(self) -> QtWidgets.QWidget:
-        """Off-screen container for the legacy Fit-from-CSV controls + plots.
-
-        These widgets are hidden on the Step-3 page but still populated by the
-        calibration run/Run-All flow, so they are created here to keep those code
-        paths (and their attribute references) working.
-        """
-        backing = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(backing)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        controls = self._panel("Fit from CSV")
-        controls_layout = QtWidgets.QGridLayout(controls)
-        self.calibration_path_edit = QtWidgets.QLineEdit()
-        browse_button = QtWidgets.QPushButton("Browse")
-        fit_button = QtWidgets.QPushButton("Run Fit")
-        self.save_fit_button = QtWidgets.QPushButton("Save Result")
-        self.save_fit_button.setEnabled(False)
-        browse_button.clicked.connect(self._browse_calibration_csv)
-        fit_button.clicked.connect(self._run_calibration_fit)
-        self.save_fit_button.clicked.connect(self._save_calibration_result)
-        self.wavelength_combo = QtWidgets.QComboBox()
-        self.wavelength_combo.currentIndexChanged.connect(self._update_calibration_view)
-        controls_layout.addWidget(self.calibration_path_edit, 0, 0)
-        controls_layout.addWidget(browse_button, 0, 1)
-        controls_layout.addWidget(fit_button, 0, 2)
-        controls_layout.addWidget(self.save_fit_button, 0, 3)
-        controls_layout.addWidget(QtWidgets.QLabel("Wavelength"), 1, 0)
-        controls_layout.addWidget(self.wavelength_combo, 1, 1, 1, 3)
-        outer.addWidget(controls)
-
-        self.fit_table = QtWidgets.QTableWidget(0, 2)
-        self.fit_table.setHorizontalHeaderLabels(["Metric", "Value"])
-        self.fit_table.horizontalHeader().setStretchLastSection(True)
-        self.fit_table.verticalHeader().setVisible(False)
-
-        self.figure = Figure(figsize=(6, 4), tight_layout=True)
-        self.canvas = FigureCanvas(self.figure)
-        plot_panel = self._panel("Fit Curve")
-        plot_layout = QtWidgets.QVBoxLayout(plot_panel)
-        plot_layout.addWidget(self.canvas)
-
-        self.map_figure = Figure(figsize=(6, 4), tight_layout=True)
-        self.map_canvas = FigureCanvas(self.map_figure)
-        map_panel = self._panel("Intensity Map")
-        map_layout = QtWidgets.QVBoxLayout(map_panel)
-        map_controls = QtWidgets.QHBoxLayout()
-        self.map_kind_combo = QtWidgets.QComboBox()
-        self.map_kind_combo.addItems(["Normalized", "Raw (W)"])
-        self.map_kind_combo.currentIndexChanged.connect(self._update_intensity_map)
-        map_controls.addWidget(QtWidgets.QLabel("Map"))
-        map_controls.addWidget(self.map_kind_combo)
-        map_controls.addStretch(1)
-        map_layout.addLayout(map_controls)
-        map_layout.addWidget(self.map_canvas)
-
-        right_tabs = QtWidgets.QTabWidget()
-        right_tabs.addTab(plot_panel, "Fit Curve")
-        right_tabs.addTab(map_panel, "Intensity Map")
-
-        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        split.addWidget(self._panel_with_widget("Fit Parameters", self.fit_table))
-        split.addWidget(right_tabs)
-        split.setSizes([360, 720])
-        outer.addWidget(split, 1)
-        return backing
-
     def _build_measurement_group(self, step: int, defaults: dict[str, str]) -> QtWidgets.QGroupBox:
         """OSA measurement settings (center λ / span / sensitivity / ref) for a step."""
         box = QtWidgets.QGroupBox("OSA settings")
@@ -1966,12 +1910,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return page
 
     def _build_step3_daq_group(self, step: int | str = 3) -> QtWidgets.QGroupBox:
-        """DAQ acquisition settings for a bucket-detector sweep (Step 3 / 3c).
+        """DAQ acquisition settings for a bucket-detector sweep (Step 3).
 
-        Defaults mirror tests/slm_sin2_level_sweep_test.py (ai1, 100 kS/s, 1 s
-        average, 150 ms settle, ±0.1 V). Hidden unless Detector = DAQ.
+        Defaults mirror tests/slm_sin2_level_sweep_test.py (ai1, 1 kS/s, 1 s
+        average, 250 ms settle, ±0.1 V).  One control per row, like step 6's:
+        the page's left column is narrow, and five across it was wider than the
+        column it has to sit in.
         """
-        box = QtWidgets.QGroupBox("DAQ acquisition (NI-DAQmx)")
+        box = QtWidgets.QGroupBox("DAQ · acquisition")
         grid = QtWidgets.QGridLayout(box)
         widgets = self.step_widgets[step]
         widgets["daq_channel"] = QtWidgets.QLineEdit("ai1")
@@ -1996,37 +1942,77 @@ class MainWindow(QtWidgets.QMainWindow):
         for lo, hi in self._DAQ_RANGES:
             widgets["daq_range"].addItem(f"\N{PLUS-MINUS SIGN}{hi:g} V", (lo, hi))
         widgets["daq_range"].setCurrentIndex(0)
-        pairs = [
+        rows = [
             ("Channel", widgets["daq_channel"]),
+            ("Range", widgets["daq_range"]),
             ("Sample rate", widgets["daq_sample_rate"]),
             ("Hold", widgets["daq_hold"]),
             ("Average for", widgets["daq_duration"]),
-            ("Range", widgets["daq_range"]),
         ]
-        for col, (label, widget) in enumerate(pairs):
-            grid.addWidget(QtWidgets.QLabel(label), 0, 2 * col)
-            grid.addWidget(widget, 0, 2 * col + 1)
+        for row, (label, widget) in enumerate(rows):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            grid.addWidget(widget, row, 1)
+        grid.setColumnStretch(1, 1)
         return box
 
     def _build_step3c_page(self) -> QtWidgets.QWidget:
-        """Step 3c: the Step-3 DAQ intensity sweep at encoding-channel centres.
+        """Step 3: the DAQ level sweep at the encoding channel centres, and its fits.
 
-        Mirrors Step 3 (one lit window at a time, dark-frame-subtracted DAQ
-        readings) but structures the scan like Step 3b: the channel grid is
-        tiled around a target centre wavelength with mirror-symmetric pairs,
-        skipping any channel that overlaps a guard band.
+        Laid out like steps 6 and 7 -- the controls in a narrow left column in
+        the order you touch them, the results in the rest of the width -- because
+        this page produces the same kind of thing they do: one fit per channel,
+        which is either in family across the array or is not.  Until 2026-10-02
+        it showed none of them.  The fits went into the calib file and the only
+        way to see a spiked channel was to run drafts/plot_step3_transfer.py over
+        the CSV afterwards, which is late: those fits ARE the encoding every step
+        below reads, and nothing re-fits them.
+
+        The sweep itself is unchanged -- one lit window at a time, dark-frame
+        subtracted DAQ readings, the channel grid tiled around a target centre
+        wavelength in mirror-symmetric pairs, skipping any channel that overlaps
+        a guard band.
         """
-        page = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(page)
-        layout.setContentsMargins(18, 14, 18, 14)
+        page = self._page_shell("Channel Transfer Curves (Step 3)")
+        # Before the controls: _calib_file_row hangs this page's file
+        # description off this line rather than on a pill (see _STEP_STATUS).
+        self.step3_status = self._page_status(page, "\N{EN DASH}")
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self._build_step3_controls())
+        split.addWidget(self._build_step3_results())
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([360, 1040])
+        page.layout().addWidget(split, 1)
+
+        # The empty-state figure, without asking for a draw: a deferred draw on
+        # a window destroyed before the event loop services it -- which is what
+        # every GUI test does -- has matplotlib drawing into a deleted canvas
+        # and printing a traceback for it.  Qt draws the artists when the page
+        # is first shown.
+        self._step3_redraw(draw=False)
+        return page
+
+    def _build_step3_controls(self) -> QtWidgets.QWidget:
+        """The left column: the calib file, the DAQ, the grid, the levels, buttons.
+
+        The file first, for the reason step 6 puts it first: every channel below
+        is placed through its step-2 map, so a sweep against the wrong one does
+        not fail, it calibrates a different set of wavelengths and reports
+        numbers that look fine.  It is also the file this run appends to.
+        """
+        col = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(col)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(12)
         widgets = self.step_widgets["3c"]
 
-        layout.addWidget(self._calib_file_row("3c"))
+        box.addWidget(self._calib_file_row("3c"))
         widgets["daq_group"] = self._build_step3_daq_group("3c")
-        layout.addWidget(widgets["daq_group"])
+        box.addWidget(widgets["daq_group"])
 
         grid_panel = self._panel("Channel grid")
         grid = QtWidgets.QGridLayout(grid_panel)
+        grid.setColumnStretch(1, 1)
         widgets["target"] = self._double_spin(700.0, 900.0, 778.04, " nm", 3)
         widgets["window"] = self._spin(1, 256, 15)
         widgets["pad"] = self._spin(0, 256, 35)
@@ -2042,36 +2028,306 @@ class MainWindow(QtWidgets.QMainWindow):
             "Half-width around each guard wavelength; channels overlapping a "
             "guard band are skipped."
         )
-        grid.addWidget(QtWidgets.QLabel("Target center"), 0, 0)
-        grid.addWidget(widgets["target"], 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Channel width"), 0, 2)
-        grid.addWidget(widgets["window"], 0, 3)
-        grid.addWidget(QtWidgets.QLabel("Gap px"), 0, 4)
-        grid.addWidget(widgets["pad"], 0, 5)
-        grid.addWidget(QtWidgets.QLabel("Channels/side"), 1, 0)
-        grid.addWidget(widgets["count"], 1, 1)
-        grid.addWidget(widgets["guard_check"], 2, 0, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Guard centers"), 2, 2)
-        grid.addWidget(widgets["guard_wl"], 2, 3)
-        grid.addWidget(QtWidgets.QLabel("Guard half-width"), 2, 4)
-        grid.addWidget(widgets["guard_nm"], 2, 5)
-        layout.addWidget(grid_panel)
+        rows = [
+            ("Target center", widgets["target"]),
+            ("Channel width", widgets["window"]),
+            ("Gap px", widgets["pad"]),
+            ("Channels/side", widgets["count"]),
+        ]
+        for row, (label, widget) in enumerate(rows):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            grid.addWidget(widget, row, 1)
+        grid.addWidget(widgets["guard_check"], len(rows), 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Guard centers"), len(rows) + 1, 0)
+        grid.addWidget(widgets["guard_wl"], len(rows) + 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Guard half-width"), len(rows) + 2, 0)
+        grid.addWidget(widgets["guard_nm"], len(rows) + 2, 1)
+        box.addWidget(grid_panel)
 
-        layout.addWidget(
-            self._level_sweep_row("3c", start=350, stop=950, stepv=25))
+        box.addWidget(self._level_sweep_row("3c", start=350, stop=950, stepv=25))
 
         # No wavelength-source choice: the map is the named file's step-2
         # section, exactly as calib_step3.py reads it.  The off/on levels ride
         # in that section too, so there is nothing left to pick.
-        run_row = self._run_row("3c", "Run Step 3c", self._run_step3c)
+        #
+        # No status label down here and no progress bar.  The page's one line of
+        # feedback is `step3_status` beside the title -- a finished run writes
+        # there, through step_widgets["3c"]["status"] -- and a twenty-minute
+        # sweep gets the shared CalibrationProgressDialog with its live trace,
+        # not a strip in a column nobody is watching.
+        self.step3_load_button = QtWidgets.QPushButton(
+            "Load\N{HORIZONTAL ELLIPSIS}")
+        self.step3_load_button.setProperty("variant", "ghost")
+        self.step3_load_button.setToolTip(
+            "Re-fit the step-3 sweep this calibration file records and show it: "
+            "every channel, from the CSV its step3 section names.\n"
+            "Reads only \N{EM DASH} nothing is written back, and the file this "
+            "page writes to does not move."
+        )
+        self.step3_load_button.clicked.connect(self._step3_load)
+        widgets["run"] = QtWidgets.QPushButton("Run Step 3")
+        widgets["run"].setEnabled(False)
+        widgets["run"].clicked.connect(self._run_step3c)
         widgets["stop"] = QtWidgets.QPushButton("Stop")
         widgets["stop"].setProperty("variant", "danger")
         widgets["stop"].setEnabled(False)
         widgets["stop"].clicked.connect(self._stop_full_calibration)
-        run_row.layout().addWidget(widgets["stop"])
-        layout.addWidget(run_row)
-        layout.addStretch(1)
-        return page
+        widgets["status"] = self.step3_status
+        btns = QtWidgets.QGridLayout()
+        btns.addWidget(self.step3_load_button, 0, 0, 1, 2)
+        btns.addWidget(widgets["run"], 1, 0)
+        btns.addWidget(widgets["stop"], 1, 1)
+        box.addLayout(btns)
+
+        box.addStretch(1)
+        return col
+
+    #: One row per channel on the step-3 results table.  Scalars only: twenty
+    #: channels have to stay readable at a glance, and the per-level detail is
+    #: the plot under it.
+    _STEP3_COLUMNS = (
+        "ch", "x (px)", "\N{GREEK SMALL LETTER LAMDA} (nm)", "contrast (mV)",
+        "off", "on", "rms (%)", "max|\N{GREEK CAPITAL LETTER DELTA}| (%)",
+        "curv (rad)", "n", "flags",
+    )
+
+    def _build_step3_results(self) -> QtWidgets.QWidget:
+        """The right column: the all-channel table over the selected channel's curve."""
+        self.step3_table = QtWidgets.QTableWidget(0, len(self._STEP3_COLUMNS))
+        self.step3_table.setHorizontalHeaderLabels(list(self._STEP3_COLUMNS))
+        self.step3_table.verticalHeader().setVisible(False)
+        self.step3_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.step3_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.step3_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.step3_table.setAlternatingRowColors(True)
+        self.step3_table.horizontalHeader().setStretchLastSection(True)
+        # The table IS the channel selector -- no separate combo box.
+        self.step3_table.itemSelectionChanged.connect(self._step3_redraw)
+
+        self.step3_fig = Figure(figsize=(6.4, 4.4), tight_layout=True)
+        self.step3_canvas = FigureCanvas(self.step3_fig)
+
+        stack = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        stack.addWidget(self._panel_with_widget("Channels", self.step3_table))
+        stack.addWidget(self._panel_with_widget(
+            "Level \N{RIGHTWARDS ARROW} output \N{MIDDLE DOT} the measured "
+            "points and the fitted curve", self.step3_canvas))
+        stack.setStretchFactor(0, 0)
+        stack.setStretchFactor(1, 1)
+        stack.setSizes([240, 520])
+        return stack
+
+    # ---- step 3 results ----------------------------------------------------
+    @staticmethod
+    def _step3_fit_curves(
+        levels: np.ndarray, curves: np.ndarray,
+    ) -> "tuple[list[TransferFit | None], list[np.ndarray], list[str]]":
+        """-> (fits, dropped masks, failures): every channel of a sweep, fitted.
+
+        A channel that will not fit comes back as None with its reason in the
+        failure list rather than stopping the other nineteen, because a Load
+        wants to show what it can.  The run path treats any failure as fatal,
+        the way ``step3_section`` does: a channel with no fit cannot be encoded
+        at all, and the moment to say so is before the section is written.
+
+        The mask is the fitter's own, so the points marked on the plot are
+        exactly the ones ``n_clipped`` counts.
+        """
+        fits: "list[TransferFit | None]" = []
+        masks: list[np.ndarray] = []
+        failed: list[str] = []
+        curves = np.asarray(curves, dtype=float)
+        for row in range(curves.shape[0]):
+            try:
+                fit, dropped = fit_transfer_curve_clipped(levels, curves[row])
+            except TransferFitError as exc:
+                fits.append(None)
+                masks.append(np.zeros(np.shape(levels), dtype=bool))
+                failed.append(f"channel {row}: {exc}")
+                continue
+            fits.append(fit)
+            masks.append(dropped)
+        return fits, masks, failed
+
+    def _step3_show(self, coords, waves, levels, curves, fits, masks) -> None:
+        """Put a fitted sweep on the page -- the one thing a run and a Load share."""
+        self.step3_coords = np.asarray(coords, dtype=float)
+        self.step3_waves = np.asarray(waves, dtype=float)
+        self.step3_levels = np.asarray(levels, dtype=float)
+        self.step3_curves = np.asarray(curves, dtype=float)
+        self.step3_fits = list(fits)
+        self.step3_clipped = list(masks)
+        self._step3_fill_table()
+        self._step3_redraw()
+
+    @staticmethod
+    def _step3_curv_rad(fit: TransferFit) -> float:
+        """``phase_curv`` as radians of departure from linear at the sweep edge.
+
+        phase_curv itself is ~1e-6 rad/level squared, which reads as nothing;
+        scaled by the half-span it is the number worth a column.  Exactly 0
+        means the fitter declined the curvature term for that channel.
+        """
+        half = 0.5 * (float(fit.level_max) - float(fit.level_min))
+        return float(fit.phase_curv) * half * half
+
+    def _step3_fill_table(self) -> None:
+        """One row per channel: every column a scalar, so 20 channels stay readable."""
+        self.step3_table.blockSignals(True)
+        self.step3_table.setRowCount(len(self.step3_fits))
+        for row, fit in enumerate(self.step3_fits):
+            cells = [
+                str(row),
+                f"{float(self.step3_coords[row]):.1f}",
+                f"{float(self.step3_waves[row]):.3f}",
+            ]
+            if fit is None:
+                cells += ["\N{EN DASH}"] * 7 + ["FIT FAILED"]
+            else:
+                # Every flag is a thing to look at, not a thing that failed:
+                # n_clipped says the fit dropped cells, `extrapolated` that
+                # v = 1 is off the end of what was swept, `clipped` that the
+                # window leaves the panel, and a missing turn that Delta turns
+                # over inside 0..1023, past which the model is not invertible.
+                flags = []
+                if fit.n_clipped:
+                    flags.append(f"{fit.n_clipped} clipped")
+                if fit.extrapolated:
+                    flags.append("extrapolated")
+                if fit.clipped:
+                    flags.append("window off-panel")
+                if not fit.turns_in_panel:
+                    flags.append("no turn in panel")
+                contrast = float(fit.contrast)
+                cells += [
+                    f"{contrast * 1e3:.4f}",
+                    str(fit.off_level),
+                    str(fit.on_level),
+                    f"{100.0 * fit.rms / contrast:.3f}" if contrast else "\N{EN DASH}",
+                    f"{100.0 * fit.max_abs / contrast:.2f}" if contrast else "\N{EN DASH}",
+                    f"{self._step3_curv_rad(fit):+.4f}",
+                    str(fit.n_used),
+                    ", ".join(flags) or "OK",
+                ]
+            for col, text in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(text)
+                if col:
+                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                self.step3_table.setItem(row, col, item)
+        self.step3_table.resizeColumnsToContents()
+        self.step3_table.blockSignals(False)
+        if self.step3_fits:
+            self.step3_table.selectRow(0)
+
+    def _step3_selected(self) -> int:
+        """The channel the table has selected; -1 when no sweep is on the page."""
+        if not self.step3_fits:
+            return -1
+        row = self.step3_table.currentRow()
+        return 0 if row < 0 or row >= len(self.step3_fits) else row
+
+    def _step3_redraw(self, *, draw: bool = True) -> None:
+        """The selected channel: its points, its fitted curve, and what was dropped.
+
+        Output in mV, because on the DAQ path ``intensity`` is a dark-subtracted
+        volt and not a normalized power.  The sin^2 model carries a free
+        amplitude so the fit does not care which it is, but the axis should say
+        what was actually read.
+        """
+        self.step3_fig.clear()
+        self.step3_fig.patch.set_facecolor("#101820")
+        ax = self.step3_fig.add_subplot(111)
+        self._style_dark_axes(ax)
+        ax.set_xlabel("SLM level")
+        ax.set_ylabel("output  (mV, dark-subtracted)")
+        row = self._step3_selected()
+        if row < 0:
+            ax.text(0.5, 0.5, "Run or load a sweep", ha="center", va="center",
+                    transform=ax.transAxes, color="#d8dee9")
+            if draw:
+                self.step3_canvas.draw_idle()
+            return
+
+        levels = self.step3_levels
+        values = self.step3_curves[row]
+        fit = self.step3_fits[row]
+        dropped = (self.step3_clipped[row] if row < len(self.step3_clipped)
+                   else np.zeros(levels.shape, dtype=bool))
+        kept = np.isfinite(values) & ~dropped
+        ax.plot(levels[kept], values[kept] * 1e3, "o", color="#8fd14f", ms=5,
+                label="measured")
+        if dropped.any():
+            ax.plot(levels[dropped], values[dropped] * 1e3, "x", color="#bf616a",
+                    ms=9, mew=2.0,
+                    label=f"{int(dropped.sum())} clipped \N{EM DASH} not in the fit")
+        title = (f"ch {row}   x = {float(self.step3_coords[row]):.1f} px   "
+                 f"{float(self.step3_waves[row]):.3f} nm")
+        if fit is None:
+            ax.text(0.5, 0.5, "this channel did not fit", ha="center", va="center",
+                    transform=ax.transAxes, color="#bf616a")
+        else:
+            grid = np.linspace(float(np.min(levels)), float(np.max(levels)), 400)
+            ax.plot(grid, fit.intensity(grid) * 1e3, "-", color="#e0a447", lw=1.4,
+                    label="fit  I = floor + contrast \N{MIDDLE DOT} "
+                          "sin\N{SUPERSCRIPT TWO}(\N{GREEK CAPITAL LETTER DELTA}(L)/2)")
+            lo, hi = sorted((fit.off_level, fit.on_level))
+            ax.axvspan(lo, hi, color="#8fd14f", alpha=0.08,
+                       label=f"encoding window  {fit.off_level}"
+                             f"\N{EN DASH}{fit.on_level}")
+            if fit.contrast:
+                title += f"   rms {100.0 * fit.rms / fit.contrast:.2f}% of contrast"
+        ax.set_title(title, color="#d8dee9", fontsize=9)
+        ax.legend(loc="upper left", fontsize=7)
+        if draw:
+            self.step3_canvas.draw_idle()
+
+    def _step3_load(self) -> None:
+        """Re-fit the sweep this calib file records, and show it.  Never writes.
+
+        ONE input, asked for: a calib.json.  Its step3 section says which CSV it
+        was fitted from, so looking at last night's sweep is opening last night's
+        calib file and there is no second path to keep in step.  The fit reads
+        that file's own levels; the grid and sweep controls describe the NEXT run
+        and play no part here.
+
+        Reads only, and the page's own calib file does not move -- a re-fit meant
+        to be kept is a run of calib_step3.py against the file, not a button on a
+        page that happened to be showing something else.
+        """
+        picked = self._open_calib("Open a calibration to re-fit its step 3", "3c")
+        if picked is None:
+            return
+        try:
+            calib = load_calib(picked)
+            path = calib.csv_path(3)
+        except Exception as exc:                            # noqa: BLE001
+            self.step3_status.setText(f"Load failed: {exc}")
+            return
+        if not path.is_file():
+            self.step3_status.setText(
+                f"Load failed: {calib.path.name} names {path.name}, which is "
+                f"not in {path.parent} \N{EM DASH} copy the CSV in beside it."
+            )
+            return
+        try:
+            coords, waves, levels, curves = load_intensity_calibration_csv(path)
+        except Exception as exc:                            # noqa: BLE001
+            self.step3_status.setText(f"Load failed: {exc}")
+            return
+
+        fits, masks, failed = self._step3_fit_curves(levels, curves)
+        self._step3_show(coords, waves, levels, curves, fits, masks)
+        clipped = sum(int(mask.sum()) for mask in masks)
+        note = f"  \N{MIDDLE DOT}  {clipped} point(s) clipped" if clipped else ""
+        if failed:
+            note += f"  \N{MIDDLE DOT}  {len(failed)} fit(s) failed"
+        self.step3_status.setText(
+            f"Loaded {self._calib_name(calib.path)} \N{MIDDLE DOT} {path.name} "
+            f"\N{MIDDLE DOT} {len(fits)} channel(s) re-fit over "
+            f"{levels.size} levels{note}"
+        )
+        for line in failed:
+            self._log(f"[step 3] fit failed \N{EM DASH} {line}")
 
     def _caption(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -9825,88 +10081,6 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self._controller()
         self._run_slm_task("Display CSV", lambda: controller.display_csv(path))
 
-    def _browse_calibration_csv(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Calibration CSV", "", "CSV Files (*.csv);;All Files (*)"
-        )
-        if path:
-            self.calibration_path_edit.setText(path)
-
-    def _run_calibration_fit(self) -> None:
-        path = self.calibration_path_edit.text().strip()
-        if not path:
-            self._log("Select a calibration CSV first")
-            return
-
-        def fit_file() -> dict[float, CalibrationFit]:
-            points = load_calibration_csv(path)
-            return fit_calibration(points)
-
-        self._run_task("Calibration fit", fit_file, self._on_calibration_fit)
-
-    def _on_calibration_fit(self, fits: dict[float, CalibrationFit]) -> None:
-        self.calibration_fits = fits
-        self.wavelength_combo.blockSignals(True)
-        self.wavelength_combo.clear()
-        for wavelength in fits:
-            self.wavelength_combo.addItem(f"{wavelength:g} nm", wavelength)
-        self.wavelength_combo.blockSignals(False)
-        self.save_fit_button.setEnabled(True)
-        self._update_calibration_view()
-
-    def _update_calibration_view(self) -> None:
-        if not self.calibration_fits or self.wavelength_combo.count() == 0:
-            return
-        wavelength = float(self.wavelength_combo.currentData())
-        fit = self.calibration_fits[wavelength]
-
-        rows = [
-            ("wavelength_nm", fit.wavelength_nm),
-            ("I0", fit.i0),
-            ("phase_slope", fit.phase_slope),
-            ("phase_offset", fit.phase_offset),
-            ("RMSE", fit.rmse),
-            ("R2", fit.r_squared),
-        ]
-        self.fit_table.setRowCount(len(rows))
-        for row, (name, value) in enumerate(rows):
-            self.fit_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
-            self.fit_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{value:.8g}"))
-        self.fit_table.resizeColumnsToContents()
-
-        self.figure.clear()
-        axes = self.figure.add_subplot(111)
-        axes.set_facecolor("#101820")
-        axes.scatter(fit.levels, fit.intensities, color="#47b8e0", label="Measured", s=32)
-        axes.plot(fit.levels, fit.fitted_intensities, color="#f5c542", label="Fit", linewidth=2)
-        axes.set_xlabel("Level")
-        axes.set_ylabel("Intensity")
-        axes.grid(True, color="#2b3a42", linewidth=0.7)
-        axes.legend()
-        self.figure.patch.set_facecolor("#101820")
-        axes.tick_params(colors="#d8dee9")
-        axes.xaxis.label.set_color("#d8dee9")
-        axes.yaxis.label.set_color("#d8dee9")
-        for spine in axes.spines.values():
-            spine.set_color("#41515c")
-        self.canvas.draw_idle()
-
-    def _save_calibration_result(self) -> None:
-        if not self.calibration_fits:
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Calibration Result", "calibration_fit.json", "JSON Files (*.json)"
-        )
-        if not path:
-            return
-        payload = {
-            f"{wavelength:g}": fit.to_dict()
-            for wavelength, fit in self.calibration_fits.items()
-        }
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2)
-        self._log(f"Saved calibration result: {path}")
-
     # ----- OSA-driven acquisition -----
     def _browse_save_into(self, edit: QtWidgets.QLineEdit, default_name: str, filt: str) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -10023,6 +10197,10 @@ class MainWindow(QtWidgets.QMainWindow):
         step3c = getattr(self, "step_widgets", {}).get("3c", {})
         if "stop" in step3c:
             step3c["stop"].setEnabled(running)
+        if hasattr(self, "step3_load_button"):
+            # As on step 6: a Load mid-sweep would put another night's fits on
+            # the page the running sweep is about to fill.
+            self.step3_load_button.setEnabled(not running)
         self.osa_connect_button.setEnabled(not running and not connected)
         self.osa_disconnect_button.setEnabled(not running and connected)
         # Step 3 may run on the DAQ instead of the OSA, so its Run button is
@@ -10428,15 +10606,31 @@ class MainWindow(QtWidgets.QMainWindow):
             stamp = time.strftime("%m%d_%H%M")
             csv_path = write_intensity_calibration_csv(
                 result, calib_file.parent / f"step3_{stamp}.csv")
+            # Fit HERE, once, and hand the fits to both the section and the
+            # page: what is on screen afterwards is then the encoding steps 6-8
+            # will read, not a second fit of the same sweep that could differ.
+            # A channel that will not fit is fatal, as it is in step3_section --
+            # without a fit it cannot be encoded at all -- but every failure is
+            # named, not just the first.
+            fits, clipped, failed = self._step3_fit_curves(
+                result.level_range, result.intensity_levels)
+            if failed:
+                raise TransferFitError("; ".join(failed))
+            result = replace(result, transfer_fits=fits)
             calib = write_section(calib_file, 3, step3_section(result),
                                   csv=csv_path, log=lambda m: self._log(m))
+            dropped = sum(int(mask.sum()) for mask in clipped)
             return {
                 "status": "ok", "step": "3c", "result": result,
                 "saved": calib.path, "csv": csv_path,
                 "center_coordinate": sweep.center_coordinate,
+                "levels": result.level_range,
+                "curves": result.intensity_levels,
+                "clipped": clipped,
                 "summary": (
                     f"{result.coordinates.size} channels, "
                     f"pitch {window + pad} px"
+                    + (f", {dropped} point(s) clipped" if dropped else "")
                 ),
             }
 
@@ -10866,12 +11060,23 @@ class MainWindow(QtWidgets.QMainWindow):
             written = [f"step{3 if step == '3c' else step}"]
             if payload.get("csv") is not None:
                 written.append(Path(payload["csv"]).name)
+            # The file it went into may now carry a section it did not before,
+            # and every page that names it has to re-gate on that.  Re-described
+            # BEFORE the line below, not after: on step 3 the file description
+            # and the page's newest message are the same one line (see
+            # _STEP_STATUS), and what just finished is the newer of the two.
+            self._calib_describe_all()
             self.step_widgets[step]["status"].setText(
                 f"Done \N{MIDDLE DOT} {summary} \N{MIDDLE DOT} wrote "
                 + " + ".join(written))
-            # The file it went into may now carry a section it did not before,
-            # and every page that names it has to re-gate on that.
-            self._calib_describe_all()
+            if step == "3c" and payload.get("curves") is not None:
+                # The fits the section was written from, drawn as they are
+                # stored: the table is the first look anybody gets at whether
+                # this sweep is in family across the array.
+                self._step3_show(
+                    result.coordinates, result.wavelength, payload["levels"],
+                    payload["curves"], result.transfer_fits, payload["clipped"],
+                )
             center_coordinate = payload.get("center_coordinate")
             if step == "3c" and center_coordinate is not None:
                 self._log(
@@ -10981,73 +11186,6 @@ class MainWindow(QtWidgets.QMainWindow):
         axes.yaxis.label.set_color("#d8dee9")
         for spine in axes.spines.values():
             spine.set_color("#41515c")
-
-    def _update_intensity_map(self) -> None:
-        if not hasattr(self, "map_canvas"):
-            return
-        self.map_figure.clear()
-        self.map_figure.patch.set_facecolor("#101820")
-        axes = self.map_figure.add_subplot(111)
-        self._style_dark_axes(axes)
-
-        result = self.calibration_result
-        if result is None or result.intensity_levels is None:
-            axes.text(
-                0.5,
-                0.5,
-                "Run a calibration to see the intensity map",
-                ha="center",
-                va="center",
-                color="#d8dee9",
-                transform=axes.transAxes,
-            )
-            self.map_canvas.draw_idle()
-            return
-
-        raw = self.map_kind_combo.currentText().startswith("Raw")
-        data = result.raw_intensity_levels if raw else result.intensity_levels
-        if data is None:
-            axes.text(
-                0.5,
-                0.5,
-                "Raw intensity map is not available",
-                ha="center",
-                va="center",
-                color="#d8dee9",
-                transform=axes.transAxes,
-            )
-            self.map_canvas.draw_idle()
-            return
-
-        data = np.asarray(data, dtype=float)
-        levels = np.asarray(result.level_range, dtype=float)
-        wavelengths = np.asarray(result.wavelength, dtype=float)
-        extent = [
-            float(levels.min()),
-            float(levels.max()),
-            float(wavelengths.min()),
-            float(wavelengths.max()),
-        ]
-        if extent[0] == extent[1]:
-            extent[1] += 1.0
-        if extent[2] == extent[3]:
-            extent[3] += 1.0
-        image = axes.imshow(
-            data,
-            aspect="auto",
-            origin="lower",
-            extent=(extent[0], extent[1], extent[2], extent[3]),
-            cmap="viridis",
-        )
-        axes.set_xlabel("Level")
-        axes.set_ylabel("Wavelength (nm)")
-        colorbar = self.map_figure.colorbar(image, ax=axes)
-        colorbar.set_label("Intensity (W)" if raw else "Normalized intensity")
-        colorbar.ax.yaxis.set_tick_params(color="#d8dee9")
-        colorbar.ax.yaxis.label.set_color("#d8dee9")
-        for label in colorbar.ax.get_yticklabels():
-            label.set_color("#d8dee9")
-        self.map_canvas.draw_idle()
 
     def _browse_scan_output(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")

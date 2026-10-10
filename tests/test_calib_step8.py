@@ -32,7 +32,7 @@ from calibration_module.fit.pair import load_tpa_pair_csv  # noqa: E402
 from calibration_module.measure.pmt_temp import open_pmt  # noqa: E402
 from daq_module import DAQMonitorSettings  # noqa: E402
 
-RUN = ROOT / "src" / "calib_data" / "run_0911_10pairs_w20g30"
+RUN = ROOT / "src" / "calib_data" / "archive" / "2026-09" / "run_0911_10pairs_w20g30"
 STEP7 = RUN / "calib.json"
 
 
@@ -824,9 +824,9 @@ class PmtInStepsSixAndSevenTests(unittest.TestCase):
     both present.
     """
 
-    S6_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step6v2_meas_0917_1811.csv"
-    S7_CSV = ROOT / "src/calib_data/calib_0917_1617/calib_step7_meas_0917_1831.csv"
-    S6_JSON = ROOT / "src/calib_data/calib_0917_1617/calib.json"
+    S6_CSV = ROOT / "src/calib_data/archive/2026-09/calib_0917_1617/calib_step6v2_meas_0917_1811.csv"
+    S7_CSV = ROOT / "src/calib_data/archive/2026-09/calib_0917_1617/calib_step7_meas_0917_1831.csv"
+    S6_JSON = ROOT / "src/calib_data/archive/2026-09/calib_0917_1617/calib.json"
     META = {"pmt_resource": "GPIB0::21::INSTR", "pmt_period_s": "60",
             "pmt_c_start": "27.2379", "pmt_c_end": "27.2146"}
 

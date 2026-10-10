@@ -142,7 +142,7 @@ class Step3InputTests(_TmpCase):
 
     def test_a_directory_means_the_calib_json_inside_it(self) -> None:
         """The runners' one concession to the old run-folder habit."""
-        run = REPO / "src/calib_data/run_0930"
+        run = REPO / "src/calib_data/archive/2026-09/run_0930"
         if not (run / "calib.json").is_file():           # pragma: no cover
             self.skipTest("run_0930 is not in this checkout")
         here = self.tmp / "copied"

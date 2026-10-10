@@ -76,13 +76,12 @@ __all__ = [
 def note_step7_moved(run, meta, log=print) -> bool:
     """Warn when a recorded CSV was driven under a different step 7 than this one.
 
-    Every file is called ``calib.json``, so a filename cannot identify a step 7;
-    its ``ran`` stamp can, and the driving run writes that into the CSV meta as
+    How: every file is called ``calib.json``, so the step 7 is identified by its
+    ``ran`` stamp, which the driving run writes into the CSV meta as
     ``step7_ran``.
 
     Out: True when it said something.  A CSV from before the stamp carries none
-    and passes in silence -- there is nothing to compare, and warning on every
-    historical file would train the operator to ignore the one that matters.
+    and passes in silence.
     """
     from calibration_module.calib_file import load_calib
 
@@ -116,9 +115,9 @@ def load_forward_model(
          it, with ``phases[ref] = 0``.
 
     A stored ``dphi_comb_rad`` IS ``Phi_k``, step 7 fitting
-    ``cos(dPhi_SLM + dPhi_comb)``, so it reads through untouched.  A file
-    tagged ``"convention": "comb-slm"`` holds the NEGATED phase and is read
-    as-is, not migrated: re-run step 7 rather than trust one.
+    ``cos(dPhi_SLM + dPhi_comb)``, so it reads through untouched.  A file tagged
+    ``"convention": "comb-slm"`` holds the NEGATED phase and is read as-is, not
+    migrated: re-run step 7 rather than trust one.
     """
     from calibration_module.calib_file import calib_path
 
@@ -165,24 +164,17 @@ def fit_y_sat(y, pred, sigma=None, *, y_lo: float = 2.0, y_hi: float = 40.0,
     Out: the fit and its interval.  ONE free parameter -- the gain is pinned
          to 1.
 
-    The grid is uniform in ``1/Y_sat``, the parameter the model is linear in
-    (``1/y = 1/Y + 1/Y_sat``), so a uniform ``Y_sat`` grid would spend most of
-    its points where the data says nothing.  The quoted uncertainty is the
-    ``Delta chi^2 = 1`` interval mapped back through the inverse, hence
+    How: a grid uniform in ``1/Y_sat``, the parameter the model is linear in
+    (``1/y = 1/Y + 1/Y_sat``).  The quoted uncertainty is the
+    ``Delta chi^2 = 1`` interval mapped back through the inverse, so it is
     asymmetric in ``Y_sat``.
 
-    THE GAIN CAVEAT, which decides what this number means.  With ``g`` pinned at
-    1, any gain error is absorbed into ``Y_sat`` and levered by roughly
-    ``Y_sat / max(pred)``, about 12x on a sweep reaching 400 mV.  Measured
-    overnight on an unchanged bench, a ``g = 1`` ``Y_sat`` swung 4.39..5.44 V
-    while tracking the separately measured gain at r = 0.98; with the gain free
-    it sat at 6.84 +- 0.20 V with no trend.
-
-    That is the point, not a defect: this fit DEFINES ``g = 1``, and a later run
-    measures its gain as the ratio of its reads to this run's on the same
-    drives.  Re-fitting another day gives a different ``Y_sat`` without either
-    being wrong.  What must not happen is mixing one day's ``Y_sat`` with
-    another day's reads.
+    THE GAIN CAVEAT.  With ``g`` pinned at 1, any gain error is absorbed into
+    ``Y_sat`` and levered by roughly ``Y_sat / max(pred)``, about 12x on a sweep
+    reaching 400 mV.  This fit DEFINES ``g = 1``, and a later run measures its
+    gain as the ratio of its reads to this run's on the same drives, so
+    re-fitting another day gives a different ``Y_sat`` without either being
+    wrong.  One day's ``Y_sat`` must not be mixed with another day's reads.
     """
     y = np.asarray(y, dtype=float)
     pred = np.asarray(pred, dtype=float)
@@ -247,11 +239,9 @@ def predict(models: Mapping[int, PairModel], phases: Mapping[int, float],
     background rather than TPA field, so it adds OUTSIDE the coherent sum, and
     ``y_sat`` applies :func:`saturate` to ``|E|^2`` alone.
 
-    ``coherent=True`` returns ``|E|^2`` by itself.  That is what ``FS = Y_max``
-    is defined on (:class:`FullScale`) and so what a level target means, while
-    the full ``Y`` is what the ADC sees and so what an input range is chosen
-    from.  Keeping them apart matters: the background ramps with level, a tilt
-    that would otherwise read as model bias.
+    ``coherent=True`` returns ``|E|^2`` by itself, which is what ``FS = Y_max``
+    is defined on (:class:`FullScale`) and so what a level target means; the
+    full ``Y`` is what the ADC sees and so what an input range is chosen from.
     """
     x = np.asarray(x, dtype=float)
     w = np.asarray(w, dtype=float)
@@ -315,11 +305,11 @@ PSI_GRID = 4001
 def support_h(psi, eta: float, phase: float) -> tuple[np.ndarray, np.ndarray]:
     """``(h_k(psi), t)`` for one pair: its support, and the ``t = u + v`` attaining it.
 
-    ``h_k(psi) = max_{t in [0, pi]} eta (1 - cos t)/2 cos(psi - phase - t)``,
-    maximised in closed form: ``d/dt = 0`` gives ``t* = (pi + 2a)/3`` up to
+        h_k(psi) = max_{t in [0, pi]} eta (1 - cos t)/2 cos(psi - phase - t)
+
+    Maximised in closed form: ``d/dt = 0`` gives ``t* = (pi + 2a)/3`` up to
     ``2 pi n/3``, so every branch landing in ``[0, pi]`` is tried along with both
-    endpoints.  ``a = psi - phase`` spans ``(-2 pi, 2 pi]``, hence ``n = -3..3``
-    -- too narrow a window undershoots the maximum silently rather than failing.
+    endpoints.  ``a = psi - phase`` spans ``(-2 pi, 2 pi]``, hence ``n = -3..3``.
     """
     psi = np.atleast_1d(np.asarray(psi, dtype=float))
     a = psi - float(phase)
@@ -339,10 +329,9 @@ def reachable_max(etas, phases) -> tuple[float, np.ndarray, float]:
     """``(Y_max, drive, psi)`` -- the largest ``|E|^2`` these pairs can be driven to.
 
     ``drive[k]`` is the ``x_k = w_k`` attaining it, the optimum being symmetric
-    in x and w since ``sin u sin v`` peaks at ``u = v`` for fixed ``u + v``.  So
+    in x and w since ``sin u sin v`` peaks at ``u = v`` for fixed ``u + v``, so
     ``predict(models, phases, driven, drive, drive)`` reproduces ``Y_max``
-    exactly, which is how this is tested: :func:`predict` knows nothing about
-    the support scan.
+    exactly.
     """
     etas = np.asarray(etas, dtype=float)
     phases = np.asarray(phases, dtype=float)
@@ -378,8 +367,7 @@ class FullScale:
 
     ``Y_min = 0`` is always reachable, so ``FS = Y_max``: the largest ``|E|^2``
     the pairs can ACTUALLY be driven to, phase and amplitude coupled as they
-    are.  The single-beam background is not part of it, being detector offset
-    rather than what a computation drives.
+    are.  The single-beam background is not part of it.
 
     :attr:`bound` is the free-phase ``S^2`` for comparison, :attr:`headroom` how
     much of it the measured phases allow.
@@ -548,9 +536,8 @@ def write_verify_csv(path: str | Path, pairs: Sequence[int], rows: Sequence[Mapp
     ``range_v`` added, so :func:`load_verify_csv` reads both.
 
     ``extra`` names further per-row columns appended after ``pred_v``, blank
-    where a row omits one.  That is how the system-accuracy run records which
-    family a read belongs to without a second file format -- the leading columns
-    being unchanged, such a CSV still loads as an ordinary n-pair block.
+    where a row omits one; the leading columns being unchanged, such a CSV still
+    loads as an ordinary n-pair block.
     """
     pairs = sorted(int(k) for k in pairs)
     out = Path(path).resolve()
@@ -583,11 +570,9 @@ def write_plan_csv(path: str | Path, patterns: Sequence, preds: Sequence[float],
     One row per pattern, laid out exactly as :func:`write_verify_csv` does, so
     the plan and the reads it produced line up column for column.  The scalars
     it was solved under -- the step-7 stamp, the seed, ``Y_max``, the ladder
-    geometry -- go in the usual trailing ``# key,value`` meta lines.
-
-    A CSV and not a JSON: a calibration is one JSON, and a list of patterns is a
-    table.  ``exact`` is False where a pattern fell back to the deterministic
-    drive because the solver could not hit its target alpha.
+    geometry -- go in trailing ``# key,value`` meta lines.  ``exact`` is False
+    where a pattern fell back to the deterministic drive, the solver not having
+    hit its target alpha.
     """
     pairs = sorted(int(k) for k in pairs)
     out = Path(path).resolve()

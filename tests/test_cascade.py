@@ -32,7 +32,7 @@ from calibration_module.fit.cascade import (  # noqa: E402
     wrap_pi,
 )
 
-RUN = REPO_ROOT / "src/calib_data/run_0916_10pairs_w15g35"
+RUN = REPO_ROOT / "src/calib_data/archive/2026-09/run_0916_10pairs_w15g35"
 # The two stages of one cascaded run.  A run directory holds ONE
 # calib.json, whose step7 section is the merged spectrum, so the
 # per-stage fits live here as fixtures trimmed to what this test reads.

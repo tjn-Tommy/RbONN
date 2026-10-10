@@ -65,7 +65,7 @@ from calibration_module.steps import calib_step8 as STEP8       # noqa: E402
 #: The forward model the patterns are solved from.  Its GAIN may be stale --
 #: see the module docstring -- but its etas and phases are what decide which
 #: drive is alpha = 0.3, and that is all it is asked for here.
-STEP7 = REPO_ROOT / "src/calib_data/run_0930/calib_step7_result_0930_1353.json"
+STEP7 = REPO_ROOT / "src/calib_data/archive/2026-09/run_0930/calib_step7_result_0930_1353.json"
 
 OUT_DIR = REPO_ROOT / "src/calib_data"
 ALPHA_LO, ALPHA_HI, N_POINTS = 0.1, 1.0, 20

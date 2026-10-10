@@ -1,53 +1,43 @@
 """Run one inference on the bench: display what the npz says, read what it predicts.
 
-The other end of :mod:`onn_module.bench_reference`.  That file writes down the
-drives and the ``Y`` each should produce; this one displays them, reads the
+The other end of :mod:`onn_module.bench_reference`: that file writes down the
+drives and the ``Y`` each should produce, this one displays them, reads the
 detector, undoes the instrument response and reports whether the optics picked
 the right digit.
 
-In:  a ``bench_reference.npz`` and the run's ``calib.json`` (``--calib``), which
-     holds every step the forward model needs.  ``--t-meas`` is the window for
-     EVERY read -- inference, anchor and the opening dark alike -- and defaults
-     to the bench window :data:`~calibration_module.measure.pair_v2.T_MEAS_S`,
-     the one steps 6-8 read at, so a read and the rung it is scaled against
-     average the same noise.
+In:  a ``bench_reference.npz`` and the run's ``calib.json`` (``--calib``),
+     whose forward model the gain is measured against.  ``--t-meas`` is the
+     window for every read --
+     inference, anchor and the opening dark alike -- and defaults to the bench
+     window :data:`~calibration_module.measure.pair_v2.T_MEAS_S`, the one steps
+     6-8 read at.
 Out: a CSV, one row per read: the volts, the recovered ``Y``, the ``g`` used,
-     ``kind=gain`` rows for the anchors it was built from and ``kind=gain_drop``
-     for the anchor reads it refused.
+     and ``kind=gain`` rows for the anchors it was built from.
 
-The detector sees, for gain ``g`` and the step-6 single-beam response,
+How the instrument response is undone.  The detector sees, for gain ``g`` and
+the step-6 single-beam response ``sb``,
 
-    V = g * [ Y + SUM_k (a_x x_k + q_x x_k^2 + a_w w_k + q_w w_k^2) ] + dark
+    V = g * [ Y + sb(x, w) ] + dark
 
-so ``Y = (V - dark) / g - SUM_k (...)``, IN THAT ORDER -- the single-beam light
-went through the same gain, and step 6 fits those coefficients where ``g`` is 1
-by definition.
-
-The gain is anchored to THIS RUN'S FIRST MINUTE.  :func:`build_anchors` solves
-:data:`GAIN_RUNGS` ladder rungs over :data:`GAIN_BAND` with step 8's own
-builder; the first block reads them right after the dark and DEFINES ``g = 1``
-there.  Every ``--gain-every`` the same drives are replayed verbatim -- so eta,
-Phi and Y_sat all cancel -- and ``g`` is the origin-slope of ``(V_now - dark) =
-g * (V_first - dark)``, interpolated in time between blocks
-(:func:`apply_gain`).  The dark is read once and held.
-
-Each anchor block is checked on its own: a rung whose ratio to its reference
--- the model's prediction in the first block, the g = 1 volts after it -- is
-more than :data:`GAIN_TOL` off the block's fitted slope is a bad read and is
-dropped from the fit, written as ``kind=gain_drop``.  The first block re-reads
-what it drops once; off again, the rung leaves the ladder for the run.  Nothing
-checks an inference read: there is nothing to judge one against.
-
-What that does NOT measure is the gain change between the step-7 fit behind
-the npz and the start of this run: that is step 8's job, and a run without one
-carries it in the residual as a multiplicative tilt.  Within the run, the
-drift is tracked.
-
-The PMT thermistor is read with every gain block and stamped on every row
-until the next one; ``--no-pmt`` turns it off.
+so ``Y = (V - dark) / g - sb``, in that order -- ``sb`` is light that went
+through the same gain, and step 6 fits it where ``g`` is 1 by definition.  ``g``
+is measured on :data:`GAIN_RUNGS` step-8-style ladder rungs spread across
+:data:`GAIN_BAND`.  The run's first block fits ``g0``, the origin-slope of
+``(V - dark)`` against the model's linear prediction of those rungs; every
+later block replays the same drives verbatim -- so eta, Phi and Y_sat cancel
+-- and fits the ratio ``s`` of its volts to the first block's, ``g = g0 * s``.
+``g`` is interpolated in time between blocks (:func:`apply_gain`).  The dark is
+read once and held.
 
 Runs in ``rbonn``, not ``rbonn-ml``: this imports the SLM and DAQ drivers and no
 torch.  The npz is the seam, read with numpy alone.
+
+With ``--no-gain`` nothing measures the gain and ``g = 1`` means "whatever it
+was when the step-7 fit behind this npz was taken".  The CSV meta then records
+``g_reference = 1 (assumed, ...)``.
+
+    python src/onn_module/onn_infer.py --npz runs/onn784_ctrl/bench_reference.npz
+        --calib src/calib_data/<run>
 """
 from __future__ import annotations
 
@@ -96,37 +86,17 @@ ACQ = replace(DEFAULT_ACQ, t_meas_s=T_MEAS_S)   # the bench acquisition
 
 GAIN_EVERY_S = 1200.0       # re-measure g (and the PMT temperature) this often (20 min)
 
-#: The gain anchors: ``GAIN_RUNGS`` ladder rungs stratified over ``GAIN_BAND``,
-#: as fractions of ``Y_max``, solved by step 8's own :func:`build` so a rung
-#: here is the same object as a rung there.
-#:
-#: All in the bright half on purpose: a gain is a scale factor, so it can be
-#: measured at any level, and the bright end is where the SNR is.  Ten distinct
-#: rungs rather than ten repeats of one buys a slope for the same read budget;
-#: see the module docstring for why the fit runs through the origin.
-#:
-#: The top is capped the way step 8 caps its ladder -- at
-#: :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V` in VOLTS,
-#: through :func:`alpha_for_volts` against this model's ``Y_max`` -- because
-
+#: The gain anchors: they measure the system's sensitivity drift as ``g``, which
+#: an inference read then divides out -- ``Y = (V - dark) / g - sb``.
+#: How: replay ``GAIN_RUNGS`` of step 8's own ladder rungs, spread over
+#: ``GAIN_BAND`` as fractions of ``Y_max``, and fit the slope through the origin
+#: -- the first block's against the model (``g0``), every later one's against
+#: the first block's volts.
 GAIN_BAND = (0.4, 0.8)
 GAIN_RUNGS = 10
 
-#: A rung more than this (relative) off the block's FITTED SLOPE is a bad read
-#: and is dropped from that block's fit.
-#:
-#: What this is for: on run_1001 single anchor reads came in 4-6 % high with a
-#: perfectly ordinary trace std -- a level shift lasting the whole window, not
-#: a transient inside it, so the step-6/7 trace guards have nothing to see.
-#: The two bad reference reads on disk sit 4.1 % and 4.6 % off their block's
-#: slope to the model, and the -4.8 / -5.1 % they left in every later block are
-#: the same reads seen from the other side.  The body of the scatter is much
-#: tighter -- 0.9 % per read (MAD sigma) once each rung's fixed model error is
-#: out -- but a later block is judged against a SINGLE-read reference, so its
-#: deviations carry both reads: p90 3.4 % on that run.  4 % passes that body
-#: and takes the tail; 3 % would drop about one read in seven.
-#:
-#: Inference reads are never checked -- there is nothing to judge one against.
+#: A rung more than this (relative) off its block's fitted slope is dropped from
+#: that block's fit.  Inference reads are never checked.
 GAIN_TOL = 0.04
 
 OUT_DIR = REPO_ROOT / "runs"
@@ -150,8 +120,7 @@ def load_npz(path: Path) -> dict:
     """Unpack the reference dump into plain arrays, banks normalised away.
 
     ``W`` and ``y_block`` lose their bank axis when there is only one, so both
-    are reshaped back to a leading bank dimension here and the rest of the file
-    never has to care whether the model was differential.
+    are reshaped back to a leading bank dimension here.
     """
     d = np.load(path, allow_pickle=False)
     meta = json.loads(str(d["meta"]))
@@ -188,20 +157,16 @@ def build_anchors(models, phases, pairs: list[int], *, seed: int,
                   n: int = GAIN_RUNGS, band=GAIN_BAND) -> dict:
     """The gain ladder to replay: ``n`` solved rungs over ``band``, in alpha order.
 
-    In:  the forward model and a seed.  ``band`` is in fractions of ``Y_max``;
-         its top is capped at :data:`LADDER_CEILING_V` exactly as step 8 caps
-         its own ladder, so the brightest anchor never exceeds what step 8 was
-         willing to drive.
-    Out: each rung's drive, its achieved alpha, its linear prediction in volts,
-         ``v_ref = None`` -- the g = 1 volts do not exist until the first
-         block has read them (:func:`measure_gain` fills them in) -- and
-         ``keep``, all ``True``: the rungs still in the ladder.  A rung the
-         first block cannot read within :data:`GAIN_TOL` twice is turned off
-         there and never displayed again.
+    In:  the forward model and a seed.  ``band`` is in fractions of ``Y_max``,
+         its top capped at :data:`LADDER_CEILING_V` as step 8 caps its own.
+    Out: per rung, its drive, its achieved alpha, its linear prediction in
+         volts, ``v_ref = None`` and ``g0 = None`` (the first block's volts and
+         its gain against the model, which :func:`measure_gain` fills) and
+         ``keep = True``.
 
-    Solved with step 8's :func:`build`, so a rung here is one of its rungs:
-    a random drive moved by least-move projection onto its level set.  Only the
-    drive matters for the ratio; the prediction is for the plan and the plot.
+    How: solved with step 8's :func:`build` -- a random drive moved by
+    least-move projection onto its level set -- so a rung here is one of its
+    rungs.  Only the drive matters for the ratio.
     """
     lo, hi = float(band[0]), float(band[1])
     cap = alpha_for_volts(full_scale(models, phases, pairs).fs)
@@ -219,6 +184,7 @@ def build_anchors(models, phases, pairs: list[int], *, seed: int,
         "labels": [p.label for p in patterns],
         "exact": [bool(p.exact) for p in patterns],
         "v_ref": None,
+        "g0": None,
         "keep": np.ones(len(patterns), dtype=bool),
         "band": (lo, float(min(hi, cap))),
         "capped": bool(cap < hi),
@@ -231,11 +197,9 @@ def build_anchors(models, phases, pairs: list[int], *, seed: int,
 def fit_gain(v_now: np.ndarray, v_ref: np.ndarray) -> tuple[float, float]:
     """``(g, rms)`` -- least squares slope through the origin, and its residual.
 
-    Through the origin because the dark is already off both sides and because
-    every anchor is bright (see "The gain"): a free intercept here is fitted
-    almost entirely to noise.  ``rms`` is the residual in volts, and it is the
-    number that says whether ``g`` explains what happened -- a pure gain change
-    scales all five rungs by one factor, so anything else shows up here.
+    Through the origin: the dark is already off both sides.  ``rms`` is the
+    residual in volts, and says whether ``g`` alone explains the block -- a pure
+    gain change scales every rung by one factor, so anything else lands here.
     """
     v_now = np.asarray(v_now, dtype=float)
     v_ref = np.asarray(v_ref, dtype=float)
@@ -247,12 +211,10 @@ def fit_gain(v_now: np.ndarray, v_ref: np.ndarray) -> tuple[float, float]:
 def flag_off_rungs(v, ref, *, tol: float = GAIN_TOL) -> np.ndarray:
     """Mask of rungs more than ``tol`` (relative) off the block's fitted slope.
 
-    The slope is :func:`fit_gain`'s -- ``v = g * ref`` through the origin, the
-    block's common factor: the gain, and in the first block the step-7-to-now
-    tilt as well.  What is left per rung is that one read, and a read whose
-    ``v / (g * ref)`` is off by more than ``tol`` is dropped.  Relative, so the
-    test is the same at 200 mV as at 450 mV.  A deviation that is not a number
-    (a reference at zero) is off.
+    How: the slope is :func:`fit_gain`'s ``v = g * ref``, the block's common
+    factor, so a rung whose ``v / (g * ref)`` is off by more than ``tol`` is
+    dropped.  Relative, so the test is the same at 200 mV as at 450 mV.  A
+    deviation that is not a number (a reference at zero) counts as off.
     """
     v = np.asarray(v, dtype=float)
     ref = np.asarray(ref, dtype=float)
@@ -281,27 +243,24 @@ def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
                  dark: float | None, pmt=None, log=print) -> tuple[float, float, float]:
     """Replay the ladder once; return ``(g, rms, dark)`` against the first block.
 
-    The first call is the reference: it fills ``anchors["v_ref"]`` with what
-    the rungs read and returns ``g = 1`` by definition.  Every later call is a
-    ratio against those volts.
+    In:  ``dark``, ``None`` on the first call (which measures one) and that
+         value on every call after.
+    Out: ``(g, rms, dark)``, and every read appended to ``rows`` in read order
+         -- ``kind=gain`` for the ones the fit used, ``kind=gain_drop`` for the
+         rest.
 
-    Every block is checked on its own with :func:`flag_off_rungs`: a rung more
-    than :data:`GAIN_TOL` off the block's fitted slope is dropped from the fit.
-    The first block judges against the model's prediction, the only reference
-    it has, and re-reads what it drops ONCE -- off again, the rung leaves the
-    ladder for the run (``anchors["keep"]``).  Later blocks judge against the
-    g = 1 volts and read only the rungs still in the ladder.
+    How: the first call fills ``anchors["v_ref"]`` with what the rungs read and
+    ``anchors["g0"]`` with their origin-slope against the model's prediction,
+    and returns ``g = g0``; every later call fits the ratio ``s`` of its volts
+    to the first block's and returns ``g = g0 * s`` -- ``g`` stays in the
+    model's units, and no model enters the ratio.  Each
+    block is checked on its own with :func:`flag_off_rungs` at
+    :data:`GAIN_TOL`.  The first block judges against the model's prediction and
+    re-reads what it drops once -- off again, the rung leaves the ladder for the
+    run (``anchors["keep"]``).  Later blocks read only the rungs still in it.
 
-    Every read reaches ``rows`` in read order: ``kind=gain`` for the ones the
-    fit used, ``kind=gain_drop`` for the ones it did not, so the CSV carries
-    its own evidence for every number in the ``g`` column.
-
-    ``dark`` is passed straight through to :func:`run_patterns`: ``None`` on the
-    first call, which measures one, and that value on every call after it.  The
-    dark it used comes back so the caller can hold it.
-
-    The PMT is read fresh here, once per block, so the gain rows and every
-    inference row until the next block carry the temperature of this moment.
+    The PMT is read once per block, so the gain rows and every inference row
+    until the next block carry that temperature.
     """
     n = anchors["n"]
     alpha = anchors["alpha"]
@@ -345,8 +304,9 @@ def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
             raise SystemExit(f"anchor rung(s) at alpha {alphas(keep & ~(v > 0))} "
                              f"read at or below the dark; there is nothing to "
                              f"take a ratio against")
-        anchors["v_ref"], anchors["keep"] = v, keep
-        use, g, rms = keep, 1.0, 0.0
+        g, rms = fit_gain(v[keep], anchors["pred_v"][keep])
+        anchors["v_ref"], anchors["keep"], anchors["g0"] = v, keep, g
+        use = keep
     else:
         keep = anchors["keep"]
         off = np.zeros(n, dtype=bool)
@@ -356,7 +316,8 @@ def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
             log("  every rung is off the block's own slope: nothing to drop "
                 "against, the block is fitted whole")
             use = keep
-        g, rms = fit_gain(v[use], anchors["v_ref"][use])
+        s, rms = fit_gain(v[use], anchors["v_ref"][use])
+        g = anchors["g0"] * s
 
     judged = {id(r): i for i, r in last.items()}
     for r in reads:
@@ -367,15 +328,24 @@ def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
     rows.extend(reads)
 
     if first:
-        log(f"  g = 1 by definition: {int(use.sum())} of {n} rungs kept, "
-            f"{v[use].min() * 1e3:.3f}..{v[use].max() * 1e3:.3f} mV above dark")
+        log(f"  g0 = {g:.5f} fitted to the model   fit rms {rms * 1e3:.4f} mV "
+            f"over {int(use.sum())} of {n} rungs, "
+            f"{v[use].min() * 1e3:.3f}..{v[use].max() * 1e3:.3f} mV above dark"
+            + (f"   out of the ladder {int(off.sum())}: alpha {alphas(off)}"
+               if off.any() else ""))
+        for i in range(n):
+            pred = anchors["pred_v"][i]
+            log(f"    alpha {alpha[i]:.4f}  {v[i] * 1e3:9.4f} mV read vs "
+                f"{pred * 1e3:9.4f} predicted   resid {(v[i] - g * pred) * 1e3:+.4f} mV"
+                + ("   DROPPED" if off[i] else ""))
         return g, rms, dark
-    log(f"  g = {g:.5f}   fit rms {rms * 1e3:.4f} mV over {int(use.sum())} rungs"
+    log(f"  g = {g:.5f} = {s:.5f} x g0 {anchors['g0']:.5f}   fit rms "
+        f"{rms * 1e3:.4f} mV over {int(use.sum())} rungs"
         + (f"   dropped {int(off.sum())}: alpha {alphas(off)}" if off.any() else ""))
     for i in np.flatnonzero(keep):
         ref, now = anchors["v_ref"][i], v[i]
         log(f"    alpha {alpha[i]:.4f}  {now * 1e3:9.4f} mV now vs {ref * 1e3:9.4f} "
-            f"at start   resid {(now - g * ref) * 1e3:+.4f} mV"
+            f"at start   resid {(now - s * ref) * 1e3:+.4f} mV"
             + ("   DROPPED" if off[i] else ""))
     return g, rms, dark
 
@@ -387,10 +357,9 @@ def measure_gain(bench, anchors: dict, *, seq0: int, t0: float, rows: list,
 def _hook(t0: float, pmt, live: bool):
     """Row hook: stamp the clock, the PMT, and a provisional Y.
 
-    ``live`` is ``False`` for the anchor reads, which have no predicted Y to be
-    compared against.  An inference row's Y uses the ``g`` measured BEFORE the
-    chunk, so an interrupted run still lands with usable numbers; it is
-    provisional, and :func:`apply_gain` rewrites every one at the end.
+    ``live`` is ``False`` for the anchor reads, which have no predicted Y.  An
+    inference row's Y uses the ``g`` measured before the chunk;
+    :func:`apply_gain` rewrites every one at the end.
     """
     def hook(row: dict) -> None:
         row["t_s"] = f"{time.monotonic() - t0:.1f}"
@@ -406,10 +375,10 @@ def _hook(t0: float, pmt, live: bool):
 def _set_y(row: dict, g: float) -> None:
     """Write ``y_meas_v`` / ``resid_v`` for one inference row at gain ``g``.
 
-    The order is fixed by where the gain sits in the chain: the single-beam
-    background is light on the detector, so it went through ``g`` too, while
-    step 6 fits ``a_x``/``a_w`` from reads where ``g`` is 1 by definition.  So
-    divide first, subtract second.
+        y = (mean_v - dark_v) / g - sb_pred_v
+
+    Divide first, subtract second: ``sb`` went through ``g`` too, and step 6
+    fits it where ``g`` is 1.
     """
     y = (row["mean_v"] - row["dark_v"]) / g - float(row["sb_pred_v"])
     row["g"] = f"{g:.9g}"
@@ -420,11 +389,9 @@ def _set_y(row: dict, g: float) -> None:
 def apply_gain(rows: list, log=print) -> int:
     """Re-derive every inference Y with ``g`` interpolated in time.  Returns n.
 
-    The anchors measure a continuous quantity at discrete times, so holding the
-    earlier one leaves a sawtooth in the residual the size of the drift across
-    the interval.  Outside them ``np.interp`` clamps, which is the right answer:
-    the nearest measurement is all there is.  Idempotent, and safe on a partial
-    run -- one anchor reduces to a constant, none leaves the rows alone.
+    How: ``np.interp`` on each row's ``t_s`` between the blocks that bracket it,
+    clamping outside them.  Idempotent, and safe on a partial run -- one block
+    reduces to a constant, none leaves the rows alone.
     """
     onn = [r for r in rows if r.get("kind") == "onn" and r.get("y_pred_v") not in ("", None)]
     # One mark per MEASUREMENT, not per read: the rungs of one anchor share a
@@ -457,8 +424,7 @@ def build_reads(ref: dict, pairs: list[int], models) -> tuple[np.ndarray, np.nda
     """Every (bank, image, shot, output) read, flattened into one block.
 
     Read order is image-major and then shot, so a partial run covers whole
-    images: an interrupted 10-image run leaves 6 complete digits rather than 10
-    unusable fragments.
+    images.
     """
     slots = [ref["channels"].index(k) for k in pairs]
     xs, ws, extra = [], [], []
@@ -486,9 +452,8 @@ def build_reads(ref: dict, pairs: list[int], models) -> tuple[np.ndarray, np.nda
 def summarise(rows: list, ref: dict, log=print) -> None:
     """Residual against y_block, and whether the optics picked the right digit.
 
-    The accuracy is the point of the run.  It is computed from the measured
-    y_sum through the SAME readout gain the simulation used, so a disagreement
-    is optical rather than a difference in how the logits were formed.
+    The accuracy is computed from the measured ``y_sum`` through the same
+    readout gain the simulation used.
     """
     onn = [r for r in rows if r.get("kind") == "onn" and r.get("y_meas_v") != ""]
     if not onn:
@@ -532,15 +497,13 @@ def summarise(rows: list, ref: dict, log=print) -> None:
 def print_anchor(anchors: dict, log=print) -> None:
     """The gain ladder: the band, the seed, and what each rung should read.
 
-    The first block's own precision propagates straight into every
-    ``y_meas_v``, and it is a COMMON-MODE systematic on the whole run -- a slope
-    fitted against ten single reads cannot be averaged down by reading more
-    later.  That is why the rungs are listed rather than summarised.
+    Listed rung by rung, not summarised: the first block's precision is a
+    common-mode systematic on every ``y_meas_v`` of the run.
     """
     lo, hi = anchors["band"]
     log(f"g anchor  : {anchors['n']} rungs over alpha {lo:.3f}..{hi:.3f} of "
         f"Y_max = {anchors['y_max_v'] * 1e3:.1f} mV   seed {anchors['seed']}   "
-        f"g = 1 at the first block of this run")
+        f"g0 fitted to the model at the first block of this run")
     if anchors["capped"]:
         log(f"            top capped at {LADDER_CEILING_V * 1e3:.0f} mV, "
             f"step 8's ladder ceiling")
@@ -636,8 +599,8 @@ def main() -> int:
     if anchors is not None:
         print(f"Gain      : {anchors['n']} rungs every {args.gain_every / 60:g} min, "
               f"~{n_gain} measurements ({n_gain * anchors['n']} reads); "
-              f"the first defines g = 1; a rung more than {GAIN_TOL:.0%} off "
-              f"its block's slope is dropped")
+              f"the first fits g0 to the model, the rest a ratio to it; a rung "
+              f"more than {GAIN_TOL:.0%} off its block's slope is dropped")
     print("Dark      : one read, at the start, held for the run")
     print(f"PMT       : {'off (--no-pmt)' if args.no_pmt else 'read with every gain block'}")
     print(f"Estimate  : {secs / 60:.1f} min ({secs / 3600:.2f} h)   "
@@ -669,13 +632,14 @@ def main() -> int:
         """The CSV on disk, whole rows only, after every chunk and at the end."""
         if rows:
             if anchors is None:
-                gain_meta = {"g_reference": "1 (assumed, --no-gain)",
+                gain_meta = {"g_reference": "1 (assumed, --no-gain)", "g0": "",
                              "g_reference_v": "", "gain_alphas": "",
                              "gain_seed": "", "gain_band": "", "gain_tol": "",
                              "gain_rungs_out": "", "y_max_v": ""}
             else:
                 gain_meta = {
-                    "g_reference": "first gain block of this run (g = 1)",
+                    "g_reference": "first gain block of this run, fitted to the model (g0)",
+                    "g0": ("" if anchors["g0"] is None else f"{anchors['g0']:.9g}"),
                     "g_reference_v": (
                         "" if anchors["v_ref"] is None else
                         " ".join(f"{v:.6g}" for v in anchors["v_ref"])),
