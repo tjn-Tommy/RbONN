@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from slm_module.calibration.calibration_new import CalibrationProgress
+from calibration_module.measure.slm_response import CalibrationProgress
 
 
 def _format_duration(seconds: float) -> str:
@@ -93,7 +93,18 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
             "Sweep point",
             "Signal (V)",
         ),
+        "ladder": (
+            "Step 8 · Saturation ladder",
+            "Predicted signal, linear model (mV)",
+            "Measured signal (mV)",
+        ),
     }
+
+    #: Phases whose points are drawn unjoined.  The default line follows
+    #: acquisition order, which is the run's own axis for a sweep -- but step
+    #: 8's ladder is driven SHUFFLED on purpose, so joining its reads draws
+    #: nothing but the shuffle.
+    _SCATTER_PHASES = frozenset({"ladder"})
 
     def __init__(
         self,
@@ -181,6 +192,19 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
             self._ys.append(float(progress.y))
             self._dirty = True
 
+    def note(self, lines: str | Iterable[str]) -> None:
+        """Write something into the log that is not tied to a measured step.
+
+        For what the caller knows BEFORE the first reading — a step-7 cascade's
+        stage breakdown, say. This window is the one thing open for the whole
+        run, so a plan written here is still on screen when a chained pair shows
+        up in the results and you want to know what it was measured against.
+        """
+        if isinstance(lines, str):
+            lines = [lines]
+        for line in lines:
+            self.log.appendPlainText(str(line))
+
     def _enter_phase(self, phase: str) -> None:
         self._phase = phase
         self._phase_start = time.perf_counter()
@@ -222,7 +246,7 @@ class CalibrationProgressDialog(QtWidgets.QDialog):
                 color="#47b8e0",
                 marker="o",
                 markersize=3,
-                linewidth=1.0,
+                linewidth=0.0 if phase in self._SCATTER_PHASES else 1.0,
             )
         self.canvas.draw_idle()
 

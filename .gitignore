@@ -9,3 +9,9 @@ refractor_codex.md
 AGENT.md
 # fit plots are regenerable output; the CSV/JSON they come from is tracked
 src/calib_data/**/*.png
+CLAUDE.md
+
+# onn_module outputs: the MNIST download and the training runs are regenerable
+# (model.pt aside, which is kept wherever you want it -- not tracked here)
+data/
+runs/

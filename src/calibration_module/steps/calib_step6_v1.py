@@ -1,52 +1,47 @@
-"""Manual smoke test: calibrate one channel pair's TPA efficiency (eta) on a grid.
+"""Step 6 v1 -- one channel pair's TPA efficiency (eta) on a reduced grid.
 
-Not a pytest test (no mocks, needs real hardware) -- run it directly::
+The joint 6-parameter fit, kept as the cross-check on
+:mod:`calib_step6_v2`'s difference estimator: either version re-fits either
+version's CSV, so the two estimators can be compared on identical rows.
 
-    python src/calibration_module/steps/calib_step6_v1.py             # sweep hardware, fit, plot
-    python src/calibration_module/steps/calib_step6_v1.py --meas       # raw meas CSV only: sweep + record, no fit
-    python src/calibration_module/steps/calib_step6_v1.py some.csv     # re-fit an existing CSV offline
-    python src/calibration_module/steps/calib_step6_v1.py some.csv --flip  # re-fit sign-flipped (inverted read)
-    python src/calibration_module/steps/calib_step6_v1.py some.csv --no-q  # re-fit without the q saturation terms
+Not a unittest (needs real hardware) -- run it directly::
 
-``--flip`` applies to a REFIT only (the measure path always records the raw
-signal): when the photodiode/DAQ reads inverted (more light -> more negative
-volts) it negates the loaded ``voltage_mean_v`` in memory (every row incl. the
-(0,0) dark) and re-fits, so the fitted Y = eta^2*(x*w) + ... + d is the positive
-light signal.  Nothing is written back -- the raw CSV on disk is untouched.
+    python src/calibration_module/steps/calib_step6_v1.py            # sweep, fit, plot
+    python src/calibration_module/steps/calib_step6_v1.py --meas      # raw CSV only
+    python src/calibration_module/steps/calib_step6_v1.py some.csv    # re-fit offline
+    python src/calibration_module/steps/calib_step6_v1.py some.csv --flip
+    python src/calibration_module/steps/calib_step6_v1.py some.csv --no-q
 
-``--no-q`` (also refit only) drops the q_x/q_w saturation terms and fits the
-purely linear background Y = eta^2*(x*w) + a_x*x + a_w*w + d, so a_x and a_w
-carry the full single-beam slopes with no a<->q split.
+In:  nothing but the constants below for a sweep; a positional CSV to re-fit.
+     ``--flip`` (refit only) negates the loaded voltages in memory for a read
+     that came out inverted, and ``--no-q`` drops the saturation terms so
+     ``a_x``/``a_w`` carry the full single-beam slopes with no a<->q split.
+     Neither touches the CSV on disk.
+Out: one ``calib_step6_result_MMDD_HHMM.json`` embedding the input step-3
+     calibration beside every fitted pair, plus a three-panel PNG per pair.
 
-For channel pair ``PAIR_INDEX`` (x[PAIR_INDEX], w[PAIR_INDEX]) this walks the
-reduced 1-D calibration curves built by ``calibration_module.fit.pair.build_pair_points`` -- one
-line per fit term rather than the full 2-D grid, ``N_SWEEP_POINTS`` points each:
+For pair ``PAIR_INDEX`` this walks the reduced 1-D curves built by
+``calibration_module.fit.pair.build_pair_points`` -- one line per fit term
+rather than the full 2-D grid, ``N_SWEEP_POINTS`` points each, every other
+channel off::
 
-  * x-only  (x=r, w=0)  -- only the x channel on -> pins a_x, q_x
-  * w-only  (x=0, w=r)  -- only the w channel on -> pins a_w, q_w
-  * cross   (x=1, w=r)  -- x pinned at 1, w swept -> pins eta
-  * one shared dark (0, 0) point anchors the offset d
+    x-only  (x=r, w=0)   pins a_x, q_x
+    w-only  (x=0, w=r)   pins a_w, q_w
+    cross   (x=1, w=r)   pins eta
+    dark    (0, 0)       one shared point, anchors d
 
-with every other channel held off, recording the DAQ reading at each point.
-The points run in REVERSE build order -- brightest first: (x=1, w=1) opens
-each pair's sweep (so a dead/blocked signal shows on the first point) and
-the shared dark (0, 0) point closes it.  Order does not affect the fit.
+Points run brightest first, so ``(x=1, w=1)`` opens each pair's sweep and a
+dead or blocked signal shows immediately; the dark closes it.  Order does not
+affect the fit.
 
-Each point is one fixed-duration ``daq_module`` acquisition (the same
-``DAQController.monitor_cycle`` read the GUI pipeline uses): acquisition time
-= ``T_SINGLE_S`` (5 s) if ``x == 0 or w == 0`` (the weak single-beam lines and
-the shared dark point need the averaging), else ``T_BOTH_S`` (3 s) for the
-bright both-beams cross points -- low-passed at the ``DAQMonitorSettings``
-bandwidth.  The weighted-least-squares fit of
+Each point is one fixed-duration acquisition: ``T_SINGLE_S`` when either arm is
+off (the weak single-beam lines need the averaging), else ``T_BOTH_S``.  The
+weighted least-squares fit of::
 
     Y = eta^2*(x*w) + a_x*x + q_x*x^2 + a_w*w + q_w*w^2 + d
 
-and the CSV persistence live in :mod:`calibration_module.fit.pair` (the same code the
-GUI's Step 6 TPA tab uses); every CSV row records the mean, its trace std and
-the std ratio (std/|mean|).
-
-The result is written to a single ``calib_step6_result_MMDD_HHMM.json`` that
-embeds the input Step-3 calibration JSON alongside every fitted pair result.
+and the CSV persistence live in :mod:`calibration_module.fit.pair`.  Every row
+records the mean, its trace std and the ratio of the two.
 """
 from __future__ import annotations
 
@@ -61,7 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from calibration_module.measure.bench import connect_daq, connect_slm, read_point  # noqa: E402
-from slm_module.calibration.calibration_new import load_calibration_result  # noqa: E402
+from calibration_module.fit.slm_response import load_calibration_result  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 from calibration_module.fit.pair import (  # noqa: E402
     ChannelPairGrid,
@@ -165,27 +160,16 @@ def _report_residuals(fit: PairFit) -> None:
 def make_plot(fit: PairFit, path: str | Path | None = None) -> None:
     """One three-panel figure per pair: background, TPA cross term, residuals.
 
-    Left -- the quasi-linear single-beam lines: the x-only (w=0) and w-only
-    (x=0) measured points with the fitted background curves ``a*r + q*r^2 + d``
-    overlaid (linear-dominated; q is the small saturation bend).  The shared
-    (0,0) dark point anchors both lines at d.
+    Left, the single-beam lines with their fitted ``a*r + q*r^2 + d`` curves,
+    both anchored at ``d`` by the shared dark point.  Middle, the TPA cross term:
+    the cross line minus the FITTED single-beam background against ``x*w``, with
+    ``eta^2*(x*w)`` overlaid -- x and w being commanded INTENSITIES while eta
+    multiplies the field, hence the square.  Right, residual pulls against the
+    +/-1 sigma band, coloured by sweep line.
 
-    Middle -- the TPA cross term, linear in the intensity product: the
-    cross-line (x=1, w=r) measurements minus the *fitted* single-beam
-    background ``a_x*x + q_x*x^2 + a_w*w + q_w*w^2 + d``, plotted vs the
-    product x*w with the fitted line ``eta^2*(x*w)`` overlaid.  x and w are
-    commanded INTENSITIES; eta multiplies the field amplitude, hence the
-    eta^2 coefficient (see :mod:`calibration_module.fit.pair`).  Error bars are the
-    per-cell stds only (background-parameter uncertainty is not propagated --
-    this is an eyeball plot; the printed report carries the real errors).
-
-    Right -- residual pulls: (measured - full model) / std for every averaged
-    cell (same numbers as the printed residual table) vs the swept level,
-    colored by sweep line, with the +/-1 sigma band shaded (same pull style
-    as the step-7 plot).
-
-    Writes a single three-panel PNG to ``path``; if ``path`` is None, opens
-    the figure in an interactive window instead.
+    Error bars are per-cell stds only, the background covariance not being
+    propagated: this is an eyeball plot and the printed report carries the real
+    errors.  ``path=None`` opens an interactive window instead of writing a PNG.
     """
     import matplotlib
 
@@ -382,20 +366,13 @@ def sweep_and_fit() -> None:
 def fit_csv(path: str | Path, *, flip: bool = False, no_q: bool = False) -> None:
     """Re-fit an already-recorded pair-grid CSV offline (no hardware).
 
-    Writes the same combined ``calib_step6_result_MMDD_HHMM.json`` (input Step-3
-    calib + every fitted pair) as the hardware run; the timestamp keeps a refit
-    from clobbering earlier results.  Every fitted pair also gets the same
-    single three-panel PNG as the hardware run (quasi-linear background,
-    linear TPA cross term, residual pulls), saved next to the JSON.
+    Writes the same timestamped JSON and per-pair PNG as the hardware run, so a
+    refit cannot clobber an earlier result.
 
-    ``flip`` handles an inverted photodiode/DAQ read (more light -> more negative
-    volts): the loaded ``voltage_mean_v`` is negated in memory on every row (incl.
-    the (0,0) dark) and each pair is re-fit, so Y = eta^2*(x*w) + ... + d comes out
-    as the positive light signal.  Nothing is written back -- the raw CSV on disk
-    is untouched, and the std is a magnitude so it stays as read.
-
-    ``no_q`` drops the q_x/q_w saturation terms from the model (see the module
-    docstring): Y = eta^2*(x*w) + a_x*x + a_w*w + d.
+    ``flip`` negates the loaded ``voltage_mean_v`` on every row, the dark
+    included, for a detector that reads inverted; the std is a magnitude and
+    stays as read, and the CSV on disk is untouched.  ``no_q`` drops the
+    saturation terms, fitting ``Y = eta^2*(x*w) + a_x*x + a_w*w + d``.
     """
     result = load_tpa_pair_csv(path)
     if flip:

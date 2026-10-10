@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from slm_module.calibration.calibration_new import CalibrationResult
+from calibration_module.fit.slm_response import CalibrationResult
 
 from ..fit.center import (
     TPACenterResult,

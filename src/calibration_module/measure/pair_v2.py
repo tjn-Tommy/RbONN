@@ -1,22 +1,22 @@
 """Step 6 v2 acquisition -- drive one pair's schedule, return rows.
 
-This half touches the instruments and does no fitting.  It hands back the raw
-``(repeat, x, w, mean_v, std_v)`` rows that
-:func:`calibration_module.fit.pair_v2.average_levels` turns into levels, so the
-offline script and the GUI collect data through exactly one implementation and
-differ only in what they do with the rows afterwards.
+This half touches the instruments and does no fitting.
 
-``monitor`` is anything with the ``monitor_cycle(timeout=..., single=...)``
-protocol -- a :class:`~daq_module.DAQController` in every current caller.  The
-near-rail escalation additionally wants ``last_values`` and the ``_settings``
-the controller was configured with; a monitor without them still measures, with
-autoranging skipped and said so once, rather than failing.
+In:  ``monitor``, anything with the ``monitor_cycle(timeout=..., single=...)``
+     protocol -- a :class:`~daq_module.DAQController` in every current caller.
+     The near-rail test additionally wants ``last_values`` and the
+     ``_settings`` the controller was configured with; a monitor without them
+     still measures, and says so once.
+Out: raw ``(repeat, x, w, mean_v, std_v)`` rows, which
+     :func:`calibration_module.fit.pair_v2.average_levels` turns into levels.
+     So the offline script and the GUI collect through one implementation and
+     differ only in what they do with the rows.
 """
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -26,45 +26,66 @@ from ..fit.pair_v2 import DEFAULT_CONFIG, PairV2Config
 __all__ = [
     "PairV2Acq",
     "DEFAULT_ACQ",
+    "T_MEAS_S",
+    "RANGE_V",
     "PairV2Aborted",
     "PairV2Progress",
     "build_schedule",
-    "read_point_autorange",
+    "read_point",
     "set_range",
-    "can_autorange",
     "measure_pair",
 ]
 
 
+#: The ONE measurement window, for every read of every step, dark included, so
+#: that a step-7 point and the step-6 eta it is pinned against were measured the
+#: same way.  Per-step windows gained nothing -- a read's noise is the trace
+#: spread, which the fit floors anyway -- and each one was a reason two steps'
+#: numbers could not be compared directly.
+T_MEAS_S = 8.0
+
+#: The ONE input range.  Deliberately the same number as
+#: :data:`~calibration_module.steps.calib_step8.AMP_LIMIT_V`: the amplifier
+#: saturates at 1 V, so a read the board could only hold at +/-2 V is already an
+#: amplifier flat-top.  Board rail and amplifier rail coinciding makes the
+#: near-rail peak test an amplifier-clip test for free.
+#:
+#: Widening costs nothing: the board is dither-dominated even at its most
+#: sensitive range, and measured across a doubled range the all-off trace std
+#: moves 0.1%.  The +/-1 V LSB on this 16-bit board lands ~2000x under
+#: ``STD_FLOOR_V`` once low-passed.  So the range is chosen for HEADROOM, never
+#: for resolution.
+RANGE_V = 1.0
+
+
 @dataclass(frozen=True)
 class PairV2Acq:
-    """The acquisition half of a step-6 run's setup -- timing and input range.
+    """The acquisition half of a run's setup -- timing and input range.
 
     Split from :class:`~calibration_module.fit.pair_v2.PairV2Config` because the
     two have different lifetimes: re-fitting a saved CSV needs the fit config and
     must not care what windows the data was taken with, while the GUI's DAQ panel
     tunes these without touching the estimator.
+
+    Named for step 6 but now every step's: steps 6, 7, 8 and the ONN inference
+    loop all take :data:`DEFAULT_ACQ` unchanged.
     """
 
-    #: DAQ averaging window when at most one beam is on (``x == 0 or w == 0``,
-    #: including the all-off dark).  A weak signal needs the extra averaging.
-    t_single_s: float = 10.0
-    #: Averaging window when both beams of the pair are on.
-    t_both_s: float = 8.0
+    #: Averaging window.  ONE field: every read of every step takes the same
+    #: one, the all-off dark included.  A dark averaged differently from the
+    #: points it is subtracted from puts its own noise into all of them.
+    t_meas_s: float = T_MEAS_S
     #: Wait after each SLM pattern change, before reading.
     settle_s: float = 0.25
-    #: Default +/- input range.  The board quantizes it (+/-0.1, 0.2, 0.5, 1, 2,
-    #: 5, 10 V) and rounds a request UP, so ask for one of those.  +/-0.1 V is
-    #: the most sensitive and right for almost every level.
-    range_v: float = 0.1
-    #: Remeasure range for a near-rail read; the next quantized step up, which
-    #: costs one bit of resolution.
-    range_wide_v: float = 0.2
-    #: "Near the rail": raw ``|peak| >=`` this fraction of the range.
-    near_rail_frac: float = 0.95
-    #: Escalate a near-rail read to :attr:`range_wide_v`.  A clipped read is a
-    #: silently wrong mean rather than an error, so this defaults on.
-    autorange: bool = True
+    #: The +/- input range, for EVERY read including the dark.  The board
+    #: quantizes it (+/-0.1, 0.2, 0.5, 1, 2, 5, 10 V) and rounds a request UP,
+    #: so ask for one of those.  See :data:`RANGE_V` for why it is 1 V and why
+    #: nothing is gained by going narrower.
+    range_v: float = RANGE_V
+    #: "Near the rail": raw ``|peak| >=`` this fraction of the range.  At
+    #: :data:`RANGE_V` that is the AMPLIFIER's rail too, so tripping this means
+    #: the read is a flat-top and no range setting can rescue it.  Nothing is
+    #: remeasured; :func:`read_point` logs it and ``peak_v`` records it.
     #: Negate the reading.  The transimpedance amplifier outputs a NEGATIVE
     #: voltage for positive light, so recording a positive light signal means
     #: inverting.  Getting this wrong is not a cosmetic error: the estimator
@@ -73,7 +94,10 @@ class PairV2Acq:
     invert: bool = True
 
 
-#: The acquisition every validated run to date used.
+#: The bench acquisition: one window, one range, one settle, for every read of
+#: every step.  Steps 6/7/8 and the ONN loop all import THIS rather than
+#: declaring their own, so "same conditions" is a property of the code and not
+#: of whoever set the spinboxes.
 DEFAULT_ACQ = PairV2Acq()
 
 
@@ -147,13 +171,15 @@ def run_seconds(schedule: Sequence[tuple[int, float, float]],
     Ten pairs of the default grid is most of an hour; a user deserves that
     number before pressing Run, not after.
     """
-    n_single = sum(1 for _, x, w in schedule if x == 0.0 or w == 0.0)
-    n_both = len(schedule) - n_single
-    return n_single * acq.t_single_s + n_both * acq.t_both_s + len(schedule) * acq.settle_s
+    return len(schedule) * (acq.t_meas_s + acq.settle_s)
 
 
 def set_range(daq, rng: float) -> None:
     """Reconfigure only the input range, keeping every other setting.
+
+    No step calls this any more -- they all run at the one fixed
+    :data:`RANGE_V` -- but a bench script that deliberately walks the signal
+    over decades (``drafts/pmt_gain_sweep.py``) still wants it.
 
     ``configure_monitor`` just stores the settings object and every acquisition
     hands them to the driver afresh, so swapping the range between reads is safe
@@ -167,66 +193,47 @@ def set_range(daq, rng: float) -> None:
     daq.configure_monitor(replace(base, min_val=-rng, max_val=rng))
 
 
-def can_autorange(monitor) -> bool:
-    return hasattr(monitor, "_settings") and hasattr(monitor, "last_values")
-
-
-def read_point_autorange(
+def read_point(
     monitor, *, single: bool, acq: PairV2Acq = DEFAULT_ACQ, timeout: float = 30.0,
     log: Callable[[str], None] | None = None,
 ) -> tuple[float, float, float]:
-    """One read, with a single near-rail escalation to ``acq.range_wide_v``.
+    """One read at ``acq.range_v``.  One read: no escalation, and no warning.
 
-    The clip test runs on the RAW trace peak (``monitor.last_values``), not on
-    the reported mean: the mean comes off the low-passed trace, which pulls a
-    clipped flat-top back below the rail, so a mean comfortably under 0.1 V can
-    still hide railed samples.  A read whose raw peak is within
-    ``acq.near_rail_frac`` of the range is remeasured once at the wide range and
-    the wide reading replaces it; the sensitive range is restored either way.
+    Out: ``(mean_v, std_v, range_v)``.  Inversion is applied HERE, so the mean
+    handed back is already a positive light signal (see
+    :attr:`PairV2Acq.invert`).  ``single`` no longer picks a window -- there is
+    one -- but is still passed to the monitor and still marks the read as a dark
+    or one-beam point.
 
-    Returns ``(mean_v, std_v, range_v)`` where ``range_v`` is the +/- range the
-    kept reading was taken at.  Inversion is applied here, so the mean handed
-    back is already a positive light signal (see :attr:`PairV2Acq.invert`).
+    No near-rail warning either, which is less obvious than why the re-read
+    went.  It fired at 0.95 of the range, and with the peak running ~1.22x the
+    mean real signal cannot get there until the MEAN is ~724..780 mV, where the
+    mean reports it anyway -- while
+    :data:`~calibration_module.steps.calib_step8.LADDER_CEILING_V` stops every
+    sweep 1.6x below that.  What CAN reach it from a 450 mV read is a spike, so
+    every firing would have been a false alarm.
+
+    The peak itself stays and costs nothing:
+    :func:`~calibration_module.measure.patterns.peak_v` is on every row as the
+    durable record, and
+    :func:`~calibration_module.steps.calib_step8.probe_verdict` judges clipping
+    on it.  That is where it earns its keep -- the probe is the one thing that
+    deliberately drives up looking for where the amplifier compresses.
     """
-    def _read() -> tuple[float, float]:
-        sample = monitor.monitor_cycle(timeout=timeout, single=single)
-        if sample is None:
-            raise PairV2Aborted("monitor read aborted")
-        mean = float(sample.value)
-        std = getattr(sample, "std", None)
-        if std is None or not np.isfinite(std):
-            raw = getattr(monitor, "last_values", None)
-            std = float(np.std(raw)) if raw is not None and np.size(raw) > 1 else 0.0
-        # std is a spread and stays non-negative -- negating a trace leaves it
-        # unchanged -- so only the mean carries the sign convention.
-        return (-mean if acq.invert else mean), float(std)
-
-    def _peak(fallback: float) -> float:
+    sample = monitor.monitor_cycle(timeout=timeout, single=single)
+    if sample is None:
+        raise PairV2Aborted("monitor read aborted")
+    mean_v = float(sample.value)
+    std_v = getattr(sample, "std", None)
+    if std_v is None or not np.isfinite(std_v):
         raw = getattr(monitor, "last_values", None)
-        if raw is None or not np.size(raw):
-            return abs(fallback)
-        return float(np.max(np.abs(raw)))
+        std_v = float(np.std(raw)) if raw is not None and np.size(raw) > 1 else 0.0
+    # std is a spread and stays non-negative -- negating a trace leaves it
+    # unchanged -- so only the mean carries the sign convention.
+    mean_v = -mean_v if acq.invert else mean_v
+    std_v = float(std_v)
 
-    mean_v, std_v = _read()
-    if not (acq.autorange and can_autorange(monitor)):
-        return mean_v, std_v, acq.range_v
-
-    peak = _peak(mean_v)
-    if peak < acq.near_rail_frac * acq.range_v:
-        return mean_v, std_v, acq.range_v
-
-    if log is not None:
-        log(f"    near the +/-{acq.range_v:g} V rail (raw peak {peak:.4f} V, "
-            f"mean {mean_v*1e3:.2f} mV) -> remeasuring at +/-{acq.range_wide_v:g} V")
-    set_range(monitor, acq.range_wide_v)
-    try:
-        mean_v, std_v = _read()
-        if log is not None and _peak(mean_v) >= acq.near_rail_frac * acq.range_wide_v:
-            log(f"    ** WARNING: still near the rail at +/-{acq.range_wide_v:g} V "
-                f"(raw peak {_peak(mean_v):.4f} V) -- this reading is suspect **")
-    finally:
-        set_range(monitor, acq.range_v)
-    return mean_v, std_v, acq.range_wide_v
+    return mean_v, std_v, acq.range_v
 
 
 def measure_pair(
@@ -245,7 +252,8 @@ def measure_pair(
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
-) -> list[tuple[int, float, float, float, float]]:
+    row_hook: Callable[[], Mapping[str, str]] | None = None,
+) -> list[tuple]:
     """Run one pair's interleaved schedule -> raw ``(rep, x, w, mean, std)`` rows.
 
     ``index`` is the pair LABEL; ``cfg.slot`` maps it onto the 0-based drive
@@ -258,6 +266,12 @@ def measure_pair(
     across pairs; they affect nothing but the numbers in
     :class:`PairV2Progress`.  Raises :class:`PairV2Aborted` if ``stop_event``
     is set between acquisitions.
+
+    ``row_hook`` is called once per acquisition for two extra cells appended to
+    every row -- in practice
+    :meth:`~calibration_module.measure.pmt_temp.PmtTemperature.sample`, whose
+    cached reading costs a GPIB round trip only once a minute.  Without it the
+    rows are the plain 5-tuples and the CSV's two thermistor columns are blank.
     """
     from slm_module.encoding import encode_to_pattern
 
@@ -266,7 +280,7 @@ def measure_pair(
     total = len(schedule) if total is None else total
     slot = cfg.slot(index)
 
-    rows: list[tuple[int, float, float, float, float]] = []
+    rows: list[tuple] = []
     for offset, (rep, x_val, w_val) in enumerate(schedule):
         if stop_event is not None and stop_event.is_set():
             raise PairV2Aborted("step-6 sweep stopped by request")
@@ -281,15 +295,19 @@ def measure_pair(
         if acq.settle_s:
             time.sleep(acq.settle_s)
         single = x_val == 0.0 or w_val == 0.0
-        mean_v, std_v, range_v = read_point_autorange(
+        mean_v, std_v, range_v = read_point(
             monitor, single=single, acq=acq, timeout=read_timeout, log=log
         )
-        rows.append((rep, float(x_val), float(w_val), mean_v, std_v))
+        row = (rep, float(x_val), float(w_val), mean_v, std_v)
+        if row_hook is not None:
+            cells = row_hook()
+            row += (cells.get("pmt_ohm_Ohm", ""), cells.get("pmt_c", ""))
+        rows.append(row)
         if progress_callback is not None:
             progress_callback(PairV2Progress(
                 step=step0 + offset + 1, total=total, pair_index=index,
                 repeat=rep, x=float(x_val), w=float(w_val),
                 mean_v=mean_v, std_v=std_v, range_v=range_v, single=single,
-                duration_s=acq.t_single_s if single else acq.t_both_s,
+                duration_s=acq.t_meas_s,
             ))
     return rows

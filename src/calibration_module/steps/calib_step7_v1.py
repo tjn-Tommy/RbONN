@@ -1,85 +1,64 @@
-"""Manual smoke test: calibrate each pair's comb phase (dPhi_comb) vs a reference.
+"""Step 7 v1 -- each pair's comb phase (dPhi_comb) vs a reference.
 
-Not a pytest test (no mocks, needs real hardware) -- run it directly.  Two
-invocations:
+The multi-parameter fit, superseded by :mod:`calib_step7_v2`'s one-parameter
+form and kept because either version re-fits either version's CSV.
 
-    python src/calibration_module/steps/calib_step7_v1.py            # COLLECT: sweep each target
-                                                     #   pair, write a raw CSV, then
-                                                     #   fit it straight away
-    python src/calibration_module/steps/calib_step7_v1.py some.csv   # REFIT:   fit dPhi_comb from an
-                                                     #   existing CSV, offline (no hw)
+Not a unittest (needs real hardware) -- run it directly::
 
-A COLLECT fits the CSV it just wrote, so the normal run needs no second command
-(add ``--no-fit`` to stop after the CSV and fit it by hand later).  Either way
-the fit writes a combined ``calib_step7_result_*.json`` (the step-3 + step-6
-payloads carried over from ``IN_STEP6`` plus the fitted ``{Phi_k}`` spectrum)
--- the single input downstream consumers read (e.g. the step-8 random-input
-forward-model check, ``calib_step8_test.py``).
+    python src/calibration_module/steps/calib_step7_v1.py           # sweep, then fit
+    python src/calibration_module/steps/calib_step7_v1.py some.csv  # re-fit offline
 
-``--bounded`` / ``--fix`` pick how the step-6 amplitudes enter the fit, on a
-REFIT or on a COLLECT's automatic fit (give both flags to run both methods back
-to back and print a comparison table; no flag defaults to ``--bounded``, the
-previous behaviour):
+In:  ``IN_STEP6``, one combined step-6 result JSON, which is the ONLY input: it
+     embeds the step-3 calibration (-> channel layout) and every fitted pair
+     (-> eta plus the single-beam/dark background), so the reference and all
+     targets come from one file.  A positional CSV re-fits offline.
+Out: one combined ``calib_step7_result_*.json`` carrying step 3 and step 6
+     forward plus the fitted ``{Phi_k}`` spectrum -- what downstream consumers
+     read -- and a PNG per fitted (pair, method).
 
-* ``--bounded`` -- ``a:b`` locked to the step-6 ``eta_ref:eta_tgt`` ratio, one
-  shared scale ``s`` floats, boxed to ``+/-BOUND_FRAC`` about 1.
-* ``--fix``     -- ``a`` and ``b`` PINNED to the step-6 etas exactly (``s = 1``
-  fixed); only ``dPhi_comb`` and the residual dark ``d`` float.
+A sweep fits the CSV it just wrote, so the normal run needs no second command
+(``--no-fit`` stops after the CSV).
 
-Add ``--flip`` to either invocation when the photodiode/DAQ reads inverted (more
-light -> more negative volts): it negates the raw ``voltage_mean_v`` and its
-per-row ``dark_v`` (the SAME channel) so the fit's ``y = mean - dark`` becomes
-the positive light signal (= dark - |mean|).  On a REFIT it writes a sibling
-``*_flipped.csv`` and fits that; on a COLLECT the values are negated as they are
-read, before the CSV is written -- so the automatic fit that follows does NOT
-negate them a second time.  The spread (``voltage_std_v``) and ``std_ratio``
-(= |std/mean|) are sign-independent and left untouched.
+``--bounded`` / ``--fix`` pick how the step-6 amplitudes enter, on either path;
+give both to run both and print a comparison table.  ``--bounded`` (the default)
+locks ``a:b`` to the step-6 ``eta_ref:eta_tgt`` ratio and floats one shared
+scale boxed to ``+/-BOUND_FRAC`` about 1; ``--fix`` pins ``a``/``b`` at the etas
+exactly, leaving only ``dPhi_comb`` and the residual dark ``d``.
 
-What it measures.  Each target pair carries a fixed comb-phase offset ``dPhi_comb``
-relative to a common reference pair (the reference defines ``Phi = 0``).  Driving
-the two pairs at once makes them interfere; the interference fringe encodes
-``dPhi_comb``.  Running every target builds the phase spectrum ``{Phi_k}``.
+``--flip`` is for a detector that reads inverted (more light -> more negative
+volts).  It negates ``voltage_mean_v`` and the per-row ``dark_v`` -- the same
+channel, so the fit's ``y = mean - dark`` becomes the positive light signal.  On
+a refit it writes a sibling ``*_flipped.csv`` and fits that; on a sweep the
+values are negated as they are READ, so the automatic fit does not negate them
+twice.  ``voltage_std_v`` and ``std_ratio`` are sign-independent and untouched.
 
-The drive (one geometry).  The reference pair is held fully on
-(``x_r = w_r = 1``); the target's TWO channels are swept TOGETHER
-(``x_t = w_t = v``) over the ramp ``SWEEP_MIN..SWEEP_MAX``.  A channel at
-intensity ``v`` sits at panel phase ``theta = 2*asin(sqrt(v))`` with field
-``sqrt(v)*exp(i theta/2)``, so the target field amplitude is
-``g = sqrt(x_t w_t) = sin^2(theta/2)`` and ``dPhi_SLM = theta - pi``::
+What it measures.  Each target pair carries a fixed comb-phase offset relative
+to a common reference pair, which defines ``Phi = 0``.  Driving the two at once
+makes them interfere, and the fringe encodes that offset.
 
-    Y = |eta_1 x_1 w_1 + eta_2 x_2 w_2|^2
-      = R_1^2 + |eta_2 Cx Cw sin^2(theta/2)|^2
-        + 2 R_1 eta_2 Cx Cw sin^2(theta/2) * cos(dPhi_comb - pi + theta)
+The drive.  The reference is held FULLY ON (``x_r = w_r = 1``); the target's two
+channels are swept together (``x_t = w_t = v``) over
+``SWEEP_MIN..SWEEP_MAX``.  A channel at intensity ``v`` sits at panel phase
+``theta = 2 asin(sqrt(v))`` with field ``sqrt(v) exp(i theta/2)``, so
+``g = sqrt(x_t w_t) = sin^2(theta/2)`` and ``dPhi_SLM = theta - pi``.  Sweeping
+``v`` 0.1 -> 1.0 traces the half fringe (~37..180 deg).
 
-with ``R_1`` the fully-on reference amplitude.  Sweeping ``v`` 0.1 -> 1.0 sweeps
-``theta`` over ~37..180 deg, tracing the half fringe.
+The fit is in :mod:`calibration_module.fit.phase`.  Every point is reduced to
+``(g, dPhi_SLM)`` from its commanded intensities, and ``dPhi_comb`` floats in::
 
-The fit (in :mod:`calibration_module.fit.phase`).  Every point is reduced to
-``(g, dPhi_SLM)`` from its commanded intensities.  It floats ``dPhi_comb`` in
+    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_SLM + dPhi_comb)
+        + step-6 single-beam background + d
 
-    Y = a^2 + b^2 g^2 + 2 a b g cos(dPhi_comb - dPhi_SLM) + step-6 background + d
+Both pairs' step-6 single-beam response is folded in as a FIXED background
+either way, so the fringe need not absorb the single-beam ramp.
 
-with ``a`` := reference amplitude and ``b`` := target amplitude, both taken from
-step 6 -- either ratio-locked with a boxed shared gain ``s`` (``--bounded``) or
-pinned outright at the etas (``--fix``, ``s = 1``).  Each pair's step-6
-single-beam response is folded in as a FIXED background either way, so the
-fringe need not absorb the single-beam ramp.
+Each point is one fixed-duration acquisition as in step 6: ``T_SINGLE_S`` for
+the all-off dark, ``T_BOTH_S`` for the sweep points, which are bright because
+the reference is fully on.  Every row records the mean, its trace std and the
+ratio of the two.
 
-Each point is one fixed-duration ``daq_module`` acquisition like step 6 (the
-same ``DAQController.monitor_cycle`` read the GUI pipeline uses): ``T_SINGLE_S``
-(5 s) for the all-off dark (near-zero signal needs the averaging) and
-``T_BOTH_S`` (3 s) for the sweep points (the reference is fully on, so they
-are bright), low-passed at the ``DAQMonitorSettings`` bandwidth.  Every CSV row
-records the mean, its trace std and the std ratio (std/|mean|).
-
-Prereq: ONE combined step-6 result JSON (``calib_step6_test.save_combined_json``)
-is the only input -- it embeds the raw Step-3 calibration under ``"step3"``
-(-> channel layout) and every fitted pair under ``"step6"`` (-> eta + single-beam
-/ dark background), so the reference and all targets come from a single file.
-Point ``IN_STEP6`` at the latest step-6 run.
-
-All model / background removal / weighted fit / persistence live in
-:mod:`calibration_module.fit.phase`; this file only wires up hardware and prints/plots.
+This file only wires up hardware and prints/plots; the model, the background
+removal, the weighted fit and the persistence are all in ``fit.phase``.
 """
 from __future__ import annotations
 
@@ -95,7 +74,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from calibration_module.measure.bench import connect_daq, connect_slm, read_point  # noqa: E402
-from slm_module.calibration.calibration_new import calibration_result_from_dict  # noqa: E402
+from calibration_module.fit.slm_response import calibration_result_from_dict  # noqa: E402
 from slm_module.encoding import channel_layout_from_calibration  # noqa: E402
 from calibration_module.fit.phase import (  # noqa: E402
     PhaseFit,
@@ -333,14 +312,11 @@ def _targets_in_csv(path, default) -> list[int]:
 def _flip_meas_csv(path) -> Path:
     """Write a sign-flipped copy of a raw step-7 CSV and return its path.
 
-    The photodiode/DAQ reads inverted (more light -> more negative volts), so the
-    raw ``voltage_mean_v`` and its per-row ``dark_v`` are negated -- both are the
-    same channel, so the fit's ``y = mean - dark`` then yields the positive light
-    signal (= dark - |mean|) with the residual dark still near zero.  Every other
-    column is copied through unchanged: the spread (``voltage_std_v``) and
-    ``std_ratio`` (= |std/mean|) are sign-independent.
-    Mirrors the hand-made ``*_flipped.csv`` refit workflow.  Output lands next to
-    the source as ``<stem>_flipped.csv``.
+    ``voltage_mean_v`` and its per-row ``dark_v`` are negated -- both the same
+    channel, so the fit's ``y = mean - dark`` becomes the positive light signal
+    with the residual dark still near zero.  Every other column copies through:
+    the spread and ``std_ratio`` are sign-independent.  Lands beside the source
+    as ``<stem>_flipped.csv``.
     """
     src = Path(path)
     with open(src, newline="", encoding="utf-8") as f:
@@ -395,24 +371,15 @@ def _compare_methods(fits: dict[tuple[int, str], PhaseFit], pairs, methods) -> N
 def fit_csv(path, *, flip: bool = False, methods: tuple[str, ...] = ("bounded",)) -> None:
     """Re-fit an already-recorded CSV offline (no hardware).
 
-    Needs two inputs: this CSV plus the combined step-6 JSON (``IN_STEP6``) for
-    each pair's eta + single-beam background.  The CSV may carry several target
-    pairs -- a collected file records every TGT_INDICES entry vs the shared
-    REF_INDEX -- so every target present (that has a step-6 model) is fit separately
-    against the reference and gets its own refit PNG.
-
-    ``methods`` picks how the step-6 amplitudes enter (:data:`METHODS`):
-    ``"bounded"`` floats the shared scale ``s`` boxed to ``+/-BOUND_FRAC``;
-    ``"fix"`` pins ``a``/``b`` to the etas exactly (``s = 1``).  Each requested
-    method runs on every target (PNG suffixed with the method name); with more
-    than one, a comparison table is printed at the end.
-
-    ``flip`` handles an inverted photodiode/DAQ read: it writes a sign-flipped
-    sibling CSV (:func:`_flip_meas_csv`, negating ``voltage_mean_v`` + ``dark_v``)
-    and re-fits that instead, so the fitted fringe is the positive light signal.
-
-    Every fitted (pair, method) is persisted into ONE combined
-    ``calib_step7_result_*.json`` (:func:`tpa_phase.save_comb_phase_json`).
+    In:  this CSV plus the combined step-6 JSON (``IN_STEP6``) for each pair's
+         eta and single-beam background.  One collected file carries several
+         targets against the shared reference, and every one with a step-6 model
+         is fitted separately.  ``methods`` picks how the amplitudes enter
+         (:data:`METHODS`); each runs on every target, and more than one prints
+         a comparison table.  ``flip`` re-fits a sign-flipped sibling CSV
+         (:func:`_flip_meas_csv`) instead.
+    Out: one combined ``calib_step7_result_*.json`` holding every fitted
+         (pair, method), plus a PNG each.
     """
     if flip:
         path = _flip_meas_csv(path)
@@ -512,13 +479,11 @@ def write_meas_csv(results, path) -> str:
 
 
 def _read_point(daq, x_t: float, w_t: float, x_r: float, w_r: float) -> tuple[float, float, float]:
-    """One fixed-duration DAQ read for a drive point; return ``(mean, std, duration)``.
+    """One fixed-duration DAQ read for a drive point -> ``(mean, std, duration)``.
 
-    Any channel on reads ``T_BOTH_S`` (sweep points are bright -- the reference
-    is fully on); the all-off dark reads the DAQ's configured T_single window
-    (``T_SINGLE_S``).  Filtering happens inside ``DAQController.monitor_cycle``
-    -- the same read the GUI pipeline uses -- and ``std`` is the spread of that
-    low-passed trace, recorded verbatim in the CSV as the per-point sigma the
+    Any channel on reads ``T_BOTH_S`` -- sweep points are bright, the reference
+    being fully on -- and the all-off dark reads ``T_SINGLE_S``.  ``std`` is the
+    spread of the low-passed trace, recorded verbatim as the per-point sigma the
     fit weights by.
     """
     single = not any(v > 0.0 for v in (x_t, w_t, x_r, w_r))
@@ -527,15 +492,14 @@ def _read_point(daq, x_t: float, w_t: float, x_r: float, w_r: float) -> tuple[fl
 
 
 def _measure_target(slm, daq, layout, k: int, drive, *, flip: bool = False) -> PhaseResult:
-    """Drive pair ``k`` (vs REF_INDEX) over ``drive`` and read Y; PhaseResult, no fit.
+    """Drive pair ``k`` vs REF_INDEX over ``drive`` and read Y.  No fit.
 
-    Only channels ``k`` and ``REF_INDEX`` are driven; all others held off.  An
-    all-off dark is read once at the start (T_SINGLE_S window) and stored per
-    row for per-row subtraction.  Needs no step-6 model -- raw data only.
+    Only ``k`` and ``REF_INDEX`` are driven, everything else held off.  The
+    all-off dark is read once at the start and stored per row, for per-row
+    subtraction.  Needs no step-6 model -- raw data only.
 
-    ``flip`` negates the raw mean and dark reads (inverted DAQ sign convention:
-    more light -> more negative volts), so the CSV this writes already carries the
-    positive light signal; the std is a magnitude and stays as read.
+    ``flip`` negates the raw mean and dark as read; the std is a magnitude and
+    stays as it was.
     """
     from slm_module.encoding import encode_to_pattern
 
@@ -590,20 +554,15 @@ def _measure_target(slm, daq, layout, k: int, drive, *, flip: bool = False) -> P
 def measure_only(*, flip: bool = False) -> Path:
     """Sweep every target pair vs the shared reference; write one raw CSV.
 
-    Loops over TGT_INDICES (each vs REF_INDEX), holding the reference fully on
-    (x_ref = w_ref = 1) and sweeping the target's two channels together
-    (x_tgt = w_tgt) over the SWEEP_MIN..SWEEP_MAX ramp.  All rows go into a
-    single timestamped CSV, tagged per row with ``tgt_index`` and ``ref_index``
-    so REF_INDEX and every TGT_INDICES entry are recorded.  Raw data only: no
-    step-6 models, no fit -- just drive the SLM and record the DAQ.  Refit later
-    with ``python calib_step7_test.py <that csv>``.
+    Every TGT_INDICES entry against REF_INDEX, the reference fully on and the
+    target's two channels swept together over the ramp.  All rows go to one
+    timestamped CSV, each tagged with its ``tgt_index`` and ``ref_index``.  Raw
+    data only -- no step-6 models, no fit.
 
-    Returns the written CSV path; :func:`main` fits it straight away (unless
-    ``--no-fit``), so a normal run needs no second command.
+    Out: the CSV path, which :func:`main` fits straight away unless ``--no-fit``.
 
-    ``flip`` negates each raw mean/dark read (inverted DAQ sign) so the written
-    CSV already holds the positive light signal -- the fit that follows (and any
-    later refit) runs WITHOUT --flip.
+    ``flip`` negates each raw mean/dark as it is read, so the written CSV
+    already holds the positive light signal and no later refit needs the flag.
     """
     layout = load_layout()
     if flip:

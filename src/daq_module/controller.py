@@ -44,6 +44,87 @@ def lowpass(v: np.ndarray, fs: float, f_cut: float, order: int = 4) -> np.ndarra
         return v
 
 
+# Leading settle guard dropped after filtering: the acquisition settles and the
+# zero-phase low-pass anchors to the first sample, so the first
+# cycles/f_cut seconds are a turn-on transient, not steady state. The narrowest
+# cutoff in the chain (min(hw, digital)) is the slowest filter, so it sets the
+# guard.
+SETTLE_CYCLES = 3.0
+
+
+@dataclass(frozen=True)
+class WaveformStats:
+    """One acquisition reduced to a reading, plus the traces behind it.
+
+    ``mean`` / ``std`` are the low-passed trace's statistics over the kept
+    (post-warmup) span -- the number the DAQ Monitor page reports. ``raw`` and
+    ``filtered`` are full-length and already sign-corrected, so a caller that
+    plots them can shade the first ``n_settle`` samples as discarded.
+    """
+
+    raw: np.ndarray
+    filtered: np.ndarray
+    n_settle: int
+    mean: float
+    std: float
+    raw_mean: float
+    raw_std: float
+
+    @property
+    def rel_percent(self) -> float:
+        """std / |mean| in percent (NaN on a zero mean)."""
+        return self.std / abs(self.mean) * 100.0 if self.mean else float("nan")
+
+
+def settle_samples(sample_rate: float, f_hw: float, f_dig: float,
+                   n_total: int | None = None, *,
+                   settle_cycles: float = SETTLE_CYCLES) -> int:
+    """Warmup samples to drop from the head of a trace (see SETTLE_CYCLES).
+
+    With ``n_total`` given, returns 0 when the window is too short to guard
+    (dropping the guard would leave nothing), so the caller always keeps a
+    usable span. Omit it to ask only how long the guard is -- e.g. to acquire
+    that much extra and keep a full-length window after the drop.
+    """
+    f_eff = min(f_hw, f_dig)      # narrowest cutoff governs settling
+    if f_eff <= 0.0 or sample_rate <= 0.0:
+        return 0
+    n_settle = int(round(settle_cycles / f_eff * sample_rate))
+    if n_total is not None and n_settle >= n_total:
+        return 0
+    return n_settle
+
+
+def waveform_stats(
+    voltages: np.ndarray,
+    *,
+    sample_rate: float,
+    f_hw: float,
+    f_dig: float,
+    invert: bool = True,
+    order: int = 4,
+    settle_cycles: float = SETTLE_CYCLES,
+) -> WaveformStats:
+    """Invert, low-pass, drop the warmup, then reduce to mean +/- std.
+
+    The single reduction shared by the DAQ Monitor's one-shot read and its
+    continuous loop, so both report the same number for the same trace.
+    ``invert`` undoes the TIA's sign (-volts -> +light).
+    """
+    raw = np.asarray(voltages, dtype=float)
+    if invert:
+        raw = -raw
+    filtered = lowpass(raw, sample_rate, f_dig, order)
+    n_settle = settle_samples(sample_rate, f_hw, f_dig, raw.size,
+                              settle_cycles=settle_cycles)
+    kept, raw_kept = filtered[n_settle:], raw[n_settle:]
+    return WaveformStats(
+        raw=raw, filtered=filtered, n_settle=n_settle,
+        mean=float(kept.mean()), std=float(kept.std()),
+        raw_mean=float(raw_kept.mean()), raw_std=float(raw_kept.std()),
+    )
+
+
 @dataclass(frozen=True)
 class DAQMonitorSettings:
     """Parameters for one untriggered averaged DAQ readout.
@@ -228,7 +309,11 @@ __all__ = [
     "DAQController",
     "DAQMonitorSettings",
     "MonitorSample",
+    "WaveformStats",
     "DAQError",
     "DAQConnectionError",
     "lowpass",
+    "settle_samples",
+    "waveform_stats",
+    "SETTLE_CYCLES",
 ]

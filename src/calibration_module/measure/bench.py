@@ -1,21 +1,18 @@
-"""Shared bench wiring for the calibration steps (SLM + DAQ).
+"""Shared bench wiring for the calibration steps (SLM + DAQ + OSA).
 
 The step scripts drive the same instruments the GUI does, but from plain
-scripts.  This module holds the wiring that used to be copy-pasted into each
-one, and is the single chokepoint every step-6/7/8 read passes through:
+scripts.  This is the wiring they used to copy-paste, and the single chokepoint
+every step-6/7/8 read passes through:
 
 * :func:`connect_slm` -- LCOS-SLM display auto-detection + DVI-mode switch.
-* :func:`connect_daq` -- a :class:`daq_module.DAQController` configured for the
-  fixed-window read scheme (``t_both`` when both beams are on, the longer
-  ``t_single`` when at most one beam is on -- incl. all-off darks).  All other
-  acquisition parameters (1 kS/s, +/-0.1 V DIFF, 20 Hz low-pass) are the
-  :class:`~daq_module.DAQMonitorSettings` defaults -- the values these steps
-  validated on hardware, now owned by ``daq_module``.
+* :func:`connect_daq` -- a :class:`daq_module.DAQController` on the fixed-window
+  read scheme.  Everything else (sample rate, range, low-pass) is the
+  :class:`~daq_module.DAQMonitorSettings` default, owned by ``daq_module``.
 * :func:`read_point` -- one fixed-window averaged read -> ``(mean, std)``.
+* :func:`connect_osa` -- the AQ637X over LAN, for the step 1-3 OSA sweeps.
+* :func:`print_progress` -- a ``progress_callback`` that prints each update.
 
-It was ``steps/draft_hw.py`` until the fit/measure split; nothing about it was
-ever a draft, and it sits here now because it is the acquisition layer itself,
-not one of the scripts that calls it.
+It is the acquisition layer itself, not one of the scripts that calls it.
 """
 from __future__ import annotations
 
@@ -26,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from daq_module import DAQController, DAQMonitorSettings  # noqa: E402
+from osa_module.controller import OSAController  # noqa: E402
 from slm_module.controller import SLMController  # noqa: E402
 
 # Our transimpedance amplifier outputs a NEGATIVE voltage for positive light, so
@@ -39,8 +37,8 @@ INVERT = True
 def detect_slm_display() -> int:
     """Find the LCOS-SLM display number (the GUI's Detect step).
 
-    Probing needs the DLL, so use a throwaway controller on display 1 just to
-    run detect_displays(); the real controller is then built on the found no.
+    Probing needs the DLL, so a throwaway controller on display 1 runs
+    ``detect_displays()`` and the real controller is built on what it found.
     Hardcoding display 1 is what dumped the pattern onto the main monitor.
     """
     probe = SLMController(display_no=1)
@@ -57,10 +55,9 @@ def detect_slm_display() -> int:
 def connect_slm(display_no: int | None = None, usb_slm_no: int = 1) -> SLMController:
     """Open the SLM (auto-detecting the display when ``display_no`` is None).
 
-    ``display_array()`` only writes the DVI-mode frame buffer; if the panel's
-    video interface is still set to Memory mode over USB, that write is
-    silently ignored by the hardware.  Force DVI mode so what we send is
-    actually what the panel shows (mirrors the GUI's "Switch to DVI mode").
+    ``display_array()`` writes only the DVI-mode frame buffer, and a panel still
+    in Memory mode over USB ignores that write SILENTLY, so DVI mode is forced
+    here -- what is sent is then what the panel shows.
     """
     if display_no is None:
         display_no = detect_slm_display()
@@ -84,16 +81,16 @@ def connect_daq(
 ) -> DAQController:
     """Connect a DAQController configured for the fixed T_both/T_single windows.
 
-    ``t_both`` / ``t_single`` default to the :class:`DAQMonitorSettings` values
-    (3 s / 5 s).  ``hold=0``: the drafts own their settle waits, matching how
-    the pipeline configures its monitor.
+    In:  ``t_both``/``t_single``, defaulting to the
+         :class:`DAQMonitorSettings` values, and ``min_val``/``max_val`` to
+         override the input range.  ``hold=0``, the callers owning their settle
+         waits, as the pipeline configures its monitor.
+    Out: the controller.
 
-    ``min_val`` / ``max_val`` override the input range (default +/-0.1 V, the
-    most sensitive the board offers).  Raise it when a step drives enough light
-    to clip: step 7 holds the reference on while sweeping a second pair, so its
-    bright end can run past 0.1 V, and a clipped read is a silently wrong mean,
-    not an error.  The board quantizes the range -- it only offers +/-0.1, 0.2,
-    0.5, 1, 2, 5, 10 V and rounds a request UP -- so ask for one of those.
+    Raise the range when a step drives enough light to clip -- step 7 holds the
+    reference on while sweeping a second pair, and a clipped read is a silently
+    wrong mean, not an error.  The board quantizes the range (+/-0.1, 0.2, 0.5,
+    1, 2, 5, 10 V) and rounds a request UP, so ask for one of those.
     """
     defaults = DAQMonitorSettings()
     settings = DAQMonitorSettings(
@@ -137,9 +134,28 @@ def read_point(
     return mean, float(sample.std)
 
 
+def connect_osa(host: str = "192.168.1.11", port: int = 10001) -> OSAController:
+    """Open the OSA over LAN (the GUI's Connections-page defaults)."""
+    osa = OSAController(host=host, port=port)
+    osa.connect()
+    print(f"OSA: {osa.identify()} at {host}:{port}")
+    return osa
+
+
+def print_progress(progress) -> None:
+    """A ``progress_callback`` for the step 1-3 sweeps: one line per update.
+
+    ``progress`` is a ``measure.slm_response.CalibrationProgress``.
+    """
+    print(f"  [{progress.phase} {progress.step + 1}/{progress.total}] "
+          f"{progress.message}")
+
+
 __all__ = [
     "detect_slm_display",
     "connect_slm",
     "connect_daq",
+    "connect_osa",
     "read_point",
+    "print_progress",
 ]

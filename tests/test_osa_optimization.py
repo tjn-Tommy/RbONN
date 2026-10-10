@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from osa_module.controller import MeasurementSettings, TraceData
-from slm_module.calibration.calibration_new import CalibrationResult
+from calibration_module.fit.slm_response import CalibrationResult
 from slm_module.optimization import (
     AmplitudeLUT,
     FixedChannelBins,
@@ -76,13 +76,17 @@ class SingleAnchorLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(coordinate, 75.0)
 
     def test_builds_layout_with_target_as_only_offset_zero_anchor(self) -> None:
+        # The anchor curve is fitted once and shared, so it has to be a sweep a
+        # sin^2 can describe; what this test checks is the geometry around it.
+        levels = np.linspace(0, 1023, 9).round().astype(int)
+        anchor_curve = np.sin(0.5 * np.pi * levels / 1023.0) ** 2
         intensity = CalibrationResult(
             wavelength=np.asarray([778.0]),
             coordinates=np.asarray([100.0]),
             max_level=1023,
             min_level=0,
-            level_range=np.asarray([0, 512, 1023]),
-            intensity_levels=np.asarray([[0.0, 0.4, 1.0]]),
+            level_range=levels,
+            intensity_levels=anchor_curve[None, :],
         )
         layout, coordinate = build_single_anchor_layout(
             self._step2(), intensity, target_wavelength_nm=778.0,
@@ -95,7 +99,7 @@ class SingleAnchorLayoutTests(unittest.TestCase):
         self.assertEqual(anchor.x_center, 100)
         self.assertEqual(anchor.wavelength_nm, 778.0)
         self.assertEqual(layout.n_channels, 5)
-        self.assertTrue(all(channel.levels.size == 3 for channel in ordered))
+        self.assertTrue(all(channel.levels.size == levels.size for channel in ordered))
 
     def test_rejects_target_outside_step2_range(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside the Step 2 range"):

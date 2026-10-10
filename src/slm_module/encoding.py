@@ -5,8 +5,8 @@ from typing import Callable
 
 import numpy as np
 
-from .calibration.calibration_new import CalibrationResult
-from .calibration.transfer import TransferFit, TransferFitError, fit_transfer_curve
+from calibration_module.fit.slm_response import CalibrationResult
+from calibration_module.fit.transfer import TransferFit, TransferFitError, fit_transfer_curve
 
 
 @dataclass
@@ -19,78 +19,45 @@ class EncodingChannel:
     wavelength_nm: float
     # measured transfer curve from the nearest calibration coordinate
     levels: np.ndarray = field(repr=False)           # SLM levels swept (ascending)
-    intensity_curve: np.ndarray = field(repr=False)  # measured normalised power
+    # Measured normalised power.  Empty is allowed when a ``transfer_fit`` is
+    # supplied: the raw sweep lives in the step-3 CSV and no longer in
+    # calib.json, and inverting the fit does not need it.  Kept for plots and
+    # for fitting a hand-built channel that arrives without one.
+    intensity_curve: np.ndarray = field(
+        repr=False, default_factory=lambda: np.asarray([], dtype=float))
 
-    # How level_for() inverts the transfer curve:
-    #   "fit"    -- invert the fitted sin^2 model (slm_module.calibration.transfer).
-    #               Full scale is the fitted Delta = pi rather than the curve's
-    #               argmax, every level is informed by all the swept points rather
-    #               than the two bracketing it, and `v` means sin^2(Delta/2)
-    #               exactly -- the same relation calibration_module.fit.phase.phi_half
-    #               assumes downstream.
-    #   "interp" -- linear interpolation on the measured curve (the original
-    #               behaviour, kept for comparison).
-    # The dataclass defaults to "interp" so a hand-built channel with a few
-    # synthetic points still works; the LOADER picks the real default.
-    # channel_layout_from_calibration -- the one the calibration chain and the
-    # GUI encoding page use -- defaults to "fit"; the alignment builders
-    # (build_channel_layout, build_single_anchor_layout) stay on "interp"
-    # because they share one measured curve across several channels.
-    method: str = "interp"
-    transfer_fit: TransferFit | None = None   # fitted in __post_init__ if absent
+    # The fitted sin^2 model level_for() inverts
+    # (calibration_module.fit.transfer).  Full scale is the fitted Delta = pi
+    # rather than the swept argmax, every level is informed by all the swept
+    # points rather than the two bracketing it, and `v` means sin^2(Delta/2)
+    # exactly -- the same relation calibration_module.fit.phase.phi_half assumes
+    # downstream.  Fitted here when absent, which is what a hand-built channel
+    # and the alignment builders rely on; a step-3 section supplies it already
+    # fitted, so the encoding is frozen with the calibration.
+    transfer_fit: TransferFit | None = None
 
     # derived in __post_init__
     on_level: int = field(init=False)    # level of full scale (v = 1)
     off_level: int = field(init=False)   # level of extinction (v = 0)
-    _seg_levels: np.ndarray = field(init=False, repr=False)
-    _seg_curve: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.method not in ("fit", "interp"):
-            raise ValueError(
-                f"unknown encoding method {self.method!r}; expected 'fit' or 'interp'"
-            )
-        if self.method == "fit" and self.transfer_fit is None:
+        curve = np.asarray(self.intensity_curve, dtype=float).reshape(-1)
+        if self.transfer_fit is None:
+            if curve.size == 0:
+                raise TransferFitError(
+                    f"channel {self.side}{self.index} has neither a measured "
+                    f"curve nor a transfer fit -- nothing to encode through"
+                )
             self.transfer_fit = fit_transfer_curve(self.levels, self.intensity_curve)
 
-        on_idx = int(np.argmax(self.intensity_curve))
-        off_idx = int(np.argmin(self.intensity_curve))
-
-        # The interpolation segment is built either way -- it costs nothing and
-        # keeps level_for_interp() available on a fitted channel, so the two
-        # mappings can be compared without rebuilding the layout.
-        # Rising segment between off (min) and on (max), made monotonic
-        # non-decreasing with a cumulative-max envelope so measurement noise
-        # near the flat top cannot map a higher target onto a lower level.
-        lo, hi = sorted((off_idx, on_idx))
-        self._seg_levels = self.levels[lo : hi + 1]
-        self._seg_curve = np.maximum.accumulate(self.intensity_curve[lo : hi + 1])
-
-        if self.method == "fit":
-            # full scale is the model's Delta = pi, extinction its Delta = 0 --
-            # NOT the swept argmax/argmin, which is the whole point (one noisy
-            # sample moved the 0903 argmax of one channel by 120 levels).
-            self.on_level = self.transfer_fit.on_level
-            self.off_level = self.transfer_fit.off_level
-        else:
-            self.on_level = int(self.levels[on_idx])
-            self.off_level = int(self.levels[off_idx])
+        # Full scale is the model's Delta = pi, extinction its Delta = 0 -- NOT
+        # the swept argmax/argmin, which is the whole point (one noisy sample
+        # moved the 0903 argmax of one channel by 120 levels).
+        self.on_level = self.transfer_fit.on_level
+        self.off_level = self.transfer_fit.off_level
 
     def level_for(self, val: float) -> int:
-        """Map a normalised output power val in [0, 1] to an SLM level.
-
-        Dispatches on ``method``: :meth:`level_for_fit` inverts the fitted
-        sin^2 model, :meth:`level_for_interp` interpolates the measured curve.
-        Both read ``val`` as the fraction of this channel's own off->on span and
-        both return an integer grayscale, so they are interchangeable from the
-        caller's side.
-        """
-        if self.method == "fit":
-            return self.level_for_fit(val)
-        return self.level_for_interp(val)
-
-    def level_for_fit(self, val: float) -> int:
-        """Invert the fitted sin^2 transfer model -- see :mod:`.calibration.transfer`.
+        """Invert the fitted sin^2 transfer model -- see :mod:`calibration_module.fit.transfer`.
 
         ``sin^2(Delta/2) = val`` gives ``Delta = 2 asin(sqrt(val))``, exactly
         the retardance ``calibration_module.fit.phase.phi_half`` assumes for a
@@ -103,30 +70,6 @@ class EncodingChannel:
                 f"channel {self.side}{self.index} has no transfer fit to invert"
             )
         return self.transfer_fit.level_for(val)
-
-    def level_for_interp(self, val: float) -> int:
-        """Map val in [0, 1] to a level by interpolating the MEASURED curve.
-
-        The original mapping, kept for comparison against :meth:`level_for_fit`.
-        The target output is  val * (max - min)  above the channel's minimum;
-        the two swept points bracketing that target define the level by linear
-        interpolation, rounded to the nearest integer grayscale — so the
-        result is not limited to the levels actually swept. The curve is
-        taken over the off->on segment with a monotonic envelope, so the
-        mapping is non-decreasing: val = 0 -> argmin level, val = 1 -> argmax
-        level.  Those endpoints are the swept extremes, so under
-        ``method="fit"`` they differ from ``off_level``/``on_level``.
-        """
-        val = float(np.clip(val, 0.0, 1.0))
-        off_p = float(self._seg_curve[0])
-        on_p = float(self._seg_curve[-1])
-        target = off_p + val * (on_p - off_p)
-        # drop the repeated points of each flat run the envelope created,
-        # keeping the lowest level that reaches each measured output, so the
-        # interpolation abscissa is strictly increasing
-        keep = np.r_[True, np.diff(self._seg_curve) > 0.0]
-        level = np.interp(target, self._seg_curve[keep], self._seg_levels[keep])
-        return int(round(float(level)))
 
 
 @dataclass
@@ -360,17 +303,15 @@ def build_channel_layout(
         (779.9, 780.1),
         (775.9, 776.1),
     ),
-    method: str = "interp",
 ) -> ChannelLayout:
     """Build an encoding layout centred at center_wl with dark guard bands.
 
-    ``method`` picks how ``level_for`` inverts the transfer curve.  Unlike
-    :func:`channel_layout_from_calibration` -- the loader the calibration chain
-    uses, which defaults to ``"fit"`` -- this one defaults to ``"interp"``.
-    This builder TILES a grid and gives each channel the curve of its nearest
-    calibration coordinate, so one measured curve can back several channels and
-    a fitted full scale would claim a per-channel precision the data does not
-    have.  Pass ``method="fit"`` when the grid really is one curve per channel.
+    This builder TILES a grid and gives each channel the curve of its NEAREST
+    calibration coordinate, so one measured curve can back several channels.
+    That sharing is the approximation here, and it is unaffected by how the
+    curve is inverted: channels snapped to the same row get the same mapping
+    either way.  Inversion is the fitted sin^2 model, the only one there is --
+    see :meth:`EncodingChannel.level_for`.
 
     .. deprecated::
         Do NOT use this to consume a Step-3b/3c channel calibration -- those
@@ -431,11 +372,8 @@ def build_channel_layout(
     )
 
     # One fit per calibration row, shared by every channel that snaps to it.
-    row_fits = (
-        [fit_transfer_curve(levels, intens[row]) for row in range(intens.shape[0])]
-        if method == "fit"
-        else None
-    )
+    row_fits = [fit_transfer_curve(levels, intens[row])
+                for row in range(intens.shape[0])]
 
     def _make(g: ChannelGeometry) -> EncodingChannel:
         nearest = int(np.argmin(np.abs(coords - g.x_center)))
@@ -448,8 +386,7 @@ def build_channel_layout(
             wavelength_nm=g.wavelength_nm,
             levels=levels.copy(),
             intensity_curve=intens[nearest].copy(),
-            method=method,
-            transfer_fit=None if row_fits is None else row_fits[nearest],
+            transfer_fit=row_fits[nearest],
         )
 
     return ChannelLayout(
@@ -472,7 +409,6 @@ def channel_layout_from_calibration(
     *,
     channel_width_px: int | None = None,
     assumed_gap_px: int = 5,
-    method: str = "fit",
     warn: bool = True,
 ) -> ChannelLayout:
     """Rebuild a ChannelLayout verbatim from a channels-only calibration.
@@ -493,36 +429,45 @@ def channel_layout_from_calibration(
     ``pitch - assumed_gap_px`` guess -- announced under ``warn``, because a
     guessed aperture is not the calibrated one.
 
-    ``method`` picks how ``level_for`` inverts the transfer curve, and defaults
-    to ``"fit"`` -- the sin^2 model of :mod:`.calibration.transfer`.  This is the
-    one loader every offline calibration step goes through (steps 6, 7 and 8 all
-    call it), so it is where the pipeline's encoding convention is set.  Pass
-    ``method="interp"`` for the original measured-curve interpolation.
+    ``level_for`` inverts the fitted sin^2 model of
+    :mod:`calibration_module.fit.transfer` -- the only inversion there is.  This
+    is the one loader every offline calibration step goes through (steps 6, 7
+    and 8 all call it), so it is where the pipeline's encoding convention is set.
 
     Fitted parameters come from ``calib.transfer_fits`` when the calibration
-    file carries them, which is what Step 3b writes from now on: the encoding is
-    then frozen with the calibration, so steps 6, 7 and 8 -- run at different
-    times against the same JSON -- cannot drift apart because an optimizer took
-    a different path.  An older file without them is fitted here instead, which
-    keeps every existing calibration usable with no re-measurement.
+    file carries them, which is what step 3 writes: the encoding is then frozen
+    with the calibration, so steps 6, 7 and 8 -- run at different times against
+    the same file -- cannot drift apart because an optimizer took a different
+    path.  A calib.json step-3 section carries ONLY the fits, its raw sweep
+    having moved to the CSV.  An older file with curves and no fits is fitted
+    here instead, which keeps every existing calibration usable.
 
     ``warn`` prints a one-line notice per channel whose fitted encoding window
     runs past the levels actually swept.  Not an error (a peak just past the top
     of the sweep is still encodable), but its ``v = 1`` is an extrapolation and
     that is worth seeing before a run rather than after.
     """
-    if method not in ("fit", "interp"):
-        raise ValueError(
-            f"unknown encoding method {method!r}; expected 'fit' or 'interp'"
-        )
-    if calib.intensity_levels is None:
-        raise ValueError("CalibrationResult has no intensity data (Step 3c not run)")
-
     coords = np.asarray(calib.coordinates, dtype=float)
     wls = np.asarray(calib.wavelength, dtype=float)
-    intens = np.asarray(calib.intensity_levels, dtype=float)
     levels = np.asarray(calib.level_range, dtype=int)
     n = coords.size
+
+    # A calib.json step-3 section stores the fits and leaves the raw sweep in
+    # its CSV, so the curves can legitimately be absent.  Then the fits ARE the
+    # calibration and there has to be one per channel; without either, there is
+    # no transfer curve at all and step 3 was not run.
+    stored_fits = getattr(calib, "transfer_fits", None)
+    curves_only = calib.intensity_levels is None
+    if curves_only and (stored_fits is None or len(stored_fits) != n):
+        raise ValueError(
+            "CalibrationResult has neither intensity curves nor one transfer "
+            f"fit per channel ({n} coordinates, "
+            f"{0 if stored_fits is None else len(stored_fits)} fits) "
+            "-- step 3 not run"
+        )
+    intens = (np.zeros((n, levels.size), dtype=float) if curves_only
+              else np.asarray(calib.intensity_levels, dtype=float))
+
     if n < 4 or n % 2:
         raise ValueError(
             f"channel calibration needs an even number of coordinates (>= 4), got {n}"
@@ -610,23 +555,20 @@ def channel_layout_from_calibration(
     # One transfer fit per row, in the SAME sorted-by-coordinate order as
     # `intens`.  Stored fits are reordered with the rows; absent ones are
     # fitted here.
-    fits: list[TransferFit] | None = None
-    if method == "fit":
-        stored = getattr(calib, "transfer_fits", None)
-        if stored is not None and len(stored) == n:
-            fits = [stored[int(i)] for i in order]
-        else:
-            fits = [fit_transfer_curve(levels, intens[row]) for row in range(n)]
-        if warn:
-            for row, fit in enumerate(fits):
-                if fit.extrapolated:
-                    print(
-                        f"  [encoding] channel at {wls[row]:.3f} nm: fitted "
-                        f"encoding window {fit.off_level_exact:.0f}.."
-                        f"{fit.on_level_exact:.0f} runs outside the swept "
-                        f"{fit.level_min}..{fit.level_max} -- v = 1 is an "
-                        f"extrapolation (widen level_range in step 3b)"
-                    )
+    if stored_fits is not None and len(stored_fits) == n:
+        fits = [stored_fits[int(i)] for i in order]
+    else:
+        fits = [fit_transfer_curve(levels, intens[row]) for row in range(n)]
+    if warn:
+        for row, fit in enumerate(fits):
+            if fit.extrapolated:
+                print(
+                    f"  [encoding] channel at {wls[row]:.3f} nm: fitted "
+                    f"encoding window {fit.off_level_exact:.0f}.."
+                    f"{fit.on_level_exact:.0f} runs outside the swept "
+                    f"{fit.level_min}..{fit.level_max} -- v = 1 is an "
+                    f"extrapolation (widen level_range in step 3)"
+                )
 
     def _make(index: int, side: str, row: int) -> EncodingChannel:
         x_c = int(round(coords[row]))
@@ -639,9 +581,11 @@ def channel_layout_from_calibration(
             x_end=x_start + width,
             wavelength_nm=float(wls[row]),
             levels=levels.copy(),
-            intensity_curve=intens[row].copy(),
-            method=method,
-            transfer_fit=None if fits is None else fits[row],
+            # Empty, not a row of zeros, when the file carries fits only: a zero
+            # curve would read as a measured one in any plot that shows it.
+            intensity_curve=(np.asarray([], dtype=float) if curves_only
+                             else intens[row].copy()),
+            transfer_fit=fits[row],
         )
 
     x_channels = [_make(i, "x", row) for i, row in enumerate(x_rows)]
@@ -731,7 +675,6 @@ def build_single_anchor_layout(
     target_wavelength_nm: float = 778.0,
     channel_width_px: int = 15,
     gap_px: int = 5,
-    method: str = "interp",
 ) -> tuple[ChannelLayout, float]:
     """Build a layout whose offset-0 channel is the interpolated target pixel.
 
@@ -740,10 +683,9 @@ def build_single_anchor_layout(
     channels needed to form fixed OSA bins; only the target channel is used as
     an optimisation anchor.
 
-    ``method`` defaults to ``"interp"`` here for the same reason as in
-    :func:`build_channel_layout`: every channel shares the anchor's curve, so a
-    fitted per-channel full scale would be one number wearing many hats.  This
-    is an alignment layout, not a calibrated one.
+    Every channel shares the anchor's fit, so its full scale is one number
+    wearing many hats -- the sharing is the approximation, not the inversion.
+    This is an alignment layout, not a calibrated one.
     """
     if channel_width_px < 1:
         raise ValueError("channel_width_px must be positive")
@@ -805,7 +747,7 @@ def build_single_anchor_layout(
         return float(np.interp(coordinate, map_coordinates, map_wavelengths))
 
     # one fit for the anchor curve, shared by every channel that reuses it
-    anchor_fit = fit_transfer_curve(levels, curve) if method == "fit" else None
+    anchor_fit = fit_transfer_curve(levels, curve)
 
     def make_channel(index: int, side: str, coordinate: int) -> EncodingChannel:
         wavelength = (
@@ -822,7 +764,6 @@ def build_single_anchor_layout(
             wavelength_nm=wavelength,
             levels=levels.copy(),
             intensity_curve=curve.copy(),
-            method=method,
             transfer_fit=anchor_fit,   # every channel reuses the anchor curve
         )
 

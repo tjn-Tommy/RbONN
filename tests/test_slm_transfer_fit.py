@@ -1,7 +1,8 @@
 """The fitted sin^2 transfer curve and the encoding built on it.
 
-Covers :mod:`slm_module.calibration.transfer` and the ``method="fit"`` path
-through :class:`slm_module.encoding.EncodingChannel`.
+Covers :mod:`calibration_module.fit.transfer` and the encoding built on it in
+:class:`slm_module.encoding.EncodingChannel` -- inverting the fit is the only
+level mapping there is.
 """
 from __future__ import annotations
 
@@ -17,12 +18,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from slm_module.calibration.calibration_new import (  # noqa: E402
+from calibration_module.fit.slm_response import (  # noqa: E402
     CalibrationResult,
     load_calibration_result,
     save_calibration_result,
 )
-from slm_module.calibration.transfer import (  # noqa: E402
+from calibration_module.fit.transfer import (  # noqa: E402
     MAX_LEVEL,
     TransferFit,
     TransferFitError,
@@ -139,17 +140,18 @@ class SpikeRejectionTests(unittest.TestCase):
         )
 
     def test_encoding_channel_full_scale_ignores_the_spike(self) -> None:
-        ch = self._channel(self.spiked, method="fit")
-        interp = self._channel(self.spiked, method="interp")
-        self.assertEqual(interp.on_level, int(LEVELS[self.spike_idx]))   # 770
-        self.assertGreater(ch.on_level, interp.on_level + 50)            # ~860
+        """Full scale is the modelled Delta = pi, not the level of the spike."""
+        ch = self._channel(self.spiked)
+        swept_argmax = int(LEVELS[self.spike_idx])                       # 770
+        self.assertGreater(ch.on_level, swept_argmax + 50)               # ~860
+        self.assertAlmostEqual(ch.on_level, round(ON_TRUE), delta=8)
 
     @staticmethod
-    def _channel(values, *, method):
+    def _channel(values):
         return EncodingChannel(
             index=0, side="x", x_center=100, x_start=93, x_end=108,
             wavelength_nm=780.0, levels=LEVELS.copy(),
-            intensity_curve=np.asarray(values, dtype=float), method=method,
+            intensity_curve=np.asarray(values, dtype=float),
         )
 
 
@@ -158,7 +160,7 @@ class FitEncodingTests(unittest.TestCase):
         self.ch = EncodingChannel(
             index=0, side="x", x_center=100, x_start=93, x_end=108,
             wavelength_nm=780.0, levels=LEVELS.copy(),
-            intensity_curve=curve(), method="fit",
+            intensity_curve=curve(),
         )
 
     def test_endpoints_are_the_fitted_window(self) -> None:
@@ -179,7 +181,7 @@ class FitEncodingTests(unittest.TestCase):
         far = EncodingChannel(
             index=0, side="x", x_center=100, x_start=93, x_end=108,
             wavelength_nm=780.0, levels=LEVELS.copy(),
-            intensity_curve=curve(on_level=1400.0), method="fit",
+            intensity_curve=curve(on_level=1400.0),
         )
         for v in (0.0, 0.5, 1.0):
             self.assertTrue(0 <= far.level_for(v) <= MAX_LEVEL)
@@ -209,20 +211,15 @@ class FitEncodingTests(unittest.TestCase):
             delivered = float(fit.retardance(fit.level_for(v)))
             self.assertAlmostEqual(delivered, 2.0 * float(phi_half(v)), places=2)
 
-    def test_interp_still_available_on_a_fitted_channel(self) -> None:
-        """Both mappings live on every channel, so they can be compared."""
-        self.assertEqual(self.ch.method, "fit")
+    def test_a_curve_is_fitted_when_none_was_supplied(self) -> None:
+        """A hand-built channel arrives with a curve and no fit; it gets one."""
         self.assertIsNotNone(self.ch.transfer_fit)
-        # on a clean curve the two agree closely; the point is that both run
-        for v in (0.25, 0.5, 0.75):
-            self.assertLess(abs(self.ch.level_for_fit(v) - self.ch.level_for_interp(v)), 12)
 
-    def test_unknown_method_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unknown encoding method"):
+    def test_neither_a_curve_nor_a_fit_is_refused(self) -> None:
+        with self.assertRaisesRegex(TransferFitError, "nothing to encode through"):
             EncodingChannel(
                 index=0, side="x", x_center=100, x_start=93, x_end=108,
                 wavelength_nm=780.0, levels=LEVELS.copy(),
-                intensity_curve=curve(), method="spline",
             )
 
 
@@ -297,35 +294,23 @@ class CalibrationPlumbingTests(unittest.TestCase):
 
     def test_layout_fits_when_the_file_has_none(self) -> None:
         layout = channel_layout_from_calibration(self._calib(), warn=False)
-        self.assertTrue(all(c.method == "fit" for c in layout.all_channels))
         self.assertTrue(all(c.transfer_fit is not None for c in layout.all_channels))
         # background columns sit at the modelled extinction, not the swept argmin
         self.assertTrue(
             np.allclose(layout.calib_off_levels, round(OFF_TRUE), atol=1)
         )
 
-    def test_interp_method_still_selectable(self) -> None:
-        layout = channel_layout_from_calibration(self._calib(), method="interp")
-        self.assertTrue(all(c.method == "interp" for c in layout.all_channels))
-        self.assertTrue(all(c.transfer_fit is None for c in layout.all_channels))
-        # interp full scale is the swept argmax
-        self.assertEqual(layout.x_channels[0].on_level, int(LEVELS[np.argmax(curve())]))
-
-    def test_unknown_layout_method_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unknown encoding method"):
-            channel_layout_from_calibration(self._calib(), method="spline")
-
 
 class AlignmentBuilderTests(unittest.TestCase):
-    """The tiling and anchor builders default to interp but accept "fit".
+    """The tiling and anchor builders share one fit across several channels.
 
     They give several channels the SAME measured curve -- one snapped from the
-    nearest calibration coordinate, one shared anchor -- so a fitted per-channel
-    full scale would claim precision the data does not carry.  The option is
-    there for a grid that really is one curve per channel.
+    nearest calibration coordinate, one shared anchor -- so their full scale is
+    one number wearing many hats.  That sharing is the approximation, and it is
+    what these tests pin; the inversion itself is the fit, as everywhere else.
     """
 
-    def test_build_channel_layout_defaults_to_interp_and_accepts_fit(self) -> None:
+    def test_build_channel_layout_shares_the_snapped_row_fit(self) -> None:
         coords = np.linspace(100.0, 900.0, 9)
         calib = CalibrationResult(
             wavelength=-0.005 * coords + 781.0,
@@ -335,15 +320,12 @@ class AlignmentBuilderTests(unittest.TestCase):
             level_range=LEVELS.copy(),
             intensity_levels=np.stack([curve() for _ in coords]),
         )
-        default = build_channel_layout(calib, n_channels=4)
-        self.assertTrue(all(c.method == "interp" for c in default.all_channels))
-
-        fitted = build_channel_layout(calib, n_channels=4, method="fit")
-        self.assertTrue(all(c.method == "fit" for c in fitted.all_channels))
+        fitted = build_channel_layout(calib, n_channels=4)
+        self.assertTrue(all(c.transfer_fit is not None for c in fitted.all_channels))
         for ch in fitted.all_channels:
             self.assertAlmostEqual(ch.on_level, round(ON_TRUE), delta=1)
 
-    def test_single_anchor_layout_defaults_to_interp_and_accepts_fit(self) -> None:
+    def test_single_anchor_layout_shares_the_anchor_fit(self) -> None:
         step2 = CalibrationResult(
             wavelength=np.asarray([780.0, 778.0, 776.0]),
             coordinates=np.asarray([0.0, 100.0, 200.0]),
@@ -355,14 +337,8 @@ class AlignmentBuilderTests(unittest.TestCase):
             max_level=860, min_level=390, level_range=LEVELS.copy(),
             intensity_levels=curve()[None, :],
         )
-        default, _ = build_single_anchor_layout(step2, intensity,
-                                                target_wavelength_nm=778.0)
-        self.assertTrue(all(c.method == "interp" for c in default.all_channels))
-
         fitted, _ = build_single_anchor_layout(step2, intensity,
-                                               target_wavelength_nm=778.0,
-                                               method="fit")
-        self.assertTrue(all(c.method == "fit" for c in fitted.all_channels))
+                                               target_wavelength_nm=778.0)
         # every channel shares the anchor's fit, hence its window
         self.assertEqual({c.on_level for c in fitted.all_channels},
                          {round(ON_TRUE)})

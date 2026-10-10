@@ -1,32 +1,33 @@
 """Step 7 v2 acquisition -- sweep one target pair against the reference.
 
-This half touches the instruments and does no fitting.  It hands back a raw
-:class:`~calibration_module.fit.phase.PhaseResult` (no ``fit``) that
-:func:`~calibration_module.fit.phase.fit_result` turns into a ``dPhi_comb``, so
-the offline script and the GUI collect data through exactly one implementation
-and differ only in what they do with the rows afterwards.  Same split, same
-reasons, as :mod:`calibration_module.measure.pair_v2` -- and the near-rail
-escalation is literally that module's, imported rather than retyped.
+This half touches the instruments and does no fitting.
 
-``monitor`` is anything with the ``monitor_cycle(timeout=..., single=...)``
-protocol -- a :class:`~daq_module.DAQController` in every current caller.
+In:  ``monitor``, anything with the ``monitor_cycle(timeout=..., single=...)``
+     protocol -- a :class:`~daq_module.DAQController` in every current caller --
+     plus the SLM, the layout and the drive list.
+Out: a raw :class:`~calibration_module.fit.phase.PhaseResult` with no ``fit``,
+     which :func:`~calibration_module.fit.phase.fit_result` turns into a
+     ``dPhi_comb``.  So the offline script and the GUI collect through one
+     implementation and differ only in what they do with the rows.
+
+Same split and the same reasons as :mod:`calibration_module.measure.pair_v2`,
+whose read is imported here rather than retyped.
 """
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 from ..fit.phase import PhaseResult
-from .pair_v2 import PairV2Acq, PairV2Aborted, read_point_autorange
+from .pair_v2 import DEFAULT_ACQ as BENCH_ACQ, PairV2Acq, PairV2Aborted, read_point
 
 __all__ = [
     "PhaseV2Config",
     "DEFAULT_CONFIG",
-    "PhaseV2Acq",
     "DEFAULT_ACQ",
     "PhaseV2Aborted",
     "PhaseV2Progress",
@@ -100,31 +101,18 @@ class PhaseV2Config:
 DEFAULT_CONFIG = PhaseV2Config()
 
 
-@dataclass(frozen=True)
-class PhaseV2Acq(PairV2Acq):
-    """Step 7's acquisition settings -- step 6's, with step-7 defaults.
-
-    A subclass rather than a twin so the shared
-    :func:`~calibration_module.measure.pair_v2.read_point_autorange` takes it as
-    the type it documents.  Only the defaults differ, and they differ for one
-    reason: step 7 is the brightest of the calibration steps.  The reference
-    stays on for every point while a second pair ramps up on top of it, so the
-    bright end runs past the +/-0.1 V step 6 lives at -- where the board clips
-    and returns a wrong mean rather than an error.
-    """
-
-    #: All-off dark only; at zero signal it needs the averaging.
-    t_single_s: float = 10.0
-    #: Every sweep point: the reference is on, so they are all bright.
-    t_both_s: float = 10.0
-    settle_s: float = 0.25
-    #: One quantized step above step 6's, costing one bit of resolution.
-    range_v: float = 0.2
-    range_wide_v: float = 0.5
-
-
-#: The acquisition every validated v2 run to date used.
-DEFAULT_ACQ = PhaseV2Acq()
+#: The bench acquisition -- step 6's and step 8's object, not a copy.
+#:
+#: Step 7 used to subclass ``PairV2Acq`` as ``PhaseV2Acq`` to hold its own
+#: defaults: a 10 s window against step 6's 8, and +/-0.2 V against step 6's
+#: +/-0.1, because step 7 is the brightest calibration step and the reference
+#: stays on for every point.  Both arguments are gone -- the range is fixed at
+#: the amplifier's own 1 V for every step, and one window is what makes a
+#: step-7 point comparable to the step-6 eta it is pinned against -- so the
+#: subclass held nothing.  Worse, it made ``step7.ACQ == step6.ACQ`` FALSE on
+#: the type while every field matched, which is exactly the claim this module
+#: now wants to be able to make.
+DEFAULT_ACQ = BENCH_ACQ
 
 
 @dataclass
@@ -181,10 +169,10 @@ def build_xw_sweep(cfg: PhaseV2Config = DEFAULT_CONFIG) -> list[Drive]:
     return [(float(v), float(v), r, r) for v in cfg.ramp()]
 
 
-def run_seconds(drive: Sequence[Drive], acq: PhaseV2Acq = DEFAULT_ACQ) -> float:
+def run_seconds(drive: Sequence[Drive], acq: PairV2Acq = DEFAULT_ACQ) -> float:
     """How long one target's sweep will take, so a caller can say so first."""
     n = len(drive)
-    return acq.t_single_s + n * acq.t_both_s + (n + 1) * acq.settle_s
+    return (n + 1) * (acq.t_meas_s + acq.settle_s)
 
 
 def measure_target(
@@ -195,7 +183,7 @@ def measure_target(
     drive: Sequence[Drive],
     *,
     cfg: PhaseV2Config = DEFAULT_CONFIG,
-    acq: PhaseV2Acq = DEFAULT_ACQ,
+    acq: PairV2Acq = DEFAULT_ACQ,
     col_ratio: np.ndarray | None = None,
     read_timeout: float = 30.0,
     step0: int = 0,
@@ -203,13 +191,14 @@ def measure_target(
     progress_callback: ProgressCallback | None = None,
     stop_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
+    row_hook: Callable[[], Mapping[str, str]] | None = None,
 ) -> PhaseResult:
     """Drive one target pair against the reference over ``drive`` -> raw rows.
 
-    ``tgt_index`` and ``cfg.ref_index`` are pair LABELS; ``cfg.slot`` maps them
+    ``tgt_index`` and ``cfg.ref_index`` are pair LABELS, which ``cfg.slot`` maps
     onto the 0-based drive arrays.  Only those two channels are driven, every
-    other one held off.  An all-off dark is read once at the start (the longer
-    ``t_single`` window) and stored per row, so the fit subtracts it row by row.
+    other held off.  The all-off dark is read once at the start and stored per
+    row, so the fit subtracts it row by row.
 
     Needs no step-6 model -- raw data only.  The returned
     :class:`~calibration_module.fit.phase.PhaseResult` carries no ``fit``;
@@ -218,6 +207,12 @@ def measure_target(
     ``step0``/``total`` let a multi-target run report one continuous progress
     count; they affect nothing but the numbers in :class:`PhaseV2Progress`.
     Raises :data:`PhaseV2Aborted` if ``stop_event`` is set between acquisitions.
+
+    ``row_hook`` is called once per acquisition for the two PMT-thermistor cells
+    stored beside every row -- in practice
+    :meth:`~calibration_module.measure.pmt_temp.PmtTemperature.sample`, whose
+    cached reading costs a GPIB round trip only once a minute.  The dark is read
+    before the first hook call, so it is not stamped.
     """
     from slm_module.encoding import encode_to_pattern
 
@@ -252,24 +247,28 @@ def measure_target(
             tgt_index=tgt_index, ref_index=cfg.ref_index,
             x_t=d[0], w_t=d[1], x_r=d[2], w_r=d[3],
             mean_v=mean_v, std_v=std_v, range_v=range_v, single=single,
-            duration_s=acq.t_single_s if single else acq.t_both_s,
+            duration_s=acq.t_meas_s,
         ))
 
     check_stop()
     display(0.0, 0.0, 0.0, 0.0)                      # all-off dark, once
-    dark_v, dark_std, dark_range = read_point_autorange(
+    dark_v, dark_std, dark_range = read_point(
         monitor, single=True, acq=acq, timeout=read_timeout, log=log
     )
     emit(0, (0.0, 0.0, 0.0, 0.0), dark_v, dark_std, dark_range, True)
 
     rows: list[tuple[float, float, float, float, float, float]] = []
+    cells: list[tuple[str, str]] = []
     for offset, (x_t, w_t, x_r, w_r) in enumerate(drive, start=1):
         check_stop()
         display(x_t, w_t, x_r, w_r)
-        mean_v, std_v, range_v = read_point_autorange(
+        mean_v, std_v, range_v = read_point(
             monitor, single=False, acq=acq, timeout=read_timeout, log=log
         )
         rows.append((x_t, w_t, x_r, w_r, mean_v, std_v))
+        if row_hook is not None:
+            s = row_hook()
+            cells.append((s.get("pmt_ohm_Ohm", ""), s.get("pmt_c", "")))
         emit(offset, (x_t, w_t, x_r, w_r), mean_v, std_v, range_v, False)
 
     def col(i: int) -> np.ndarray:
@@ -282,4 +281,6 @@ def measure_target(
         voltage_mean_v=col(4), voltage_std_v=col(5),
         dark_v=np.full(len(rows), float(dark_v)),
         n_trials=1,
+        pmt_ohm=np.array([c[0] for c in cells], dtype=object) if cells else None,
+        pmt_c=np.array([c[1] for c in cells], dtype=object) if cells else None,
     )
