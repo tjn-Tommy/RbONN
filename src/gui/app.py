@@ -2975,33 +2975,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 "click Send to SLM again."
             )
             return
-        tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-        tmp.close()
-        write_santec_csv(pattern, tmp.name)
-        self._enc_log("Sending encoding pattern to SLM… (full-res transfer, a few seconds)")
+        self._enc_log("Sending encoding pattern to SLM…")
         self.enc_send_button.setEnabled(False)
-
-        def _cleanup() -> None:
-            try:
-                Path(tmp.name).unlink(missing_ok=True)
-            except OSError:
-                pass
 
         def done(_result: Any) -> None:
             self._enc_log("\N{CHECK MARK} Pattern received and displayed on the SLM.")
             # pattern is now live on the SLM: clear the dim preview veil
             self.enc_monitor_view.set_preview(False)
-            _cleanup()
             self.enc_send_button.setEnabled(True)
 
         def failed(_error: str) -> None:
             self._enc_log("\N{CROSS MARK} Send failed (see the Status log on the Connections page).")
             self.enc_send_button.setEnabled(True)
-            _cleanup()
 
         self._run_slm_task(
             "Send encoding pattern",
-            lambda: controller.display_csv(tmp.name),
+            lambda: controller.display_array(pattern),
             done, failed,
         )
 
@@ -11554,7 +11543,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self._controller()
         self._run_slm_task(
             "Display segments",
-            lambda: controller.display_mask_csv(data),
+            lambda: controller.display_array(data),
         )
 
     def _export_segments_csv(self) -> None:

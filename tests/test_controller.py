@@ -20,6 +20,7 @@ class FakeDriver:
     def __init__(self, size: tuple[int, int] = (10, 4)):
         self.size = size
         self.loaded_csv: list[tuple[str, float]] = []
+        self.loaded_arrays: list[tuple[np.ndarray, float]] = []
         self.grayscale: list[tuple[int, float]] = []
         self.opened = False
         self.video_mode = MODE_DVI
@@ -39,6 +40,9 @@ class FakeDriver:
 
     def load_csv(self, csv_path: str, interval: float = 0.2) -> None:
         self.loaded_csv.append((csv_path, interval))
+
+    def load_array(self, data, interval: float = 0.2) -> None:
+        self.loaded_arrays.append((np.array(data, copy=True), interval))
 
     def ping(self, slm_number: int = 1, verify_video_mode: bool = False) -> int | None:
         self.pings.append((slm_number, verify_video_mode))
@@ -73,24 +77,38 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(len(fake.loaded_csv), 1)
             validate_slm_csv(result, expected_width=8, expected_height=3)
 
-    def test_display_array_writes_santec_csv(self) -> None:
+    def test_display_array_sends_buffer_without_writing_a_file(self) -> None:
         fake = FakeDriver(size=(8, 3))
         controller = SLMController(driver=fake)
         data = np.full((3, 8), 512, dtype=np.uint16)
 
-        try:
-            controller.display_array(data, interval=0.01)
-            loaded_path = Path(fake.loaded_csv[-1][0])
+        controller.display_array(data, interval=0.01)
 
-            self.assertEqual(len(fake.loaded_csv), 1)
-            self.assertTrue(loaded_path.exists())
-            validate_slm_csv(loaded_path, expected_width=8, expected_height=3)
+        self.assertEqual(fake.loaded_csv, [])
+        self.assertEqual(len(fake.loaded_arrays), 1)
+        sent, interval = fake.loaded_arrays[-1]
+        np.testing.assert_array_equal(sent, data)
+        self.assertEqual(interval, 0.01)
 
-            self.assertTrue(controller.refresh_display())
-            self.assertEqual(fake.loaded_csv[-1], (str(loaded_path), 0.0))
-        finally:
-            if fake.loaded_csv:
-                Path(fake.loaded_csv[0][0]).unlink(missing_ok=True)
+        # the keep-alive re-sends the same frame from memory
+        self.assertTrue(controller.refresh_display())
+        self.assertEqual(fake.loaded_csv, [])
+        self.assertEqual(len(fake.loaded_arrays), 2)
+        np.testing.assert_array_equal(fake.loaded_arrays[-1][0], data)
+        self.assertEqual(fake.loaded_arrays[-1][1], 0.0)
+
+    def test_display_mask_csv_still_writes_the_file_it_is_given(self) -> None:
+        fake = FakeDriver(size=(8, 3))
+        controller = SLMController(driver=fake)
+        data = np.full((3, 8), 512, dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mask.csv"
+
+            result = controller.display_mask_csv(data, csv_path=path, interval=0.01)
+
+            self.assertEqual(result, path.resolve())
+            self.assertEqual(fake.loaded_csv, [(str(path.resolve()), 0.01)])
+            validate_slm_csv(result, expected_width=8, expected_height=3)
 
     def test_display_center_scan_stops_when_event_is_set(self) -> None:
         fake = FakeDriver(size=(10, 2))
@@ -288,12 +306,13 @@ class CurrentPatternTests(unittest.TestCase):
         finally:
             if fake.loaded_csv:
                 Path(fake.loaded_csv[0][0]).unlink(missing_ok=True)
+        self.assertEqual(fake.loaded_csv, [])
 
         self.assertEqual(pattern.shape, (3, 10))
         self.assertTrue(np.all(pattern[:, 4:6] == 800))
         self.assertTrue(np.all(pattern[:, :4] == 50))
         self.assertTrue(np.all(pattern[:, 6:] == 50))
-        self.assertTrue(controller.describe_last_display().startswith("CSV: "))
+        self.assertEqual(controller.describe_last_display(), "Pattern array (10x3)")
 
     def test_scan_updates_captured_frame(self) -> None:
         fake = FakeDriver(size=(10, 2))
