@@ -160,6 +160,9 @@ class SLM_DVI_Driver:
         self.dll = _load_slm_dll()
         self._bind_functions()
         self._device = _DeviceThread()
+        # keeps the buffer handed to SLM_Disp_Data alive past a call() timeout,
+        # where the job can still run on the device thread after we gave up
+        self._pinned_buffer: np.ndarray | None = None
 
     def _bind_functions(self):
         self.dll.SLM_Disp_Info.argtypes = [
@@ -196,6 +199,15 @@ class SLM_DVI_Driver:
             ctypes.c_wchar_p,
         ]
         self.dll.SLM_Disp_ReadCSV.restype = ctypes.c_int32
+
+        self.dll.SLM_Disp_Data.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint16,
+            ctypes.c_uint16,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint16),
+        ]
+        self.dll.SLM_Disp_Data.restype = ctypes.c_int32
 
         # USB control functions for switching Memory/DVI mode (Guide 1.3.1)
         self.dll.SLM_Ctrl_Open.argtypes = [ctypes.c_uint32]
@@ -288,6 +300,33 @@ class SLM_DVI_Driver:
             lambda: self.dll.SLM_Disp_ReadCSV(self.display_no, flags, csv_path),
         )
         self._check_error(ret, "SLM_Disp_ReadCSV")
+        time.sleep(interval)
+
+    def load_array(self, data, interval: float = 0.2, flags: int | None = None):
+        """Display a 2D grid straight from memory (SLM_Disp_Data).
+
+        The same DVI path as load_csv without the CSV detour: the DLL reads
+        the uint16 buffer as-is, so no frame is serialised to text for it to
+        parse back. `data` is (height, width); the SDK fills its buffer
+        row-major (sample CPP, SLM_Disp_Data), which is how a C-contiguous
+        array of that shape already lies in memory.
+        """
+        buffer = np.ascontiguousarray(data, dtype=np.uint16)
+        if buffer.ndim != 2:
+            raise ValueError(f"pattern must be 2D, got shape {buffer.shape}")
+        height, width = buffer.shape
+        flags = self.flags if flags is None else int(flags)
+        self._pinned_buffer = buffer
+        pointer = buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        # the settle sleep stays on the calling thread so it never delays
+        # other device-thread jobs
+        ret = self._device.call(
+            "SLM_Disp_Data",
+            lambda: self.dll.SLM_Disp_Data(
+                self.display_no, width, height, flags, pointer
+            ),
+        )
+        self._check_error(ret, "SLM_Disp_Data")
         time.sleep(interval)
 
     def load_grayscale(self, grayscale: int, interval: float = 0.2, flags: int | None = None):

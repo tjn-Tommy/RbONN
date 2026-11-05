@@ -46,7 +46,10 @@ Do not merge two such folders into one table. `accuracy_0917_1834` was built on
 share no drive vectors and their residuals are not comparable.
 
 Older runs still carry the legacy `run_<MMDD>_<desc>` form. Renaming them is
-not free — see below.
+not free — see below. `archive/2026-10/` adds a third form, `<MMDD>_<desc>`
+(`1015_twostep`, `1020_f75_tpa`, …), kept as-is when it was archived: the name
+is the record of what the run was, and every CSV inside carries the same
+`<MMDD>` stamp.
 
 ## Do not move these without updating the tests
 

@@ -316,7 +316,7 @@ class SLMController:
             self._last_display = ("csv", resolved)
             self._last_pattern = pattern
 
-    # load npy array as a csv. input should be 2D
+    # load a 2D array straight from memory -- the default display path
     def display_array(self, arr: np.ndarray, interval: float = 0.2) -> None:
         slm_width, slm_height = self.get_slm_info()
         if arr.ndim != 2:
@@ -326,17 +326,27 @@ class SLMController:
                 f"Input array shape {arr.shape} does not match SLM dimensions "
                 f"({slm_height}, {slm_width})"
             )
-        self.display_mask_csv(arr, interval=interval)
+        pattern = np.asarray(arr).astype(np.uint16, copy=True)
+        with self._io_lock:
+            self._ensure_open()
+            self.driver.load_array(pattern, interval)
+            self._last_display = ("array", None)
+            self._last_pattern = pattern
 
     def display_mask_csv(
         self,
         data,
-        csv_path: str | Path | None = None,
+        csv_path: str | Path,
         interval: float = 0.2,
     ) -> Path:
+        """Display a 2D grid via a CSV on disk, which is left in place.
+
+        `display_array` is the path for simply showing a pattern; this one is
+        for the callers that want the frame as a file as well, and so must say
+        where it goes -- a frame written somewhere nobody owns is a frame
+        nobody deletes.
+        """
         slm_width, slm_height = self.get_slm_info()
-        if csv_path is None:
-            csv_path = _temporary_csv_path("slm_mask_")
         csv_path = write_santec_csv(data, csv_path)
         validate_slm_csv(csv_path, expected_width=slm_width, expected_height=slm_height)
         pattern = np.asarray(data).astype(np.uint16, copy=True)
@@ -355,11 +365,15 @@ class SLMController:
         csv_path: str | Path | None = None,
         interval: float = 0.2,
         background_level: int = 0,
-    ) -> Path:
+    ) -> Path | None:
+        """Show one vertical window; writes a CSV only when given a path."""
         slm_width, slm_height = self.get_slm_info()
         data = make_vertical_window(
             slm_width, slm_height, x_start, level, window_px, background_level
         )
+        if csv_path is None:
+            self.display_array(data, interval=interval)
+            return None
         return self.display_mask_csv(data, csv_path=csv_path, interval=interval)
 
     def ping(self, slm_number: int = 1, verify_dvi: bool = False) -> None:
@@ -390,6 +404,11 @@ class SLMController:
             kind, value = last
             if kind == "gray":
                 self.driver.load_grayscale(value, 0.0)
+            elif kind == "array":
+                pattern = self._last_pattern
+                if pattern is None:
+                    return False
+                self.driver.load_array(pattern, 0.0)
             else:
                 self.driver.load_csv(value, 0.0)
             return True
@@ -418,6 +437,11 @@ class SLMController:
         kind, value = last
         if kind == "gray":
             return f"Grayscale level {value}"
+        if kind == "array":
+            pattern = self._last_pattern
+            if pattern is None:
+                return "Pattern array"
+            return f"Pattern array ({pattern.shape[1]}x{pattern.shape[0]})"
         return f"CSV: {value}"
 
     def run_center_scan(
@@ -577,10 +601,3 @@ def _validate_positive_float(value: float, name: str) -> float:
         raise ValueError(f"{name} must be positive")
     return result
 
-
-def _temporary_csv_path(prefix: str) -> Path:
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".csv", prefix=prefix, delete=False
-    )
-    handle.close()
-    return Path(handle.name)
