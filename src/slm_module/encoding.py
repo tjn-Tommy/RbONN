@@ -468,9 +468,9 @@ def channel_layout_from_calibration(
     intens = (np.zeros((n, levels.size), dtype=float) if curves_only
               else np.asarray(calib.intensity_levels, dtype=float))
 
-    if n < 4 or n % 2:
+    if n < 2 or n % 2:
         raise ValueError(
-            f"channel calibration needs an even number of coordinates (>= 4), got {n}"
+            f"channel calibration needs an even number of coordinates (>= 2), got {n}"
         )
     if wls.size != n or intens.ndim != 2 or intens.shape[0] != n:
         raise ValueError("wavelength/intensity rows do not match the coordinates")

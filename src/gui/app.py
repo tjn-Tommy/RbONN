@@ -2015,7 +2015,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setColumnStretch(1, 1)
         widgets["target"] = self._double_spin(700.0, 900.0, 778.04, " nm", 3)
         widgets["window"] = self._spin(1, 256, 15)
-        widgets["pad"] = self._spin(0, 256, 35)
+        widgets["pad"] = self._spin(0, 1920, 35)
         widgets["count"] = self._spin(1, 200, 10)
         widgets["guard_check"] = QtWidgets.QCheckBox("Min-level guard bands")
         widgets["guard_check"].setChecked(True)
