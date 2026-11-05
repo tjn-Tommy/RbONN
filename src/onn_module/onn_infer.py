@@ -2,8 +2,9 @@
 
 The other end of :mod:`onn_module.bench_reference`: that file writes down the
 drives and the ``Y`` each should produce, this one displays them, reads the
-detector, undoes the instrument response and reports whether the optics picked
-the right digit.
+detector, undoes the instrument response and writes every read to a CSV.  It
+scores nothing: the classes, the accuracy and the confusion matrices are
+the job of the ``report.py`` beside the CSV, off that CSV and the same npz.
 
 In:  a ``bench_reference.npz`` and the run's ``calib.json`` (``--calib``),
      whose forward model the gain is measured against.  ``--t-meas`` is the
@@ -11,8 +12,9 @@ In:  a ``bench_reference.npz`` and the run's ``calib.json`` (``--calib``),
      inference, anchor and the opening dark alike -- and defaults to the bench
      window :data:`~calibration_module.measure.pair_v2.T_MEAS_S`, the one steps
      6-8 read at.
-Out: a CSV, one row per read: the volts, the recovered ``Y``, the ``g`` used,
-     and ``kind=gain`` rows for the anchors it was built from.
+Out: a CSV in ``--out``, which is REQUIRED -- there is no default dataset
+     directory to fall into.  One row per read: the volts, the recovered
+     ``Y``, the ``g`` used, and ``kind=gain`` rows for the anchors.
 
 How the instrument response is undone.  The detector sees, for gain ``g`` and
 the step-6 single-beam response ``sb``,
@@ -80,7 +82,7 @@ USB_SLM_NO = 1              # SLM_Ctrl_* device index for the DVI-mode switch
 DAQ_DEVICE = "Dev1"
 DAQ_CHANNEL = "ai0"
 
-T_MEAS_S = 4.8        # DAQ window per read, seconds; --t-meas overrides
+T_MEAS_S = 4.0        # DAQ window per read, seconds; --t-meas overrides
 
 ACQ = replace(DEFAULT_ACQ, t_meas_s=T_MEAS_S)   # the bench acquisition
 
@@ -98,8 +100,6 @@ GAIN_RUNGS = 10
 #: A rung more than this (relative) off its block's fitted slope is dropped from
 #: that block's fit.  Inference reads are never checked.
 GAIN_TOL = 0.04
-
-OUT_DIR = REPO_ROOT / "runs"
 
 #: Extra CSV columns, in order.  The first group is fixed before the run
 #: (``extra``); the second can only be filled after a read (``row_hook``).
@@ -449,51 +449,6 @@ def build_reads(ref: dict, pairs: list[int], models) -> tuple[np.ndarray, np.nda
     return (np.asarray(xs)[None], np.asarray(ws)[None], extra)
 
 
-def summarise(rows: list, ref: dict, log=print) -> None:
-    """Residual against y_block, and whether the optics picked the right digit.
-
-    The accuracy is computed from the measured ``y_sum`` through the same
-    readout gain the simulation used.
-    """
-    onn = [r for r in rows if r.get("kind") == "onn" and r.get("y_meas_v") != ""]
-    if not onn:
-        log("\nno completed inference reads to summarise")
-        return
-    res = np.array([float(r["resid_v"]) for r in onn])
-    pred = np.array([float(r["y_pred_v"]) for r in onn])
-    span = float(pred.max() - pred.min()) or 1.0
-    log(f"\n{len(onn)} of {ref['n'] * ref['n_tiles'] * ref['n_out'] * ref['n_banks']} "
-        f"inference reads")
-    log(f"  residual vs y_block   rms {res.std() * 1e3:.4f} mV  "
-        f"bias {res.mean() * 1e3:+.4f} mV  max |{np.abs(res).max() * 1e3:.4f}| mV"
-        f"   ({100 * res.std() / span:.2f}% of the predicted span)")
-
-    # y_sum per (image, output), but only for images read all the way through.
-    got: dict[int, np.ndarray] = {}
-    counts: dict[int, np.ndarray] = {}
-    for r in onn:
-        i = int(r["image"])
-        sign = 1.0 if int(r["bank"] or 0) == 0 else -1.0
-        got.setdefault(i, np.zeros(ref["n_out"]))
-        counts.setdefault(i, np.zeros(ref["n_out"]))
-        got[i][int(r["out"])] += sign * float(r["y_meas_v"])
-        counts[i][int(r["out"])] += 1
-    want = ref["n_tiles"] * ref["n_banks"]
-    whole = [i for i in got if counts[i].min() == want]
-    if not whole:
-        log("  no image was read all the way through, so there is no class to compare")
-        return
-    pos = {int(v): j for j, v in enumerate(ref["idx"])}
-    hit = agree = 0
-    for i in sorted(whole):
-        j = pos[i]
-        bench_class = int(np.argmax(got[i] * ref["out_scale"]))
-        hit += bench_class == int(ref["labels"][j])
-        agree += bench_class == int(np.argmax(ref["logits_ref"][j]))
-    log(f"  {len(whole)} complete image(s): bench accuracy {hit}/{len(whole)}, "
-        f"agrees with the simulation on {agree}/{len(whole)}")
-
-
 def print_anchor(anchors: dict, log=print) -> None:
     """The gain ladder: the band, the seed, and what each rung should read.
 
@@ -553,7 +508,9 @@ def main() -> int:
     ap.add_argument("--no-gain", action="store_true",
                     help="measure no gain at all and assume g = 1 throughout; "
                          "nothing then tracks a drift")
-    ap.add_argument("--out", type=Path, default=None, metavar="DIR")
+    ap.add_argument("--out", required=True, type=Path, metavar="DIR",
+                    help="directory for the CSV; required, so a run can never "
+                         "land in the folder of a different dataset")
     ap.add_argument("--pmt", default=None, metavar="RESOURCE",
                     help="VISA address of the Keithley 2400 reading the PMT "
                          "thermistor (default: daq_pmt_monitor.K2400_RESOURCE)")
@@ -610,7 +567,7 @@ def main() -> int:
 
     pmt = open_pmt(args.pmt, period_s=args.gain_every, enabled=not args.no_pmt)
 
-    out = Path(args.out or OUT_DIR)
+    out = Path(args.out)
     stamp = time.strftime("%m%d_%H%M")
     csv_path = out / f"onn_infer_{stamp}.csv"
     columns = BEFORE + AFTER + (list(pmt.COLUMNS) if pmt else [])
@@ -709,7 +666,6 @@ def main() -> int:
             apply_gain(rows)
         flush()
         print(f"\n{csv_path}   [{status}]")
-        summarise(rows, ref)
     return 0
 
 
