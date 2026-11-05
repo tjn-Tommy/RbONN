@@ -1,7 +1,13 @@
 """Draft: acquire the ladder that measures how many bits the bench really has.
 
-    python src/drafts/bit_acc_chara.py --dry-run    # solve it all, touch no hardware
-    python src/drafts/bit_acc_chara.py              # the ~45 min acquisition
+    python src/drafts/bit_acc_chara.py --calib RUN --dry-run   # solve it, no hardware
+    python src/drafts/bit_acc_chara.py --calib RUN             # the ~45 min acquisition
+
+``--calib`` is the run whose forward model the drives are solved from, either
+its ``calib.json`` or the directory holding one, and it is REQUIRED: the
+resolution being measured is the resolution of ONE calibration, so which one
+has to be said out loud rather than left to whichever run was current when
+this file was last edited.
 
 This script MEASURES and writes a CSV to ``runs/4bit_acc_char``.  It does no
 fitting, no reporting and no plotting -- the analysis happens separately, off
@@ -60,10 +66,7 @@ from calibration_module.measure.patterns import (               # noqa: E402
     DARK_EVERY_S, run_patterns,
 )
 from calibration_module.steps import calib_step8 as STEP8       # noqa: E402
-
-#: The forward model the drives are solved from.  Only its etas and phases
-#: matter here -- they decide which drive is alpha = 0.1.
-STEP7 = REPO_ROOT / "src/calib_data/1027_calib/calib.json"
+from calibration_module.calib_file import calib_path            # noqa: E402
 
 OUT_DIR = REPO_ROOT / "runs/4bit_acc_char"
 
@@ -204,8 +207,11 @@ def measure(step7: Path, patterns, entries, models, phases, pairs,
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--step7", type=Path, default=STEP7,
-                   help="calib.json (or a step-7 result) to solve drives from")
+    p.add_argument("--calib", required=True, type=Path, metavar="RUN",
+                   help="the run to solve the drives from: its calib.json, or "
+                        "the directory holding one.  Only its step-6 etas and "
+                        "step-7 phases matter here -- they decide which drive "
+                        "is alpha = 0.1")
     p.add_argument("--hi", type=float, default=ALPHA_HI,
                    help="top of the band; the 1027 ONN run reached 0.235")
     p.add_argument("--levels", type=int, default=LEVELS)
@@ -222,18 +228,24 @@ def main(argv=None) -> int:
     if not 0.0 < args.hi <= 1.0:
         p.error(f"--hi {args.hi}: expected 0 < hi <= 1")
 
+    # resolve a directory to the calib.json inside it once, here, so the file
+    # the drives came from is what the CSV's metadata records
+    step7 = calib_path(args.calib)
+    if not step7.is_file():
+        p.error(f"--calib {args.calib}: no calib.json at {step7}")
+
     acq = replace(STEP8.ACQ, t_meas_s=args.t_meas)
     models, phases, pairs, scale, patterns = solve(
-        args.step7, args.hi, args.levels, args.seed)
+        step7, args.hi, args.levels, args.seed)
     entries = build_reads(patterns, args.repeats, args.shuffle_seed)
-    print(f"step 7: {Path(args.step7).name}   pairs {pairs}")
+    print(f"step 7: {step7.parent.name}/{step7.name}   pairs {pairs}")
     report_plan(scale, patterns, entries, acq, args.out)
     if args.dry_run:
         print("\ndry run: nothing was opened")
         return 0
 
     args.out.mkdir(parents=True, exist_ok=True)
-    measure(args.step7, patterns, entries, models, phases, pairs, acq, args.out)
+    measure(step7, patterns, entries, models, phases, pairs, acq, args.out)
     return 0
 
 

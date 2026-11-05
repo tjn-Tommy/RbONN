@@ -12,13 +12,13 @@ axis.  Measure first, analyse second.
 
 2. Rehearse.  Solves the 16 drives, prints the estimate, opens nothing:
 
-       python .\src\drafts\bit_acc_chara.py --step7 .\src\calib_data\1027_calib\ --dry-run
+       python .\src\drafts\bit_acc_chara.py --calib .\src\calib_data\1027_calib\ --dry-run
 
 3. Measure, ~46 min.  The GUI must not be holding the DAQ or the SLM -- the
    DAQ is opened first, so a busy machine stops the run before the panel is
    touched:
 
-       python .\src\drafts\bit_acc_chara.py --step7 .\src\calib_data\1027_calib\
+       python .\src\drafts\bit_acc_chara.py --calib .\src\calib_data\1027_calib\
 
    Writes `bit_acc_chara_<MMDD_HHMM>.csv` here (`--out` moves it).  Stops
    itself if any raw trace peaks at 0.90 V, and re-reads the dark throughout
