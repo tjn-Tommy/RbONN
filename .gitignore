@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.mplconfig/
 .vscode/
 settings.json
 *.npz
@@ -14,4 +15,12 @@ CLAUDE.md
 # onn_module outputs: the MNIST download and the training runs are regenerable
 # (model.pt aside, which is kept wherever you want it -- not tracked here)
 data/
-runs/
+
+# a run's measured output is regenerable, but the notes and the report script
+# that drive it are hand-written -- those are tracked
+runs/*
+!runs/*/
+!runs/queue.ps1
+runs/*/*
+!runs/*/workflow.md
+!runs/*/report.py
